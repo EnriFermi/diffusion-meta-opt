@@ -1,0 +1,33 @@
+downstream:
+  name: cifar10
+
+meta:
+  algorithm: sac
+  inner_steps: 25
+
+cifar10:
+  data_dir: ./data
+  download: true
+  n_train: 128
+  n_val: 128
+  augment: true
+  normalize: true
+  cache_on_gpu: false
+rl:
+  train_episodes: 5000
+  warmup_steps: 500
+
+baseline:
+  episodes: 10
+
+checkpoint:
+  path: micro_meta_sac_cifar10.pt
+
+perf:
+  # Keep portable defaults; override locally if you want more loader parallelism.
+  num_workers: 0
+  compile: true
+  amp: auto
+  channels_last: true
+  tf32: true
+  cudnn_benchmark: true
