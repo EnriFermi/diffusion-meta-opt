@@ -10,9 +10,9 @@ hf:
   repo: zhoubolei/scene_parse_150
   subset: null
   split: train
-  streaming: false
+  streaming: true
   shuffle_buffer: 10000
-  trust_remote_code: false
+  trust_remote_code: true
 
 schema:
   image_mode: image_field
@@ -26,7 +26,6 @@ schema:
 cache:
   num_chunks_kept: 2
   chunk_size_images: 256
-  prefetch_low_watermark: 1
 
 worker:
   idle_sleep_s: 0.5

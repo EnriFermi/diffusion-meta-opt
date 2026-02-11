@@ -14,11 +14,12 @@ dataset_config_dirs:
   - conf/data/datasets
 
 enabled_datasets:
-  - flickr30k
   - coco2017
   - cc12m
   - visual_genome
   - scene_parse_150
+  - mapillary_vistas_v2
+  - relaion400m
 
 # Точечные override'ы для выбранного профиля.
 # Пример:

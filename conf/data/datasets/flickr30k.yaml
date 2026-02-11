@@ -1,5 +1,5 @@
 name: flickr30k
-enabled: true
+enabled: false
 gated: false
 sampling_weight: 1.0
 models:
@@ -10,7 +10,7 @@ collector_device: null
 hf:
   repo: nlphuji/flickr30k
   subset: null
-  split: train
+  split: test
   streaming: false
   shuffle_buffer: 10000
   trust_remote_code: false
@@ -21,13 +21,12 @@ schema:
   image_field_candidates: [image, img]
   url_field: null
   url_field_candidates: []
-  id_field: id
+  id_field: img_id
   extra_fields: [caption]
 
 cache:
   num_chunks_kept: 2
   chunk_size_images: 256
-  prefetch_low_watermark: 1
 
 worker:
   idle_sleep_s: 0.5

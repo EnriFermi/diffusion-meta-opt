@@ -30,7 +30,7 @@ def main(cfg: DictConfig) -> None:
     try:
         started = time.time()
         while time.time() - started < runtime_seconds:
-            logger.info("cache size=%s stats=%s", collector.cache.size(), collector.stats())
+            logger.info("cache size=%s stats=%s", collector.cache_size(), collector.stats())
             time.sleep(1.0)
     finally:
         collector.shutdown()

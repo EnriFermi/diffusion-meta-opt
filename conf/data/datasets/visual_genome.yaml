@@ -8,7 +8,7 @@ collector_device: null
 
 hf:
   repo: ranjaykrishna/visual_genome
-  subset: null
+  subset: region_descriptions_v1.2.0
   split: train
   streaming: true
   shuffle_buffer: 10000
@@ -18,15 +18,14 @@ schema:
   image_mode: url_field
   image_field: null
   image_field_candidates: []
-  url_field: url
-  url_field_candidates: [url, image_url, imageURL]
+  url_field: image_url
+  url_field_candidates: [image_url, imageURL, url, flickr_url]
   id_field: image_id
-  extra_fields: [caption, region_descriptions]
+  extra_fields: [phrase, region_id]
 
 cache:
   num_chunks_kept: 2
   chunk_size_images: 256
-  prefetch_low_watermark: 1
 
 worker:
   idle_sleep_s: 0.5

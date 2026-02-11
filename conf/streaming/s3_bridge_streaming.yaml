@@ -1,0 +1,34 @@
+mode: s3_bridge
+
+chunk_size_samples: 256
+chunk_format:
+  compression: none
+
+producer:
+  local_spool_dir: ${data.path}/streaming/spool/producer
+  local_max_chunks: 64
+
+consumer:
+  local_cache_dir: ${data.path}/streaming/cache/consumer
+  local_max_chunks: 16
+  delete_remote_after: consume
+
+local_disk:
+  root_dir: ${data.path}/streaming/local_disk
+  max_ready_chunks: 200
+  low_watermark_chunks: 100
+
+s3:
+  bucket: ""
+  prefix: diffusion-meta-opt/streaming
+  region: null
+  endpoint_url: null
+  max_remote_chunks: 1000
+  staging_prefix: staging
+  ready_prefix: ready
+
+distributed:
+  enabled: false
+  rank_env: RANK
+  world_size_env: WORLD_SIZE
+  shard_by: chunk

@@ -13,9 +13,9 @@ class TestCompatibilityIndex(unittest.TestCase):
                 "path": "./data",
                 "seed": 1,
                 "dataset_config_dirs": ["conf/data/datasets"],
-                "enabled_datasets": ["flickr30k", "coco2017"],
+                "enabled_datasets": ["cc12m", "coco2017"],
                 "dataset_overrides": {
-                    "flickr30k": {"models": []},
+                    "cc12m": {"models": []},
                     "coco2017": {"models": []},
                 },
             },
@@ -29,7 +29,7 @@ class TestCompatibilityIndex(unittest.TestCase):
         index = CompatibilityIndex(cfg)
 
         self.assertIn("clip_vit_b32", index.get_models())
-        self.assertIn("flickr30k", index.get_datasets_for_model("clip_vit_b32"))
+        self.assertIn("cc12m", index.get_datasets_for_model("clip_vit_b32"))
         self.assertIn("coco2017", index.get_datasets_for_model("clip_vit_b32"))
 
     def test_async_filters_dataset_with_mismatched_collector_device(self) -> None:
@@ -39,9 +39,9 @@ class TestCompatibilityIndex(unittest.TestCase):
                 "path": "./data",
                 "seed": 1,
                 "dataset_config_dirs": ["conf/data/datasets"],
-                "enabled_datasets": ["flickr30k"],
+                "enabled_datasets": ["coco2017"],
                 "dataset_overrides": {
-                    "flickr30k": {
+                    "coco2017": {
                         "collector_device": "cuda:2",
                     },
                 },

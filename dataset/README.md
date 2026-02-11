@@ -1,79 +1,83 @@
-# Shared Data Collection Pipeline
+# Dataset Pipeline Entry README
 
-Проект использует единственный production-путь:
+Полная техническая документация пайплайна находится в:
+- `docs/data_pipeline_README.md`
 
-- `dataset/data_raw/`: виртуализация HF raw-датасетов с chunk-cache.
-- `dataset/models/`: виртуальные модели с хуками `nn.Linear` и `LayerIORecord`.
-- `dataset/shared/`: model-first оркестрация (`CollectorService`, `SharedModelDataset`, кэш, scheduler).
+Этот файл оставлен как короткий entry-point.
 
-## Конфиги
+## Что сейчас production-path
 
-- `conf/config.yaml`: top-level + `defaults`.
-- `conf/data/test_dataset.yaml`: профиль набора датасетов/override-ов.
-- `conf/data/datasets/*.yaml`: отдельные raw-датасеты.
-- `conf/data/models/*.yaml`: отдельные модели.
+Используется только связка:
+- `dataset/data_raw/` — виртуализация HF raw datasets + chunk-cache
+- `dataset/models/` — model virtualization + `nn.Linear` hooks
+- `dataset/shared/` — model-first orchestration + shared cache/streaming + iterable dataset
 
-Выбор профиля делается через `defaults` в `conf/config.yaml`:
+Streaming modes:
+- `streaming.mode=none` (in-memory cache)
+- `streaming.mode=local_disk` (final chunks on local disk)
+- `streaming.mode=s3_bridge` (producer/consumer через S3)
 
-```yaml
-defaults:
-  - data: test_dataset
-  - collector: interleaved
-  - _self_
-```
+Подробности и тюнинг streaming вынесены в:
+- `docs/data_pipeline_README.md` (разделы 8-15)
+- `tutorials/00_how_to_choose_data_mode.md` (выбор режима)
+- `tutorials/10_data_mode_none_in_memory.ipynb`
+- `tutorials/11_data_mode_local_disk_gpu_parallel.ipynb`
+- `tutorials/12_data_mode_s3_bridge.ipynb`
 
-Локальные override-ы датасетов задаются в профиле `data.dataset_overrides`, например:
+## Быстрые команды
 
-```yaml
-dataset_overrides:
-  flickr30k:
-    models: [clip_vit_b32, dinov2_base]
-```
-
-## Model-First Flow
-
-Один collector job:
-
-1. Выбор модели (`collector.model_policy`, `collector.model_burst_jobs`).
-2. Mixed batch из совместимых датасетов (`dataset_mix_policy`, `mix_cap_per_dataset`).
-3. Инференс модели (на collector device, LRU cap = 1).
-4. Атомизация LayerIO и запись в bounded cache.
-
-## Режимы
-
-- `async`: `collector.device != train.device`.
-- `interleaved`: `collector.device == null` или `collector.device == train.device`.
-
-## Запуск демо
-
-Async:
+Inspect raw dataset:
 
 ```bash
-pipenv run python -m dataset.shared.demo_async \
-  train.device=cuda:0 collector.device=cuda:1 collector.mode=auto
+pipenv run python -m dataset.data_raw.tools.inspect_dataset coco2017 --n 3
 ```
 
-Interleaved:
+Interleaved demo:
 
 ```bash
 pipenv run python -m dataset.shared.demo_interleaved \
-  train.device=cuda:0 collector.device=null collector.mode=auto
+  train.device=cuda:0 \
+  collector.device=null \
+  collector.mode=auto
 ```
 
-End-to-end:
+Async demo:
+
+```bash
+pipenv run python -m dataset.shared.demo_async \
+  train.device=cuda:0 \
+  collector.device=cuda:1 \
+  collector.mode=auto
+```
+
+End-to-end demo:
 
 ```bash
 pipenv run python -m dataset.shared.demo_end_to_end \
-  train.device=cuda:0 collector.device=cuda:1 \
-  data.enabled_datasets=[flickr30k,coco2017] \
-  data.dataset_overrides.flickr30k.models=[clip_vit_b32,dinov2_base] \
-  data.dataset_overrides.coco2017.models=[clip_vit_b32] \
-  collector.cache.max_items=2000 collector.cache.low_watermark=1200 collector.cache.fill_target=2000 \
+  train.device=cuda:0 \
+  collector.device=null \
+  collector.mode=auto \
+  data.enabled_datasets=[coco2017,cc12m,scene_parse_150] \
   demo.num_samples=200
 ```
 
-## Инспекция raw-датасета
+Local streaming demo:
 
 ```bash
-pipenv run python -m dataset.data_raw.tools.inspect_dataset flickr30k --n 3
+pipenv run python -m dataset.shared.demo_streaming_local \
+  streaming=gpu_parallel_streaming \
+  train.device=cuda:0 \
+  collector.device=cuda:1 \
+  collector.mode=auto
+```
+
+S3 bridge streaming demo:
+
+```bash
+pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
+  streaming=s3_bridge_streaming \
+  streaming.s3.bucket=YOUR_BUCKET \
+  train.device=cuda:0 \
+  collector.device=cuda:1 \
+  collector.mode=auto
 ```

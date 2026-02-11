@@ -1,5 +1,5 @@
 name: mapillary_vistas_v2
-enabled: false
+enabled: true
 gated: true
 sampling_weight: 1.0
 models:
@@ -10,7 +10,7 @@ hf:
   repo: candylion/mapillary-vistas-v2
   subset: null
   split: train
-  streaming: false
+  streaming: true
   shuffle_buffer: 10000
   trust_remote_code: false
 
@@ -26,7 +26,6 @@ schema:
 cache:
   num_chunks_kept: 2
   chunk_size_images: 256
-  prefetch_low_watermark: 1
 
 worker:
   idle_sleep_s: 0.5

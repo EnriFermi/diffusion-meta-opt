@@ -2,6 +2,9 @@ enabled: true
 device: null
 mode: auto
 max_loaded_models: 1
+pin_gpu: false
+release_device_on_unload: true
+empty_cuda_cache_on_unload: true
 model_policy: shuffled_cycle
 model_burst_jobs: 2
 dataset_mix_policy: multinomial

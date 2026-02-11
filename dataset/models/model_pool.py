@@ -21,6 +21,8 @@ class ModelPool:
         device_override: str | None,
         max_loaded_models: int,
         runtime_local_only: bool,
+        release_device_on_unload: bool = True,
+        empty_cuda_cache_on_unload: bool = True,
     ) -> None:
         self.global_cfg = global_cfg
         self.global_cfg_dict = to_plain_dict(global_cfg)
@@ -33,6 +35,8 @@ class ModelPool:
         self.device_override = device_override
         self.max_loaded_models = max(1, int(max_loaded_models))
         self.runtime_local_only = bool(runtime_local_only)
+        self.release_device_on_unload = bool(release_device_on_unload)
+        self.empty_cuda_cache_on_unload = bool(empty_cuda_cache_on_unload)
 
         self._loaded_models: OrderedDict[str, BaseVirtualModel] = OrderedDict()
 
@@ -85,6 +89,8 @@ class ModelPool:
             "device_override": self.device_override,
             "runtime_local_only": self.runtime_local_only,
             "max_loaded_models": self.max_loaded_models,
+            "release_device_on_unload": self.release_device_on_unload,
+            "empty_cuda_cache_on_unload": self.empty_cuda_cache_on_unload,
             "loaded_models": list(self._loaded_models.keys()),
         }
 
@@ -101,6 +107,8 @@ class ModelPool:
         if self.device_override:
             runtime_cfg["device"] = self.device_override
         runtime_cfg["local_files_only"] = self.runtime_local_only
+        runtime_cfg["release_device_on_unload"] = self.release_device_on_unload
+        runtime_cfg["empty_cuda_cache_on_unload"] = self.empty_cuda_cache_on_unload
 
         model = create_model(model_name, cfg=runtime_cfg, global_cfg=self.global_cfg)
         model.load()

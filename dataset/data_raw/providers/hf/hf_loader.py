@@ -24,13 +24,34 @@ def load_hf_dataset(cfg: Any, token: str | None, seed: int):
     streaming = bool(hf_cfg.get("streaming", False))
     trust_remote_code = bool(hf_cfg.get("trust_remote_code", False))
 
-    kwargs = {
-        "split": split,
+    base_kwargs = {
         "streaming": streaming,
         "trust_remote_code": trust_remote_code,
     }
 
-    dataset = _load_dataset_with_best_auth(repo=repo, subset=subset, kwargs=kwargs, token=token)
+    try:
+        dataset = _load_dataset_with_best_auth(
+            repo=repo,
+            subset=subset,
+            kwargs={"split": split, **base_kwargs},
+            token=token,
+        )
+    except ValueError as exc:
+        # Some datasets expose only a subset of splits (e.g. ["test"]).
+        # Fallback to loading split map and selecting the closest available split.
+        text = str(exc)
+        if "Bad split" not in text:
+            raise
+        LOGGER.warning("Dataset '%s' split '%s' is unavailable: %s", repo, split, text)
+        dataset = _load_dataset_with_best_auth(
+            repo=repo,
+            subset=subset,
+            kwargs=base_kwargs,
+            token=token,
+        )
+        resolved_split = _select_split(dataset=dataset, preferred=str(split))
+        LOGGER.warning("Dataset '%s': using fallback split '%s' instead of '%s'", repo, resolved_split, split)
+        dataset = dataset[resolved_split]
 
     if streaming and hasattr(dataset, "shuffle"):
         shuffle_buffer = int(hf_cfg.get("shuffle_buffer", 10_000))
@@ -56,3 +77,16 @@ def _load_dataset_with_best_auth(
                 LOGGER.debug("load_dataset(..., use_auth_token=...) is unsupported; relying on env token")
 
     return load_dataset(repo, subset, **kwargs)
+
+
+def _select_split(dataset: Any, preferred: str) -> str:
+    keys = list(getattr(dataset, "keys", lambda: [])())
+    if not keys:
+        raise ValueError("Cannot resolve split fallback: dataset has no split keys")
+
+    preferred_order = [preferred, "train", "validation", "test"]
+    for name in preferred_order:
+        if name in keys:
+            return name
+
+    return keys[0]

@@ -1,6 +1,7 @@
 defaults:
   - data: test_dataset
   - collector: interleaved
+  - streaming: none
   - _self_
 
 hf:

@@ -13,10 +13,15 @@ from dataset.shared.shared_dataset import SharedModelDataset
 @hydra.main(version_base=None, config_path="../../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
     _setup_logging(cfg)
-    logger = logging.getLogger("dataset.shared.demo_end_to_end")
+    logger = logging.getLogger("dataset.shared.demo_streaming_s3_bridge")
 
-    logger.info("Starting end-to-end shared dataset demo")
+    logger.info("Starting S3-bridge streaming demo")
     logger.debug("Config:\n%s", OmegaConf.to_yaml(cfg, resolve=True))
+
+    if str(cfg.streaming.mode).lower() != "s3_bridge":
+        raise ValueError("demo_streaming_s3_bridge requires streaming.mode=s3_bridge")
+    if not str(cfg.streaming.s3.bucket).strip():
+        raise ValueError("streaming.s3.bucket must be set for demo_streaming_s3_bridge")
 
     demo_cfg = cfg.get("demo", {})
     num_samples = int(demo_cfg.get("num_samples", 200))
@@ -27,49 +32,30 @@ def main(cfg: DictConfig) -> None:
 
     dataset = SharedModelDataset(collector)
     iterator = iter(dataset)
-
     model_counts: Counter[str] = Counter()
-    layer_counts: Counter[str] = Counter()
-    dataset_mix_counts: Counter[str] = Counter()
-    job_mix_log: list[dict[str, int]] = []
 
     try:
         step_idx = 0
         while sum(model_counts.values()) < num_samples:
             if not collector.is_async_mode:
-                collected_stats = dataset.maybe_collect(step_idx)
-                for item in collected_stats:
-                    job_mix_log.append(dict(item.dataset_mix))
+                dataset.maybe_collect(step_idx)
 
             sample = next(iterator)
             model_counts[sample.model_name] += 1
-            layer_counts[sample.layer_name] += 1
-
-            image_meta = sample.meta.get("image_meta", [])
-            for item in image_meta:
-                dataset_name = item.get("dataset_name")
-                if dataset_name:
-                    dataset_mix_counts[str(dataset_name)] += 1
 
             if sum(model_counts.values()) % 20 == 0:
                 logger.info(
-                    "consumed=%s cache=%s model_counts=%s",
+                    "consumed=%s remote_ready=%s model_counts=%s",
                     sum(model_counts.values()),
-                    collector.cache_size(),
+                    dataset.cache_size(),
                     dict(model_counts),
                 )
-
             step_idx += 1
     finally:
         dataset.close()
         collector.shutdown()
 
-    logger.info("Final cache size: %s", collector.cache_size())
-    logger.info("Model switching frequency: %s", dict(model_counts))
-    logger.info("Top layers: %s", layer_counts.most_common(5))
-    logger.info("Dataset mix distribution (from sample meta): %s", dict(dataset_mix_counts))
-    if job_mix_log:
-        logger.info("Dataset mix per interleaved collector job: %s", job_mix_log[:20])
+    logger.info("Done. final_remote_ready=%s model_counts=%s", dataset.cache_size(), dict(model_counts))
 
 
 def _setup_logging(cfg: DictConfig) -> None:

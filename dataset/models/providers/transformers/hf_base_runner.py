@@ -32,6 +32,8 @@ class HFBaseRunner(BaseVirtualModel):
         self.gated = bool(self.cfg_dict.get("gated", False))
         self.trust_remote_code = bool(self.cfg_dict.get("trust_remote_code", False))
         self.local_files_only = bool(self.cfg_dict.get("local_files_only", False))
+        self.release_device_on_unload = bool(self.cfg_dict.get("release_device_on_unload", True))
+        self.empty_cuda_cache_on_unload = bool(self.cfg_dict.get("empty_cuda_cache_on_unload", True))
 
         self.device = self._resolve_device(str(self.cfg_dict.get("device", "auto")))
         configured_dtype = self._resolve_dtype(str(self.cfg_dict.get("dtype", "float32")))
@@ -108,16 +110,17 @@ class HFBaseRunner(BaseVirtualModel):
         self._hook_buffers = {}
 
         if self._model is not None:
-            try:
-                self._model.to("cpu")
-            except Exception:
-                pass
+            if self.release_device_on_unload:
+                try:
+                    self._model.to("cpu")
+                except Exception:
+                    pass
 
         self._model = None
         self._processor = None
         self._loaded = False
 
-        if torch.cuda.is_available():
+        if self.empty_cuda_cache_on_unload and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def run(self, batch_pil: list[Image.Image]) -> list[LayerIORecord]:
@@ -151,6 +154,8 @@ class HFBaseRunner(BaseVirtualModel):
             "num_runs": self._num_runs,
             "cache_dir": str(self.cache_dir),
             "local_files_only": self.local_files_only,
+            "release_device_on_unload": self.release_device_on_unload,
+            "empty_cuda_cache_on_unload": self.empty_cuda_cache_on_unload,
         }
 
     @abstractmethod
@@ -290,9 +295,31 @@ class HFBaseRunner(BaseVirtualModel):
 
     @staticmethod
     def _resolve_device(device_name: str) -> torch.device:
-        normalized = str(device_name).lower()
+        text = str(device_name).strip()
+        normalized = text.lower()
+
         if normalized == "auto":
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if normalized == "cuda":
-            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        return torch.device("cpu")
+
+        if normalized in {"cpu", ""}:
+            return torch.device("cpu")
+
+        if normalized.startswith("cuda"):
+            if not torch.cuda.is_available():
+                return torch.device("cpu")
+            device = torch.device(text)
+            if device.index is not None and device.index >= torch.cuda.device_count():
+                raise ValueError(
+                    f"Requested device '{text}' is unavailable: only {torch.cuda.device_count()} CUDA device(s) found"
+                )
+            return device
+
+        if normalized == "mps":
+            if torch.backends.mps.is_available():
+                return torch.device("mps")
+            return torch.device("cpu")
+
+        try:
+            return torch.device(text)
+        except Exception as exc:
+            raise ValueError(f"Unsupported device value '{device_name}'") from exc

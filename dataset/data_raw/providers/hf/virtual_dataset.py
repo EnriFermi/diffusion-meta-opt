@@ -41,6 +41,7 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         worker_cfg = self.cfg_dict.get("worker", {})
         self.get_timeout_s = float(worker_cfg.get("get_timeout_s", 5.0))
+        self.startup_get_timeout_s = float(worker_cfg.get("startup_get_timeout_s", max(300.0, self.get_timeout_s * 20)))
         self.idle_sleep_s = float(worker_cfg.get("idle_sleep_s", 0.2))
         self.max_worker_restarts = int(worker_cfg.get("max_worker_restarts", 5))
 
@@ -49,6 +50,8 @@ class HFVirtualDataset(BaseVirtualDataset):
         self._stop_event: Any | None = None
         self._worker: mp.Process | None = None
         self._worker_restarts = 0
+        self._worker_permanently_stopped = False
+        self._last_worker_error: str | None = None
 
         self._known_chunks: set[str] = set()
         self._chunk_queue: deque[dict[str, Any]] = deque()
@@ -64,7 +67,12 @@ class HFVirtualDataset(BaseVirtualDataset):
         if batch_size <= 0:
             return []
 
-        deadline = time.monotonic() + self.get_timeout_s
+        timeout_s = self.get_timeout_s
+        # First chunk warmup can be slower (metadata/parquet/network); avoid false empty batches at startup.
+        if self._served_samples == 0 and not self._chunk_queue:
+            timeout_s = max(timeout_s, self.startup_get_timeout_s)
+
+        deadline = time.monotonic() + timeout_s
         batch: list[ImageSample] = []
 
         while len(batch) < batch_size:
@@ -75,16 +83,26 @@ class HFVirtualDataset(BaseVirtualDataset):
                 continue
 
             self._ensure_worker_alive()
+            if self._worker_permanently_stopped and not self._chunk_queue:
+                break
             if time.monotonic() >= deadline:
                 break
             time.sleep(self.idle_sleep_s)
 
         if len(batch) < batch_size:
-            self.logger.warning(
-                "Requested %s samples, returned %s (cache currently underfilled)",
-                batch_size,
-                len(batch),
-            )
+            if self._last_worker_error:
+                self.logger.warning(
+                    "Requested %s samples, returned %s (cache underfilled). Last worker error: %s",
+                    batch_size,
+                    len(batch),
+                    self._last_worker_error,
+                )
+            else:
+                self.logger.warning(
+                    "Requested %s samples, returned %s (cache currently underfilled)",
+                    batch_size,
+                    len(batch),
+                )
 
         return batch
 
@@ -152,6 +170,7 @@ class HFVirtualDataset(BaseVirtualDataset):
             name=f"{self.name}_prefetch",
         )
         self._worker.start()
+        self._worker_permanently_stopped = False
         self.logger.info("Started worker pid=%s", self._worker.pid)
 
     def _ensure_worker_alive(self) -> None:
@@ -162,12 +181,14 @@ class HFVirtualDataset(BaseVirtualDataset):
         if self._worker.is_alive():
             return
 
-        self.logger.error("Worker exited with code %s", self._worker.exitcode)
-
         if self._worker_restarts >= self.max_worker_restarts:
-            self.logger.error("Max worker restarts reached: %s", self.max_worker_restarts)
+            if not self._worker_permanently_stopped:
+                self.logger.error("Worker exited with code %s", self._worker.exitcode)
+                self.logger.error("Max worker restarts reached: %s", self.max_worker_restarts)
+            self._worker_permanently_stopped = True
             return
 
+        self.logger.error("Worker exited with code %s", self._worker.exitcode)
         self._worker_restarts += 1
         self._spawn_worker(force=True)
 
@@ -187,7 +208,9 @@ class HFVirtualDataset(BaseVirtualDataset):
             elif event_type == "chunk_evicted":
                 self._forget_chunk(str(event["chunk_id"]))
             elif event_type == "error":
-                self.logger.error("Worker error: %s", event.get("message"))
+                message = str(event.get("message", "unknown worker error"))
+                self._last_worker_error = message
+                self.logger.error("Worker error: %s", message)
             else:
                 self.logger.debug("Worker event: %s", event)
 
@@ -197,6 +220,10 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         try:
             manifest = self.chunk_cache.load_chunk(chunk_id)
+        except FileNotFoundError:
+            # Stale chunk event: chunk may have been evicted before we processed event.
+            self.logger.debug("Skipping stale chunk event for missing chunk: %s", chunk_id)
+            return
         except Exception as exc:
             self.logger.warning("Cannot load chunk %s: %s", chunk_id, exc)
             return
@@ -326,18 +353,25 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
     cache_cfg = dataset_cfg.get("cache", {})
     chunk_size = int(cache_cfg.get("chunk_size_images", 1024))
     num_chunks_kept = int(cache_cfg.get("num_chunks_kept", 2))
-    prefetch_low_watermark = int(cache_cfg.get("prefetch_low_watermark", 1))
 
     worker_cfg = dataset_cfg.get("worker", {})
     idle_sleep_s = float(worker_cfg.get("idle_sleep_s", 0.5))
     request_timeout_s = int(worker_cfg.get("request_timeout_s", 10))
     max_retries = int(worker_cfg.get("max_retries", 2))
+    max_chunk_build_seconds = float(worker_cfg.get("max_chunk_build_seconds", 20.0))
 
     cache = ChunkCache(dataset_root=dataset_root, num_chunks_kept=num_chunks_kept)
 
     rng = random.Random(seed + int(time.time()))
 
-    dataset = load_hf_dataset(dataset_cfg, token=token, seed=seed)
+    try:
+        dataset = load_hf_dataset(dataset_cfg, token=token, seed=seed)
+    except Exception as exc:
+        message = _format_dataset_load_error(dataset_cfg=dataset_cfg, exc=exc)
+        logger.exception("Dataset load failed for %s", dataset_name)
+        _emit_event(events_queue, {"type": "error", "dataset": dataset_name, "message": message})
+        return
+
     streaming = bool(dataset_cfg.get("hf", {}).get("streaming", False))
     dataset_size = _safe_len(dataset) if not streaming else None
     iterator = iter(dataset) if streaming else None
@@ -352,10 +386,6 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
                 _emit_event(events_queue, {"type": "chunk_evicted", "chunk_id": chunk_id, "dataset": dataset_name})
 
             chunks_now = cache.list_chunks()
-            if len(chunks_now) >= num_chunks_kept and len(chunks_now) > prefetch_low_watermark:
-                time.sleep(idle_sleep_s)
-                continue
-
             if len(chunks_now) >= num_chunks_kept:
                 time.sleep(idle_sleep_s)
                 continue
@@ -364,6 +394,7 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
             records: list[dict[str, Any]] = []
             attempts = 0
             max_attempts = max(chunk_size * 10, chunk_size + 32)
+            chunk_started_at = time.monotonic()
 
             while len(records) < chunk_size and not stop_event.is_set():
                 attempts += 1
@@ -371,6 +402,14 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
                     logger.warning(
                         "Stopping chunk fill early after %s attempts (%s records collected)",
                         attempts,
+                        len(records),
+                    )
+                    break
+
+                if records and (time.monotonic() - chunk_started_at) >= max_chunk_build_seconds:
+                    logger.debug(
+                        "Finalizing partial chunk after %.1fs with %s records",
+                        time.monotonic() - chunk_started_at,
                         len(records),
                     )
                     break
@@ -576,6 +615,18 @@ def _emit_event(queue_obj: Any, payload: dict[str, Any]) -> None:
         queue_obj.put_nowait(payload)
     except Full:
         pass
+
+
+def _format_dataset_load_error(dataset_cfg: dict[str, Any], exc: Exception) -> str:
+    if not bool(dataset_cfg.get("gated", False)):
+        return str(exc)
+
+    base = (
+        f"{exc}. Set hf.token in conf/config.yaml. "
+        "Accept the dataset license on Hugging Face dataset page. "
+        "Ensure token has access (for fine-grained tokens enable access to public gated repositories)."
+    )
+    return base
 
 
 def _configure_logging(dataset_cfg: dict[str, Any]) -> None:

@@ -6,6 +6,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 from dataset.shared.collector_service import CollectorService
+from dataset.shared.shared_dataset import SharedModelDataset
 
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="config")
@@ -25,19 +26,21 @@ def main(cfg: DictConfig) -> None:
 
     collector.predownload_models()
     collector.start()
+    dataset = SharedModelDataset(collector)
 
     try:
         for step_idx in range(steps):
             stats = collector.maybe_collect(step_idx)
-            consumed = collector.cache.try_get()
+            consumed = dataset.try_next_sample()
             logger.info(
                 "step=%s cache=%s collected_jobs=%s consumed=%s",
                 step_idx,
-                collector.cache.size(),
+                collector.cache_size(),
                 len(stats),
                 consumed is not None,
             )
     finally:
+        dataset.close()
         collector.shutdown()
 
 
