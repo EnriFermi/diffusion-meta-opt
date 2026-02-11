@@ -1,0 +1,38 @@
+name: mapillary_vistas_v2
+enabled: false
+gated: true
+sampling_weight: 1.0
+models:
+  - swinv2_base
+collector_device: null
+
+hf:
+  repo: candylion/mapillary-vistas-v2
+  subset: null
+  split: train
+  streaming: false
+  shuffle_buffer: 10000
+  trust_remote_code: false
+
+schema:
+  image_mode: image_field
+  image_field: image
+  image_field_candidates: [image, img]
+  url_field: null
+  url_field_candidates: []
+  id_field: id
+  extra_fields: []
+
+cache:
+  num_chunks_kept: 2
+  chunk_size_images: 256
+  prefetch_low_watermark: 1
+
+worker:
+  idle_sleep_s: 0.5
+  get_timeout_s: 5.0
+  request_timeout_s: 10
+  max_retries: 2
+  max_worker_restarts: 5
+
+licensing_note: "GATED: accept Mapillary Vistas v2 license on HF and ensure token access."

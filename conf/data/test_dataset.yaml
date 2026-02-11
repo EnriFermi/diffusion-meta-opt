@@ -1,0 +1,34 @@
+# Профиль набора raw-датасетов для shared-оркестратора.
+# Создавайте новые профили рядом с этим файлом:
+#   conf/data/<your_profile>.yaml
+# и выбирайте их через defaults в conf/config.yaml.
+
+path: ${oc.env:DATA_ROOT,./data}
+seed: 42
+output_format: pil  # tensor | pil
+image_size: 224
+log_level: INFO
+max_loaded_models: 1
+
+dataset_config_dirs:
+  - conf/data/datasets
+
+enabled_datasets:
+  - flickr30k
+  - coco2017
+  - cc12m
+  - visual_genome
+  - scene_parse_150
+
+# Точечные override'ы для выбранного профиля.
+# Пример:
+# dataset_overrides:
+#   flickr30k:
+#     models: [clip_vit_b32, dinov2_base]
+#   coco2017:
+#     sampling_weight: 0.7
+dataset_overrides: {}
+
+cli:
+  batch_size: 8
+  num_batches: 1
