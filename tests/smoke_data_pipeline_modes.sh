@@ -10,6 +10,10 @@ set -euo pipefail
 # По умолчанию активен только (1).
 # Чтобы протестировать другой режим: раскомментируйте нужный блок,
 # а остальные оставьте закомментированными.
+#
+# Скрипт python дополнительно выполняет turnover-probe:
+# после базового smoke-прохода потребляет ещё объекты и проверяет,
+# что ready-чанки действительно обновляются (как у нормального streaming dataset).
 
 # Hugging Face token: задайте через переменную окружения перед запуском:
 #   export HF_TOKEN="hf_..."
@@ -24,7 +28,13 @@ COMMON_ARGS=(
   --dataset-model "coco2017=clip_vit_b32"
   --dataset-model "scene_parse_150=clip_vit_b32"
   --predownload
+  --chunk-size-samples 8
+  --raw-chunk-size-images 16
+  --raw-num-chunks-kept 2
+  --atom-chunk-rows 32
   --target-samples 20
+  --turnover-probe-samples 24
+  --turnover-probe-timeout-seconds 240
   --timeout-seconds 300
   --hf-token "$HF_TOKEN"
 )
