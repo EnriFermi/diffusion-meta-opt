@@ -38,6 +38,45 @@ def _logger(name: str, rank: int) -> logging.Logger:
     return logging.getLogger(f"{name}.rank{rank}")
 
 
+@contextlib.contextmanager
+def data_pipeline(
+    cfg: DictConfig,
+    *,
+    start_collector: bool = True,
+    predownload_models: bool | None = None,
+    logger: logging.Logger | None = None,
+) -> Iterator[tuple[SharedModelDataset, CollectorService]]:
+    _logger_local = logger or logging.getLogger("train")
+
+    collector = CollectorService(cfg)
+    dataset = SharedModelDataset(collector)
+
+    should_predownload = bool(cfg.train.get("predownload_models", False))
+    if predownload_models is not None:
+        should_predownload = bool(predownload_models)
+
+    if start_collector and should_predownload:
+        _logger_local.info("Predownloading model artifacts before collector start")
+        collector.predownload_models()
+
+    if start_collector:
+        collector.start()
+
+    _logger_local.info(
+        "Data pipeline initialized: collector_mode=%s streaming_mode=%s cache_metric=%s",
+        collector.collector_mode,
+        collector.streaming_mode,
+        dataset.cache_size(),
+    )
+
+    try:
+        yield dataset, collector
+    finally:
+        dataset.close()
+        collector.shutdown()
+        _logger_local.info("Training entrypoint shutdown complete")
+
+
 def _seed_everything(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -416,206 +455,208 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
         dataset_sharding,
     )
 
-    collector: CollectorService | None = None
-    dataset: SharedModelDataset | None = None
-    dataset_iter: Iterator[SharedSample] | None = None
-
     model = None
     optimizer = None
     scheduler = None
     scaler = None
 
     try:
-        if rank == 0:
-            collector = CollectorService(cfg)
-            if bool(cfg.train.get("predownload_models", False)):
-                logger.info("Predownloading model artifacts before collector start")
-                collector.predownload_models()
-            collector.start()
-            dataset = SharedModelDataset(collector)
-            dataset_iter = iter(dataset)
-        elif dataset_sharding:
-            # Consumer-only wrapper over shared chunk stream.
-            collector = CollectorService(cfg)
-            dataset = SharedModelDataset(collector)
-            dataset_iter = iter(dataset)
+        collector: CollectorService | None = None
+        dataset: SharedModelDataset | None = None
+        dataset_iter: Iterator[SharedSample] | None = None
 
-        model_cfg = _build_model_cfg(cfg)
-        model = WeightQuantileVAE(model_cfg).to(device)
-        model = _maybe_compile(model, cfg=cfg, logger=logger)
-
-        if is_distributed:
-            if device.type == "cuda":
-                model = DDP(
-                    model,
-                    device_ids=[device.index],
-                    output_device=device.index,
-                    broadcast_buffers=False,
-                    find_unused_parameters=False,
-                    gradient_as_bucket_view=True,
-                )
-            else:
-                model = DDP(
-                    model,
-                    broadcast_buffers=False,
-                    find_unused_parameters=False,
-                    gradient_as_bucket_view=True,
-                )
-
-        optimizer = _build_optimizer(model=model, cfg=cfg, device=device)
-        scheduler = _build_scheduler(optimizer=optimizer, cfg=cfg)
-
-        amp_enabled, amp_dtype = _resolve_amp(cfg=cfg, device=device)
-        scaler = GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
-
-        max_steps = max(1, int(cfg.train.get("max_steps", 1000)))
-        grad_accum_steps = max(1, int(cfg.train.get("grad_accum_steps", 1)))
-        kl_beta = float(cfg.train.get("kl_beta", 1e-3))
-        grad_clip_norm = float(cfg.train.get("grad_clip_norm", 1.0))
-        max_x_rows = int(cfg.train.get("max_x_rows", 0))
-
-        log_every = max(1, int(cfg.train.get("log_every", 10)))
-        checkpoint_every = max(1, int(cfg.train.get("checkpoint_every", 200)))
-
-        loss_window = 0.0
-        recon_window = 0.0
-        kl_window = 0.0
-        window_steps = 0
-        t0 = time.time()
-
-        for step_idx in range(max_steps):
-            global_step = step_idx + 1
-            model.train()
-            optimizer.zero_grad(set_to_none=True)
-
-            if rank == 0 and collector is not None and dataset is not None and not collector.is_async_mode:
-                dataset.maybe_collect(step_idx)
-
-            loss_acc = 0.0
-            recon_acc = 0.0
-            kl_acc = 0.0
-            step_is_finite = True
-
-            for micro_idx in range(grad_accum_steps):
-                sync_grad = micro_idx == grad_accum_steps - 1
-
-                x, W = _fetch_batch(
-                    rank=rank,
-                    device=device,
-                    dataset_iter=dataset_iter,
-                    use_broadcast=use_broadcast,
-                    max_x_rows=max_x_rows,
-                    logger=logger,
-                )
-
-                no_sync_ctx = contextlib.nullcontext()
-                if is_distributed and not sync_grad:
-                    no_sync_ctx = model.no_sync()  # type: ignore[union-attr]
-
-                with no_sync_ctx:
-                    with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
-                        W_hat, kl_loss, _ = model(x, W)
-                        recon_loss = F.mse_loss(W_hat, W)
-                        total_loss = recon_loss + kl_beta * kl_loss
-                        loss_for_backward = total_loss / grad_accum_steps
-
-                    finite_flag = torch.tensor(
-                        1 if torch.isfinite(loss_for_backward.detach()) else 0,
-                        dtype=torch.int32,
-                        device=device,
+        with contextlib.ExitStack() as stack:
+            if rank == 0:
+                dataset, collector = stack.enter_context(data_pipeline(cfg, logger=logger))
+                dataset_iter = iter(dataset)
+            elif dataset_sharding:
+                # Consumer-only wrapper over shared chunk stream.
+                dataset, collector = stack.enter_context(
+                    data_pipeline(
+                        cfg,
+                        start_collector=False,
+                        predownload_models=False,
+                        logger=logger,
                     )
-                    if is_distributed:
-                        dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
+                )
+                dataset_iter = iter(dataset)
 
-                    if int(finite_flag.item()) == 0:
-                        step_is_finite = False
-                    else:
-                        if scaler.is_enabled():
-                            scaler.scale(loss_for_backward).backward()
+            model_cfg = _build_model_cfg(cfg)
+            model = WeightQuantileVAE(model_cfg).to(device)
+            model = _maybe_compile(model, cfg=cfg, logger=logger)
+
+            if is_distributed:
+                if device.type == "cuda":
+                    model = DDP(
+                        model,
+                        device_ids=[device.index],
+                        output_device=device.index,
+                        broadcast_buffers=False,
+                        find_unused_parameters=False,
+                        gradient_as_bucket_view=True,
+                    )
+                else:
+                    model = DDP(
+                        model,
+                        broadcast_buffers=False,
+                        find_unused_parameters=False,
+                        gradient_as_bucket_view=True,
+                    )
+
+            optimizer = _build_optimizer(model=model, cfg=cfg, device=device)
+            scheduler = _build_scheduler(optimizer=optimizer, cfg=cfg)
+
+            amp_enabled, amp_dtype = _resolve_amp(cfg=cfg, device=device)
+            scaler = GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
+
+            max_steps = max(1, int(cfg.train.get("max_steps", 1000)))
+            grad_accum_steps = max(1, int(cfg.train.get("grad_accum_steps", 1)))
+            kl_beta = float(cfg.train.get("kl_beta", 1e-3))
+            grad_clip_norm = float(cfg.train.get("grad_clip_norm", 1.0))
+            max_x_rows = int(cfg.train.get("max_x_rows", 0))
+
+            log_every = max(1, int(cfg.train.get("log_every", 10)))
+            checkpoint_every = max(1, int(cfg.train.get("checkpoint_every", 200)))
+
+            loss_window = 0.0
+            recon_window = 0.0
+            kl_window = 0.0
+            window_steps = 0
+            t0 = time.time()
+
+            for step_idx in range(max_steps):
+                global_step = step_idx + 1
+                model.train()
+                optimizer.zero_grad(set_to_none=True)
+
+                if rank == 0 and collector is not None and dataset is not None and not collector.is_async_mode:
+                    dataset.maybe_collect(step_idx)
+
+                loss_acc = 0.0
+                recon_acc = 0.0
+                kl_acc = 0.0
+                step_is_finite = True
+
+                for micro_idx in range(grad_accum_steps):
+                    sync_grad = micro_idx == grad_accum_steps - 1
+
+                    x, W = _fetch_batch(
+                        rank=rank,
+                        device=device,
+                        dataset_iter=dataset_iter,
+                        use_broadcast=use_broadcast,
+                        max_x_rows=max_x_rows,
+                        logger=logger,
+                    )
+
+                    no_sync_ctx = contextlib.nullcontext()
+                    if is_distributed and not sync_grad:
+                        no_sync_ctx = model.no_sync()  # type: ignore[union-attr]
+
+                    with no_sync_ctx:
+                        with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
+                            W_hat, kl_loss, _ = model(x, W)
+                            recon_loss = F.mse_loss(W_hat, W)
+                            total_loss = recon_loss + kl_beta * kl_loss
+                            loss_for_backward = total_loss / grad_accum_steps
+
+                        finite_flag = torch.tensor(
+                            1 if torch.isfinite(loss_for_backward.detach()) else 0,
+                            dtype=torch.int32,
+                            device=device,
+                        )
+                        if is_distributed:
+                            dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
+
+                        if int(finite_flag.item()) == 0:
+                            step_is_finite = False
                         else:
-                            loss_for_backward.backward()
+                            if scaler.is_enabled():
+                                scaler.scale(loss_for_backward).backward()
+                            else:
+                                loss_for_backward.backward()
 
-                loss_acc += float(total_loss.detach().item())
-                recon_acc += float(recon_loss.detach().item())
-                kl_acc += float(kl_loss.detach().item())
+                    loss_acc += float(total_loss.detach().item())
+                    recon_acc += float(recon_loss.detach().item())
+                    kl_acc += float(kl_loss.detach().item())
+
+                    if not step_is_finite:
+                        break
 
                 if not step_is_finite:
-                    break
+                    optimizer.zero_grad(set_to_none=True)
+                    if rank == 0:
+                        logger.warning("Skipping step %s due to non-finite loss", global_step)
+                    continue
 
-            if not step_is_finite:
-                optimizer.zero_grad(set_to_none=True)
-                if rank == 0:
-                    logger.warning("Skipping step %s due to non-finite loss", global_step)
-                continue
+                if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
 
-            if scaler.is_enabled():
-                scaler.unscale_(optimizer)
+                if grad_clip_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
 
-            if grad_clip_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
 
-            if scaler.is_enabled():
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
+                scheduler.step()
 
-            scheduler.step()
+                step_loss = loss_acc / grad_accum_steps
+                step_recon = recon_acc / grad_accum_steps
+                step_kl = kl_acc / grad_accum_steps
 
-            step_loss = loss_acc / grad_accum_steps
-            step_recon = recon_acc / grad_accum_steps
-            step_kl = kl_acc / grad_accum_steps
+                stats = torch.tensor([step_loss, step_recon, step_kl], dtype=torch.float32, device=device)
+                if is_distributed:
+                    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                    stats /= float(world_size)
 
-            stats = torch.tensor([step_loss, step_recon, step_kl], dtype=torch.float32, device=device)
-            if is_distributed:
-                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                stats /= float(world_size)
+                loss_window += float(stats[0].item())
+                recon_window += float(stats[1].item())
+                kl_window += float(stats[2].item())
+                window_steps += 1
 
-            loss_window += float(stats[0].item())
-            recon_window += float(stats[1].item())
-            kl_window += float(stats[2].item())
-            window_steps += 1
+                if rank == 0 and global_step % log_every == 0:
+                    dt = max(1e-6, time.time() - t0)
+                    avg_loss = loss_window / max(1, window_steps)
+                    avg_recon = recon_window / max(1, window_steps)
+                    avg_kl = kl_window / max(1, window_steps)
+                    lr = float(optimizer.param_groups[0]["lr"])
+                    speed = window_steps / dt
 
-            if rank == 0 and global_step % log_every == 0:
-                dt = max(1e-6, time.time() - t0)
-                avg_loss = loss_window / max(1, window_steps)
-                avg_recon = recon_window / max(1, window_steps)
-                avg_kl = kl_window / max(1, window_steps)
-                lr = float(optimizer.param_groups[0]["lr"])
-                speed = window_steps / dt
+                    cache_metric = dataset.cache_size() if dataset is not None else 0
+                    logger.info(
+                        "step=%s/%s loss=%.6f recon=%.6f kl=%.6f lr=%.6e steps/s=%.2f cache=%s",
+                        global_step,
+                        max_steps,
+                        avg_loss,
+                        avg_recon,
+                        avg_kl,
+                        lr,
+                        speed,
+                        cache_metric,
+                    )
 
-                cache_metric = dataset.cache_size() if dataset is not None else 0
-                logger.info(
-                    "step=%s/%s loss=%.6f recon=%.6f kl=%.6f lr=%.6e steps/s=%.2f cache=%s",
-                    global_step,
-                    max_steps,
-                    avg_loss,
-                    avg_recon,
-                    avg_kl,
-                    lr,
-                    speed,
-                    cache_metric,
-                )
+                    loss_window = 0.0
+                    recon_window = 0.0
+                    kl_window = 0.0
+                    window_steps = 0
+                    t0 = time.time()
 
-                loss_window = 0.0
-                recon_window = 0.0
-                kl_window = 0.0
-                window_steps = 0
-                t0 = time.time()
+                if rank == 0 and (global_step % checkpoint_every == 0 or global_step == max_steps):
+                    _save_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        cfg=cfg,
+                        step_idx=global_step,
+                        logger=logger,
+                    )
 
-            if rank == 0 and (global_step % checkpoint_every == 0 or global_step == max_steps):
-                _save_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    cfg=cfg,
-                    step_idx=global_step,
-                    logger=logger,
-                )
-
-        if rank == 0:
-            logger.info("Training completed successfully: steps=%s", max_steps)
+            if rank == 0:
+                logger.info("Training completed successfully: steps=%s", max_steps)
 
     finally:
         if is_distributed:
@@ -623,12 +664,6 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
                 dist.barrier()
             except Exception:
                 pass
-
-        if dataset is not None:
-            dataset.close()
-
-        if collector is not None:
-            collector.shutdown()
 
         if is_distributed and dist.is_initialized():
             dist.destroy_process_group()
