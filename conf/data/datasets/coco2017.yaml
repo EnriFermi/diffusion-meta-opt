@@ -1,0 +1,38 @@
+name: coco2017
+enabled: true
+gated: false
+sampling_weight: 1.0
+models:
+  - clip_vit_b32
+  - siglip_base_p16_384
+collector_device: null
+
+hf:
+  repo: phiyodr/coco2017
+  subset: null
+  split: train
+  streaming: true
+  shuffle_buffer: 10000
+  trust_remote_code: false
+
+schema:
+  image_mode: url_field
+  image_field: null
+  image_field_candidates: []
+  url_field: coco_url
+  url_field_candidates: [coco_url, url, image_url, imageURL]
+  id_field: image_id
+  extra_fields: [caption]
+
+cache:
+  num_chunks_kept: 2
+  chunk_size_images: 256
+
+worker:
+  idle_sleep_s: 0.5
+  get_timeout_s: 5.0
+  request_timeout_s: 10
+  max_retries: 2
+  max_worker_restarts: 5
+
+licensing_note: "Use according to COCO license and repository terms."

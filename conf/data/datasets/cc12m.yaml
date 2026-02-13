@@ -1,0 +1,37 @@
+name: cc12m
+enabled: true
+gated: false
+sampling_weight: 1.0
+models:
+  - clip_vit_b32
+collector_device: null
+
+hf:
+  repo: flax-community/conceptual-captions-12
+  subset: null
+  split: train
+  streaming: true
+  shuffle_buffer: 20000
+  trust_remote_code: false
+
+schema:
+  image_mode: url_field
+  image_field: null
+  image_field_candidates: []
+  url_field: image_url
+  url_field_candidates: [image_url, url, imageURL]
+  id_field: null
+  extra_fields: [caption]
+
+cache:
+  num_chunks_kept: 2
+  chunk_size_images: 256
+
+worker:
+  idle_sleep_s: 0.5
+  get_timeout_s: 5.0
+  request_timeout_s: 10
+  max_retries: 2
+  max_worker_restarts: 5
+
+licensing_note: "URLs may become unavailable; respect source website licenses."

@@ -1,0 +1,30 @@
+defaults:
+  - data: test_dataset
+  - collector: interleaved
+  - streaming: none
+  - _self_
+
+hf:
+  token: "YOUR_HF_TOKEN_HERE"
+  hf_home: ${data.path}/hf_home
+  datasets_cache: ${data.path}/hf_datasets_cache
+  hub_cache: ${data.path}/hf_hub_cache
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+train:
+  device: "cuda:0"
+
+models:
+  enabled: []
+  model_config_dirs:
+    - conf/data/models
+
+demo:
+  num_samples: 200
+  runtime_seconds: 10
+  steps: 2
+  batch: 8

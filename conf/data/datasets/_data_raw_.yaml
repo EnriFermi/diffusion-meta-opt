@@ -1,0 +1,138 @@
+# ================================================================
+# ШАБЛОН КОНФИГА RAW-ДАТАСЕТА (HF) ДЛЯ dataset/data_raw
+# ================================================================
+# Этот файл — шаблон-документация.
+# Скопируйте его в новый файл, например:
+#   conf/data/datasets/my_dataset.yaml
+# и заполните поля под ваш датасет.
+
+# Короткое имя конфига/датасета.
+# Обычно совпадает с именем файла (без .yaml).
+name: my_dataset
+
+# Опционально: флаг включения датасета.
+# Даже если вы управляете списком через data.enabled_datasets,
+# этот флаг полезен для временного отключения.
+enabled: true
+
+# true, если датасет gated на Hugging Face.
+# ВАЖНО:
+# 1) обязательно задайте cfg.hf.token в conf/config.yaml;
+# 2) примите лицензию/условия на странице датасета в HF.
+gated: false
+
+# Вес датасета при смешивании.
+# Больше вес -> выше вероятность, что из датасета возьмут изображения.
+sampling_weight: 1.0
+
+# Опциональный override устройства коллектора для датасета.
+# null -> использовать global collector.device.
+# "cuda:1" -> датасет считается совместимым с этим collector device.
+# В текущем single-collector сценарии обычно оставляют null.
+collector_device: null
+
+hf:
+  # HF dataset repo id, например: nlphuji/flickr30k
+  repo: org_or_user/dataset_name
+
+  # Подконфиг/subset (если есть), иначе null.
+  subset: null
+
+  # Сплит датасета: train / validation / test и т.д.
+  split: train
+
+  # true -> streaming через IterableDataset,
+  # false -> обычная загрузка с len() и random index.
+  streaming: false
+
+  # Размер буфера перемешивания в streaming-режиме.
+  # Чем больше, тем лучше "случайность", но выше RAM/latency.
+  shuffle_buffer: 10000
+
+  # Включать только если датасет реально требует remote code.
+  trust_remote_code: false
+
+schema:
+  # РЕАЛЬНЫЕ значения для текущей реализации:
+  # - image_field: изображения лежат прямо в колонке (HF Image feature)
+  # - url_field: в колонке URL, изображения скачиваются в chunk cache
+  image_mode: image_field  # image_field | url_field
+
+  # Имя колонки с изображением (если image_mode=image_field).
+  image_field: image
+
+  # Альтернативные имена поля (fallback), если встречаются в записи.
+  image_field_candidates: [image, img]
+
+  # Имя колонки с URL (если image_mode=url_field).
+  url_field: null
+
+  # Альтернативные URL-колонки (fallback).
+  url_field_candidates: []
+
+  # Колонка с уникальным id/ключом примера (опционально).
+  id_field: id
+
+  # Доп. колонки, которые сохраняются в meta у сэмпла.
+  # Пример: caption, language, source и т.д.
+  extra_fields: []
+
+cache:
+  # Опциональный subdir под data.path, если поддержан вашей интеграцией.
+  # В текущей реализации может игнорироваться и заменяться на data.path/<name>.
+  root_subdir: datasets/${name}
+
+  # Сколько изображений в одном чанке на диске.
+  chunk_size_images: 256
+
+  # Сколько чанков хранить одновременно.
+  # Если больше — старые эвиктятся (FIFO по id/времени).
+  num_chunks_kept: 2
+
+  # Опционально: число потоков декодирования (если поддержано адаптером).
+  # В текущей реализации может не использоваться.
+  decode_threads: 1
+
+# Опциональные transform-параметры (если поддержаны вашей веткой кода).
+# В базовой реализации могут быть проигнорированы.
+transforms:
+  resize_shorter: null
+  center_crop: null
+  convert_mode: RGB
+
+# Список моделей (имена YAML из conf/data/models/*.yaml),
+# которые могут получать изображения из этого датасета.
+models:
+  - clip_vit_b32
+  - dinov2_base
+
+# Текстовая заметка по лицензированию/ограничениям.
+licensing_note: "Добавьте краткое описание условий использования."
+
+# ----------------------------------------------------------------
+# Как этот конфиг используется в пайплайне
+# ----------------------------------------------------------------
+# 1) RawDatasetPool загружает конфиг по имени из data.enabled_datasets.
+# 2) CompatibilityIndex строит связь model -> datasets из поля models.
+# 3) Для выбранной модели формируется mixed batch из всех совместимых датасетов.
+# 4) HFVirtualDataset хранит на диске ограниченное число чанков:
+#    chunks/chunk_<id>/... + manifest.json
+# 5) При переполнении кэша старые чанки удаляются автоматически.
+
+# ----------------------------------------------------------------
+# Мини-пример (как комментарий)
+# ----------------------------------------------------------------
+# name: flickr30k
+# gated: false
+# sampling_weight: 1.0
+# hf:
+#   repo: nlphuji/flickr30k
+#   split: train
+#   streaming: false
+# schema:
+#   image_mode: image_field
+#   image_field: image
+# cache:
+#   chunk_size_images: 256
+#   num_chunks_kept: 2
+# models: [clip_vit_b32, dinov2_base]
