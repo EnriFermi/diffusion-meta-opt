@@ -63,6 +63,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--print-config", action="store_true")
     parser.add_argument("--weight-preview-rows", type=int, default=4)
     parser.add_argument("--weight-preview-cols", type=int, default=4)
+    parser.add_argument(
+        "--run-tag",
+        default=None,
+        help="Optional run tag for isolated local/S3 smoke paths. Defaults to timestamp.",
+    )
     parser.add_argument("--turnover-probe-samples", type=int, default=24)
     parser.add_argument("--turnover-probe-timeout-seconds", type=int, default=180)
     parser.add_argument("--skip-turnover-probe", action="store_true")
@@ -102,6 +107,7 @@ def _parse_dataset_model_map(items: list[str]) -> dict[str, list[str]]:
 
 
 def _build_overrides(args: argparse.Namespace) -> list[str]:
+    run_tag = str(args.run_tag).strip() if args.run_tag else f"run_{int(time.time())}"
     datasets = [item.strip() for item in str(args.datasets).split(",") if item.strip()]
     if not datasets:
         raise ValueError("--datasets is empty")
@@ -140,9 +146,9 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
         )
 
     if args.mode == "local_disk":
-        local_root = Path(args.data_root) / "streaming" / "local_disk_smoke"
-        producer_dir = Path(args.data_root) / "streaming" / "spool" / "producer_smoke"
-        consumer_dir = Path(args.data_root) / "streaming" / "cache" / "consumer_smoke"
+        local_root = Path(args.data_root) / "streaming" / "local_disk_smoke" / run_tag
+        producer_dir = Path(args.data_root) / "streaming" / "spool" / "producer_smoke" / run_tag
+        consumer_dir = Path(args.data_root) / "streaming" / "cache" / "consumer_smoke" / run_tag
 
         overrides.extend(
             [
@@ -159,13 +165,18 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
         if not args.s3_bucket:
             raise ValueError("--s3-bucket is required for --mode s3_bridge")
 
-        producer_dir = Path(args.data_root) / "streaming" / "spool" / "producer_s3_smoke"
-        consumer_dir = Path(args.data_root) / "streaming" / "cache" / "consumer_s3_smoke"
+        producer_dir = Path(args.data_root) / "streaming" / "spool" / "producer_s3_smoke" / run_tag
+        consumer_dir = Path(args.data_root) / "streaming" / "cache" / "consumer_s3_smoke" / run_tag
+        prefix = str(args.s3_prefix).strip().rstrip("/")
+        if prefix:
+            prefix = f"{prefix}/{run_tag}"
+        else:
+            prefix = run_tag
 
         overrides.extend(
             [
                 f"streaming.s3.bucket={args.s3_bucket}",
-                f"streaming.s3.prefix={args.s3_prefix}",
+                f"streaming.s3.prefix={prefix}",
                 f"streaming.s3.max_remote_chunks={int(args.s3_max_remote_chunks)}",
                 f"streaming.consumer.delete_remote_after={args.delete_remote_after}",
                 f"streaming.producer.local_spool_dir={producer_dir}",
@@ -225,6 +236,14 @@ def _consume_samples(
     while len(items) < need:
         if time.time() - started > timeout_seconds:
             raise TimeoutError(f"Timeout while consuming {need} samples, got {len(items)}")
+
+        if collector.is_async_mode:
+            process = getattr(collector, "_process", None)
+            if process is not None and not process.is_alive():
+                raise RuntimeError(
+                    "Async collector process exited unexpectedly during smoke run. "
+                    "Check collector subprocess traceback in logs."
+                )
 
         if not collector.is_async_mode:
             dataset.maybe_collect(step)
