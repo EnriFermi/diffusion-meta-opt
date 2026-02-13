@@ -24,25 +24,25 @@ COMMON_ARGS=(
 # -----------------------------------------------------------------------------
 # (1) MODE=none (in-memory) [АКТИВЕН ПО УМОЛЧАНИЮ]
 # -----------------------------------------------------------------------------
-pipenv run python "$SCRIPT" \
-  --mode none \
-  --train-device "cuda:0" \
-  --collector-device "null" \
-  --collector-mode "auto" \
-  "${COMMON_ARGS[@]}"
+# pipenv run python "$SCRIPT" \
+#   --mode none \
+#   --train-device "cuda:0" \
+#   --collector-device "null" \
+#   --collector-mode "auto" \
+#   "${COMMON_ARGS[@]}"
 
 # -----------------------------------------------------------------------------
 # (2) MODE=local_disk (chunk streaming на локальном диске)
 # -----------------------------------------------------------------------------
-# pipenv run python "$SCRIPT" \
-#   --mode local_disk \
-#   --train-device "cuda:0" \
-#   --collector-device "cuda:1" \
-#   --collector-mode "auto" \
-#   --chunk-size-samples 64 \
-#   --local-max-ready-chunks 40 \
-#   --local-low-watermark-chunks 20 \
-#   "${COMMON_ARGS[@]}"
+pipenv run python "$SCRIPT" \
+  --mode local_disk \
+  --train-device "cuda:0" \
+  --collector-device "cuda:1" \
+  --collector-mode "auto" \
+  --chunk-size-samples 64 \
+  --local-max-ready-chunks 40 \
+  --local-low-watermark-chunks 20 \
+  "${COMMON_ARGS[@]}"
 
 # -----------------------------------------------------------------------------
 # (3) MODE=s3_bridge (producer/consumer через S3)
