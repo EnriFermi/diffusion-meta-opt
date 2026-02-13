@@ -55,7 +55,7 @@ python "$SCRIPT" \
 # Для S3-compatible (MinIO и т.п.) можно добавить endpoint:
 # --s3-endpoint-url "http://127.0.0.1:9000"
 #
-python "$SCRIPT" \
+# python "$SCRIPT" \
 #   --mode s3_bridge \
 #   --train-device "cuda:0" \
 #   --collector-device "cuda:1" \
