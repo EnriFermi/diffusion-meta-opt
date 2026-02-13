@@ -116,7 +116,7 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
     for dataset_name in datasets:
         models = mapping.get(dataset_name)
         if models:
-            overrides.append(f"data.dataset_overrides.{dataset_name}.models=[{','.join(models)}]")
+            overrides.append(f"+data.dataset_overrides.{dataset_name}.models=[{','.join(models)}]")
 
     if args.mode == "local_disk":
         local_root = Path(args.data_root) / "streaming" / "local_disk_smoke"
