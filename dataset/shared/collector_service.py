@@ -520,7 +520,7 @@ class CollectorService:
         self._process = self._ctx.Process(
             target=collector_process_main,
             args=(cfg_dict, cache_arg, self._stop_event),
-            daemon=True,
+            daemon=False,  # must be False: collector spawns dataset workers (daemon cannot have children)
             name="collector_service",
         )
         self._process.start()
