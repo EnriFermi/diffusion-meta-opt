@@ -22,7 +22,8 @@ COMMON_ARGS=(
   --data-root "./data"
   --datasets "coco2017,scene_parse_150"
   --dataset-model "coco2017=clip_vit_b32"
-  --dataset-model "scene_parse_150=dinov2_base"
+  --dataset-model "scene_parse_150=clip_vit_b32"
+  --predownload
   --target-samples 20
   --timeout-seconds 300
   --hf-token "$HF_TOKEN"

@@ -109,7 +109,7 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
     if not mapping:
         mapping = {
             "coco2017": ["clip_vit_b32"],
-            "scene_parse_150": ["dinov2_base"],
+            "scene_parse_150": ["clip_vit_b32"],
             "cc12m": ["clip_vit_b32"],
         }
 
@@ -261,7 +261,17 @@ def main() -> int:
             predownload=bool(args.predownload),
         )
     except Exception as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, indent=2, ensure_ascii=False))
+        message = str(exc)
+        hint = None
+        if "Can't load image processor" in message and not args.predownload:
+            hint = (
+                "Model artifacts are likely missing in local cache while runtime uses local_files_only=True. "
+                "Retry with --predownload or keep --predownload in smoke_data_pipeline_modes.sh."
+            )
+        payload: dict[str, Any] = {"ok": False, "error": message}
+        if hint:
+            payload["hint"] = hint
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 1
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
