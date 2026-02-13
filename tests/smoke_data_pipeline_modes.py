@@ -57,6 +57,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--delete-remote-after", choices=["consume", "download"], default="consume")
 
     parser.add_argument("--print-config", action="store_true")
+    parser.add_argument("--weight-preview-rows", type=int, default=4)
+    parser.add_argument("--weight-preview-cols", type=int, default=4)
+    parser.add_argument(
+        "--dump-first-weight",
+        default=None,
+        help="Optional path to save full first-sample weight tensor (.pt)",
+    )
     return parser.parse_args()
 
 
@@ -159,7 +166,28 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
     return overrides
 
 
-def _run_smoke(cfg: DictConfig, target_samples: int, timeout_seconds: int, poll_sleep: float, predownload: bool) -> dict[str, Any]:
+def _weight_preview(weight: torch.Tensor, rows: int, cols: int) -> list[list[float]]:
+    if weight.ndim != 2:
+        flat = weight.reshape(-1)
+        take = max(1, min(int(rows * cols), int(flat.numel())))
+        return [flat[:take].detach().to("cpu", dtype=torch.float32).tolist()]
+
+    r = max(1, min(int(rows), int(weight.shape[0])))
+    c = max(1, min(int(cols), int(weight.shape[1])))
+    chunk = weight[:r, :c].detach().to("cpu", dtype=torch.float32)
+    return chunk.tolist()
+
+
+def _run_smoke(
+    cfg: DictConfig,
+    target_samples: int,
+    timeout_seconds: int,
+    poll_sleep: float,
+    predownload: bool,
+    weight_preview_rows: int,
+    weight_preview_cols: int,
+    dump_first_weight: str | None,
+) -> dict[str, Any]:
     collector = CollectorService(cfg)
     dataset = SharedModelDataset(collector)
 
@@ -195,17 +223,38 @@ def _run_smoke(cfg: DictConfig, target_samples: int, timeout_seconds: int, poll_
 
             if not torch.is_tensor(sample.x) or not torch.is_tensor(sample.y):
                 raise TypeError("SharedSample x/y must be tensors")
+            if not torch.is_tensor(sample.weight):
+                raise TypeError("SharedSample weight must be tensor")
             if sample.x.dtype != torch.float32 or sample.y.dtype != torch.float32:
                 raise TypeError(f"Expected float32 tensors, got x={sample.x.dtype}, y={sample.y.dtype}")
             if str(sample.x.device) != "cpu" or str(sample.y.device) != "cpu":
                 raise TypeError(f"Expected CPU tensors, got x={sample.x.device}, y={sample.y.device}")
 
             if first_sample_summary is None:
+                weight = sample.weight.detach().to("cpu", dtype=torch.float32)
+
+                weight_dump_path = None
+                if dump_first_weight:
+                    dump_path = Path(dump_first_weight)
+                    dump_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(weight, dump_path)
+                    weight_dump_path = str(dump_path.resolve())
+
                 first_sample_summary = {
                     "model_name": sample.model_name,
                     "layer_name": sample.layer_name,
                     "x_shape": tuple(sample.x.shape),
                     "y_shape": tuple(sample.y.shape),
+                    "weight_shape": tuple(weight.shape),
+                    "weight_dtype": str(weight.dtype),
+                    "weight_device": str(weight.device),
+                    "weight_l2_norm": float(weight.norm().item()),
+                    "weight_preview": _weight_preview(
+                        weight=weight,
+                        rows=weight_preview_rows,
+                        cols=weight_preview_cols,
+                    ),
+                    "weight_dump_path": weight_dump_path,
                     "meta_keys": sorted(sample.meta.keys()),
                 }
 
@@ -259,6 +308,9 @@ def main() -> int:
             timeout_seconds=int(args.timeout_seconds),
             poll_sleep=float(args.poll_sleep),
             predownload=bool(args.predownload),
+            weight_preview_rows=int(args.weight_preview_rows),
+            weight_preview_cols=int(args.weight_preview_cols),
+            dump_first_weight=args.dump_first_weight,
         )
     except Exception as exc:
         message = str(exc)
