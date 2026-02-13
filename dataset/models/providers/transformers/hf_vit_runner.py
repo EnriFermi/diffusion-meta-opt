@@ -16,9 +16,12 @@ class HFViTRunner(HFBaseRunner):
         return self._from_pretrained(AutoModel, token=token)
 
     def _load_processor(self, token: str | None) -> Any:
-        from transformers import AutoImageProcessor
+        from transformers import AutoImageProcessor, AutoProcessor
 
-        return self._from_pretrained(AutoImageProcessor, token=token)
+        try:
+            return self._from_pretrained(AutoImageProcessor, token=token)
+        except Exception:
+            return self._from_pretrained(AutoProcessor, token=token)
 
     def prepare_inputs(self, batch_pil: list[Image.Image]) -> dict[str, Any]:
         payload = self._prepare_processor_payload(images=batch_pil)
