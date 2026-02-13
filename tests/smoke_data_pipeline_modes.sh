@@ -11,6 +11,12 @@ set -euo pipefail
 # Чтобы протестировать другой режим: раскомментируйте нужный блок,
 # а остальные оставьте закомментированными.
 
+# Hugging Face token: задайте через переменную окружения перед запуском:
+#   export HF_TOKEN="hf_..."
+# или передайте inline:
+#   HF_TOKEN="hf_..." bash tests/smoke_data_pipeline_modes.sh
+: "${HF_TOKEN:?Set HF_TOKEN before running this script (export HF_TOKEN=hf_...)}"
+
 SCRIPT="tests/smoke_data_pipeline_modes.py"
 COMMON_ARGS=(
   --data-root "./data"
@@ -19,6 +25,7 @@ COMMON_ARGS=(
   --dataset-model "scene_parse_150=dinov2_base"
   --target-samples 20
   --timeout-seconds 300
+  --hf-token "$HF_TOKEN"
 )
 
 # -----------------------------------------------------------------------------
