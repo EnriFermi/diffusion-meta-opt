@@ -40,7 +40,7 @@ COMMON_ARGS=(
 # -----------------------------------------------------------------------------
 # (1) MODE=none (in-memory) [АКТИВЕН ПО УМОЛЧАНИЮ]
 # -----------------------------------------------------------------------------
-# python "$SCRIPT" \
+# pipenv run python "$SCRIPT" \
 #   --mode none \
 #   --train-device "cuda:0" \
 #   --collector-device "null" \
@@ -50,7 +50,7 @@ COMMON_ARGS=(
 # -----------------------------------------------------------------------------
 # (2) MODE=local_disk (chunk streaming на локальном диске)
 # -----------------------------------------------------------------------------
-python "$SCRIPT" \
+pipenv run python "$SCRIPT" \
   --mode local_disk \
   --train-device "cuda:0" \
   --collector-device "cuda:1" \
@@ -71,7 +71,7 @@ python "$SCRIPT" \
 # Для S3-compatible (MinIO и т.п.) можно добавить endpoint:
 # --s3-endpoint-url "http://127.0.0.1:9000"
 #
-# python "$SCRIPT" \
+# pipenv run python "$SCRIPT" \
 #   --mode s3_bridge \
 #   --train-device "cuda:0" \
 #   --collector-device "cuda:1" \

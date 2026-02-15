@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 from hydra import compose, initialize_config_dir
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -117,7 +117,18 @@ def _project_root() -> Path:
 def _load_cfg(overrides: list[str]) -> DictConfig:
     config_dir = _project_root() / "conf"
     with initialize_config_dir(version_base=None, config_dir=str(config_dir.resolve())):
-        return compose(config_name="config", overrides=overrides)
+        cfg = compose(config_name="config", overrides=overrides)
+
+    # This script composes config outside @hydra.main.
+    # Replace hydra-dependent log interpolations with concrete values.
+    with open_dict(cfg):
+        if "logging" in cfg:
+            project = str(cfg.logging.get("project_name", "diffusion_meta_opt"))
+            ts = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+            cfg.logging.file_name = f"{project}_smoke_data_pipeline_modes_{ts}.log"
+            cfg.logging.file_path = f"{cfg.logging.dir}/{cfg.logging.file_name}"
+
+    return cfg
 
 
 def _parse_dataset_model_map(items: list[str]) -> dict[str, list[str]]:
