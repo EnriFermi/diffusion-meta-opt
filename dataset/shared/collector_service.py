@@ -236,6 +236,7 @@ class CollectorService:
         )
 
         self.atom_cfg = collector_cfg.get("layer_output_splitting", {})
+        self._validate_layer_output_splitting(self.atom_cfg)
 
         max_loaded = int(collector_cfg.get("max_loaded_models", 1))
         if max_loaded != 1:
@@ -581,6 +582,20 @@ class CollectorService:
     def _next_run_id(self) -> int:
         self._model_run_id += 1
         return self._model_run_id
+
+    @staticmethod
+    def _validate_layer_output_splitting(atom_cfg: dict[str, Any]) -> None:
+        value = atom_cfg.get("xy_samples_random_slice")
+        if value is None:
+            raise ValueError("collector.layer_output_splitting.xy_samples_random_slice must be a positive integer")
+        if isinstance(value, str) and value.strip().lower() in {"none", "null", ""}:
+            raise ValueError("collector.layer_output_splitting.xy_samples_random_slice must be a positive integer")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("collector.layer_output_splitting.xy_samples_random_slice must be a positive integer") from exc
+        if parsed <= 0:
+            raise ValueError("collector.layer_output_splitting.xy_samples_random_slice must be a positive integer")
 
 
 def collector_process_main(cfg_dict: dict[str, Any], cache: SharedSampleCache | None, stop_event: Any) -> None:

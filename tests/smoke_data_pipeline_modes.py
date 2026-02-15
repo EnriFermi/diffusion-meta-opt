@@ -49,7 +49,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size-samples", type=int, default=16)
     parser.add_argument("--raw-chunk-size-images", type=int, default=32)
     parser.add_argument("--raw-num-chunks-kept", type=int, default=2)
-    parser.add_argument("--atom-chunk-rows", type=int, default=64)
+    parser.add_argument("--xy-samples-random-slice", type=int, default=64)
     parser.add_argument("--local-ready-store-max-chunks", type=int, default=40)
     parser.add_argument("--local-refill-after-consumed-chunks", type=int, default=20)
 
@@ -121,7 +121,7 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
         f"train.device={args.train_device}",
         f"streaming.mode={args.mode}",
         f"streaming.chunk_size_samples={int(args.chunk_size_samples)}",
-        f"collector.layer_output_splitting.rows_per_chunk_sample={int(args.atom_chunk_rows)}",
+        f"collector.layer_output_splitting.xy_samples_random_slice={int(args.xy_samples_random_slice)}",
     ]
 
     if args.hf_token:

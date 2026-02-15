@@ -31,7 +31,7 @@ COMMON_ARGS=(
   --chunk-size-samples 8
   --raw-chunk-size-images 16
   --raw-num-chunks-kept 2
-  --atom-chunk-rows 32
+  --xy-samples-random-slice 32
   --target-samples 20
   --turnover-probe-samples 24
   --turnover-probe-timeout-seconds 240

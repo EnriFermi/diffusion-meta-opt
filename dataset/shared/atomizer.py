@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 import time
 from typing import Iterator
 
@@ -16,8 +17,17 @@ def atomize(
 ) -> Iterator[SharedSample]:
     """Convert one LayerIORecord into atomic SharedSample items."""
 
-    atom_mode = str(atom_cfg.get("sample_granularity", "chunk")).lower()
-    chunk_rows = max(1, int(atom_cfg.get("rows_per_chunk_sample", 256)))
+    slice_cfg = atom_cfg.get("xy_samples_random_slice")
+    if slice_cfg is None:
+        raise ValueError("collector.layer_output_splitting.xy_samples_random_slice must be a positive integer")
+    if isinstance(slice_cfg, str) and slice_cfg.strip().lower() in {"none", "null", ""}:
+        raise ValueError("collector.layer_output_splitting.xy_samples_random_slice must be a positive integer")
+    try:
+        slice_size = int(slice_cfg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("collector.layer_output_splitting.xy_samples_random_slice must be a positive integer") from exc
+    if slice_size <= 0:
+        raise ValueError("collector.layer_output_splitting.xy_samples_random_slice must be a positive integer")
 
     inputs = layer_record.inputs
     outputs = layer_record.outputs
@@ -40,40 +50,52 @@ def atomize(
         "layer_meta": dict(layer_record.meta),
     }
 
-    if atom_mode == "row":
-        for row_idx in range(num_rows):
-            local_meta = dict(base_meta)
-            local_meta["row_start"] = row_idx
-            local_meta["row_end"] = row_idx + 1
-            if row2img is not None and row_idx < len(row2img):
-                local_meta["row2img"] = [row2img[row_idx]]
-
-            yield SharedSample(
-                model_name=layer_record.model_name,
-                layer_name=layer_record.layer_name,
-                weight=layer_record.weight,
-                x=inputs[row_idx : row_idx + 1],
-                y=outputs[row_idx : row_idx + 1],
-                meta=local_meta,
-            )
-        return
-
-    for start in range(0, num_rows, chunk_rows):
-        end = min(num_rows, start + chunk_rows)
+    if num_rows <= 0:
         local_meta = dict(base_meta)
-        local_meta["row_start"] = start
-        local_meta["row_end"] = end
+        local_meta["xy_sampling_mode"] = "full"
+        local_meta["selected_row_count"] = 0
+        local_meta["selected_row_indices_preview"] = []
+        local_meta["row_start"] = 0
+        local_meta["row_end"] = 0
         if row2img is not None:
-            local_meta["row2img"] = row2img[start:end]
-
+            local_meta["row2img"] = []
         yield SharedSample(
             model_name=layer_record.model_name,
             layer_name=layer_record.layer_name,
             weight=layer_record.weight,
-            x=inputs[start:end],
-            y=outputs[start:end],
+            x=inputs,
+            y=outputs,
             meta=local_meta,
         )
+        return
+
+    if num_rows <= slice_size:
+        selected_indices = list(range(num_rows))
+        sampling_mode = "full"
+    else:
+        selected_indices = sorted(random.sample(range(num_rows), k=slice_size))
+        sampling_mode = "random_slice"
+
+    x_selected = inputs[selected_indices]
+    y_selected = outputs[selected_indices]
+
+    local_meta = dict(base_meta)
+    local_meta["xy_sampling_mode"] = sampling_mode
+    local_meta["selected_row_count"] = len(selected_indices)
+    local_meta["selected_row_indices_preview"] = selected_indices[:32]
+    local_meta["row_start"] = 0
+    local_meta["row_end"] = len(selected_indices)
+    if row2img is not None:
+        local_meta["row2img"] = [row2img[idx] for idx in selected_indices]
+
+    yield SharedSample(
+        model_name=layer_record.model_name,
+        layer_name=layer_record.layer_name,
+        weight=layer_record.weight,
+        x=x_selected,
+        y=y_selected,
+        meta=local_meta,
+    )
 
 
 def _build_row2img(

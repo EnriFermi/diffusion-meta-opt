@@ -43,7 +43,7 @@ pipenv run python -m dataset.shared.demo_end_to_end \
 
 1. `collector.in_memory_buffer.capacity_samples/fill_target_samples/low_watermark_samples`
 2. `collector.jobs_per_selected_model`
-3. `collector.layer_output_splitting.rows_per_chunk_sample`
+3. `collector.layer_output_splitting.xy_samples_random_slice`
 
 ## Ограничения режима
 

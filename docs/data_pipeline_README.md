@@ -243,9 +243,14 @@ dataset/
 ## 7.4 `Atomizer`
 
 Преобразует `LayerIORecord` в `SharedSample`:
-- `sample_granularity=row|chunk`
-- `rows_per_chunk_sample`
+- `xy_samples_random_slice` (mandatory positive int)
 - meta: `model_run_id`, timestamps, `image_meta`, `row2img`, ranges.
+
+Behavior:
+- One `LayerIORecord` -> one `SharedSample`.
+- If rows `N <= xy_samples_random_slice`: full `x/y` is returned.
+- If rows `N > xy_samples_random_slice`: random unique linked `x/y` pairs are selected.
+- `weight` is always full (never sliced).
 
 ---
 
@@ -440,8 +445,7 @@ Shutdown semantics:
 
 ## 13.5 Atomization
 
-- `collector.layer_output_splitting.sample_granularity=chunk`
-- `collector.layer_output_splitting.rows_per_chunk_sample=128..256`
+- `collector.layer_output_splitting.xy_samples_random_slice=128..256`
 
 ---
 
