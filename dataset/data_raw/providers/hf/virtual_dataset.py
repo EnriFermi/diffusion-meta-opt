@@ -534,8 +534,15 @@ def _materialize_image(
         field = _resolve_image_field(record, schema)
         if field is None:
             return None
-        image = decode_to_pil(record[field])
-        image_path = cache.save_image(sample_id=sample_id, image=image, chunk_id=chunk_id)
+        image_value = record[field]
+        image_path = _materialize_image_field_value(
+            image_value=image_value,
+            sample_id=sample_id,
+            cache=cache,
+            chunk_id=chunk_id,
+            timeout=timeout,
+            retries=retries,
+        )
     elif mode == "url_field":
         url = _resolve_url(record, schema)
         if not url:
@@ -560,6 +567,52 @@ def _materialize_image(
             item_meta[extra_key] = _safe_meta_value(record[extra_key])
 
     return image_path, item_meta
+
+
+def _materialize_image_field_value(
+    image_value: Any,
+    sample_id: str | int,
+    cache: ChunkCache,
+    chunk_id: str,
+    timeout: int,
+    retries: int,
+) -> Path | None:
+    # `datasets.Image(decode=False)` may produce dict payloads with `bytes`, `path` or `src`.
+    if isinstance(image_value, dict):
+        bytes_value = image_value.get("bytes")
+        if bytes_value is not None:
+            image = decode_to_pil(bytes_value)
+            return cache.save_image(sample_id=sample_id, image=image, chunk_id=chunk_id)
+
+        for key in ("path", "src", "url"):
+            url_like = image_value.get(key)
+            if isinstance(url_like, str) and url_like.startswith(("http://", "https://")):
+                return fetch_image_to_cache(
+                    url=url_like,
+                    cache=cache,
+                    sample_key=sample_id,
+                    timeout=timeout,
+                    retries=retries,
+                    chunk_id=chunk_id,
+                )
+
+        path_value = image_value.get("path")
+        if isinstance(path_value, str) and path_value:
+            image = decode_to_pil({"path": path_value})
+            return cache.save_image(sample_id=sample_id, image=image, chunk_id=chunk_id)
+
+    if isinstance(image_value, str) and image_value.startswith(("http://", "https://")):
+        return fetch_image_to_cache(
+            url=image_value,
+            cache=cache,
+            sample_key=sample_id,
+            timeout=timeout,
+            retries=retries,
+            chunk_id=chunk_id,
+        )
+
+    image = decode_to_pil(image_value)
+    return cache.save_image(sample_id=sample_id, image=image, chunk_id=chunk_id)
 
 
 def _resolve_image_field(record: dict[str, Any], schema: dict[str, Any]) -> str | None:

@@ -26,7 +26,7 @@ schema:
   url_field: null
   url_field_candidates: []
   id_field: id
-  extra_fields: [query, answers, words, bounding_boxes, answer]
+  extra_fields: [query, answers]
 
 cache:
   num_chunks_kept: 2
