@@ -20,15 +20,45 @@ from dataset.shared.collector_service import CollectorService
 from dataset.shared.shared_dataset import SharedModelDataset
 from dataset.shared.streaming.factory import build_chunk_store, resolve_streaming_cfg
 
+DEFAULT_FULL_DATASET_PROFILE = "all_datasets_no_flickr30k"
+DEFAULT_FULL_DATASET_LIST = [
+    "bdd100k",
+    "cc12m",
+    "coco2017",
+    "cord_v2",
+    "doclaynet_v11",
+    "docvqa_1200",
+    "dtd_textures",
+    "eurosat_rgb",
+    "funsd",
+    "mapillary_vistas_v2",
+    "oxford_pets",
+    "patchcamelyon",
+    "relaion400m",
+    "scene_parse_150",
+    "stanford_cars",
+    "visual_genome",
+    "wider_face",
+]
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Smoke-check the full data pipeline in one of modes: none, local_disk, s3_bridge"
     )
     parser.add_argument("--mode", choices=["none", "local_disk", "s3_bridge"], required=True)
+    parser.add_argument(
+        "--data-profile",
+        default=DEFAULT_FULL_DATASET_PROFILE,
+        help="Hydra data profile from conf/data/<profile>.yaml (default: all datasets except flickr30k)",
+    )
 
     parser.add_argument("--data-root", default="./data")
-    parser.add_argument("--datasets", default="coco2017,scene_parse_150")
+    parser.add_argument(
+        "--datasets",
+        default="",
+        help="Optional comma-separated dataset subset override. If empty, profile datasets are used.",
+    )
     parser.add_argument(
         "--dataset-model",
         action="append",
@@ -36,12 +66,12 @@ def _parse_args() -> argparse.Namespace:
         help="Dataset->models mapping in form: dataset=model_a,model_b (can repeat)",
     )
 
-    parser.add_argument("--train-device", default="cpu")
-    parser.add_argument("--collector-device", default="null")
+    parser.add_argument("--train-device", default="cuda:0")
+    parser.add_argument("--collector-device", default="cuda:1")
     parser.add_argument("--collector-mode", default="auto", choices=["auto", "async", "interleaved"])
 
     parser.add_argument("--target-samples", type=int, default=20)
-    parser.add_argument("--timeout-seconds", type=int, default=180)
+    parser.add_argument("--timeout-seconds", type=int, default=600)
     parser.add_argument("--poll-sleep", type=float, default=0.05)
     parser.add_argument("--predownload", action="store_true")
     parser.add_argument("--hf-token", default=None)
@@ -109,13 +139,12 @@ def _parse_dataset_model_map(items: list[str]) -> dict[str, list[str]]:
 
 def _build_overrides(args: argparse.Namespace) -> list[str]:
     run_tag = str(args.run_tag).strip() if args.run_tag else f"run_{int(time.time())}"
-    datasets = [item.strip() for item in str(args.datasets).split(",") if item.strip()]
-    if not datasets:
-        raise ValueError("--datasets is empty")
+    cli_datasets = [item.strip() for item in str(args.datasets).split(",") if item.strip()]
+    datasets = cli_datasets if cli_datasets else DEFAULT_FULL_DATASET_LIST
 
     overrides: list[str] = [
+        f"data={args.data_profile}",
         f"data.path={args.data_root}",
-        f"data.enabled_datasets=[{','.join(datasets)}]",
         f"collector.mode={args.collector_mode}",
         f"collector.device={args.collector_device}",
         f"train.device={args.train_device}",
@@ -123,17 +152,13 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
         f"streaming.chunk_size_samples={int(args.chunk_size_samples)}",
         f"collector.layer_output_splitting.xy_samples_random_slice={int(args.xy_samples_random_slice)}",
     ]
+    if datasets:
+        overrides.append(f"data.enabled_datasets=[{','.join(datasets)}]")
 
     if args.hf_token:
         overrides.append(f"hf.token={args.hf_token}")
 
     mapping = _parse_dataset_model_map(args.dataset_model)
-    if not mapping:
-        mapping = {
-            "coco2017": ["clip_vit_b32"],
-            "scene_parse_150": ["clip_vit_b32"],
-            "cc12m": ["clip_vit_b32"],
-        }
 
     for dataset_name in datasets:
         models = mapping.get(dataset_name)

@@ -34,7 +34,7 @@ streaming:
     ready_prefix: ready
 
   distributed:
-    enabled: false
+    enabled: true
     rank_env: RANK
     world_size_env: WORLD_SIZE
     shard_by: chunk

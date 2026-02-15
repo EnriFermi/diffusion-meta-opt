@@ -87,3 +87,44 @@ pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
 Логи любого запуска дублируются:
 - в консоль;
 - в файл `${logging.dir}/${logging.file_name}` (по умолчанию `logs/*.log`).
+
+## Extra HF raw datasets (10-pack)
+
+Добавлен отдельный профиль данных:
+- `conf/data/hf_extra_10.yaml`
+
+Он включает новые датасеты:
+- `stanford_cars`
+- `dtd_textures`
+- `eurosat_rgb`
+- `patchcamelyon`
+- `oxford_pets`
+- `wider_face`
+- `doclaynet_v11`
+- `cord_v2`
+- `funsd`
+- `docvqa_1200`
+
+Базовые YAML лежат в:
+- `conf/data/datasets/*.yaml` (по имени датасета)
+
+Как запустить профиль:
+
+```bash
+pipenv run python train.py data=hf_extra_10
+```
+
+Smoke-проверка каждого датасета:
+
+```bash
+pipenv run python -m dataset.data_raw.tools.inspect_dataset stanford_cars --n 8 --output-format pil
+pipenv run python -m dataset.data_raw.tools.inspect_dataset dtd_textures --n 8 --output-format pil
+pipenv run python -m dataset.data_raw.tools.inspect_dataset eurosat_rgb --n 8 --output-format pil
+pipenv run python -m dataset.data_raw.tools.inspect_dataset patchcamelyon --n 8 --output-format pil
+pipenv run python -m dataset.data_raw.tools.inspect_dataset oxford_pets --n 8 --output-format pil
+pipenv run python -m dataset.data_raw.tools.inspect_dataset wider_face --n 8 --output-format pil
+pipenv run python -m dataset.data_raw.tools.inspect_dataset doclaynet_v11 --n 8 --output-format pil
+pipenv run python -m dataset.data_raw.tools.inspect_dataset cord_v2 --n 8 --output-format pil
+pipenv run python -m dataset.data_raw.tools.inspect_dataset funsd --n 8 --output-format pil
+pipenv run python -m dataset.data_raw.tools.inspect_dataset docvqa_1200 --n 8 --output-format pil
+```

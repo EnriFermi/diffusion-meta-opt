@@ -1,9 +1,14 @@
 name: relaion400m
+description: "Масштабный веб-корпус URL-изображений с текстом; задача vision-language pretraining."
 enabled: true
 gated: true
 sampling_weight: 1.0
 models:
   - clip_vit_b32
+  - siglip_base_p16_384
+  - blip_image_captioning_base
+  - dinov2_vits14
+  - vit_mae_base
 collector_device: null
 
 hf:

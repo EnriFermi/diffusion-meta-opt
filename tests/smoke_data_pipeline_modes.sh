@@ -23,10 +23,8 @@ set -euo pipefail
 
 SCRIPT="tests/smoke_data_pipeline_modes.py"
 COMMON_ARGS=(
+  --data-profile "all_datasets_no_flickr30k"
   --data-root "./data"
-  --datasets "coco2017,scene_parse_150"
-  --dataset-model "coco2017=clip_vit_b32"
-  --dataset-model "scene_parse_150=clip_vit_b32"
   --predownload
   --chunk-size-samples 8
   --raw-chunk-size-images 16
