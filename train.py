@@ -21,9 +21,6 @@ from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dataset import data_pipeline, setup_logging
-from dataset.shared.collector_service import CollectorService
-from dataset.shared.shared_dataset import SharedModelDataset
-from dataset.shared.types import SharedSample
 from models.weight_quantile_vae import EncoderConfig, ModelConfig, ResamplerConfig, WeightQuantileVAE
 
 
@@ -259,7 +256,7 @@ def _save_checkpoint(
 
 
 def _next_valid_sample(
-    dataset_iter: Iterator[SharedSample],
+    dataset_iter: Iterator[Any],
     max_x_rows: int,
     logger: logging.Logger,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -329,7 +326,7 @@ def _broadcast_tensor_2d(
 def _fetch_batch(
     rank: int,
     device: torch.device,
-    dataset_iter: Iterator[SharedSample] | None,
+    dataset_iter: Iterator[Any] | None,
     use_broadcast: bool,
     max_x_rows: int,
     logger: logging.Logger,
@@ -415,9 +412,9 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
     scaler = None
 
     try:
-        collector: CollectorService | None = None
-        dataset: SharedModelDataset | None = None
-        dataset_iter: Iterator[SharedSample] | None = None
+        collector: Any | None = None
+        dataset: Any | None = None
+        dataset_iter: Iterator[Any] | None = None
 
         with contextlib.ExitStack() as stack:
             if rank == 0:
