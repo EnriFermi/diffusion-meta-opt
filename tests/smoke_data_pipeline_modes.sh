@@ -58,8 +58,8 @@ python "$SCRIPT" \
   --collector-device "cuda:1" \
   --collector-mode "auto" \
   --chunk-size-samples 64 \
-  --local-max-ready-chunks 40 \
-  --local-low-watermark-chunks 20 \
+  --local-ready-store-max-chunks 40 \
+  --local-refill-after-consumed-chunks 20 \
   "${COMMON_ARGS[@]}"
 
 # -----------------------------------------------------------------------------

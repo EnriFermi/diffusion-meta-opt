@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from dataset.shared.streaming.backends.local_disk import LocalDiskChunkStore
+from dataset.shared.streaming.chunk_format import load_chunk
 from dataset.shared.streaming.chunk_reader import ChunkReader
 from dataset.shared.streaming.chunk_writer import ChunkWriter
 from dataset.shared.types import SharedSample
@@ -33,7 +34,7 @@ class TestStreamingChunkWriterReaderLocal(unittest.TestCase):
                 spool_dir=root / "spool",
                 chunk_size_samples=3,
                 compression="none",
-                local_max_chunks=10,
+                spool_max_pending_chunks=10,
             )
 
             expected = 7
@@ -45,8 +46,8 @@ class TestStreamingChunkWriterReaderLocal(unittest.TestCase):
 
             reader = ChunkReader(
                 store=store,
-                local_cache_dir=root / "consumer_cache",
-                local_max_chunks=2,
+                cache_dir=root / "consumer_cache",
+                prefetch_max_chunks=2,
                 delete_remote_after="consume",
                 distributed_cfg={"enabled": False},
             )
@@ -61,6 +62,53 @@ class TestStreamingChunkWriterReaderLocal(unittest.TestCase):
             finally:
                 reader.close()
                 writer.close()
+
+    def test_chunk_contains_mixed_runs_and_datasets_with_window_striping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = LocalDiskChunkStore(root_dir=root / "store", max_ready_chunks=20, low_watermark_chunks=10)
+            writer = ChunkWriter(
+                store=store,
+                spool_dir=root / "spool",
+                chunk_size_samples=3,
+                compression="none",
+                spool_max_pending_chunks=10,
+            )
+
+            writer.open_window(window_chunks=2, window_id=1)
+            for idx in range(12):
+                run_id = (idx // 2) % 2
+                ds_name = "coco2017" if (idx // 2) % 2 == 0 else "scene_parse_150"
+                sample = _make_sample(idx)
+                sample.meta = {
+                    "model_run_id": run_id,
+                    "image_meta": [{"dataset_name": ds_name, "source_id": idx}],
+                }
+                writer.append(sample)
+            writer.close_window(flush_partial=True)
+            writer.close()
+
+            refs = store.list_ready(limit=None)
+            self.assertGreaterEqual(len(refs), 2)
+
+            saw_mixed_run_chunk = False
+            saw_mixed_dataset_chunk = False
+            for ref in refs:
+                samples, _ = load_chunk(Path(ref.backend_key))
+                run_ids = {int(item.meta.get("model_run_id", -1)) for item in samples}
+                ds_names = {
+                    str(meta.get("dataset_name"))
+                    for item in samples
+                    for meta in item.meta.get("image_meta", [])
+                    if meta.get("dataset_name") is not None
+                }
+                if len(run_ids) > 1:
+                    saw_mixed_run_chunk = True
+                if len(ds_names) > 1:
+                    saw_mixed_dataset_chunk = True
+
+            self.assertTrue(saw_mixed_run_chunk)
+            self.assertTrue(saw_mixed_dataset_chunk)
 
 
 if __name__ == "__main__":

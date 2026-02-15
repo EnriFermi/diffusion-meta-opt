@@ -16,8 +16,8 @@ def atomize(
 ) -> Iterator[SharedSample]:
     """Convert one LayerIORecord into atomic SharedSample items."""
 
-    atom_mode = str(atom_cfg.get("atom_mode", "chunk")).lower()
-    chunk_rows = max(1, int(atom_cfg.get("chunk_rows", 256)))
+    atom_mode = str(atom_cfg.get("sample_granularity", "chunk")).lower()
+    chunk_rows = max(1, int(atom_cfg.get("rows_per_chunk_sample", 256)))
 
     inputs = layer_record.inputs
     outputs = layer_record.outputs

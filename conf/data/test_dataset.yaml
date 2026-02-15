@@ -1,7 +1,7 @@
-# Профиль набора raw-датасетов для shared-оркестратора.
-# Создавайте новые профили рядом с этим файлом:
+# Raw dataset profile for shared orchestrator.
+# Create additional profiles next to this file:
 #   conf/data/<your_profile>.yaml
-# и выбирайте их через defaults в conf/config.yaml.
+# and select them via defaults in conf/config.yaml.
 
 path: ${oc.env:DATA_ROOT,./data/datasets}
 seed: 42
@@ -21,8 +21,8 @@ enabled_datasets:
   - mapillary_vistas_v2
   - relaion400m
 
-# Точечные override'ы для выбранного профиля.
-# Пример:
+# Per-profile focused overrides.
+# Example:
 # dataset_overrides:
 #   flickr30k:
 #     models: [clip_vit_b32, dinov2_base]

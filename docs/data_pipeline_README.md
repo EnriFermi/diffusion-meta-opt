@@ -139,6 +139,17 @@ dataset/
 Для обратной совместимости принимается alias:
 - `in_memory` -> `none`
 
+Новые anti-block поля:
+- `streaming.producer.refill_after_consumed_chunks`:
+  - после consume этого количества ready chunk-ов начинается новый refill цикл.
+- `streaming.producer.stripe_window_chunks`:
+  - размер окна stripe-укладки (`i % n`) при записи.
+  - `null` => используется `refill_after_consumed_chunks`.
+- `streaming.consumer.randomize_within_chunk`:
+  - случайная перестановка порядка sample-ов внутри активного chunk-а.
+- `streaming.consumer.random_seed`:
+  - seed для deterministic порядка чтения внутри chunk-а (`null` => берётся `data.seed`, если задан).
+
 ## 4.3 Data profile (`conf/data/*.yaml`)
 
 Пример: `conf/data/test_dataset.yaml`.
@@ -219,21 +230,21 @@ dataset/
 - `shuffled_cycle`
 - `weighted`
 
-`model_burst_jobs` контролирует частоту переключения модели.
+`jobs_per_selected_model` контролирует частоту переключения модели.
 
 ## 7.3 `RawDatasetPool`
 
 Для выбранной модели:
 1. Берёт совместимые датасеты.
-2. Делит `batch_size` по policy (`multinomial`/`uniform`) + cap (`mix_cap_per_dataset`).
+2. Делит `batch_size` по strategy (`weighted_random`/`uniform_random`) + cap (`max_dataset_fraction_per_batch`).
 3. Запрашивает PIL batch у каждого датасета.
 4. Собирает unified mixed batch + `MixedImageMeta`.
 
 ## 7.4 `Atomizer`
 
 Преобразует `LayerIORecord` в `SharedSample`:
-- `atom_mode=row|chunk`
-- `chunk_rows`
+- `sample_granularity=row|chunk`
+- `rows_per_chunk_sample`
 - meta: `model_run_id`, timestamps, `image_meta`, `row2img`, ranges.
 
 ---
@@ -284,13 +295,16 @@ dataset/
 - лимит remote: `max_remote_chunks`
 
 ### `chunk_writer.py`
-- буферизует `SharedSample`
+- поддерживает **windowed stripe write**:
+  - `open_window(window_chunks, window_id)`
+  - распределение sample по slot: `slot = i % window_chunks`
+- каждый slot даёт свои chunk-и, в id/metadata сохраняются `window_id`/`window_slot`
 - flush по `chunk_size_samples`
 - умеет `flush(force_partial=True)` на shutdown
 
 ### `chunk_reader.py`
 - prefetch готовых chunk-ов в локальный cache
-- выдаёт `SharedSample` по одному
+- читает **один активный chunk за раз**, но выдаёт sample-ы в случайном порядке (если `randomize_within_chunk=true`)
 - delete policy:
   - `download` — удалять remote сразу после download
   - `consume` — удалять remote после полного потребления chunk-а (**default**)
@@ -321,11 +335,11 @@ dataset/
 
 Поведение fill control:
 - `none`: по `cache.fill_target/low_watermark`.
-- `local_disk`: hysteresis fill-to-max/resume-at-low:
-  - fill пока `ready < max_ready_chunks`,
-  - остановка на max,
-  - возобновление когда `ready <= low_watermark_chunks`.
-- `s3_bridge`: fill пока backend может принять (`ready < max_remote_chunks`) и writer может spool.
+- `local_disk|s3_bridge`: refill-window state machine:
+  - старт fill, когда прочитано `refill_after_consumed_chunks` ready chunk-ов от верхней границы,
+  - при старте fill открывается `writer.open_window(stripe_window_chunks or refill_after_consumed_chunks)`,
+  - stop fill на верхней границе backend capacity,
+  - в fill-фазе запись идёт stripe-укладкой по окну.
 
 Shutdown semantics:
 - на остановке sink закрывается,
@@ -343,6 +357,7 @@ Shutdown semantics:
 2. `streaming.mode=local_disk|s3_bridge`:
    - создаёт `ChunkReader` через `collector.create_chunk_reader()`
    - читает `reader.next_sample()`.
+   - после полного consume активного chunk-а reader сразу подкачивает следующий.
 
 Методы:
 - `__iter__()` — бесконечный stream sample-ов.
@@ -403,13 +418,13 @@ Shutdown semantics:
 ## 13.1 Producer/consumer буфер
 
 - `streaming.chunk_size_samples`: `128..512`
-- `streaming.producer.local_max_chunks`: `32..128`
-- `streaming.consumer.local_max_chunks`: `8..32`
+- `streaming.producer.max_pending_spool_chunks`: `32..128`
+- `streaming.consumer.prefetch_max_chunks`: `8..32`
 
 ## 13.2 Local disk backend
 
-- `streaming.local_disk.max_ready_chunks`: `200..1000`
-- `streaming.local_disk.low_watermark_chunks`: `~50% от max_ready_chunks`
+- `streaming.producer.ready_store_max_chunks`: `200..1000` (для `streaming.mode=local_disk`)
+- `streaming.producer.refill_after_consumed_chunks`: обычно `~50% от ready_store_max_chunks`
 
 ## 13.3 S3 bridge backend
 
@@ -419,14 +434,14 @@ Shutdown semantics:
 
 ## 13.4 Collector knobs
 
-- `collector.model_burst_jobs`: `1..2`
+- `collector.jobs_per_selected_model`: `1..2`
 - `collector.num_inflight_jobs`: `1..2`
-- `collector.mix_cap_per_dataset`: `0.4..0.7`
+- `collector.max_dataset_fraction_per_batch`: `0.4..0.7`
 
 ## 13.5 Atomization
 
-- `collector.atomization.atom_mode=chunk`
-- `collector.atomization.chunk_rows=128..256`
+- `collector.layer_output_splitting.sample_granularity=chunk`
+- `collector.layer_output_splitting.rows_per_chunk_sample=128..256`
 
 ---
 
@@ -537,6 +552,9 @@ pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
 - `tests/test_streaming_local_disk_backend.py`
 - `tests/test_streaming_sharding.py`
 - `tests/test_streaming_chunk_writer_reader_local.py`
+- `tests/test_streaming_chunk_writer_round_robin.py`
+- `tests/test_streaming_chunk_reader_shuffle.py`
+- `tests/test_streaming_refill_window_logic.py`
 - `tests/test_streaming_mode_resolution.py`
 - `tests/test_streaming_s3_backend.py`
 

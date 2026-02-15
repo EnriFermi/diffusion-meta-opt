@@ -30,15 +30,15 @@ pipenv run python -m dataset.shared.demo_streaming_local \
 ## Что важно в этом режиме
 
 1. Hysteresis по chunk-store:
-- fill до `streaming.local_disk.max_ready_chunks`
+- fill до `streaming.producer.ready_store_max_chunks`
 - stop на max
-- resume когда `ready <= streaming.local_disk.low_watermark_chunks`
+- resume после consume `streaming.producer.refill_after_consumed_chunks`
 
 2. Producer-side spool:
-- `streaming.producer.local_max_chunks`
+- `streaming.producer.max_pending_spool_chunks`
 
 3. Consumer-side prefetch:
-- `streaming.consumer.local_max_chunks`
+- `streaming.consumer.prefetch_max_chunks`
 
 ## DDP шардирование
 

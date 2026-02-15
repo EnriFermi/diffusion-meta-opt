@@ -76,18 +76,33 @@ class _InMemorySampleSink(_SampleSink):
         return {
             "sink": "in_memory",
             "size": self.cache.size(),
-            "max_items": self.cache.max_items,
-            "fill_target": self.cache.fill_target,
-            "low_watermark": self.cache.low_watermark,
+            "capacity_samples": self.cache.max_items,
+            "fill_target_samples": self.cache.fill_target,
+            "low_watermark_samples": self.cache.low_watermark,
         }
 
 
 class _ChunkedSampleSink(_SampleSink):
-    def __init__(self, mode: str, store: Any, writer: Any) -> None:
+    def __init__(
+        self,
+        mode: str,
+        store: Any,
+        writer: Any,
+        refill_after_consumed_chunks: int,
+        stripe_window_chunks: int | None,
+    ) -> None:
         self.mode = mode
         self.store = store
         self.writer = writer
-        self._fill_active = True
+        self.refill_after_consumed_chunks = max(1, int(refill_after_consumed_chunks))
+        self.stripe_window_chunks = (
+            max(1, int(stripe_window_chunks))
+            if stripe_window_chunks is not None
+            else self.refill_after_consumed_chunks
+        )
+
+        self._fill_active = False
+        self._window_id = 0
 
     def emit(self, sample: SharedSample) -> None:
         self.writer.append(sample)
@@ -95,35 +110,30 @@ class _ChunkedSampleSink(_SampleSink):
     def needs_fill(self) -> bool:
         state = self.store.capacity_state()
         can_accept = bool(state.get("can_accept", True))
-        if not can_accept:
-            self._fill_active = False
+        ready, upper_bound = self._resolve_ready_and_upper_bound(state)
+        start_threshold = max(0, upper_bound - self.refill_after_consumed_chunks)
+
+        if self._fill_active:
+            if not can_accept or ready >= upper_bound:
+                self._fill_active = False
+                self.writer.close_window(flush_partial=False)
+                return False
+            return True
+
+        should_start = can_accept and ready <= start_threshold
+        if not should_start:
             return False
 
-        if self.mode == "local_disk":
-            ready = int(state.get("ready_chunks", 0))
-            low = int(state.get("low_watermark_chunks", 0))
-            max_ready = int(state.get("max_ready_chunks", 1))
-
-            if self._fill_active:
-                if ready >= max_ready:
-                    self._fill_active = False
-                    return False
-                return True
-
-            if ready <= low:
-                self._fill_active = True
-                return True
-            return False
-
+        self.writer.open_window(window_chunks=self.stripe_window_chunks, window_id=self._window_id)
+        self._window_id += 1
+        self._fill_active = True
         return True
 
     def is_low(self) -> bool:
         state = self.store.capacity_state()
-        if self.mode == "local_disk":
-            ready = int(state.get("ready_chunks", 0))
-            low = int(state.get("low_watermark_chunks", 0))
-            return ready <= low
-        return bool(state.get("can_accept", True))
+        ready, upper_bound = self._resolve_ready_and_upper_bound(state)
+        start_threshold = max(0, upper_bound - self.refill_after_consumed_chunks)
+        return ready <= start_threshold
 
     def size_metric(self) -> int:
         state = self.store.capacity_state()
@@ -132,6 +142,9 @@ class _ChunkedSampleSink(_SampleSink):
         return self.store.count_ready()
 
     def close(self) -> None:
+        if self._fill_active:
+            self.writer.close_window(flush_partial=True)
+            self._fill_active = False
         self.writer.close()
 
     def stats(self) -> dict[str, Any]:
@@ -141,10 +154,27 @@ class _ChunkedSampleSink(_SampleSink):
             "mode": self.mode,
             "size_metric": self.size_metric(),
             "backend": state.get("backend"),
+            "fill_active": self._fill_active,
+            "refill_after_consumed_chunks": self.refill_after_consumed_chunks,
+            "stripe_window_chunks": self.stripe_window_chunks,
+            "window_id": self._window_id,
         }
         payload.update({f"backend_{k}": v for k, v in state.items()})
         payload.update({f"writer_{k}": v for k, v in self.writer.stats().items()})
         return payload
+
+    def _resolve_ready_and_upper_bound(self, state: dict[str, Any]) -> tuple[int, int]:
+        ready = int(state.get("ready_chunks", self.store.count_ready()))
+
+        if self.mode == "local_disk":
+            upper = max(1, int(state.get("max_ready_chunks", 1)))
+            return ready, upper
+
+        if self.mode == "s3_bridge":
+            upper = max(1, int(state.get("max_remote_chunks", 1)))
+            return ready, upper
+
+        return ready, max(1, ready)
 
 
 class CollectorService:
@@ -160,18 +190,24 @@ class CollectorService:
         self.collector_mode = resolve_collector_mode(self.cfg_dict)
 
         collector_cfg = self.cfg_dict.get("collector", {})
-        cache_cfg = collector_cfg.get("cache", {})
+        in_memory_cfg = collector_cfg.get("in_memory_buffer", {})
 
         self.streaming_cfg = resolve_streaming_cfg(self.cfg_dict.get("streaming", {}))
+        consumer_cfg = dict(self.streaming_cfg.get("consumer", {}))
+        if consumer_cfg.get("random_seed") is None:
+            data_cfg = self.cfg_dict.get("data") or {}
+            if data_cfg.get("seed") is not None:
+                consumer_cfg["random_seed"] = int(data_cfg.get("seed"))
+        self.streaming_cfg["consumer"] = consumer_cfg
         self.streaming_mode = str(self.streaming_cfg.get("mode", "none"))
         self.streaming_enabled = self.streaming_mode != "none"
 
         self.cache: SharedSampleCache | None = None
         if not self.streaming_enabled:
             self.cache = cache or SharedSampleCache(
-                max_items=int(cache_cfg.get("max_items", 5000)),
-                fill_target=int(cache_cfg.get("fill_target", 5000)),
-                low_watermark=int(cache_cfg.get("low_watermark", 3000)),
+                max_items=int(in_memory_cfg.get("capacity_samples", 5000)),
+                fill_target=int(in_memory_cfg.get("fill_target_samples", 5000)),
+                low_watermark=int(in_memory_cfg.get("low_watermark_samples", 3000)),
             )
 
         self.collector_device = normalize_device(collector_cfg.get("device"))
@@ -183,17 +219,23 @@ class CollectorService:
             if self.train_device is not None and self.collector_device == self.train_device:
                 raise ValueError("async collector mode requires collector.device != train.device")
 
-        self.model_policy = str(collector_cfg.get("model_policy", "shuffled_cycle"))
-        self.model_burst_jobs = int(collector_cfg.get("model_burst_jobs", 2))
-        self.dataset_mix_policy = str(collector_cfg.get("dataset_mix_policy", "multinomial"))
-        self.mix_cap_per_dataset = float(collector_cfg.get("mix_cap_per_dataset", 0.6))
+        self.model_selection_strategy = str(collector_cfg.get("model_selection_strategy", "round_robin_shuffled"))
+        self.jobs_per_selected_model = int(collector_cfg.get("jobs_per_selected_model", 2))
+        self.dataset_sampling_strategy = str(collector_cfg.get("dataset_sampling_strategy", "weighted_random"))
+        self.max_dataset_fraction_per_batch = float(collector_cfg.get("max_dataset_fraction_per_batch", 0.6))
         self.num_inflight_jobs = max(1, int(collector_cfg.get("num_inflight_jobs", 2)))
 
-        self.interleaved_cfg = collector_cfg.get("interleaved", {})
-        self.interleaved_every_n_steps = max(1, int(self.interleaved_cfg.get("every_n_steps", 30)))
-        self.interleaved_burst_jobs = max(1, int(self.interleaved_cfg.get("burst_jobs", 1)))
+        self.interleaved_cfg = collector_cfg.get("interleaved_schedule", {})
+        self.interleaved_every_n_steps = max(
+            1,
+            int(self.interleaved_cfg.get("collect_every_n_train_steps", 30)),
+        )
+        self.interleaved_burst_jobs = max(
+            1,
+            int(self.interleaved_cfg.get("collector_jobs_per_cycle", 1)),
+        )
 
-        self.atom_cfg = collector_cfg.get("atomization", {})
+        self.atom_cfg = collector_cfg.get("layer_output_splitting", {})
 
         max_loaded = int(collector_cfg.get("max_loaded_models", 1))
         if max_loaded != 1:
@@ -329,8 +371,8 @@ class CollectorService:
         pil_batch, image_meta = self._raw_pool.sample_mixed_batch(
             model_name=model_name,
             batch_size=batch_size,
-            mixing_policy=self.dataset_mix_policy,
-            mix_cap_per_dataset=self.mix_cap_per_dataset,
+            dataset_sampling_strategy=self.dataset_sampling_strategy,
+            max_dataset_fraction_per_batch=self.max_dataset_fraction_per_batch,
         )
 
         if not pil_batch:
@@ -470,8 +512,8 @@ class CollectorService:
         self._scheduler = ModelScheduler(
             model_names=collectable_models,
             model_weights=self.compat_index.get_model_weights(),
-            policy=self.model_policy,
-            burst_jobs=self.model_burst_jobs,
+            policy=self.model_selection_strategy,
+            burst_jobs=self.jobs_per_selected_model,
             seed=seed,
         )
 
@@ -489,7 +531,16 @@ class CollectorService:
             raise ValueError(f"streaming.mode={self.streaming_mode} requires a chunk store")
 
         writer = build_chunk_writer(self.streaming_cfg, store=store)
-        return _ChunkedSampleSink(mode=self.streaming_mode, store=store, writer=writer)
+        producer_cfg = dict(self.streaming_cfg.get("producer", {}))
+        refill_after = int(producer_cfg.get("refill_after_consumed_chunks", 1))
+        stripe_window = producer_cfg.get("stripe_window_chunks")
+        return _ChunkedSampleSink(
+            mode=self.streaming_mode,
+            store=store,
+            writer=writer,
+            refill_after_consumed_chunks=refill_after,
+            stripe_window_chunks=int(stripe_window) if stripe_window is not None else None,
+        )
 
     def _shutdown_runtime_components(self) -> None:
         if self._sink is not None:

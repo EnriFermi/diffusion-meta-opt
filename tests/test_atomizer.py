@@ -21,11 +21,21 @@ class TestAtomizer(unittest.TestCase):
         )
 
         image_meta = [MixedImageMeta(dataset_name="ds", source_id=i) for i in range(5)]
-        items = list(atomize(record, {"atom_mode": "chunk", "chunk_rows": 2}, image_meta, model_run_id=7))
+        items = list(
+            atomize(
+                record,
+                {"sample_granularity": "chunk", "rows_per_chunk_sample": 2},
+                image_meta,
+                model_run_id=7,
+            )
+        )
 
         self.assertEqual(len(items), 3)
         self.assertEqual(items[0].x.shape[0], 2)
         self.assertEqual(items[0].meta["model_run_id"], 7)
+        for item in items:
+            self.assertEqual(tuple(item.weight.shape), tuple(record.weight.shape))
+            self.assertTrue(torch.equal(item.weight, record.weight))
 
 
 if __name__ == "__main__":

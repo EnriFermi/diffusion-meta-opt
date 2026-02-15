@@ -41,9 +41,9 @@ pipenv run python -m dataset.shared.demo_end_to_end \
 
 ## Практические параметры
 
-1. `collector.cache.max_items/fill_target/low_watermark`
-2. `collector.model_burst_jobs`
-3. `collector.atomization.chunk_rows`
+1. `collector.in_memory_buffer.capacity_samples/fill_target_samples/low_watermark_samples`
+2. `collector.jobs_per_selected_model`
+3. `collector.layer_output_splitting.rows_per_chunk_sample`
 
 ## Ограничения режима
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import random
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -26,16 +27,18 @@ class ChunkReader:
     def __init__(
         self,
         store: ChunkStore,
-        local_cache_dir: str | Path,
-        local_max_chunks: int,
+        cache_dir: str | Path,
+        prefetch_max_chunks: int,
         delete_remote_after: str,
         distributed_cfg: dict[str, Any] | None,
+        randomize_within_chunk: bool = True,
+        random_seed: int | None = None,
     ) -> None:
         self.store = store
-        self.local_cache_dir = Path(local_cache_dir)
-        self.local_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        self.local_max_chunks = max(1, int(local_max_chunks))
+        self.prefetch_max_chunks = max(1, int(prefetch_max_chunks))
         self.delete_remote_after = str(delete_remote_after or "consume").lower()
         if self.delete_remote_after not in {"consume", "download"}:
             raise ValueError("streaming.consumer.delete_remote_after must be 'consume' or 'download'")
@@ -43,6 +46,8 @@ class ChunkReader:
         self.distributed: DistributedSettings = resolve_distributed_settings(distributed_cfg)
 
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.randomize_within_chunk = bool(randomize_within_chunk)
+        self._rng = random.Random(random_seed if random_seed is not None else time.time_ns())
 
         self._pending_chunks: deque[_LocalChunk] = deque()
         self._known_chunk_ids: set[str] = set()
@@ -50,6 +55,7 @@ class ChunkReader:
         self._active_chunk: _LocalChunk | None = None
         self._active_samples: list[SharedSample] = []
         self._active_index = 0
+        self._active_order: list[int] = []
 
     def next_sample(self, block: bool = True, timeout: float | None = None) -> SharedSample:
         deadline = None
@@ -75,12 +81,18 @@ class ChunkReader:
 
         if self._active_chunk is None:
             return None
+        if not self._active_order:
+            self._finalize_active_chunk()
+            self._prefetch_once()
+            return None
 
-        sample = self._active_samples[self._active_index]
+        read_index = self._active_order[self._active_index]
+        sample = self._active_samples[read_index]
         self._active_index += 1
 
         if self._active_index >= len(self._active_samples):
             self._finalize_active_chunk()
+            self._prefetch_once()
 
         return sample
 
@@ -110,10 +122,13 @@ class ChunkReader:
         samples, _ = load_chunk(self._active_chunk.local_path)
         self._active_samples = samples
         self._active_index = 0
+        self._active_order = list(range(len(self._active_samples)))
+        if self.randomize_within_chunk and len(self._active_order) > 1:
+            self._rng.shuffle(self._active_order)
 
     def _prefetch_once(self) -> None:
-        while len(self._pending_chunks) < self.local_max_chunks:
-            refs = self.store.list_ready(limit=self.local_max_chunks * 4)
+        while len(self._pending_chunks) < self.prefetch_max_chunks:
+            refs = self.store.list_ready(limit=self.prefetch_max_chunks * 4)
             refs = [ref for ref in refs if self._eligible_ref(ref)]
 
             if not refs:
@@ -122,7 +137,7 @@ class ChunkReader:
             ref = refs[0]
             self._known_chunk_ids.add(ref.chunk_id)
 
-            target = self.local_cache_dir / _chunk_filename(ref)
+            target = self.cache_dir / _chunk_filename(ref)
             self.store.fetch_to_local(ref, target)
 
             remote_deleted = False
@@ -161,6 +176,7 @@ class ChunkReader:
         self._active_chunk = None
         self._active_samples = []
         self._active_index = 0
+        self._active_order = []
 
 
 def assign_chunk_rank(chunk_id: str, world_size: int) -> int:

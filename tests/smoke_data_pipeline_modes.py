@@ -50,8 +50,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-chunk-size-images", type=int, default=32)
     parser.add_argument("--raw-num-chunks-kept", type=int, default=2)
     parser.add_argument("--atom-chunk-rows", type=int, default=64)
-    parser.add_argument("--local-max-ready-chunks", type=int, default=40)
-    parser.add_argument("--local-low-watermark-chunks", type=int, default=20)
+    parser.add_argument("--local-ready-store-max-chunks", type=int, default=40)
+    parser.add_argument("--local-refill-after-consumed-chunks", type=int, default=20)
 
     parser.add_argument("--s3-bucket", default=None)
     parser.add_argument("--s3-prefix", default="diffusion-meta-opt/streaming")
@@ -71,6 +71,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--turnover-probe-samples", type=int, default=24)
     parser.add_argument("--turnover-probe-timeout-seconds", type=int, default=180)
     parser.add_argument("--skip-turnover-probe", action="store_true")
+    parser.add_argument("--diversity-window", type=int, default=128)
     parser.add_argument(
         "--dump-first-weight",
         default=None,
@@ -120,7 +121,7 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
         f"train.device={args.train_device}",
         f"streaming.mode={args.mode}",
         f"streaming.chunk_size_samples={int(args.chunk_size_samples)}",
-        f"collector.atomization.chunk_rows={int(args.atom_chunk_rows)}",
+        f"collector.layer_output_splitting.rows_per_chunk_sample={int(args.atom_chunk_rows)}",
     ]
 
     if args.hf_token:
@@ -149,14 +150,15 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
         local_root = Path(args.data_root) / "streaming" / "local_disk_smoke" / run_tag
         producer_dir = Path(args.data_root) / "streaming" / "spool" / "producer_smoke" / run_tag
         consumer_dir = Path(args.data_root) / "streaming" / "cache" / "consumer_smoke" / run_tag
+        refill_after = max(1, int(args.local_refill_after_consumed_chunks))
 
         overrides.extend(
             [
-                f"streaming.local_disk.root_dir={local_root}",
-                f"streaming.local_disk.max_ready_chunks={int(args.local_max_ready_chunks)}",
-                f"streaming.local_disk.low_watermark_chunks={int(args.local_low_watermark_chunks)}",
-                f"streaming.producer.local_spool_dir={producer_dir}",
-                f"streaming.consumer.local_cache_dir={consumer_dir}",
+                f"streaming.producer.ready_store_dir={local_root}",
+                f"streaming.producer.ready_store_max_chunks={int(args.local_ready_store_max_chunks)}",
+                f"streaming.producer.refill_after_consumed_chunks={int(refill_after)}",
+                f"streaming.producer.spool_dir={producer_dir}",
+                f"streaming.consumer.cache_dir={consumer_dir}",
                 "streaming.distributed.enabled=false",
             ]
         )
@@ -179,8 +181,8 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
                 f"streaming.s3.prefix={prefix}",
                 f"streaming.s3.max_remote_chunks={int(args.s3_max_remote_chunks)}",
                 f"streaming.consumer.delete_remote_after={args.delete_remote_after}",
-                f"streaming.producer.local_spool_dir={producer_dir}",
-                f"streaming.consumer.local_cache_dir={consumer_dir}",
+                f"streaming.producer.spool_dir={producer_dir}",
+                f"streaming.consumer.cache_dir={consumer_dir}",
             ]
         )
         if args.s3_region:
@@ -218,6 +220,84 @@ def _streaming_chunk_snapshot(cfg: DictConfig) -> dict[str, Any] | None:
     return {
         "ready_count": len(ids),
         "ready_chunk_ids": ids,
+    }
+
+
+def _diversity_report(samples: list[Any], window_size: int) -> dict[str, Any]:
+    if not samples:
+        return {
+            "window_size": int(window_size),
+            "num_samples": 0,
+            "min_unique_model_run_ids_in_window": 0,
+            "min_unique_datasets_in_window": 0,
+            "global_unique_model_run_ids": 0,
+            "global_unique_datasets": 0,
+            "max_model_run_streak": 0,
+            "max_primary_dataset_streak": 0,
+        }
+
+    run_ids: list[int | None] = []
+    dataset_sets: list[set[str]] = []
+    primary_datasets: list[str | None] = []
+
+    for sample in samples:
+        run_value = sample.meta.get("model_run_id")
+        run_ids.append(int(run_value) if run_value is not None else None)
+
+        image_meta = sample.meta.get("image_meta", [])
+        ds_set = {
+            str(item.get("dataset_name"))
+            for item in image_meta
+            if isinstance(item, dict) and item.get("dataset_name") is not None
+        }
+        dataset_sets.append(ds_set)
+        primary_datasets.append(next(iter(ds_set)) if ds_set else None)
+
+    real_window = max(1, min(int(window_size), len(samples)))
+    min_unique_run_ids = 10**9
+    min_unique_datasets = 10**9
+
+    for start in range(0, len(samples) - real_window + 1):
+        end = start + real_window
+        window_run_ids = {value for value in run_ids[start:end] if value is not None}
+        window_datasets: set[str] = set()
+        for ds_set in dataset_sets[start:end]:
+            window_datasets.update(ds_set)
+        min_unique_run_ids = min(min_unique_run_ids, len(window_run_ids))
+        min_unique_datasets = min(min_unique_datasets, len(window_datasets))
+
+    max_model_streak = 1
+    max_dataset_streak = 1
+    current_model_streak = 1
+    current_dataset_streak = 1
+
+    for idx in range(1, len(samples)):
+        if run_ids[idx] is not None and run_ids[idx] == run_ids[idx - 1]:
+            current_model_streak += 1
+        else:
+            current_model_streak = 1
+        max_model_streak = max(max_model_streak, current_model_streak)
+
+        if primary_datasets[idx] is not None and primary_datasets[idx] == primary_datasets[idx - 1]:
+            current_dataset_streak += 1
+        else:
+            current_dataset_streak = 1
+        max_dataset_streak = max(max_dataset_streak, current_dataset_streak)
+
+    global_run_ids = {value for value in run_ids if value is not None}
+    global_datasets: set[str] = set()
+    for ds_set in dataset_sets:
+        global_datasets.update(ds_set)
+
+    return {
+        "window_size": int(real_window),
+        "num_samples": len(samples),
+        "min_unique_model_run_ids_in_window": int(min_unique_run_ids),
+        "min_unique_datasets_in_window": int(min_unique_datasets),
+        "global_unique_model_run_ids": len(global_run_ids),
+        "global_unique_datasets": len(global_datasets),
+        "max_model_run_streak": int(max_model_streak),
+        "max_primary_dataset_streak": int(max_dataset_streak),
     }
 
 
@@ -272,6 +352,7 @@ def _run_smoke(
     turnover_probe_timeout_seconds: int,
     skip_turnover_probe: bool,
     dump_first_weight: str | None,
+    diversity_window: int,
 ) -> dict[str, Any]:
     collector = CollectorService(cfg)
     dataset = SharedModelDataset(collector)
@@ -282,6 +363,7 @@ def _run_smoke(
 
     consumed = 0
     first_sample_summary: dict[str, Any] | None = None
+    all_consumed_samples: list[Any] = []
     started = time.time()
     step = 0
     turnover_report: dict[str, Any] | None = None
@@ -347,6 +429,7 @@ def _run_smoke(
                     dataset_counts[str(ds_name)] += 1
 
             consumed += 1
+            all_consumed_samples.append(sample)
 
         if (
             str(cfg.streaming.mode).lower() != "none"
@@ -375,6 +458,7 @@ def _run_smoke(
                     if item.meta.get("model_run_id") is not None
                 }
             )
+            all_consumed_samples.extend(probe_items)
 
             turnover_ok = bool(new_ids or removed_ids or after.get("ready_count") != before.get("ready_count"))
             turnover_report = {
@@ -404,6 +488,8 @@ def _run_smoke(
     if consumed <= 0:
         raise RuntimeError("Smoke run produced zero samples")
 
+    diversity_report = _diversity_report(all_consumed_samples, window_size=int(diversity_window))
+
     return {
         "ok": True,
         "consumed": consumed,
@@ -416,6 +502,7 @@ def _run_smoke(
         "dataset_counts": dict(dataset_counts),
         "top_layers": layer_counts.most_common(10),
         "first_sample": first_sample_summary,
+        "diversity": diversity_report,
         "turnover_probe": turnover_report,
         "collector_stats": collector.stats(),
     }
@@ -444,6 +531,7 @@ def main() -> int:
             turnover_probe_timeout_seconds=int(args.turnover_probe_timeout_seconds),
             skip_turnover_probe=bool(args.skip_turnover_probe),
             dump_first_weight=args.dump_first_weight,
+            diversity_window=int(args.diversity_window),
         )
     except Exception as exc:
         message = str(exc)

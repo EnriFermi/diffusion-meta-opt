@@ -7,19 +7,29 @@ collector:
   pin_gpu: true
   release_device_on_unload: false
   empty_cuda_cache_on_unload: false
-  model_policy: shuffled_cycle
-  model_burst_jobs: 2
-  dataset_mix_policy: multinomial
-  mix_cap_per_dataset: 0.6
+  # How to pick the next model:
+  # - round_robin_shuffled: cycle over a shuffled model list
+  # - weighted_random: random by model.sampling_weight
+  model_selection_strategy: round_robin_shuffled
+  # Number of collector jobs to run consecutively for a selected model.
+  jobs_per_selected_model: 2
+  # How to split raw batch across datasets compatible with the selected model:
+  # - uniform_random: equal probability
+  # - weighted_random: by dataset.sampling_weight
+  dataset_sampling_strategy: uniform_random
+  # Max share (0..1) of one dataset in a mixed model batch.
+  max_dataset_fraction_per_batch: 0.6
   num_inflight_jobs: 2
-  cache:
-    max_items: 5000
-    fill_target: 5000
-    low_watermark: 3000
-  interleaved:
-    every_n_steps: 30
-    burst_jobs: 1
-    max_collect_share: 0.15
-  atomization:
-    atom_mode: chunk
-    chunk_rows: 256
+  # Used only when streaming.mode=none (in-memory buffer).
+  in_memory_buffer:
+    capacity_samples: 5000
+    fill_target_samples: 5000
+    low_watermark_samples: 3000
+  interleaved_schedule:
+    collect_every_n_train_steps: 30
+    collector_jobs_per_cycle: 1
+  layer_output_splitting:
+    # chunk | row
+    sample_granularity: chunk
+    # How many embedding rows (N,D) are stored in one SharedSample in chunk mode.
+    rows_per_chunk_sample: 256

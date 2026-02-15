@@ -21,7 +21,7 @@ class ModelScheduler:
 
         self.model_names = [str(name) for name in model_names]
         self.model_weights = {name: float((model_weights or {}).get(name, 1.0)) for name in self.model_names}
-        self.policy = str(policy).lower()
+        self.policy = self._normalize_policy(policy)
         self.burst_jobs = max(1, int(burst_jobs))
 
         self._rng = random.Random(seed)
@@ -39,7 +39,7 @@ class ModelScheduler:
         elif self.policy == "weighted":
             model = self._next_weighted()
         else:
-            raise ValueError(f"Unsupported collector.model_policy='{self.policy}'")
+            raise ValueError(f"Unsupported collector.model_selection_strategy='{self.policy}'")
 
         self._current_model = model
         self._burst_remaining = self.burst_jobs - 1
@@ -79,3 +79,14 @@ class ModelScheduler:
             "burst_remaining": self._burst_remaining,
             "num_models": len(self.model_names),
         }
+
+    @staticmethod
+    def _normalize_policy(value: str) -> str:
+        raw = str(value or "round_robin_shuffled").lower()
+        aliases = {
+            "round_robin_shuffled": "shuffled_cycle",
+            "shuffled_cycle": "shuffled_cycle",
+            "weighted_random": "weighted",
+            "weighted": "weighted",
+        }
+        return aliases.get(raw, raw)

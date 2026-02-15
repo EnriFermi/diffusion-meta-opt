@@ -20,6 +20,8 @@ class TestStreamingModeResolution(unittest.TestCase):
         cfg = resolve_streaming_cfg({})
         self.assertEqual(cfg["mode"], "none")
         self.assertEqual(cfg["chunk_size_samples"], 256)
+        self.assertIn("refill_after_consumed_chunks", cfg["producer"])
+        self.assertEqual(cfg["consumer"]["randomize_within_chunk"], True)
 
     def test_resolve_streaming_cfg_alias(self) -> None:
         cfg = resolve_streaming_cfg({"mode": "in_memory"})

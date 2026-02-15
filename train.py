@@ -395,8 +395,13 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
         cfg.streaming.distributed.rank_env = "RANK"
         cfg.streaming.distributed.world_size_env = "WORLD_SIZE"
         cfg.streaming.distributed.shard_by = str(cfg.streaming.distributed.get("shard_by", "chunk"))
-        base_cache_dir = str(cfg.streaming.consumer.get("local_cache_dir", "./data/streaming/cache/consumer"))
-        cfg.streaming.consumer.local_cache_dir = str(Path(base_cache_dir) / f"rank_{rank}")
+        base_cache_dir = str(
+            cfg.streaming.consumer.get(
+                "cache_dir",
+                "./data/streaming/cache/consumer",
+            )
+        )
+        cfg.streaming.consumer.cache_dir = str(Path(base_cache_dir) / f"rank_{rank}")
 
     logger.info(
         "Runtime: device=%s distributed=%s world_size=%s streaming_mode=%s dataset_sharding=%s",

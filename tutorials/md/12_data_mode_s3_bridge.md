@@ -42,8 +42,8 @@ pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
 - альтернатива: `download`
 
 4. Локальные кэши:
-- `streaming.producer.local_spool_dir`
-- `streaming.consumer.local_cache_dir`
+- `streaming.producer.spool_dir`
+- `streaming.consumer.cache_dir`
 
 ## Что проверять в первую очередь
 

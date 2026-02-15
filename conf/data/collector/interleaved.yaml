@@ -7,19 +7,20 @@ collector:
   pin_gpu: false
   release_device_on_unload: true
   empty_cuda_cache_on_unload: true
-  model_policy: shuffled_cycle
-  model_burst_jobs: 2
-  dataset_mix_policy: multinomial
-  mix_cap_per_dataset: 0.6
+  # round_robin_shuffled | weighted_random
+  model_selection_strategy: round_robin_shuffled
+  jobs_per_selected_model: 2
+  # uniform_random | weighted_random
+  dataset_sampling_strategy: weighted_random
+  max_dataset_fraction_per_batch: 0.6
   num_inflight_jobs: 1
-  cache:
-    max_items: 3000
-    fill_target: 3000
-    low_watermark: 1500
-  interleaved:
-    every_n_steps: 30
-    burst_jobs: 1
-    max_collect_share: 0.15
-  atomization:
-    atom_mode: chunk
-    chunk_rows: 256
+  in_memory_buffer:
+    capacity_samples: 3000
+    fill_target_samples: 3000
+    low_watermark_samples: 1500
+  interleaved_schedule:
+    collect_every_n_train_steps: 30
+    collector_jobs_per_cycle: 1
+  layer_output_splitting:
+    sample_granularity: chunk
+    rows_per_chunk_sample: 256
