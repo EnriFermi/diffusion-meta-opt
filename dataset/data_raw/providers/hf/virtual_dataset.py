@@ -18,6 +18,7 @@ from dataset.data_raw.core.types import ImageSample
 from dataset.data_raw.providers.hf.auth import init_hf_auth
 from dataset.data_raw.providers.hf.hf_loader import load_hf_dataset
 from dataset.data_raw.providers.hf.url_fetch import fetch_image_to_cache
+from dataset.logging_utils import configure_root_logging
 
 
 class HFVirtualDataset(BaseVirtualDataset):
@@ -630,6 +631,8 @@ def _format_dataset_load_error(dataset_cfg: dict[str, Any], exc: Exception) -> s
 
 
 def _configure_logging(dataset_cfg: dict[str, Any]) -> None:
-    level_name = str(dataset_cfg.get("log_level", "INFO")).upper()
-    level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    runtime_cfg = {
+        "data": {"log_level": str(dataset_cfg.get("log_level", "INFO"))},
+        "logging": dataset_cfg.get("runtime_logging", {}),
+    }
+    configure_root_logging(cfg=runtime_cfg, rank=0, force=True)

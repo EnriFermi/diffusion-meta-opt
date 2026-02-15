@@ -29,7 +29,3 @@ enabled_datasets:
 #   coco2017:
 #     sampling_weight: 0.7
 dataset_overrides: {}
-
-cli:
-  batch_size: 8
-  num_batches: 1

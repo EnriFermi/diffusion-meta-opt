@@ -40,20 +40,24 @@ class RawDatasetPool:
 
         self.datasets: dict[str, Any] = {}
         self.dataset_weights: dict[str, float] = {}
+        runtime_logging = to_plain_dict(self.cfg_dict.get("logging", {}))
 
         for dataset_name, ds_cfg in self.index.dataset_cfgs.items():
             if not bool(ds_cfg.get("enabled", True)):
                 continue
 
+            ds_cfg_runtime = to_plain_dict(ds_cfg)
+            ds_cfg_runtime["runtime_logging"] = runtime_logging
+
             dataset = create_dataset(
                 name=dataset_name,
-                cfg=ds_cfg,
+                cfg=ds_cfg_runtime,
                 global_root=self.data_root,
                 seed=self.seed,
                 hf_cfg=hf_cfg,
             )
             self.datasets[dataset_name] = dataset
-            self.dataset_weights[dataset_name] = float(ds_cfg.get("sampling_weight", 1.0))
+            self.dataset_weights[dataset_name] = float(ds_cfg_runtime.get("sampling_weight", 1.0))
 
         if not self.datasets:
             raise ValueError("RawDatasetPool has no enabled datasets")

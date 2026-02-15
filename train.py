@@ -21,6 +21,7 @@ from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dataset import data_pipeline, setup_logging
+from dataset.logging_utils import LOG_PATH_ENV, resolve_log_path
 from models.weight_quantile_vae import EncoderConfig, ModelConfig, ResamplerConfig, WeightQuantileVAE
 
 
@@ -635,6 +636,10 @@ def _spawn_entry(rank: int, world_size: int, cfg_dict: dict[str, Any], master_ad
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
+    # Freeze one shared log path before spawning worker processes.
+    if not os.environ.get(LOG_PATH_ENV):
+        os.environ[LOG_PATH_ENV] = str(resolve_log_path(cfg))
+
     world_size = _resolve_world_size(cfg)
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     assert isinstance(cfg_dict, dict)

@@ -106,6 +106,15 @@ dataset/
 - `data.*` (через профиль `conf/data/*.yaml`)
 - `collector.*` (через профиль `conf/data/collector/*.yaml`)
 - `streaming.*` (через профиль `conf/data/streaming/*.yaml`)
+- `logging.*` (единая конфигурация console+file логирования)
+
+Логирование ранa:
+- логи пишутся одновременно в консоль и в файл;
+- директория по умолчанию: `logs/`;
+- формула имени файла:
+  - `${logging.project_name}_${hydra:job.name}_${now:%Y-%m-%d_%H-%M-%S}.log`
+- итоговый путь:
+  - `${logging.dir}/${logging.file_name}`.
 
 ## 4.2 Профили streaming (`conf/data/streaming/*`)
 

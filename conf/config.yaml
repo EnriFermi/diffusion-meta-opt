@@ -13,17 +13,20 @@ hf:
   hub_cache: ${data.path}/hf_hub_cache
 
 hydra:
+  job:
+    name: train
   run:
     dir: .
   output_subdir: null
+
+logging:
+  project_name: diffusion_meta_opt
+  dir: logs
+  file_name: ${logging.project_name}_${hydra:job.name}_${now:%Y-%m-%d_%H-%M-%S}.log
+  file_path: ${logging.dir}/${logging.file_name}
+  format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 
 models:
   enabled: []
   model_config_dirs:
     - conf/data/models
-
-demo:
-  num_samples: 200
-  runtime_seconds: 10
-  steps: 2
-  batch: 8

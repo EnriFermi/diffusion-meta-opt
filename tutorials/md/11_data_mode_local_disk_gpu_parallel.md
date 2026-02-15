@@ -21,9 +21,11 @@ pipenv run python -m dataset.shared.demo_streaming_local \
   collector.mode=auto \
   data.enabled_datasets=[coco2017,scene_parse_150] \
   data.dataset_overrides.coco2017.models=[clip_vit_b32] \
-  data.dataset_overrides.scene_parse_150.models=[dinov2_base] \
-  demo.num_samples=150
+  data.dataset_overrides.scene_parse_150.models=[dinov2_base]
 ```
+
+`target_samples` и остальные demo-only параметры задаются в шапке
+`dataset/shared/demo_streaming_local.py` и печатаются таблицей при запуске.
 
 ## Что важно в этом режиме
 

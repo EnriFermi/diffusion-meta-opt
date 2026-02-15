@@ -11,6 +11,7 @@ from typing import Any
 from omegaconf import DictConfig
 
 from dataset.data_raw.core.config import to_plain_dict
+from dataset.logging_utils import configure_root_logging
 from dataset.models.model_pool import ModelPool
 from dataset.shared.atomizer import atomize
 from dataset.shared.cache import SharedSampleCache
@@ -532,8 +533,9 @@ class CollectorService:
 
 
 def collector_process_main(cfg_dict: dict[str, Any], cache: SharedSampleCache | None, stop_event: Any) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    log_path = configure_root_logging(cfg=cfg_dict, rank=0, force=True)
     logger = logging.getLogger("collector_process")
+    logger.info("Run log file: %s", log_path)
 
     service = CollectorService(cfg=cfg_dict, cache=cache)
     try:

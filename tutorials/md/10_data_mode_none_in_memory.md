@@ -18,9 +18,11 @@ pipenv run python -m dataset.shared.demo_end_to_end \
   collector.mode=auto \
   data.enabled_datasets=[coco2017,cc12m] \
   data.dataset_overrides.coco2017.models=[clip_vit_b32] \
-  data.dataset_overrides.cc12m.models=[clip_vit_b32] \
-  demo.num_samples=100
+  data.dataset_overrides.cc12m.models=[clip_vit_b32]
 ```
+
+`target_samples` и остальные demo-only параметры задаются в шапке
+`dataset/shared/demo_end_to_end.py` и печатаются таблицей при запуске.
 
 ## Что вы увидите
 

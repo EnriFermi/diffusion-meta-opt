@@ -23,9 +23,11 @@ pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
   collector.mode=auto \
   data.enabled_datasets=[coco2017,cc12m] \
   data.dataset_overrides.coco2017.models=[clip_vit_b32] \
-  data.dataset_overrides.cc12m.models=[clip_vit_b32] \
-  demo.num_samples=120
+  data.dataset_overrides.cc12m.models=[clip_vit_b32]
 ```
+
+`target_samples` и остальные demo-only параметры задаются в шапке
+`dataset/shared/demo_streaming_s3_bridge.py` и печатаются таблицей при запуске.
 
 ## Ключевые параметры
 

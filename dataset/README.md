@@ -57,9 +57,11 @@ pipenv run python -m dataset.shared.demo_end_to_end \
   train.device=cuda:0 \
   collector.device=null \
   collector.mode=auto \
-  data.enabled_datasets=[coco2017,cc12m,scene_parse_150] \
-  demo.num_samples=200
+  data.enabled_datasets=[coco2017,cc12m,scene_parse_150]
 ```
+
+Параметры demo-run (`target_samples`, `steps`, `runtime_seconds`) задаются локальными
+константами в начале каждого `dataset/shared/demo_*.py` и логируются таблицей при старте.
 
 Local streaming demo:
 
@@ -81,3 +83,7 @@ pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
   collector.device=cuda:1 \
   collector.mode=auto
 ```
+
+Логи любого запуска дублируются:
+- в консоль;
+- в файл `${logging.dir}/${logging.file_name}` (по умолчанию `logs/*.log`).

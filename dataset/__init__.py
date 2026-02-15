@@ -11,17 +11,16 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from dataset.data_raw.providers.hf.auth import init_hf_auth
+from dataset.logging_utils import configure_root_logging
 from dataset.models.registry import create_model
 from dataset.shared.collector_service import CollectorService
 from dataset.shared.shared_dataset import SharedModelDataset
 
 
-def setup_logging(cfg: DictConfig, rank: int = 0) -> None:
-    level_name = str(cfg.data.get("log_level", "INFO")).upper()
-    level = getattr(logging, level_name, logging.INFO)
-    if rank != 0:
-        level = max(level, logging.WARNING)
-    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+def setup_logging(cfg: DictConfig, rank: int = 0) -> Path:
+    log_path = configure_root_logging(cfg=cfg, rank=rank, force=True)
+    logging.getLogger("dataset.logging").info("Run log file: %s", log_path)
+    return log_path
 
 
 def _read_dataset_size_from_meta(data_root: Path, dataset_name: str) -> int | None:
