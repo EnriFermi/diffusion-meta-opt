@@ -1,7 +1,6 @@
 # Full raw-data profile for smoke: streaming-stable datasets except flickr30k.
 # Excluded from this profile:
 # - dtd_textures, wider_face: HF scripts require full-archive materialization.
-# - cord_v2, docvqa_1200, oxford_pets, stanford_cars: first streaming record latency is unstable for current pipeline.
 
 path: ${oc.env:DATA_ROOT,./data/datasets}
 seed: 42
@@ -17,13 +16,17 @@ enabled_datasets:
   - bdd100k
   - cc12m
   - coco2017
+  - cord_v2
   - doclaynet_v11
+  - docvqa_1200
   - eurosat_rgb
   - funsd
   - mapillary_vistas_v2
+  - oxford_pets
   - patchcamelyon
   - relaion400m
   - scene_parse_150
+  - stanford_cars
   - visual_genome
 
 dataset_overrides: {}

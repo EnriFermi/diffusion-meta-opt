@@ -30,9 +30,24 @@ class ChunkCache:
         return self.chunks_root / chunk_id
 
     def list_chunks(self) -> list[str]:
-        chunks = [path.name for path in self.chunks_root.iterdir() if path.is_dir() and path.name.startswith("chunk_")]
+        chunks = [
+            path.name
+            for path in self._iter_chunk_dirs()
+            if (path / "manifest.json").exists()
+        ]
         chunks.sort()
         return chunks
+
+    def cleanup_incomplete_chunks(self) -> list[str]:
+        removed: list[str] = []
+        for path in self._iter_chunk_dirs():
+            if (path / "manifest.json").exists():
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(path.name)
+        if removed:
+            self._write_index()
+        return removed
 
     def start_chunk(self, chunk_id: str | None = None) -> str:
         if chunk_id is None:
@@ -117,3 +132,6 @@ class ChunkCache:
             "chunks": self.list_chunks(),
         }
         write_json_atomic(self.index_path, payload)
+
+    def _iter_chunk_dirs(self) -> list[Path]:
+        return [path for path in self.chunks_root.iterdir() if path.is_dir() and path.name.startswith("chunk_")]

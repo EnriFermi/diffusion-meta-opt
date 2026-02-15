@@ -25,13 +25,17 @@ DEFAULT_FULL_DATASET_LIST = [
     "bdd100k",
     "cc12m",
     "coco2017",
+    "cord_v2",
     "doclaynet_v11",
+    "docvqa_1200",
     "eurosat_rgb",
     "funsd",
     "mapillary_vistas_v2",
+    "oxford_pets",
     "patchcamelyon",
     "relaion400m",
     "scene_parse_150",
+    "stanford_cars",
     "visual_genome",
 ]
 
