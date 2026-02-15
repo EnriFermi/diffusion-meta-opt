@@ -6,13 +6,12 @@ from collections import Counter
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from dataset.shared.collector_service import CollectorService
-from dataset.shared.shared_dataset import SharedModelDataset
+from dataset import data_pipeline, setup_logging
 
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
-    _setup_logging(cfg)
+    setup_logging(cfg)
     logger = logging.getLogger("dataset.shared.demo_end_to_end")
 
     logger.info("Starting end-to-end shared dataset demo")
@@ -21,19 +20,12 @@ def main(cfg: DictConfig) -> None:
     demo_cfg = cfg.get("demo", {})
     num_samples = int(demo_cfg.get("num_samples", 200))
 
-    collector = CollectorService(cfg)
-    collector.predownload_models()
-    collector.start()
-
-    dataset = SharedModelDataset(collector)
-    iterator = iter(dataset)
-
-    model_counts: Counter[str] = Counter()
-    layer_counts: Counter[str] = Counter()
-    dataset_mix_counts: Counter[str] = Counter()
-    job_mix_log: list[dict[str, int]] = []
-
-    try:
+    with data_pipeline(cfg, logger=logger, emit_run_report=False) as (dataset, collector):
+        iterator = iter(dataset)
+        model_counts: Counter[str] = Counter()
+        layer_counts: Counter[str] = Counter()
+        dataset_mix_counts: Counter[str] = Counter()
+        job_mix_log: list[dict[str, int]] = []
         step_idx = 0
         while sum(model_counts.values()) < num_samples:
             if not collector.is_async_mode:
@@ -60,23 +52,12 @@ def main(cfg: DictConfig) -> None:
                 )
 
             step_idx += 1
-    finally:
-        dataset.close()
-        collector.shutdown()
-
-    logger.info("Final cache size: %s", collector.cache_size())
-    logger.info("Model switching frequency: %s", dict(model_counts))
-    logger.info("Top layers: %s", layer_counts.most_common(5))
-    logger.info("Dataset mix distribution (from sample meta): %s", dict(dataset_mix_counts))
-    if job_mix_log:
-        logger.info("Dataset mix per interleaved collector job: %s", job_mix_log[:20])
-
-
-def _setup_logging(cfg: DictConfig) -> None:
-    data_cfg = cfg.data
-    level_name = str(data_cfg.get("log_level", "INFO")).upper()
-    level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+        logger.info("Final cache size: %s", collector.cache_size())
+        logger.info("Model switching frequency: %s", dict(model_counts))
+        logger.info("Top layers: %s", layer_counts.most_common(5))
+        logger.info("Dataset mix distribution (from sample meta): %s", dict(dataset_mix_counts))
+        if job_mix_log:
+            logger.info("Dataset mix per interleaved collector job: %s", job_mix_log[:20])
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@ defaults:
   - data: test_dataset
   - collector: interleaved
   - streaming: none
+  - train: default
+  - model: weight_quantile_vae
   - _self_
 
 hf:
@@ -14,9 +16,6 @@ hydra:
   run:
     dir: .
   output_subdir: null
-
-train:
-  device: "cuda:0"
 
 models:
   enabled: []
