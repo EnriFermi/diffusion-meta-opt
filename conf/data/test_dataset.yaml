@@ -3,7 +3,7 @@
 #   conf/data/<your_profile>.yaml
 # и выбирайте их через defaults в conf/config.yaml.
 
-path: ${oc.env:DATA_ROOT,./data}
+path: ${oc.env:DATA_ROOT,./data/datasets}
 seed: 42
 output_format: pil  # tensor | pil
 image_size: 224
