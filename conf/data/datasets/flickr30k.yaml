@@ -1,10 +1,14 @@
 name: flickr30k
+description: "Пользовательские фото с текстовыми описаниями; задачи image-text alignment и captioning."
 enabled: false
 gated: false
 sampling_weight: 1.0
 models:
   - clip_vit_b32
+  - siglip_base_p16_384
   - dinov2_base
+  - blip_image_captioning_base
+  - deit_base
 collector_device: null
 
 hf:

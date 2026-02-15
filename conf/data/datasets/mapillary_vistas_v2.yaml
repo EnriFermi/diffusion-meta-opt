@@ -1,9 +1,14 @@
 name: mapillary_vistas_v2
+description: "Уличные дорожные изображения; задачи segmentation и urban scene understanding."
 enabled: true
 gated: true
 sampling_weight: 1.0
 models:
   - swinv2_base
+  - mask2former_swin_base
+  - grounding_dino_tiny
+  - dinov2_base
+  - deit_base
 collector_device: null
 
 hf:

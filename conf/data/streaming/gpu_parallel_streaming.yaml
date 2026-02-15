@@ -1,0 +1,44 @@
+# @package _global_
+streaming:
+  mode: local_disk
+
+  chunk_size_samples: 256
+  chunk_format:
+    # Supported values:
+    # - none: no compression (.pt)
+    # - gzip: gzip compression (.pt.gz)
+    compression: none
+
+  producer:
+    # Producer local spool (temporary chunk files before publish to ready-store).
+    spool_dir: ${data.path}/streaming/spool/producer
+    # Shared ready-store used by producer and consumer.
+    ready_store_dir: ${data.path}/streaming/local_disk
+    max_pending_spool_chunks: 64
+    ready_store_max_chunks: 400
+    # Producer starts refill after this many ready chunks are consumed.
+    refill_after_consumed_chunks: 200
+    # Stripe write window size (i % n). null => equals refill_after_consumed_chunks.
+    stripe_window_chunks: null
+
+  consumer:
+    cache_dir: ${data.path}/streaming/cache/consumer
+    prefetch_max_chunks: 16
+    delete_remote_after: consume
+    randomize_within_chunk: true
+    random_seed: null
+
+  s3:
+    bucket: ""
+    prefix: diffusion-meta-opt/streaming
+    region: null
+    endpoint_url: null
+    max_remote_chunks: 1000
+    staging_prefix: staging
+    ready_prefix: ready
+
+  distributed:
+    enabled: true
+    rank_env: RANK
+    world_size_env: WORLD_SIZE
+    shard_by: chunk

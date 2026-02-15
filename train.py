@@ -19,9 +19,9 @@ from omegaconf import DictConfig, OmegaConf
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from dataset.shared.collector_service import CollectorService
-from dataset.shared.shared_dataset import SharedModelDataset
-from dataset.shared.types import SharedSample
+
+from dataset import data_pipeline, setup_logging
+from dataset.logging_utils import LOG_PATH_ENV, resolve_log_path
 from models.weight_quantile_vae import (
     BigVAEConfig,
     DistributionConfig,
@@ -31,56 +31,8 @@ from models.weight_quantile_vae import (
     WeightQuantileVAE,
 )
 
-
-def setup_logging(cfg: DictConfig, rank: int = 0) -> None:
-    level_name = str(cfg.data.get("log_level", "INFO")).upper()
-    level = getattr(logging, level_name, logging.INFO)
-    if rank != 0:
-        level = max(level, logging.WARNING)
-    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-
-
 def _logger(name: str, rank: int) -> logging.Logger:
     return logging.getLogger(f"{name}.rank{rank}")
-
-
-@contextlib.contextmanager
-def data_pipeline(
-    cfg: DictConfig,
-    *,
-    start_collector: bool = True,
-    predownload_models: bool | None = None,
-    logger: logging.Logger | None = None,
-) -> Iterator[tuple[SharedModelDataset, CollectorService]]:
-    _logger_local = logger or logging.getLogger("train")
-
-    collector = CollectorService(cfg)
-    dataset = SharedModelDataset(collector)
-
-    should_predownload = bool(cfg.train.get("predownload_models", False))
-    if predownload_models is not None:
-        should_predownload = bool(predownload_models)
-
-    if start_collector and should_predownload:
-        _logger_local.info("Predownloading model artifacts before collector start")
-        collector.predownload_models()
-
-    if start_collector:
-        collector.start()
-
-    _logger_local.info(
-        "Data pipeline initialized: collector_mode=%s streaming_mode=%s cache_metric=%s",
-        collector.collector_mode,
-        collector.streaming_mode,
-        dataset.cache_size(),
-    )
-
-    try:
-        yield dataset, collector
-    finally:
-        dataset.close()
-        collector.shutdown()
-        _logger_local.info("Training entrypoint shutdown complete")
 
 
 def _seed_everything(seed: int) -> None:
@@ -330,7 +282,7 @@ def _save_checkpoint(
 
 
 def _next_valid_sample(
-    dataset_iter: Iterator[SharedSample],
+    dataset_iter: Iterator[Any],
     max_x_rows: int,
     logger: logging.Logger,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -400,7 +352,7 @@ def _broadcast_tensor_2d(
 def _fetch_batch(
     rank: int,
     device: torch.device,
-    dataset_iter: Iterator[SharedSample] | None,
+    dataset_iter: Iterator[Any] | None,
     use_broadcast: bool,
     max_x_rows: int,
     logger: logging.Logger,
@@ -468,8 +420,13 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
         cfg.streaming.distributed.rank_env = "RANK"
         cfg.streaming.distributed.world_size_env = "WORLD_SIZE"
         cfg.streaming.distributed.shard_by = str(cfg.streaming.distributed.get("shard_by", "chunk"))
-        base_cache_dir = str(cfg.streaming.consumer.get("local_cache_dir", "./data/streaming/cache/consumer"))
-        cfg.streaming.consumer.local_cache_dir = str(Path(base_cache_dir) / f"rank_{rank}")
+        base_cache_dir = str(
+            cfg.streaming.consumer.get(
+                "cache_dir",
+                "./data/streaming/cache/consumer",
+            )
+        )
+        cfg.streaming.consumer.cache_dir = str(Path(base_cache_dir) / f"rank_{rank}")
 
     logger.info(
         "Runtime: device=%s distributed=%s world_size=%s streaming_mode=%s dataset_sharding=%s",
@@ -486,13 +443,20 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
     scaler = None
 
     try:
-        collector: CollectorService | None = None
-        dataset: SharedModelDataset | None = None
-        dataset_iter: Iterator[SharedSample] | None = None
+        collector: Any | None = None
+        dataset: Any | None = None
+        dataset_iter: Iterator[Any] | None = None
 
         with contextlib.ExitStack() as stack:
             if rank == 0:
-                dataset, collector = stack.enter_context(data_pipeline(cfg, logger=logger))
+                dataset, collector = stack.enter_context(
+                    data_pipeline(
+                        cfg,
+                        logger=logger,
+                        emit_run_report=True,
+                        rank=rank,
+                    )
+                )
                 dataset_iter = iter(dataset)
             elif dataset_sharding:
                 # Consumer-only wrapper over shared chunk stream.
@@ -502,6 +466,8 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
                         start_collector=False,
                         predownload_models=False,
                         logger=logger,
+                        emit_run_report=False,
+                        rank=rank,
                     )
                 )
                 dataset_iter = iter(dataset)
@@ -701,6 +667,10 @@ def _spawn_entry(rank: int, world_size: int, cfg_dict: dict[str, Any], master_ad
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
+    # Freeze one shared log path before spawning worker processes.
+    if not os.environ.get(LOG_PATH_ENV):
+        os.environ[LOG_PATH_ENV] = str(resolve_log_path(cfg))
+
     world_size = _resolve_world_size(cfg)
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     assert isinstance(cfg_dict, dict)

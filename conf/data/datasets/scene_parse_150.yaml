@@ -1,9 +1,14 @@
 name: scene_parse_150
+description: "Сценовые изображения ADE20K; задачи scene parsing и semantic segmentation."
 enabled: true
 gated: false
 sampling_weight: 1.0
 models:
   - swinv2_base
+  - mask2former_swin_base
+  - grounding_dino_tiny
+  - deit_base
+  - beit_base
 collector_device: null
 
 hf:

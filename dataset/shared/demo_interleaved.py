@@ -5,31 +5,28 @@ import logging
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from dataset.shared.collector_service import CollectorService
-from dataset.shared.shared_dataset import SharedModelDataset
+from dataset import data_pipeline, setup_logging
+
+# Demo-only runtime knobs.
+# These values are intentionally local to this demo script and are NOT part of
+# the core data-pipeline Hydra runtime schema (train/model/data configs).
+DEMO_STEPS = 120
 
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
-    _setup_logging(cfg)
+    setup_logging(cfg)
     logger = logging.getLogger("dataset.shared.demo_interleaved")
 
     logger.info("Starting interleaved collector demo")
     logger.debug("Config:\n%s", OmegaConf.to_yaml(cfg, resolve=True))
 
-    collector = CollectorService(cfg)
-    if collector.is_async_mode:
-        raise ValueError("demo_interleaved requires interleaved mode")
+    _log_demo_settings(logger, {"steps": DEMO_STEPS})
 
-    demo_cfg = cfg.get("demo", {})
-    steps = int(demo_cfg.get("steps", 120))
-
-    collector.predownload_models()
-    collector.start()
-    dataset = SharedModelDataset(collector)
-
-    try:
-        for step_idx in range(steps):
+    with data_pipeline(cfg, logger=logger, emit_run_report=False) as (dataset, collector):
+        if collector.is_async_mode:
+            raise ValueError("demo_interleaved requires interleaved mode")
+        for step_idx in range(DEMO_STEPS):
             stats = collector.maybe_collect(step_idx)
             consumed = dataset.try_next_sample()
             logger.info(
@@ -39,16 +36,16 @@ def main(cfg: DictConfig) -> None:
                 len(stats),
                 consumed is not None,
             )
-    finally:
-        dataset.close()
-        collector.shutdown()
 
 
-def _setup_logging(cfg: DictConfig) -> None:
-    data_cfg = cfg.data
-    level_name = str(data_cfg.get("log_level", "INFO")).upper()
-    level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+def _log_demo_settings(logger: logging.Logger, values: dict[str, int]) -> None:
+    logger.info("Demo-only settings (not part of core runtime config):")
+    logger.info("+---------------------+--------+")
+    logger.info("| parameter           | value  |")
+    logger.info("+---------------------+--------+")
+    for key, value in values.items():
+        logger.info("| %-19s | %-6s |", key, value)
+    logger.info("+---------------------+--------+")
 
 
 if __name__ == "__main__":

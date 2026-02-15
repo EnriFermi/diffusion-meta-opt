@@ -6,13 +6,17 @@ from collections import Counter
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from dataset.shared.collector_service import CollectorService
-from dataset.shared.shared_dataset import SharedModelDataset
+from dataset import data_pipeline, setup_logging
+
+# Demo-only runtime knobs.
+# These values are intentionally local to this demo script and are NOT part of
+# the core data-pipeline Hydra runtime schema (train/model/data configs).
+DEMO_TARGET_SAMPLES = 200
 
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
-    _setup_logging(cfg)
+    setup_logging(cfg)
     logger = logging.getLogger("dataset.shared.demo_streaming_s3_bridge")
 
     logger.info("Starting S3-bridge streaming demo")
@@ -23,20 +27,13 @@ def main(cfg: DictConfig) -> None:
     if not str(cfg.streaming.s3.bucket).strip():
         raise ValueError("streaming.s3.bucket must be set for demo_streaming_s3_bridge")
 
-    demo_cfg = cfg.get("demo", {})
-    num_samples = int(demo_cfg.get("num_samples", 200))
+    _log_demo_settings(logger, {"target_samples": DEMO_TARGET_SAMPLES})
 
-    collector = CollectorService(cfg)
-    collector.predownload_models()
-    collector.start()
-
-    dataset = SharedModelDataset(collector)
-    iterator = iter(dataset)
-    model_counts: Counter[str] = Counter()
-
-    try:
+    with data_pipeline(cfg, logger=logger, emit_run_report=False) as (dataset, collector):
+        iterator = iter(dataset)
+        model_counts: Counter[str] = Counter()
         step_idx = 0
-        while sum(model_counts.values()) < num_samples:
+        while sum(model_counts.values()) < DEMO_TARGET_SAMPLES:
             if not collector.is_async_mode:
                 dataset.maybe_collect(step_idx)
 
@@ -51,18 +48,17 @@ def main(cfg: DictConfig) -> None:
                     dict(model_counts),
                 )
             step_idx += 1
-    finally:
-        dataset.close()
-        collector.shutdown()
-
-    logger.info("Done. final_remote_ready=%s model_counts=%s", dataset.cache_size(), dict(model_counts))
+        logger.info("Done. final_remote_ready=%s model_counts=%s", dataset.cache_size(), dict(model_counts))
 
 
-def _setup_logging(cfg: DictConfig) -> None:
-    data_cfg = cfg.data
-    level_name = str(data_cfg.get("log_level", "INFO")).upper()
-    level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+def _log_demo_settings(logger: logging.Logger, values: dict[str, int]) -> None:
+    logger.info("Demo-only settings (not part of core runtime config):")
+    logger.info("+---------------------+--------+")
+    logger.info("| parameter           | value  |")
+    logger.info("+---------------------+--------+")
+    for key, value in values.items():
+        logger.info("| %-19s | %-6s |", key, value)
+    logger.info("+---------------------+--------+")
 
 
 if __name__ == "__main__":

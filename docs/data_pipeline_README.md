@@ -1,544 +1,383 @@
-# Data Pipeline README (финальная архитектура)
+# Data Pipeline README
 
-Этот документ описывает **текущую боевую реализацию** data pipeline в репозитории после добавления
-**second-level streaming virtualization** (виртуализация финальных post-inference sample chunks).
+Этот документ описывает текущую реализацию data pipeline с фокусом на `dataset/data_raw`:
 
-Документ отражает код в:
+1. как задается каждый raw dataset,
+2. как датасет фетчится и кэшируется,
+3. что означает каждый ключ в конфиге,
+4. как корректно добавить новый датасет, чтобы агент мог сделать это без догадок.
+
+Все ниже соответствует текущему коду в:
+
 - `dataset/data_raw/*`
-- `dataset/models/*`
-- `dataset/shared/*`
-- `dataset/shared/streaming/*`
-- `conf/*`
-- `tests/*`
-
----
-
-## 1. Зачем нужен этот пайплайн
-
-Цель пайплайна: готовить обучающие объекты не напрямую из raw-изображений, а из
-**layer-level представлений моделей** (inputs/outputs linear-слоёв), при этом:
-
-1. Не держать все raw datasets целиком на диске.
-2. Не держать все модели одновременно в GPU.
-3. Поддерживать model-first scheduling и mixed batching из нескольких датасетов.
-4. Поддерживать два уровня буферизации:
-   - уровень raw images (chunk cache per dataset),
-   - уровень final samples (in-memory cache или streaming chunks: local disk / S3 bridge).
-
----
-
-## 2. Главные инварианты системы
-
-Текущая реализация гарантирует:
-
-1. **Model-first scheduling**: сначала выбирается модель, потом датасеты, совместимые с этой моделью.
-2. **Mixed batch**: батч модели собирается из нескольких raw datasets, а не из одного.
-3. **Single collector model on collector device**: в `CollectorService` жёстко `collector.max_loaded_models=1`.
-4. **Hooks на все `nn.Linear`** (с фильтрами regex) + flatten `(..., D) -> (N, D)`.
-5. **CPU float32 capture** для hook-тензоров.
-6. **Гейтед HF-доступ**: для gated datasets/models обязателен `hf.token` в top-level config.
-7. **Second-level streaming**: финальные `SharedSample` могут идти:
-   - в in-memory queue (`streaming.mode=none`),
-   - в chunk store на локальном диске (`local_disk`),
-   - в chunk store через S3 bridge (`s3_bridge`).
-
----
-
-## 3. Структура кода
-
-```text
-dataset/
-  data_raw/
-    core/
-    providers/hf/
-    registry.py
-    tools/inspect_dataset.py
-
-  models/
-    providers/transformers/
-    hooks.py
-    model_pool.py
-    model_runner.py
-    registry.py
-
-  shared/
-    compatibility_index.py
-    model_scheduler.py
-    raw_dataset_pool.py
-    atomizer.py
-    cache.py
-    collector_service.py
-    shared_dataset.py
-
-    streaming/
-      chunk_format.py
-      chunk_writer.py
-      chunk_reader.py
-      config.py
-      factory.py
-      backends/
-        base.py
-        local_disk.py
-        s3.py
-
-    demo_async.py
-    demo_interleaved.py
-    demo_end_to_end.py
-    demo_streaming_local.py
-    demo_streaming_s3_bridge.py
-```
-
----
-
-## 4. Конфигурация (Hydra)
-
-## 4.1 Top-level `conf/config.yaml`
-
-`defaults`:
-- `data: test_dataset`
-- `collector: interleaved`
-- `streaming: none`
-- `_self_`
-
-Ключевые секции:
-- `hf.token`, `hf.hf_home`, `hf.datasets_cache`, `hf.hub_cache`
-- `train.device`
-- `data.*` (через профиль `conf/data/*.yaml`)
-- `collector.*` (через профиль `conf/collector/*.yaml`)
-- `streaming.*` (через профиль `conf/streaming/*.yaml`)
-
-## 4.2 Профили streaming (`conf/streaming/*`)
-
-### `none.yaml`
-- `streaming.mode=none`
-- Используется только in-memory `SharedSampleCache`.
-
-### `gpu_parallel_streaming.yaml`
-- `streaming.mode=local_disk`
-- `streaming.distributed.enabled=true`
-- Предназначен для single-node multi-process DDP consumption через chunk sharding.
-
-### `s3_bridge_streaming.yaml`
-- `streaming.mode=s3_bridge`
-- Producer публикует chunk-файлы в S3 ready-prefix, consumer скачивает и потребляет.
-
-### Канонические mode values
-- `none`
-- `local_disk`
-- `s3_bridge`
-
-Для обратной совместимости принимается alias:
-- `in_memory` -> `none`
-
-## 4.3 Data profile (`conf/data/*.yaml`)
-
-Пример: `conf/data/test_dataset.yaml`.
-
-Содержит:
-- `path` — общий root для raw cache, model cache, streaming dirs.
-- `enabled_datasets` — список dataset YAML имён.
-- `dataset_config_dirs` — где лежат dataset YAML.
-- `dataset_overrides` — точечные override для текущего эксперимента.
-
-## 4.4 Dataset configs (`conf/data/datasets/*.yaml`)
-
-Каждый датасет описывает:
-- HF источник (`hf.repo`, `subset`, `split`, `streaming`, `trust_remote_code`)
-- схему (`schema.image_mode`, `image_field`/`url_field`)
-- raw cache параметры (`cache.chunk_size_images`, `cache.num_chunks_kept`)
-- mapping `models: [...]`
-- `sampling_weight`
-- `collector_device` (опционально)
-- `gated` + `licensing_note`
-
-## 4.5 Model configs (`conf/data/models/*.yaml`)
-
-Каждая модель задаёт:
-- runner / provider параметры
-- `hf_repo`, `revision`, `gated`
-- `cache_subdir` (локальный model cache)
-- `batch_size`, `sampling_weight`
-- `device`, `dtype`, `run_mode`
-- hook filters (`include_regex`, `exclude_regex`)
-- limits (`max_records_per_layer`, `max_layers`)
-
----
-
-## 5. Уровень raw datasets (`dataset/data_raw`)
-
-## 5.1 Что происходит
-
-1. Для каждого enabled датасета стартует отдельный worker process.
-2. Worker держит на диске ограниченное число chunk-ов (`num_chunks_kept`).
-3. По потреблению chunk-ов старые удаляются (FIFO), новые догружаются.
-4. Поддерживается `image`-field и `url`-field режимы.
-
-## 5.2 Что важно понимать
-
-- Raw virtualization **не скачивает весь dataset в ваш chunk cache**.
-- Но HF экосистема может хранить свои служебные artifacts в `HF_HOME/HF_DATASETS_CACHE/HF_HUB_CACHE`.
-
----
-
-## 6. Уровень моделей (`dataset/models`)
-
-1. `ModelPool` реализует LRU (с жёстким лимитом `max_loaded_models=1` на collector path).
-2. Модель загружается из локального cache dir `${data.path}/${model.cache_subdir}`.
-3. `run(batch_pil)` возвращает `LayerIORecord` по linear-слоям.
-4. `merge_layer_records` объединяет micro-batches в единый per-layer output.
-
----
-
-## 7. Shared orchestration (`dataset/shared`)
-
-## 7.1 `CompatibilityIndex`
-
-Строит:
-- `model -> datasets`
-- `model -> dataset_weights`
-- `model_weights`
-
-Учитывает:
-- `data.enabled_datasets`
-- `data.dataset_overrides`
-- `collector.mode/device`
-- dataset-level `collector_device` фильтрацию для async режима.
-
-## 7.2 `ModelScheduler`
-
-Поддерживает:
-- `shuffled_cycle`
-- `weighted`
-
-`model_burst_jobs` контролирует частоту переключения модели.
-
-## 7.3 `RawDatasetPool`
-
-Для выбранной модели:
-1. Берёт совместимые датасеты.
-2. Делит `batch_size` по policy (`multinomial`/`uniform`) + cap (`mix_cap_per_dataset`).
-3. Запрашивает PIL batch у каждого датасета.
-4. Собирает unified mixed batch + `MixedImageMeta`.
-
-## 7.4 `Atomizer`
-
-Преобразует `LayerIORecord` в `SharedSample`:
-- `atom_mode=row|chunk`
-- `chunk_rows`
-- meta: `model_run_id`, timestamps, `image_meta`, `row2img`, ranges.
-
----
-
-## 8. Second-level streaming virtualization
-
-## 8.1 Зачем
-
-Раньше финальные `SharedSample` шли только в in-memory queue.
-Теперь есть второй слой: **final chunks** (post-inference) в backend store.
-
-Это даёт:
-- decoupling producer/consumer,
-- контроль диска/remote буфера,
-- bridge между машинами (S3 producer -> trainer consumer),
-- DDP-friendly chunk sharding в local mode.
-
-## 8.2 Компоненты (`dataset/shared/streaming`)
-
-### `chunk_format.py`
-- `save_chunk(path, samples, meta, compression)`
-- `load_chunk(path) -> (samples, meta)`
-- формат: `chunk_id`, `created_at`, `num_samples`, `samples`, `meta`
-- поддержка `compression=none|gzip`
-
-### `backends/base.py`
-- `ChunkStore` интерфейс:
-  - `put_ready`
-  - `list_ready`
-  - `fetch_to_local`
-  - `delete_ready`
-  - `count_ready`
-  - `capacity_state`
-
-### `backends/local_disk.py`
-- структура: `root/staging`, `root/ready`, `root/consumed`
-- publish pattern: staging -> atomic rename в ready
-- лимиты:
-  - `max_ready_chunks`
-  - `low_watermark_chunks`
-
-### `backends/s3.py`
-- publish pattern:
-  - upload в staging key
-  - copy в ready key
-  - delete staging key
-- готовые chunk-и листаются в `ready_prefix`
-- лимит remote: `max_remote_chunks`
-
-### `chunk_writer.py`
-- буферизует `SharedSample`
-- flush по `chunk_size_samples`
-- умеет `flush(force_partial=True)` на shutdown
-
-### `chunk_reader.py`
-- prefetch готовых chunk-ов в локальный cache
-- выдаёт `SharedSample` по одному
-- delete policy:
-  - `download` — удалять remote сразу после download
-  - `consume` — удалять remote после полного потребления chunk-а (**default**)
-- поддерживает distributed chunk sharding.
-
-### `config.py`
-- normalize mode (`in_memory -> none`)
-- resolve distributed rank/world_size из env.
-
-### `factory.py`
-- единая сборка:
-  - streaming cfg
-  - chunk store
-  - chunk writer
-  - chunk reader
-
----
-
-## 9. Как это интегрировано в `CollectorService`
-
-`CollectorService` теперь использует sink abstraction:
-
-1. `_InMemorySampleSink` (`streaming.mode=none`)
-   - пишет в `SharedSampleCache`.
-
-2. `_ChunkedSampleSink` (`local_disk|s3_bridge`)
-   - пишет в `ChunkWriter` + backend store.
-
-Поведение fill control:
-- `none`: по `cache.fill_target/low_watermark`.
-- `local_disk`: hysteresis fill-to-max/resume-at-low:
-  - fill пока `ready < max_ready_chunks`,
-  - остановка на max,
-  - возобновление когда `ready <= low_watermark_chunks`.
-- `s3_bridge`: fill пока backend может принять (`ready < max_remote_chunks`) и writer может spool.
-
-Shutdown semantics:
-- на остановке sink закрывается,
-- для chunked sink вызывается `writer.flush(force_partial=True)` через `close()`.
-
----
-
-## 10. Как это интегрировано в `SharedModelDataset`
-
-`SharedModelDataset` сохранил публичный контракт, но источник теперь mode-aware:
-
-1. `streaming.mode=none`:
-   - читает `collector.cache.get(block=True)`.
-
-2. `streaming.mode=local_disk|s3_bridge`:
-   - создаёт `ChunkReader` через `collector.create_chunk_reader()`
-   - читает `reader.next_sample()`.
-
-Методы:
-- `__iter__()` — бесконечный stream sample-ов.
-- `maybe_collect(step_idx)` — interleaved hook.
-- `cache_size()`:
-  - для `none`: count sample-ов,
-  - для chunked: backend ready chunks (метрика уровня chunk store).
-- `try_next_sample()` — non-blocking удобный путь для демо.
-
----
-
-## 11. Async vs Interleaved режимы
-
-## 11.1 Async mode
-
-Условие:
-- `collector.device != train.device` и mode resolves to `async`.
-
-Поведение:
-- отдельный collector process,
-- непрерывно выполняет collector jobs пока sink требует fill.
-
-## 11.2 Interleaved mode
-
-Условие:
-- `collector.device == train.device` или `collector.device=null`.
-
-Поведение:
-- тот же процесс что и training loop,
-- `maybe_collect(step_idx)` запускает burst по:
-  - `every_n_steps`
-  - `burst_jobs`
-  - только если sink low.
+- `dataset/shared/compatibility_index.py`
+- `dataset/shared/raw_dataset_pool.py`
+- `conf/data/datasets/*.yaml`
+
+## 1. Где и как выбираются датасеты
+
+Точка входа:
+
+- `conf/config.yaml` -> `defaults: - data: test_dataset`
+- `conf/data/test_dataset.yaml`:
+  - `dataset_config_dirs`: где искать yaml-файлы датасетов,
+  - `enabled_datasets`: какие имена датасетов включены в ран,
+  - `dataset_overrides`: runtime override конкретных полей датасета.
+
+Лоадер совместимости:
+
+- `dataset/shared/compatibility_index.py`
+  - читает `data.enabled_datasets`,
+  - грузит `conf/data/datasets/<name>.yaml`,
+  - накладывает `data.dataset_overrides.<name>`,
+  - отбрасывает отключенные (`enabled: true`) и несовместимые по `collector_device` (в async-режиме),
+  - строит связи `model -> datasets`.
 
 Важно:
-- Нельзя пытаться параллелить training и collector в разных process на одной GPU.
 
----
+- Имя датасета в `enabled_datasets` должно совпадать с именем файла без `.yaml`.
+- Датасет должен быть зарегистрирован в реестре `dataset/data_raw/registry.py` через adapter-модуль.
 
-## 12. DDP chunk sharding (`gpu_parallel_streaming`)
+## 2. Какие датасеты сейчас есть и как они описаны
 
-В `streaming.distributed.enabled=true`:
+Реальные конфиги лежат в `conf/data/datasets/`:
 
-1. rank/world_size читаются из env (`RANK`, `WORLD_SIZE` по умолчанию).
-2. Chunk assignment:
-   - `assigned_rank = sha1(chunk_id) % world_size`
-3. Каждый rank потребляет только свои chunk-и.
-4. После consume локальные файлы удаляются reader-ом.
+- `coco2017.yaml` (`phiyodr/coco2017`, URL mode, streaming)
+- `cc12m.yaml` (`flax-community/conceptual-captions-12`, URL mode, streaming)
+- `visual_genome.yaml` (`ranjaykrishna/visual_genome`, URL mode, streaming, `trust_remote_code=true`)
+- `scene_parse_150.yaml` (`zhoubolei/scene_parse_150`, image mode, streaming)
+- `bdd100k.yaml` (`dgural/bdd100k`, image mode, streaming)
+- `mapillary_vistas_v2.yaml` (gated, image mode, streaming)
+- `relaion400m.yaml` (gated, URL mode, streaming)
+- `flickr30k.yaml` (image mode, currently `enabled: true`)
 
-Это позволяет multi-process consumption без централизованного coordinator.
+Шаблон с комментариями:
 
----
+- `conf/data/datasets/_data_raw_.yaml`
 
-## 13. Рекомендованные hyperparameters
+Этот файл нужно использовать как стартовую точку для новых датасетов.
 
-Ниже стартовые ориентиры, потом подбирать под throughput/latency:
+## 3. Полная схема dataset-конфига (runtime semantics)
 
-## 13.1 Producer/consumer буфер
+Ниже поля, которые реально используются runtime-кодом.
 
-- `streaming.chunk_size_samples`: `128..512`
-- `streaming.producer.local_max_chunks`: `32..128`
-- `streaming.consumer.local_max_chunks`: `8..32`
+### Корневые поля
 
-## 13.2 Local disk backend
+- `name: str`
+  - логическое имя датасета (обычно равно имени yaml-файла).
+- `enabled: bool`
+  - локальный флаг включения.
+- `gated: bool`
+  - если `true`, обязателен `hf.token` в `conf/config.yaml`.
+- `sampling_weight: float`
+  - вес датасета в mixed batching.
+- `models: list[str]`
+  - список model config names из `conf/data/models/*.yaml`.
+- `collector_device: null | "cuda:X"`
+  - фильтрация датасета для async collector по устройству.
+- `licensing_note: str`
+  - текстовая заметка по лицензии/условиям.
 
-- `streaming.local_disk.max_ready_chunks`: `200..1000`
-- `streaming.local_disk.low_watermark_chunks`: `~50% от max_ready_chunks`
+### `hf`
 
-## 13.3 S3 bridge backend
+- `hf.repo: str`
+  - HF dataset id.
+- `hf.subset: str | null`
+  - subset/config name для `load_dataset`.
+- `hf.split: str`
+  - split (`train`, `validation`, `test`, ...).
+- `hf.streaming: bool`
+  - `true`: итератор + `.shuffle(buffer_size=...)`,
+  - `false`: индексный доступ по random index.
+- `hf.shuffle_buffer: int`
+  - буфер shuffle в streaming-режиме.
+- `hf.trust_remote_code: bool`
+  - включать только если dataset script этого требует.
 
-- `streaming.s3.max_remote_chunks`: `500..5000`
-- `streaming.consumer.delete_remote_after=consume` (default)
-  - safer, потому что remote удаляется только после полного consume.
+### `schema`
 
-## 13.4 Collector knobs
+- `schema.image_mode: "image_field" | "url_field"`
+  - режим извлечения изображения.
+- `schema.image_field: str | null`
+  - основная колонка с изображением (HF Image feature / bytes / PIL-like).
+- `schema.image_field_candidates: list[str]`
+  - fallback-кандидаты колонки с изображением.
+- `schema.url_field: str | null`
+  - основная колонка URL.
+- `schema.url_field_candidates: list[str]`
+  - fallback-кандидаты URL колонки.
+- `schema.id_field: str | null`
+  - колонка с sample id.
+- `schema.extra_fields: list[str]`
+  - поля, сохраняемые в `ImageSample.meta`.
 
-- `collector.model_burst_jobs`: `1..2`
-- `collector.num_inflight_jobs`: `1..2`
-- `collector.mix_cap_per_dataset`: `0.4..0.7`
+### `cache`
 
-## 13.5 Atomization
+- `cache.chunk_size_images: int`
+  - сколько изображений собирать в один raw chunk.
+- `cache.num_chunks_kept: int`
+  - сколько raw chunk-ов хранить на диске одновременно.
 
-- `collector.atomization.atom_mode=chunk`
-- `collector.atomization.chunk_rows=128..256`
+### `worker`
 
----
+- `worker.idle_sleep_s: float`
+  - sleep, когда кэш заполнен или нет работы.
+- `worker.get_timeout_s: float`
+  - timeout чтения для consumer-side `get_batch`.
+- `worker.startup_get_timeout_s: float` (опционально)
+  - увеличенный timeout на прогрев первого chunk.
+- `worker.request_timeout_s: int`
+  - timeout HTTP-запросов для URL mode.
+- `worker.max_retries: int`
+  - число ретраев URL download.
+- `worker.max_worker_restarts: int`
+  - лимит перезапусков prefetch worker.
+- `worker.max_chunk_build_seconds: float` (опционально)
+  - лимит времени сборки одного chunk перед partial finalize.
 
-## 14. Failure modes и recovery
+Поля в шаблоне, которые сейчас в runtime не используются напрямую:
 
-## 14.1 `HF token missing in top-level config: set hf.token`
+- `cache.root_subdir`
+- `cache.decode_threads`
+- `transforms.*`
+
+Их можно оставлять как документационные, но опираться на них в логике пока нельзя.
+
+## 4. Как именно датасет фетчится (шаг за шагом)
+
+### 4.1 Инициализация
+
+1. `RawDatasetPool` (`dataset/shared/raw_dataset_pool.py`) вызывает:
+   - `validate_gated_datasets_token(...)`,
+   - `init_hf_auth(...)`.
+2. По каждому датасету вызывается `create_dataset(...)`.
+3. Для HF-датасетов создается `HFVirtualDataset`.
+4. `HFVirtualDataset`:
+   - создает root: `${data.path}/${dataset_name}`,
+   - создает `meta.json`, если отсутствует,
+   - поднимает `ChunkCache`.
+
+### 4.2 Старт worker-процесса
+
+`HFVirtualDataset.start()` запускает `hf_dataset_prefetch_worker(...)` (multiprocessing, spawn).
+
+Worker делает:
+
+1. auth (`init_hf_auth`),
+2. `load_hf_dataset(...)`,
+3. бесконечный цикл prefetch.
+
+### 4.3 Как формируется chunk
+
+Внутри worker loop:
+
+1. `cache.evict_old_chunks()` удаляет лишние старые chunk-и.
+2. Если `len(chunks) >= num_chunks_kept`, worker спит (`idle_sleep_s`).
+3. Иначе открывается новый `chunk_<timestamp>_<rand>`.
+4. До `chunk_size_images`:
+   - берется следующий record:
+     - streaming: `next(iterator)`, с перезапуском при `StopIteration`,
+     - non-streaming: `dataset[random_index]`.
+   - извлекается `sample_id`,
+   - materialize image:
+     - `image_field`: `decode_to_pil(record[field])`,
+     - `url_field`: `fetch_image_to_cache(url, timeout, retries)`.
+5. Если собрано > 0 записей -> `finalize_chunk(...)` + event `chunk_ready`.
+6. Если 0 -> chunk удаляется.
+
+### 4.4 Как chunk читается потребителем
+
+`HFVirtualDataset.get_batch(n)`:
+
+1. забирает worker events (`chunk_ready`, `chunk_evicted`, `error`),
+2. загружает `manifest.json` chunk-а в локальную очередь,
+3. выдает `ImageSample` по одному, читая файлы с диска,
+4. когда chunk исчерпан -> удаляет этот chunk с диска (`remove_chunk`),
+5. если данных мало, возвращает partial batch и логирует underfill.
+
+Итог:
+
+- raw cache всегда ограничен `num_chunks_kept`,
+- полностью датасет в raw chunk cache не складывается.
+
+## 5. Структура файлов raw cache
+
+Для датасета `<name>` под `${data.path}`:
+
+```text
+${data.path}/${name}/
+  meta.json
+  chunks/
+    index.json
+    chunk_<id_1>/
+      manifest.json
+      <img files>.jpg
+    chunk_<id_2>/
+      manifest.json
+      <img files>.jpg
+```
+
+`meta.json` содержит:
+
+- hf repo/subset/split,
+- schema,
+- streaming/trust_remote_code flags,
+- `dataset_size` (если удалось оценить),
+- gated/licensing info,
+- timestamp.
+
+## 6. Как добавить новый датасет (инструкция для агента)
+
+Ниже канонический workflow.
+
+### Шаг 1. Создать YAML в `conf/data/datasets/`
+
+1. Скопировать `conf/data/datasets/_data_raw_.yaml`.
+2. Заполнить:
+   - `name`,
+   - `hf.repo/subset/split`,
+   - `schema.image_mode` + соответствующие поля,
+   - `cache.chunk_size_images`, `cache.num_chunks_kept`,
+   - `models`,
+   - `gated`, `licensing_note`.
+3. Если датасет gated:
+   - `gated: true`,
+   - убедиться, что `hf.token` задан в `conf/config.yaml`,
+   - лицензия принята на HF странице датасета.
+
+### Шаг 2. Добавить adapter-модуль
+
+Создать файл `dataset/data_raw/providers/hf/<dataset_name>.py`:
+
+```python
+from __future__ import annotations
+
+from typing import Any
+
+from dataset.data_raw.providers.hf.virtual_dataset import HFVirtualDataset
+from dataset.data_raw.registry import register_dataset
+
+DATASET_NAME = "my_dataset"
+
+
+def build_dataset(cfg: Any, global_data_root: str, seed: int, hf_cfg: Any) -> HFVirtualDataset:
+    return HFVirtualDataset(cfg=cfg, global_data_root=global_data_root, seed=seed, hf_cfg=hf_cfg)
+
+
+register_dataset(DATASET_NAME, build_dataset)
+```
+
+### Шаг 3. Зарегистрировать модуль в пакете adapter-ов
+
+В `dataset/data_raw/providers/hf/__init__.py` добавить модуль в `_ADAPTER_MODULES`.
+
+Без этого `register_all_adapters()` его не импортирует, и датасет не попадет в registry.
+
+### Шаг 4. Включить датасет в data-профиль
+
+В `conf/data/<profile>.yaml`:
+
+- добавить имя в `enabled_datasets`,
+- при необходимости задать `dataset_overrides.<name>`.
+
+### Шаг 5. Проверить совместимость с моделями
+
+В dataset yaml `models: [...]` должны ссылаться только на существующие model yaml names.
+
+Иначе `CompatibilityIndex` завершится ошибкой при старте.
+
+### Шаг 6. Smoke-проверка
+
+Команда:
+
+```bash
+python -m dataset.data_raw.tools.inspect_dataset <dataset_name> --n 8 --output-format pil
+```
+
+Проверить:
+
+1. worker стартует,
+2. chunk-и появляются в `${data.path}/${dataset_name}/chunks`,
+3. возвращаются sample id и изображения,
+4. нет бесконечных `underfilled` предупреждений.
+
+## 7. Специфика image vs url mode
+
+### image_field mode
+
+Когда использовать:
+
+- HF датасет уже хранит изображения как `datasets.Image` feature или bytes/PIL-подобный объект.
+
+Что важно:
+
+- корректно указать `image_field`,
+- задать `image_field_candidates` для устойчивости к вариациям схемы.
+
+### url_field mode
+
+Когда использовать:
+
+- датасет дает URL, не бинарные картинки.
+
+Что важно:
+
+- корректно указать `url_field`,
+- добавить fallback `url_field_candidates`,
+- понимать, что часть URL может быть битой/недоступной,
+- под это настроить `worker.request_timeout_s` и `worker.max_retries`.
+
+## 8. Ошибки и диагностика
+
+### `HF token missing in top-level config: set hf.token`
 
 Причина:
-- gated dataset/model включён без валидного token.
 
-Recovery:
-1. Указать `hf.token` в `conf/config.yaml`.
-2. Принять лицензию/условия на странице HF.
-3. Проверить, что token имеет доступ.
+- включен gated датасет, но токен не задан/плейсхолдер.
 
-## 14.2 Chunk store переполнен
+Исправление:
 
-Симптом:
-- producer перестаёт пополнять.
+1. заполнить `hf.token` в `conf/config.yaml`,
+2. принять лицензию на HF dataset page,
+3. убедиться, что токен имеет доступ.
 
-Это ожидаемо при backpressure.
+### Датасет не находится
 
-Recovery:
-- увеличить consumption rate,
-- уменьшить `chunk_size_samples`,
-- увеличить `max_ready_chunks`/`max_remote_chunks`.
+Причины:
 
-## 14.3 S3 backlog не уменьшается
+- нет yaml в `dataset_config_dirs`,
+- имя в `enabled_datasets` не совпадает с файлом,
+- adapter не зарегистрирован в `_ADAPTER_MODULES`.
 
-Проверить:
-- `delete_remote_after` (consume/download),
-- доступы на `DeleteObject`,
-- корректный `bucket/prefix`.
+### Пустые батчи / underfilled
 
-## 14.4 Cache не наполняется
+Причины:
 
-Проверить:
-- совместимость dataset->models в `CompatibilityIndex`,
-- `collector.mode/device`,
-- gated token/license,
-- worker-логи raw datasets,
-- `collector.stats()` (`sink`, `cache_size`, `jobs_by_model`).
+- медленный network (URL mode),
+- много битых URL,
+- слишком маленькие timeout/retry,
+- стриминг датасета с временными проблемами.
 
----
+Что сделать:
 
-## 15. Команды запуска
+1. увеличить `request_timeout_s`, `max_retries`,
+2. уменьшить `chunk_size_images`,
+3. временно включить non-streaming, если dataset это поддерживает.
 
-## 15.0 Быстрые туториалы по 3 режимам
+## 9. Минимальный чеклист для PR с новым датасетом
 
-1. Выбор режима:
-`/Users/artemon/Library/Mobile Documents/com~apple~CloudDocs/Programming/python_projects/diffusion-meta-opt/tutorials/00_how_to_choose_data_mode.md`
-2. In-memory (`streaming.mode=none`):
-`/Users/artemon/Library/Mobile Documents/com~apple~CloudDocs/Programming/python_projects/diffusion-meta-opt/tutorials/10_data_mode_none_in_memory.ipynb`
-3. Local disk (`streaming.mode=local_disk`):
-`/Users/artemon/Library/Mobile Documents/com~apple~CloudDocs/Programming/python_projects/diffusion-meta-opt/tutorials/11_data_mode_local_disk_gpu_parallel.ipynb`
-4. S3 bridge (`streaming.mode=s3_bridge`):
-`/Users/artemon/Library/Mobile Documents/com~apple~CloudDocs/Programming/python_projects/diffusion-meta-opt/tutorials/12_data_mode_s3_bridge.ipynb`
-
-## 15.1 Unit tests
-
-```bash
-pipenv run pytest -q tests
-```
-
-## 15.2 Raw dataset inspect
-
-```bash
-pipenv run python -m dataset.data_raw.tools.inspect_dataset coco2017 --n 3
-```
-
-## 15.3 End-to-end (in-memory)
-
-```bash
-pipenv run python -m dataset.shared.demo_end_to_end \
-  streaming.mode=none \
-  train.device=cuda:0 \
-  collector.device=null \
-  collector.mode=auto
-```
-
-## 15.4 Streaming local disk
-
-```bash
-pipenv run python -m dataset.shared.demo_streaming_local \
-  streaming=gpu_parallel_streaming \
-  train.device=cuda:0 \
-  collector.device=cuda:1 \
-  collector.mode=auto
-```
-
-## 15.5 Streaming S3 bridge
-
-```bash
-pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
-  streaming=s3_bridge_streaming \
-  streaming.s3.bucket=YOUR_BUCKET \
-  train.device=cuda:0 \
-  collector.device=cuda:1 \
-  collector.mode=auto
-```
+1. Добавлен `conf/data/datasets/<name>.yaml`.
+2. Добавлен adapter `dataset/data_raw/providers/hf/<name>.py`.
+3. Модуль добавлен в `_ADAPTER_MODULES`.
+4. `models` в dataset yaml валидны.
+5. Для gated датасета стоит `gated: true` + корректный `licensing_note`.
+6. `inspect_dataset` smoke проходит.
+7. В `meta.json` создаются корректные поля после первого запуска.
 
 ---
 
-## 16. Тестовое покрытие streaming слоя
+Если этот файл используется как вход для внешнего “agent that writes implementation instructions”, передавайте агенту минимум:
 
-Добавлены тесты:
-- `tests/test_streaming_chunk_format.py`
-- `tests/test_streaming_local_disk_backend.py`
-- `tests/test_streaming_sharding.py`
-- `tests/test_streaming_chunk_writer_reader_local.py`
-- `tests/test_streaming_mode_resolution.py`
-- `tests/test_streaming_s3_backend.py`
-
-Также обновлены token-тесты:
-- `tests/test_hf_token_requirements.py`
-
----
-
-## 17. Что расширять дальше
-
-1. Добавить retry/persistence для writer buffer при длительном backend full.
-2. Добавить batch IPC протокол для chunk reader/writer telemetry.
-3. Добавить richer metrics endpoint (Prometheus-friendly counters).
-4. Добавить multi-collector (per-device) поверх текущего single-collector контракта.
+1. разделы 3-6 (schema + fetch lifecycle + onboarding steps),
+2. шаблон `conf/data/datasets/_data_raw_.yaml`,
+3. пример adapter-кода из раздела 6.

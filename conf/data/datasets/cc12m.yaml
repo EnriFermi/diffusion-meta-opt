@@ -1,9 +1,14 @@
 name: cc12m
+description: "Веб-изображения с текстовыми подписями; задачи image-text alignment и retrieval."
 enabled: true
 gated: false
 sampling_weight: 1.0
 models:
   - clip_vit_b32
+  - siglip_base_p16_384
+  - dinov2_vits14
+  - beit_base
+  - blip_image_captioning_base
 collector_device: null
 
 hf:

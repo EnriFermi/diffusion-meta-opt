@@ -40,20 +40,24 @@ class RawDatasetPool:
 
         self.datasets: dict[str, Any] = {}
         self.dataset_weights: dict[str, float] = {}
+        runtime_logging = to_plain_dict(self.cfg_dict.get("logging", {}))
 
         for dataset_name, ds_cfg in self.index.dataset_cfgs.items():
             if not bool(ds_cfg.get("enabled", True)):
                 continue
 
+            ds_cfg_runtime = to_plain_dict(ds_cfg)
+            ds_cfg_runtime["runtime_logging"] = runtime_logging
+
             dataset = create_dataset(
                 name=dataset_name,
-                cfg=ds_cfg,
+                cfg=ds_cfg_runtime,
                 global_root=self.data_root,
                 seed=self.seed,
                 hf_cfg=hf_cfg,
             )
             self.datasets[dataset_name] = dataset
-            self.dataset_weights[dataset_name] = float(ds_cfg.get("sampling_weight", 1.0))
+            self.dataset_weights[dataset_name] = float(ds_cfg_runtime.get("sampling_weight", 1.0))
 
         if not self.datasets:
             raise ValueError("RawDatasetPool has no enabled datasets")
@@ -98,8 +102,8 @@ class RawDatasetPool:
         self,
         model_name: str,
         batch_size: int,
-        mixing_policy: str,
-        mix_cap_per_dataset: float,
+        dataset_sampling_strategy: str,
+        max_dataset_fraction_per_batch: float,
     ) -> tuple[list[Any], list[MixedImageMeta]]:
         if batch_size <= 0:
             return [], []
@@ -109,12 +113,25 @@ class RawDatasetPool:
             raise ValueError(f"No supporting datasets for model '{model_name}'")
 
         dataset_weights = self.index.get_dataset_weights_for_model(model_name)
+        effective_max_fraction = _normalize_max_dataset_fraction_per_batch(
+            requested=float(max_dataset_fraction_per_batch),
+            num_datasets=len(dataset_names),
+        )
+        if effective_max_fraction > float(max_dataset_fraction_per_batch):
+            self.logger.warning(
+                "Adjusted collector.max_dataset_fraction_per_batch for model=%s: requested=%.6f, effective=%.6f, "
+                "num_datasets=%s (need cap * n_dataset >= 1.0)",
+                model_name,
+                float(max_dataset_fraction_per_batch),
+                effective_max_fraction,
+                len(dataset_names),
+            )
         counts = _allocate_dataset_counts(
             dataset_names=dataset_names,
             dataset_weights=dataset_weights,
             batch_size=batch_size,
-            mixing_policy=mixing_policy,
-            cap_fraction=mix_cap_per_dataset,
+            dataset_sampling_strategy=dataset_sampling_strategy,
+            max_dataset_fraction=effective_max_fraction,
             rng=self._rng,
         )
 
@@ -184,15 +201,24 @@ def _allocate_dataset_counts(
     dataset_names: list[str],
     dataset_weights: list[float],
     batch_size: int,
-    mixing_policy: str,
-    cap_fraction: float,
+    dataset_sampling_strategy: str,
+    max_dataset_fraction: float,
     rng: random.Random,
 ) -> dict[str, int]:
     if len(dataset_names) == 1:
         return {dataset_names[0]: batch_size}
 
-    cap_count = max(1, int(batch_size * float(cap_fraction)))
-    weights = _normalize_weights(dataset_weights if mixing_policy == "multinomial" else [1.0] * len(dataset_names))
+    cap_count = max(1, int(batch_size * max(0.0, min(1.0, float(max_dataset_fraction)))))
+    normalized_strategy = str(dataset_sampling_strategy).lower()
+    if normalized_strategy in {"weighted_random", "multinomial", "weighted"}:
+        weights = _normalize_weights(dataset_weights)
+    elif normalized_strategy in {"uniform_random", "uniform"}:
+        weights = _normalize_weights([1.0] * len(dataset_names))
+    else:
+        raise ValueError(
+            f"Unsupported collector.dataset_sampling_strategy='{dataset_sampling_strategy}'. "
+            "Use one of: uniform_random, weighted_random"
+        )
 
     counts: Counter[str] = Counter()
 
@@ -221,3 +247,12 @@ def _normalize_weights(values: list[float]) -> list[float]:
     if total <= 0:
         return [1.0 / len(values) for _ in values]
     return [item / total for item in safe]
+
+
+def _normalize_max_dataset_fraction_per_batch(requested: float, num_datasets: int, eps: float = 1e-6) -> float:
+    n = max(1, int(num_datasets))
+    clipped = max(0.0, min(1.0, float(requested)))
+    if n <= 1:
+        return 1.0
+    min_required = (1.0 / float(n)) + float(eps)
+    return min(1.0, max(clipped, min_required))

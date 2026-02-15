@@ -1,10 +1,14 @@
 name: coco2017
+description: "Фотографии реальных сцен с подписями; задачи captioning и общее понимание изображений."
 enabled: true
 gated: false
 sampling_weight: 1.0
 models:
   - clip_vit_b32
   - siglip_base_p16_384
+  - dinov2_base
+  - deit_base
+  - vit_mae_base
 collector_device: null
 
 hf:

@@ -1,9 +1,9 @@
-# Профиль набора raw-датасетов для shared-оркестратора.
-# Создавайте новые профили рядом с этим файлом:
+# Raw dataset profile for shared orchestrator.
+# Create additional profiles next to this file:
 #   conf/data/<your_profile>.yaml
-# и выбирайте их через defaults в conf/config.yaml.
+# and select them via defaults in conf/config.yaml.
 
-path: ${oc.env:DATA_ROOT,./data}
+path: ${oc.env:DATA_ROOT,./data/datasets}
 seed: 42
 output_format: pil  # tensor | pil
 image_size: 224
@@ -14,22 +14,29 @@ dataset_config_dirs:
   - conf/data/datasets
 
 enabled_datasets:
-  - coco2017
+  - bdd100k
   - cc12m
-  - visual_genome
-  - scene_parse_150
+  - coco2017
   - mapillary_vistas_v2
   - relaion400m
+  - scene_parse_150
+  - visual_genome
+  - stanford_cars
+  - dtd_textures
+  - eurosat_rgb
+  - patchcamelyon
+  - oxford_pets
+  - wider_face
+  - doclaynet_v11
+  - cord_v2
+  - funsd
+  - docvqa_1200
 
-# Точечные override'ы для выбранного профиля.
-# Пример:
+# Per-profile focused overrides.
+# Example:
 # dataset_overrides:
 #   flickr30k:
 #     models: [clip_vit_b32, dinov2_base]
 #   coco2017:
 #     sampling_weight: 0.7
 dataset_overrides: {}
-
-cli:
-  batch_size: 8
-  num_batches: 1

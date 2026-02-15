@@ -1,9 +1,14 @@
 name: bdd100k
+description: "Кадры с автомобильных камер; задачи дорожного восприятия и scene understanding."
 enabled: true
 gated: false
 sampling_weight: 1.0
 models:
+  - swinv2_base
   - dinov2_base
+  - vit_mae_base
+  - deit_base
+  - clip_vit_b32
 collector_device: null
 
 hf:

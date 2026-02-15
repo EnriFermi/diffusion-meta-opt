@@ -8,7 +8,7 @@ from dataset.shared.streaming.backends.local_disk import LocalDiskChunkStore
 from dataset.shared.streaming.backends.s3 import S3ChunkStore
 from dataset.shared.streaming.chunk_reader import ChunkReader
 from dataset.shared.streaming.chunk_writer import ChunkWriter
-from dataset.shared.streaming.config import normalize_streaming_mode
+from dataset.shared.streaming.config import normalize_streaming_mode, resolve_refill_after_consumed_chunks
 
 
 def resolve_streaming_cfg(cfg: dict[str, Any] | None) -> dict[str, Any]:
@@ -21,6 +21,38 @@ def resolve_streaming_cfg(cfg: dict[str, Any] | None) -> dict[str, Any]:
     payload.setdefault("local_disk", {})
     payload.setdefault("s3", {})
     payload.setdefault("distributed", {})
+
+    producer_cfg = dict(payload.get("producer", {}))
+    consumer_cfg = dict(payload.get("consumer", {}))
+    local_cfg = dict(payload.get("local_disk", {}))
+    s3_cfg = dict(payload.get("s3", {}))
+
+    # Canonical producer keys.
+    producer_cfg.setdefault("spool_dir", None)
+    producer_cfg.setdefault("max_pending_spool_chunks", 64)
+    producer_cfg.setdefault(
+        "ready_store_dir",
+        local_cfg.get("root_dir"),
+    )
+    producer_cfg.setdefault(
+        "ready_store_max_chunks",
+        int(local_cfg.get("max_ready_chunks", 200)),
+    )
+
+    refill_after = resolve_refill_after_consumed_chunks(payload["mode"], producer_cfg, local_cfg, s3_cfg)
+    producer_cfg.setdefault("refill_after_consumed_chunks", refill_after)
+    producer_cfg.setdefault("stripe_window_chunks", None)
+    if producer_cfg.get("stripe_window_chunks") is None:
+        producer_cfg["stripe_window_chunks"] = None
+
+    # Canonical consumer keys.
+    consumer_cfg.setdefault("cache_dir", None)
+    consumer_cfg.setdefault("prefetch_max_chunks", 16)
+    consumer_cfg.setdefault("randomize_within_chunk", True)
+    consumer_cfg.setdefault("random_seed", None)
+
+    payload["producer"] = producer_cfg
+    payload["consumer"] = consumer_cfg
     return payload
 
 
@@ -30,14 +62,28 @@ def build_chunk_store(streaming_cfg: dict[str, Any]) -> ChunkStore | None:
         return None
 
     if mode == "local_disk":
+        producer_cfg = dict(streaming_cfg.get("producer", {}))
         local_cfg = dict(streaming_cfg.get("local_disk", {}))
-        root_dir = local_cfg.get("root_dir")
+        root_dir = producer_cfg.get("ready_store_dir") or local_cfg.get("root_dir")
         if not root_dir:
-            raise ValueError("streaming.local_disk.root_dir must be set for mode=local_disk")
+            spool_dir = producer_cfg.get("spool_dir")
+            if spool_dir:
+                root_dir = str(Path(spool_dir).parent / "ready_store")
+            else:
+                raise ValueError(
+                    "For mode=local_disk set streaming.producer.ready_store_dir"
+                )
+        max_ready_chunks = int(
+            producer_cfg.get("ready_store_max_chunks", local_cfg.get("max_ready_chunks", 200))
+        )
+        refill_after = int(
+            producer_cfg.get("refill_after_consumed_chunks", max(1, max_ready_chunks // 2))
+        )
+        low_watermark_chunks = max(0, max_ready_chunks - max(1, refill_after))
         return LocalDiskChunkStore(
             root_dir=root_dir,
-            max_ready_chunks=int(local_cfg.get("max_ready_chunks", 200)),
-            low_watermark_chunks=int(local_cfg.get("low_watermark_chunks", 100)),
+            max_ready_chunks=max_ready_chunks,
+            low_watermark_chunks=low_watermark_chunks,
         )
 
     if mode == "s3_bridge":
@@ -61,28 +107,30 @@ def build_chunk_store(streaming_cfg: dict[str, Any]) -> ChunkStore | None:
 def build_chunk_writer(streaming_cfg: dict[str, Any], store: ChunkStore) -> ChunkWriter:
     producer_cfg = dict(streaming_cfg.get("producer", {}))
     chunk_format_cfg = dict(streaming_cfg.get("chunk_format", {}))
-    spool_dir = producer_cfg.get("local_spool_dir")
+    spool_dir = producer_cfg.get("spool_dir")
     if not spool_dir:
-        raise ValueError("streaming.producer.local_spool_dir must be set")
+        raise ValueError("streaming.producer.spool_dir must be set")
     return ChunkWriter(
         store=store,
         spool_dir=Path(spool_dir),
         chunk_size_samples=int(streaming_cfg.get("chunk_size_samples", 256)),
         compression=str(chunk_format_cfg.get("compression", "none")),
-        local_max_chunks=int(producer_cfg.get("local_max_chunks", 64)),
+        spool_max_pending_chunks=int(producer_cfg.get("max_pending_spool_chunks", 64)),
     )
 
 
 def build_chunk_reader(streaming_cfg: dict[str, Any], store: ChunkStore) -> ChunkReader:
     consumer_cfg = dict(streaming_cfg.get("consumer", {}))
-    local_cache_dir = consumer_cfg.get("local_cache_dir")
-    if not local_cache_dir:
-        raise ValueError("streaming.consumer.local_cache_dir must be set")
+    cache_dir = consumer_cfg.get("cache_dir")
+    if not cache_dir:
+        raise ValueError("streaming.consumer.cache_dir must be set")
 
     return ChunkReader(
         store=store,
-        local_cache_dir=local_cache_dir,
-        local_max_chunks=int(consumer_cfg.get("local_max_chunks", 16)),
+        cache_dir=cache_dir,
+        prefetch_max_chunks=int(consumer_cfg.get("prefetch_max_chunks", 16)),
         delete_remote_after=str(consumer_cfg.get("delete_remote_after", "consume")),
         distributed_cfg=dict(streaming_cfg.get("distributed", {})),
+        randomize_within_chunk=bool(consumer_cfg.get("randomize_within_chunk", True)),
+        random_seed=int(consumer_cfg["random_seed"]) if consumer_cfg.get("random_seed") is not None else None,
     )

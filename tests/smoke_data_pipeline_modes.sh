@@ -23,15 +23,13 @@ set -euo pipefail
 
 SCRIPT="tests/smoke_data_pipeline_modes.py"
 COMMON_ARGS=(
+  --data-profile "all_datasets_no_flickr30k"
   --data-root "./data"
-  --datasets "coco2017,scene_parse_150"
-  --dataset-model "coco2017=clip_vit_b32"
-  --dataset-model "scene_parse_150=clip_vit_b32"
   --predownload
   --chunk-size-samples 8
   --raw-chunk-size-images 16
   --raw-num-chunks-kept 2
-  --atom-chunk-rows 32
+  --xy-samples-random-slice 32
   --target-samples 20
   --turnover-probe-samples 24
   --turnover-probe-timeout-seconds 240
@@ -42,7 +40,7 @@ COMMON_ARGS=(
 # -----------------------------------------------------------------------------
 # (1) MODE=none (in-memory) [АКТИВЕН ПО УМОЛЧАНИЮ]
 # -----------------------------------------------------------------------------
-# python "$SCRIPT" \
+# pipenv run python "$SCRIPT" \
 #   --mode none \
 #   --train-device "cuda:0" \
 #   --collector-device "null" \
@@ -58,8 +56,8 @@ python "$SCRIPT" \
   --collector-device "cuda:1" \
   --collector-mode "auto" \
   --chunk-size-samples 64 \
-  --local-max-ready-chunks 40 \
-  --local-low-watermark-chunks 20 \
+  --local-ready-store-max-chunks 40 \
+  --local-refill-after-consumed-chunks 20 \
   "${COMMON_ARGS[@]}"
 
 # -----------------------------------------------------------------------------
@@ -73,7 +71,7 @@ python "$SCRIPT" \
 # Для S3-compatible (MinIO и т.п.) можно добавить endpoint:
 # --s3-endpoint-url "http://127.0.0.1:9000"
 #
-# python "$SCRIPT" \
+# pipenv run python "$SCRIPT" \
 #   --mode s3_bridge \
 #   --train-device "cuda:0" \
 #   --collector-device "cuda:1" \

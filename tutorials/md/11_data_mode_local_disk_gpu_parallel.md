@@ -3,7 +3,7 @@
 Collector пишет финальные chunk-файлы на локальный диск, training читает их через `ChunkReader`.
 
 Профиль по умолчанию для этого режима:
-- `streaming=gpu_parallel_streaming`
+- `data/streaming=gpu_parallel_streaming`
 
 ## Когда использовать
 
@@ -15,28 +15,30 @@ Collector пишет финальные chunk-файлы на локальный
 
 ```bash
 pipenv run python -m dataset.shared.demo_streaming_local \
-  streaming=gpu_parallel_streaming \
+  data/streaming=gpu_parallel_streaming \
   train.device=cuda:0 \
   collector.device=cuda:1 \
   collector.mode=auto \
   data.enabled_datasets=[coco2017,scene_parse_150] \
   data.dataset_overrides.coco2017.models=[clip_vit_b32] \
-  data.dataset_overrides.scene_parse_150.models=[dinov2_base] \
-  demo.num_samples=150
+  data.dataset_overrides.scene_parse_150.models=[dinov2_base]
 ```
+
+`target_samples` и остальные demo-only параметры задаются в шапке
+`dataset/shared/demo_streaming_local.py` и печатаются таблицей при запуске.
 
 ## Что важно в этом режиме
 
 1. Hysteresis по chunk-store:
-- fill до `streaming.local_disk.max_ready_chunks`
+- fill до `streaming.producer.ready_store_max_chunks`
 - stop на max
-- resume когда `ready <= streaming.local_disk.low_watermark_chunks`
+- resume после consume `streaming.producer.refill_after_consumed_chunks`
 
 2. Producer-side spool:
-- `streaming.producer.local_max_chunks`
+- `streaming.producer.max_pending_spool_chunks`
 
 3. Consumer-side prefetch:
-- `streaming.consumer.local_max_chunks`
+- `streaming.consumer.prefetch_max_chunks`
 
 ## DDP шардирование
 

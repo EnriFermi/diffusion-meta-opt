@@ -3,7 +3,7 @@
 Collector публикует финальные chunk-файлы в S3, training скачивает и потребляет.
 
 Профиль:
-- `streaming=s3_bridge_streaming`
+- `data/streaming=s3_bridge_streaming`
 
 ## Когда использовать
 
@@ -15,7 +15,7 @@ Collector публикует финальные chunk-файлы в S3, training
 
 ```bash
 pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
-  streaming=s3_bridge_streaming \
+  data/streaming=s3_bridge_streaming \
   streaming.s3.bucket=YOUR_BUCKET \
   streaming.s3.prefix=diffusion-meta-opt/streaming \
   train.device=cuda:0 \
@@ -23,9 +23,11 @@ pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
   collector.mode=auto \
   data.enabled_datasets=[coco2017,cc12m] \
   data.dataset_overrides.coco2017.models=[clip_vit_b32] \
-  data.dataset_overrides.cc12m.models=[clip_vit_b32] \
-  demo.num_samples=120
+  data.dataset_overrides.cc12m.models=[clip_vit_b32]
 ```
+
+`target_samples` и остальные demo-only параметры задаются в шапке
+`dataset/shared/demo_streaming_s3_bridge.py` и печатаются таблицей при запуске.
 
 ## Ключевые параметры
 
@@ -40,8 +42,8 @@ pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
 - альтернатива: `download`
 
 4. Локальные кэши:
-- `streaming.producer.local_spool_dir`
-- `streaming.consumer.local_cache_dir`
+- `streaming.producer.spool_dir`
+- `streaming.consumer.cache_dir`
 
 ## Что проверять в первую очередь
 

@@ -39,9 +39,23 @@ def main() -> None:
 
     with open_dict(cfg):
         cfg.data.enabled_datasets = [args.dataset_name]
+        dataset_overrides = cfg.data.get("dataset_overrides")
+        if dataset_overrides is None:
+            cfg.data.dataset_overrides = {}
+        cfg.data.dataset_overrides[args.dataset_name] = {
+            "enabled": True,
+            # Speed up smoke inspection regardless of production chunk size.
+            "cache": {"chunk_size_images": max(8, min(args.n * 2, 32))},
+            "worker": {"startup_get_timeout_s": 60.0},
+        }
+        # `config.yaml` uses `${hydra:job.name}` in logging.file_name, but this script
+        # composes config outside `@hydra.main`. Replace with concrete values.
+        if "logging" in cfg:
+            cfg.logging.file_name = f"inspect_dataset_{args.dataset_name}.log"
+            cfg.logging.file_path = f"{cfg.logging.dir}/{cfg.logging.file_name}"
 
     logger.info("Inspecting dataset: %s", args.dataset_name)
-    logger.debug("Config:\n%s", OmegaConf.to_yaml(cfg, resolve=True))
+    logger.debug("Config:\n%s", OmegaConf.to_yaml(cfg, resolve=False))
 
     index = CompatibilityIndex(cfg)
     pool = RawDatasetPool(cfg=cfg, index=index)

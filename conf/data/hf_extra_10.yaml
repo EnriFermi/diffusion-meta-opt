@@ -1,0 +1,46 @@
+# Explicit profile for the 10 extra HF datasets.
+# Use with: python train.py data=hf_extra_10
+
+path: ${oc.env:DATA_ROOT,./data/datasets}
+seed: 42
+output_format: pil
+image_size: 224
+log_level: INFO
+max_loaded_models: 1
+
+dataset_config_dirs:
+  - conf/data/datasets
+
+enabled_datasets:
+  - stanford_cars
+  - dtd_textures
+  - eurosat_rgb
+  - patchcamelyon
+  - oxford_pets
+  - wider_face
+  - doclaynet_v11
+  - cord_v2
+  - funsd
+  - docvqa_1200
+
+dataset_overrides:
+  stanford_cars:
+    enabled: true
+  dtd_textures:
+    enabled: true
+  eurosat_rgb:
+    enabled: true
+  patchcamelyon:
+    enabled: true
+  oxford_pets:
+    enabled: true
+  wider_face:
+    enabled: true
+  doclaynet_v11:
+    enabled: true
+  cord_v2:
+    enabled: true
+  funsd:
+    enabled: true
+  docvqa_1200:
+    enabled: true

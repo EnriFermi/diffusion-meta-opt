@@ -12,15 +12,17 @@
 
 ```bash
 pipenv run python -m dataset.shared.demo_end_to_end \
-  streaming=none \
+  data/streaming=none \
   train.device=cuda:0 \
   collector.device=null \
   collector.mode=auto \
   data.enabled_datasets=[coco2017,cc12m] \
   data.dataset_overrides.coco2017.models=[clip_vit_b32] \
-  data.dataset_overrides.cc12m.models=[clip_vit_b32] \
-  demo.num_samples=100
+  data.dataset_overrides.cc12m.models=[clip_vit_b32]
 ```
+
+`target_samples` и остальные demo-only параметры задаются в шапке
+`dataset/shared/demo_end_to_end.py` и печатаются таблицей при запуске.
 
 ## Что вы увидите
 
@@ -39,9 +41,9 @@ pipenv run python -m dataset.shared.demo_end_to_end \
 
 ## Практические параметры
 
-1. `collector.cache.max_items/fill_target/low_watermark`
-2. `collector.model_burst_jobs`
-3. `collector.atomization.chunk_rows`
+1. `collector.in_memory_buffer.capacity_samples/fill_target_samples/low_watermark_samples`
+2. `collector.jobs_per_selected_model`
+3. `collector.layer_output_splitting.xy_samples_random_slice`
 
 ## Ограничения режима
 

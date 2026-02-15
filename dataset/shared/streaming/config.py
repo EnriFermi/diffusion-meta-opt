@@ -16,6 +16,30 @@ def normalize_streaming_mode(value: Any) -> str:
     return mode
 
 
+def resolve_refill_after_consumed_chunks(
+    mode: str,
+    producer_cfg: dict[str, Any],
+    local_disk_cfg: dict[str, Any],  # kept for interface compatibility
+    s3_cfg: dict[str, Any],
+) -> int:
+    configured = producer_cfg.get("refill_after_consumed_chunks")
+    if configured is not None:
+        return max(1, int(configured))
+
+    if mode == "local_disk":
+        max_ready = max(
+            1,
+            int(producer_cfg.get("ready_store_max_chunks", local_disk_cfg.get("max_ready_chunks", 200))),
+        )
+        return max(1, max_ready // 2)
+
+    if mode == "s3_bridge":
+        max_remote = max(1, int(s3_cfg.get("max_remote_chunks", 1)))
+        return max(1, max_remote // 2)
+
+    return 1
+
+
 @dataclass(slots=True)
 class DistributedSettings:
     enabled: bool

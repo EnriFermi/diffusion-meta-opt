@@ -1,0 +1,35 @@
+# @package _global_
+collector:
+  enabled: true
+  device: "cuda:1"
+  mode: auto
+  max_loaded_models: 1
+  pin_gpu: true
+  release_device_on_unload: false
+  empty_cuda_cache_on_unload: false
+  # How to pick the next model:
+  # - round_robin_shuffled: cycle over a shuffled model list
+  # - weighted_random: random by model.sampling_weight
+  model_selection_strategy: round_robin_shuffled
+  # Number of collector jobs to run consecutively for a selected model.
+  jobs_per_selected_model: 2
+  # How to split raw batch across datasets compatible with the selected model:
+  # - uniform_random: equal probability
+  # - weighted_random: by dataset.sampling_weight
+  dataset_sampling_strategy: uniform_random
+  # Max share (0..1) of one dataset in a mixed model batch.
+  max_dataset_fraction_per_batch: 0.6
+  num_inflight_jobs: 2
+  # Used only when streaming.mode=none (in-memory buffer).
+  in_memory_buffer:
+    capacity_samples: 5000
+    fill_target_samples: 5000
+    low_watermark_samples: 3000
+  interleaved_schedule:
+    collect_every_n_train_steps: 30
+    collector_jobs_per_cycle: 1
+  layer_output_splitting:
+    # Mandatory positive integer.
+    # If layer rows N <= xy_samples_random_slice -> keep full x/y.
+    # If N > xy_samples_random_slice -> keep random linked x/y pairs of this size.
+    xy_samples_random_slice: 512

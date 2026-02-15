@@ -26,7 +26,7 @@ class ChunkWriter:
         spool_dir: str | Path,
         chunk_size_samples: int,
         compression: str,
-        local_max_chunks: int,
+        spool_max_pending_chunks: int,
     ) -> None:
         self.store = store
         self.spool_dir = Path(spool_dir)
@@ -34,48 +34,95 @@ class ChunkWriter:
 
         self.chunk_size_samples = max(1, int(chunk_size_samples))
         self.compression = str(compression or "none").lower()
-        self.local_max_chunks = max(1, int(local_max_chunks))
+        self.spool_max_pending_chunks = max(1, int(spool_max_pending_chunks))
 
         self.logger = logging.getLogger(self.__class__.__name__)
 
-        self._buffer: list[SharedSample] = []
+        self._window_open = False
+        self._window_chunks = 1
+        self._window_id = 0
+        self._window_cursor = 0
+        self._slot_buffers: dict[int, list[SharedSample]] = {0: []}
+
         self._sequence = 0
         self._num_chunks_written = 0
         self._num_chunks_published = 0
         self._spool_items: deque[_SpoolItem] = deque()
 
+    def open_window(self, window_chunks: int, window_id: int) -> None:
+        normalized_chunks = max(1, int(window_chunks))
+        normalized_window_id = max(0, int(window_id))
+
+        if self._window_open and normalized_chunks == self._window_chunks and normalized_window_id == self._window_id:
+            return
+
+        if normalized_chunks != self._window_chunks and any(self._slot_buffers.get(slot) for slot in self._slot_buffers):
+            # Window size changed while buffers are non-empty: flush remainder first to avoid remapping ambiguity.
+            self.flush(force_partial=True)
+
+        self._window_chunks = normalized_chunks
+        self._window_id = normalized_window_id
+        self._window_cursor = 0
+        self._window_open = True
+        self._ensure_slot_buffers()
+
+    def close_window(self, flush_partial: bool = False) -> None:
+        self.flush(force_partial=bool(flush_partial))
+        self._window_open = False
+
     def append(self, sample: SharedSample) -> None:
         self._drain_spool()
 
-        self._buffer.append(sample)
-        if len(self._buffer) >= self.chunk_size_samples:
+        self._ensure_window_open()
+        self._ensure_slot_buffers()
+
+        slot = self._window_cursor % self._window_chunks
+        self._window_cursor += 1
+
+        slot_buffer = self._slot_buffers[slot]
+        slot_buffer.append(sample)
+        if len(slot_buffer) >= self.chunk_size_samples:
             self.flush(force_partial=False)
 
     def flush(self, force_partial: bool = False) -> int:
         emitted_chunks = 0
         self._drain_spool()
 
-        while len(self._buffer) >= self.chunk_size_samples:
-            batch = self._buffer[: self.chunk_size_samples]
-            if not self._enqueue_chunk(batch):
-                return emitted_chunks
-            del self._buffer[: self.chunk_size_samples]
-            emitted_chunks += 1
-            self._drain_spool()
+        self._ensure_slot_buffers()
 
-        if force_partial and self._buffer:
-            if self._enqueue_chunk(self._buffer):
-                self._buffer = []
+        while True:
+            emitted_in_pass = 0
+            for slot in range(self._window_chunks):
+                slot_buffer = self._slot_buffers[slot]
+                while len(slot_buffer) >= self.chunk_size_samples:
+                    batch = slot_buffer[: self.chunk_size_samples]
+                    if not self._enqueue_chunk(batch, slot=slot):
+                        return emitted_chunks
+                    del slot_buffer[: self.chunk_size_samples]
+                    emitted_chunks += 1
+                    emitted_in_pass += 1
+                    self._drain_spool()
+            if emitted_in_pass == 0:
+                break
+
+        if force_partial:
+            for slot in range(self._window_chunks):
+                slot_buffer = self._slot_buffers[slot]
+                if not slot_buffer:
+                    continue
+                if not self._enqueue_chunk(slot_buffer[:], slot=slot):
+                    return emitted_chunks
+                slot_buffer.clear()
                 emitted_chunks += 1
                 self._drain_spool()
 
         return emitted_chunks
 
     def can_accept_more(self) -> bool:
-        return self._spool_size() < self.local_max_chunks
+        return self._spool_size() < self.spool_max_pending_chunks
 
     def pending_samples(self) -> int:
-        return len(self._buffer)
+        return sum(len(items) for items in self._slot_buffers.values())
 
     def close(self) -> None:
         self.flush(force_partial=True)
@@ -83,23 +130,28 @@ class ChunkWriter:
 
     def stats(self) -> dict[str, Any]:
         return {
-            "pending_samples": len(self._buffer),
+            "pending_samples": self.pending_samples(),
             "num_chunks_written": self._num_chunks_written,
             "num_chunks_published": self._num_chunks_published,
             "chunk_size_samples": self.chunk_size_samples,
             "compression": self.compression,
             "spool_dir": str(self.spool_dir),
             "spool_pending_chunks": self._spool_size(),
+            "spool_max_pending_chunks": self.spool_max_pending_chunks,
+            "window_open": self._window_open,
+            "window_chunks": self._window_chunks,
+            "window_id": self._window_id,
+            "window_cursor": self._window_cursor,
         }
 
-    def _enqueue_chunk(self, samples: list[SharedSample]) -> bool:
+    def _enqueue_chunk(self, samples: list[SharedSample], slot: int) -> bool:
         if not samples:
             return True
 
         if not self.can_accept_more():
             return False
 
-        chunk_id = _new_chunk_id(sequence=self._sequence)
+        chunk_id = _new_chunk_id(window_id=self._window_id, slot=slot, sequence=self._sequence)
         self._sequence += 1
 
         local_path = self.spool_dir / f"{chunk_id}{chunk_suffix(self.compression)}"
@@ -107,6 +159,9 @@ class ChunkWriter:
             "chunk_id": chunk_id,
             "created_at": time.time(),
             "num_samples": len(samples),
+            "window_id": self._window_id,
+            "window_slot": int(slot),
+            "window_chunks": int(self._window_chunks),
         }
 
         save_chunk(local_path, samples=samples, meta=meta, compression=self.compression)
@@ -139,5 +194,20 @@ class ChunkWriter:
         return len(self._spool_items)
 
 
-def _new_chunk_id(sequence: int) -> str:
-    return f"final_chunk_{int(time.time() * 1000)}_{sequence:08d}"
+    def _ensure_slot_buffers(self) -> None:
+        for slot in range(self._window_chunks):
+            self._slot_buffers.setdefault(slot, [])
+        stale = [slot for slot in self._slot_buffers if slot >= self._window_chunks]
+        for slot in stale:
+            if self._slot_buffers[slot]:
+                raise RuntimeError(f"Found stale non-empty slot buffer: slot={slot}, window_chunks={self._window_chunks}")
+            del self._slot_buffers[slot]
+
+    def _ensure_window_open(self) -> None:
+        if self._window_open:
+            return
+        self.open_window(window_chunks=self._window_chunks, window_id=self._window_id)
+
+
+def _new_chunk_id(window_id: int, slot: int, sequence: int) -> str:
+    return f"final_chunk_w{int(window_id):05d}_s{int(slot):03d}_{int(time.time() * 1000)}_{sequence:08d}"

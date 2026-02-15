@@ -1,9 +1,14 @@
 name: visual_genome
+description: "Фотографии с region-level описаниями; задачи grounding, captioning и scene understanding."
 enabled: true
 gated: false
 sampling_weight: 1.0
 models:
   - clip_vit_b32
+  - dinov2_base
+  - dinov2_vits14
+  - grounding_dino_tiny
+  - blip_image_captioning_base
 collector_device: null
 
 hf:
