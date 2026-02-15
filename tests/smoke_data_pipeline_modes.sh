@@ -50,7 +50,7 @@ COMMON_ARGS=(
 # -----------------------------------------------------------------------------
 # (2) MODE=local_disk (chunk streaming на локальном диске)
 # -----------------------------------------------------------------------------
-pipenv run python "$SCRIPT" \
+python "$SCRIPT" \
   --mode local_disk \
   --train-device "cuda:0" \
   --collector-device "cuda:1" \
