@@ -15,7 +15,6 @@ import hydra
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -23,7 +22,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from dataset.shared.collector_service import CollectorService
 from dataset.shared.shared_dataset import SharedModelDataset
 from dataset.shared.types import SharedSample
-from models.weight_quantile_vae import EncoderConfig, ModelConfig, ResamplerConfig, WeightQuantileVAE
+from models.weight_quantile_vae import (
+    BigVAEConfig,
+    DistributionConfig,
+    EncoderConfig,
+    MiniVAEConfig,
+    ModelConfig,
+    WeightQuantileVAE,
+)
 
 
 def setup_logging(cfg: DictConfig, rank: int = 0) -> None:
@@ -160,33 +166,52 @@ def _set_speed_optimizations(cfg: DictConfig, device: torch.device) -> None:
 
 
 def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
-    model_cfg = cfg.get("model")
-    if model_cfg is None:
-        # Backward compatibility with older config layout.
-        model_cfg = cfg.train.get("model", {})
+    model_cfg = cfg.get("model", {})
 
-    encoder_cfg = model_cfg.get("encoder", {})
-    resampler_cfg = model_cfg.get("resampler", {})
+    dist_cfg = model_cfg.get("distribution", {})
+    mini_cfg = model_cfg.get("mini_vae", {})
+    big_cfg = model_cfg.get("big_vae", {})
+    enc_cfg = big_cfg.get("encoder", {})
 
     return ModelConfig(
-        k=int(model_cfg.get("k", 8)),
-        k_mlp=int(model_cfg.get("k_mlp", 24)),
         patch_size=int(model_cfg.get("patch_size", 16)),
-        d_tok=int(model_cfg.get("d_tok", 64)),
-        m_lat=int(model_cfg.get("m_lat", 32)),
-        d_lat=int(model_cfg.get("d_lat", 64)),
-        n_heads=int(model_cfg.get("n_heads", 8)),
-        pos_fourier_dim=int(model_cfg.get("pos_fourier_dim", 32)),
-        row_mlp_mult=float(model_cfg.get("row_mlp_mult", 4.0)),
-        resampler_mlp_mult=float(model_cfg.get("resampler_mlp_mult", 4.0)),
-        decoder_mlp_mult=float(model_cfg.get("decoder_mlp_mult", 2.0)),
-        dropout=float(model_cfg.get("dropout", 0.0)),
-        encoder=EncoderConfig(
-            n_row_layers=int(encoder_cfg.get("n_row_layers", 2)),
-            self_attn_mode=str(encoder_cfg.get("self_attn_mode", "full")),
+        beta=float(model_cfg.get("beta", 1e-3)),
+        mini_encoder_ckpt_path=str(model_cfg.get("mini_encoder_ckpt_path", "")),
+        distribution=DistributionConfig(
+            k_s=int(dist_cfg.get("k_s", 16)),
+            Kq=int(dist_cfg.get("Kq", 32)),
+            d_var=int(dist_cfg.get("d_var", 128)),
+            d_dist=int(dist_cfg.get("d_dist", 128)),
+            num_var_attn_layers=int(dist_cfg.get("num_var_attn_layers", 2)),
+            var_attn_heads=int(dist_cfg.get("var_attn_heads", 4)),
+            dcn_num_cross_layers=int(dist_cfg.get("dcn_num_cross_layers", 3)),
+            dcn_deep_hidden=int(dist_cfg.get("dcn_deep_hidden", 0)),
+            dcn_deep_layers=int(dist_cfg.get("dcn_deep_layers", 0)),
+            dropout=float(dist_cfg.get("dropout", 0.0)),
         ),
-        resampler=ResamplerConfig(
-            n_layers=int(resampler_cfg.get("n_layers", 2)),
+        mini_vae=MiniVAEConfig(
+            z_dim=int(mini_cfg.get("z_dim", 64)),
+            d_e=int(mini_cfg.get("d_e", 128)),
+            num_attn_layers_encoder=int(mini_cfg.get("num_attn_layers_encoder", 2)),
+            num_layers_decoder=int(mini_cfg.get("num_layers_decoder", 2)),
+            n_heads=int(mini_cfg.get("n_heads", 4)),
+            d_patch=int(mini_cfg.get("d_patch", 64)),
+            dropout=float(mini_cfg.get("dropout", 0.0)),
+        ),
+        big_vae=BigVAEConfig(
+            d_model=int(big_cfg.get("d_model", 256)),
+            d_lat=int(big_cfg.get("d_lat", 256)),
+            num_latents=int(big_cfg.get("num_latents", 32)),
+            num_encoder_layers=int(big_cfg.get("num_encoder_layers", 4)),
+            num_decoder_layers=int(big_cfg.get("num_decoder_layers", 4)),
+            n_heads=int(big_cfg.get("n_heads", 8)),
+            ffn_mult=float(big_cfg.get("ffn_mult", 4.0)),
+            dropout=float(big_cfg.get("dropout", 0.0)),
+            pos_fourier_dim=int(big_cfg.get("pos_fourier_dim", 64)),
+            encoder=EncoderConfig(
+                self_attn_mode=str(enc_cfg.get("self_attn_mode", "full")),
+                cross_attend_only_cls=bool(enc_cfg.get("cross_attend_only_cls", True)),
+            ),
         ),
     )
 
@@ -555,8 +580,9 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
 
                     with no_sync_ctx:
                         with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
-                            W_hat, kl_loss, _ = model(x, W)
-                            recon_loss = F.mse_loss(W_hat, W)
+                            W_hat, mu, logvar = model(W, x)
+                            recon_loss = WeightQuantileVAE.operator_recon_loss(x, W, W_hat)
+                            kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
                             total_loss = recon_loss + kl_beta * kl_loss
                             loss_for_backward = total_loss / grad_accum_steps
 

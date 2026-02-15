@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -9,7 +10,7 @@ import torch.nn.functional as F
 
 
 def sinusoidal_embedding(indices: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
-    """Deterministic Fourier/sinusoidal embedding for integer-like indices."""
+    """Deterministic sinusoidal embedding for arbitrary-sized integer grids."""
     if dim <= 0:
         raise ValueError(f"dim must be positive, got {dim}")
 
@@ -18,12 +19,9 @@ def sinusoidal_embedding(indices: torch.Tensor, dim: int, max_period: float = 10
     if half == 0:
         return x.unsqueeze(-1)
 
-    scale = torch.arange(half, device=x.device, dtype=torch.float32)
-    scale = scale / max(half - 1, 1)
-    freqs = torch.exp(-math.log(max_period) * scale)
+    freqs = torch.exp(-math.log(max_period) * torch.arange(half, device=x.device, dtype=torch.float32) / max(half - 1, 1))
     angles = x.unsqueeze(-1) * freqs
     emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-
     if dim % 2 == 1:
         emb = F.pad(emb, (0, 1))
     return emb
@@ -33,8 +31,8 @@ class MLP(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.0) -> None:
         super().__init__()
         self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden_dim, out_dim)
+        self.act = nn.GELU()
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -46,458 +44,933 @@ class MLP(nn.Module):
         return x
 
 
-class InputDistributionEncoder(nn.Module):
-    """
-    Encodes input distributions from Q_feature_major [d_in, k] once per layer.
-    Steps: shared MLP (k -> k_mlp) per feature, one self-attention layer over d_in, then patch mean.
-    Output: dist_patches [n_patches, k_mlp].
-    """
+class CrossLayer(nn.Module):
+    """Minimal DCNv2-style cross layer: x_{l+1} = x_l + x_0 * W(x_l) + b."""
 
-    def __init__(self, k: int, k_mlp: int, dropout: float = 0.0) -> None:
+    def __init__(self, d_in: int) -> None:
         super().__init__()
-        self.k = k
-        self.k_mlp = k_mlp
-        hidden = max(1, k_mlp)
+        self.linear = nn.Linear(d_in, d_in, bias=False)
+        self.bias = nn.Parameter(torch.zeros(d_in))
 
-        self.feature_mlp = nn.Sequential(
-            nn.Linear(k, hidden),
+    def forward(self, x0: torch.Tensor, xl: torch.Tensor) -> torch.Tensor:
+        # x0: [B, d_in], xl: [B, d_in]
+        return xl + x0 * self.linear(xl) + self.bias
+
+
+class DCNv2(nn.Module):
+    """Minimal DCNv2: stack of cross layers + optional deep tower."""
+
+    def __init__(
+        self,
+        d_in: int,
+        d_out: int,
+        num_cross_layers: int = 3,
+        deep_hidden: int = 0,
+        deep_layers: int = 0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.cross_layers = nn.ModuleList([CrossLayer(d_in) for _ in range(max(1, num_cross_layers))])
+
+        self.has_deep = deep_hidden > 0 and deep_layers > 0
+        if self.has_deep:
+            deep: list[nn.Module] = []
+            in_dim = d_in
+            for _ in range(deep_layers):
+                deep.append(nn.Linear(in_dim, deep_hidden))
+                deep.append(nn.GELU())
+                deep.append(nn.Dropout(dropout))
+                in_dim = deep_hidden
+            self.deep = nn.Sequential(*deep)
+            self.out = nn.Linear(d_in + deep_hidden, d_out)
+        else:
+            self.deep = None
+            self.out = nn.Linear(d_in, d_out)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, d_in]
+        x0 = x
+        xl = x
+        for layer in self.cross_layers:
+            xl = layer(x0, xl)
+
+        if self.has_deep and self.deep is not None:
+            xd = self.deep(x)
+            x_cat = torch.cat([xl, xd], dim=-1)
+            return self.out(x_cat)
+
+        return self.out(xl)
+
+
+@dataclass(slots=True)
+class DistributionConfig:
+    k_s: int = 16
+    Kq: int = 32
+    d_var: int = 128
+    d_dist: int = 128
+    num_var_attn_layers: int = 2
+    var_attn_heads: int = 4
+    dcn_num_cross_layers: int = 3
+    dcn_deep_hidden: int = 0
+    dcn_deep_layers: int = 0
+    dropout: float = 0.0
+
+
+class InputDistributionEncodingModule(nn.Module):
+    """
+    Encodes empirical input distribution for one input patch.
+
+    Inputs:
+    - X: [B, n, d_in]
+    - patch_idx: [B, p] (indices along d_in)
+
+    Outputs:
+    - dist_var_tokens: [B, p, d_var]
+    - dist_patch_embed: [B, d_dist]
+    """
+
+    def __init__(self, cfg: DistributionConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        if cfg.k_s < 2:
+            raise ValueError(f"k_s must be >= 2 to enforce quantile normalization endpoints, got {cfg.k_s}")
+
+        if cfg.d_var % cfg.var_attn_heads != 0:
+            raise ValueError(f"d_var ({cfg.d_var}) must be divisible by var_attn_heads ({cfg.var_attn_heads})")
+
+        # Conv along quantile axis only, shared across variables (via reshape to [B*p, 1, k_s]).
+        self.quantile_conv = nn.Conv1d(in_channels=1, out_channels=cfg.Kq, kernel_size=3, padding=1)
+
+        # Shared per-variable MLP: (Kq + 2) -> d_var.
+        self.var_mlp = nn.Sequential(
+            nn.Linear(cfg.Kq + 2, cfg.d_var),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, k_mlp),
-            nn.Dropout(dropout),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.d_var, cfg.d_var),
+            nn.Dropout(cfg.dropout),
         )
-        self.norm_attn = nn.LayerNorm(k_mlp)
-        self.attn = nn.MultiheadAttention(k_mlp, num_heads=1, dropout=dropout, batch_first=True)
-        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, Q_feature_major: torch.Tensor, P: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-        # Q_feature_major: [d_in, k]
-        if Q_feature_major.ndim != 2:
-            raise ValueError(f"Expected Q_feature_major rank-2 [d_in, k], got {tuple(Q_feature_major.shape)}")
-        d_in, k = Q_feature_major.shape
-        if k != self.k:
-            raise ValueError(f"Expected k={self.k}, got k={k}")
-        if P <= 0:
-            raise ValueError(f"P must be > 0, got {P}")
+        # 2-layer variable self-attention (configurable layer count).
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=cfg.d_var,
+            nhead=cfg.var_attn_heads,
+            dim_feedforward=max(4 * cfg.d_var, cfg.d_var),
+            dropout=cfg.dropout,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.var_encoder = nn.TransformerEncoder(enc_layer, num_layers=max(1, cfg.num_var_attn_layers))
 
-        x = self.feature_mlp(Q_feature_major)  # [d_in, k_mlp]
-        h = self.norm_attn(x).unsqueeze(0)  # [1, d_in, k_mlp]
-        attn_out, _ = self.attn(h, h, h, need_weights=False)
-        x = x + self.dropout(attn_out.squeeze(0))  # [d_in, k_mlp]
+        self.dcn = DCNv2(
+            d_in=cfg.d_var,
+            d_out=cfg.d_dist,
+            num_cross_layers=cfg.dcn_num_cross_layers,
+            deep_hidden=cfg.dcn_deep_hidden,
+            deep_layers=cfg.dcn_deep_layers,
+            dropout=cfg.dropout,
+        )
 
-        n_patches = (d_in + P - 1) // P
-        d_in_pad = n_patches * P
-        x_pad = torch.zeros(d_in_pad, self.k_mlp, device=x.device, dtype=x.dtype)
-        x_pad[:d_in, :] = x
-        dist_patches = x_pad.view(n_patches, P, self.k_mlp).mean(dim=1)  # [n_patches, k_mlp]
-        dist_flat = dist_patches.reshape(n_patches * self.k_mlp)  # [n_patches_per_output * K_mlp]
-        return dist_patches, dist_flat, n_patches, d_in_pad
+        probs = torch.linspace(0.0, 1.0, cfg.k_s, dtype=torch.float32)
+        self.register_buffer("quantile_probs", probs, persistent=False)
+
+    def forward(self, X: torch.Tensor, patch_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # X: [B, n, d_in]
+        # patch_idx: [B, p]
+        if X.ndim != 3:
+            raise ValueError(f"X must be rank-3 [B, n, d_in], got {tuple(X.shape)}")
+        if patch_idx.ndim != 2:
+            raise ValueError(f"patch_idx must be rank-2 [B, p], got {tuple(patch_idx.shape)}")
+
+        B, n, d_in = X.shape
+        B_idx, p = patch_idx.shape
+        if B_idx != B:
+            raise ValueError(f"patch_idx batch ({B_idx}) must match X batch ({B})")
+
+        idx = patch_idx.to(dtype=torch.long, device=X.device).clamp(min=0, max=max(0, d_in - 1))
+
+        # Gather patch variables.
+        # X_I: [B, n, p]
+        X_I = X.gather(dim=2, index=idx.unsqueeze(1).expand(-1, n, -1))
+
+        # Quantiles over sample axis n.
+        # q_raw: [k_s, B, p] -> q: [B, k_s, p]
+        X_q = X_I.to(torch.float32)
+        q_raw = torch.quantile(X_q, q=self.quantile_probs.to(X_q.device), dim=1)
+        q = q_raw.permute(1, 0, 2).contiguous()
+
+        # Normalize quantiles per variable into [-1, 1] scale.
+        # q_first/q_last: [B, 1, p]
+        q_first = q[:, 0:1, :]
+        q_last = q[:, -1:, :]
+        q_span = (q_last - q_first).clamp_min(1e-6)
+        q = 2.0 * (q - q_first) / q_span - 1.0  # [B, k_s, p]
+        q[:, 0, :] = -1.0
+        q[:, -1, :] = 1.0
+
+        # Mu/sigma (unconvolved): [B, p]
+        mu = X_q.mean(dim=1)
+        sigma = X_q.std(dim=1, unbiased=False)
+        eps = 1e-6
+
+        # Log-versions of moments:
+        # mu_log uses signed log to preserve sign information for negative means.
+        # sigma_log is standard log on positive sigma.
+        mu_log = torch.sign(mu) * torch.log1p(mu.abs())
+        sigma_log = torch.log(sigma + eps)
+
+        # Convolution along quantile axis only.
+        # q_var_major: [B, p, k_s]
+        # q_conv_in: [B*p, 1, k_s]
+        q_var_major = q.permute(0, 2, 1).contiguous()
+        q_conv_in = q_var_major.view(B * p, 1, self.cfg.k_s)
+
+        # q_conv_seq: [B*p, Kq, k_s] -> q_conv: [B, p, Kq]
+        q_conv_seq = self.quantile_conv(q_conv_in)
+        q_conv = q_conv_seq.mean(dim=-1).view(B, p, self.cfg.Kq)
+
+        # Per-variable features: [B, p, Kq + 2]
+        f = torch.cat([q_conv, mu_log.unsqueeze(-1), sigma_log.unsqueeze(-1)], dim=-1)
+
+        # Shared var MLP: [B, p, d_var]
+        v = self.var_mlp(f.to(dtype=X.dtype if X.dtype.is_floating_point else torch.float32))
+
+        # Variable context via self-attention: [B, p, d_var]
+        dist_var_tokens = self.var_encoder(v)
+
+        # Mean pool over variables: [B, d_var]
+        v_pool = dist_var_tokens.mean(dim=1)
+
+        # DCNv2 patch embedding: [B, d_dist]
+        dist_patch_embed = self.dcn(v_pool)
+
+        return dist_var_tokens, dist_patch_embed
+
+
+@dataclass(slots=True)
+class MiniVAEConfig:
+    z_dim: int = 64
+    d_e: int = 128
+    num_attn_layers_encoder: int = 2
+    num_layers_decoder: int = 2
+    n_heads: int = 4
+    d_patch: int = 64
+    dropout: float = 0.0
+
+
+class MiniPatchEncoder(nn.Module):
+    """Encoder used for both MiniPatchVAE pretraining and BigWeightVAE tokenization."""
+
+    def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.d_var = d_var
+
+        if cfg.d_e % cfg.n_heads != 0:
+            raise ValueError(f"mini d_e ({cfg.d_e}) must be divisible by n_heads ({cfg.n_heads})")
+
+        # Per-element embed: (1 + d_var) -> d_e.
+        self.elem_embed = nn.Sequential(
+            nn.Linear(1 + d_var, cfg.d_e),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.d_e, cfg.d_e),
+            nn.Dropout(cfg.dropout),
+        )
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=cfg.d_e,
+            nhead=cfg.n_heads,
+            dim_feedforward=max(4 * cfg.d_e, cfg.d_e),
+            dropout=cfg.dropout,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.set_encoder = nn.TransformerEncoder(enc_layer, num_layers=max(1, cfg.num_attn_layers_encoder))
+
+        self.to_mu = nn.Linear(cfg.d_e, cfg.z_dim)
+        self.to_logvar = nn.Linear(cfg.d_e, cfg.z_dim)
+
+        if cfg.d_patch == cfg.z_dim:
+            self.patch_proj = nn.Identity()
+        else:
+            self.patch_proj = nn.Linear(cfg.z_dim, cfg.d_patch)
+
+    def encode(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # w_patch: [B, p]
+        # dist_var_tokens: [B, p, d_var]
+        if w_patch.ndim != 2:
+            raise ValueError(f"w_patch must be [B, p], got {tuple(w_patch.shape)}")
+        if dist_var_tokens.ndim != 3:
+            raise ValueError(f"dist_var_tokens must be [B, p, d_var], got {tuple(dist_var_tokens.shape)}")
+
+        B, p = w_patch.shape
+        Bv, pv, d_var = dist_var_tokens.shape
+        if Bv != B or pv != p:
+            raise ValueError(f"Shape mismatch: w_patch={tuple(w_patch.shape)}, dist_var_tokens={tuple(dist_var_tokens.shape)}")
+        if d_var != self.d_var:
+            raise ValueError(f"dist_var_tokens last dim must be {self.d_var}, got {d_var}")
+
+        # T: [B, p, 1 + d_var]
+        t = torch.cat([w_patch.unsqueeze(-1), dist_var_tokens], dim=-1)
+
+        # E: [B, p, d_e]
+        e = self.elem_embed(t)
+
+        # E_ctx: [B, p, d_e]
+        e_ctx = self.set_encoder(e)
+
+        # h: [B, d_e]
+        h = e_ctx.mean(dim=1)
+
+        # mu/logvar: [B, z_dim]
+        mu = self.to_mu(h)
+        logvar = self.to_logvar(h)
+        return mu, logvar
+
+    def encode_patch(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
+        # patch_token: [B, d_patch]
+        mu, _ = self.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+        patch_token = self.patch_proj(mu)
+        return patch_token
+
+
+class MiniPatchDecoder(nn.Module):
+    """Per-element decoder conditioned on z and dist_var_tokens."""
+
+    def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+
+        if cfg.d_e % cfg.n_heads != 0:
+            raise ValueError(f"mini d_e ({cfg.d_e}) must be divisible by n_heads ({cfg.n_heads})")
+
+        self.in_proj = nn.Linear(cfg.z_dim + d_var, cfg.d_e)
+
+        if cfg.num_layers_decoder > 0:
+            dec_layer = nn.TransformerEncoderLayer(
+                d_model=cfg.d_e,
+                nhead=cfg.n_heads,
+                dim_feedforward=max(4 * cfg.d_e, cfg.d_e),
+                dropout=cfg.dropout,
+                batch_first=True,
+                activation="gelu",
+            )
+            self.decoder_context = nn.TransformerEncoder(dec_layer, num_layers=cfg.num_layers_decoder)
+        else:
+            self.decoder_context = nn.Identity()
+
+        self.out_head = nn.Sequential(
+            nn.Linear(cfg.d_e, cfg.d_e),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.d_e, 1),
+        )
+
+    def forward(self, z: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
+        # z: [B, z_dim]
+        # dist_var_tokens: [B, p, d_var]
+        if z.ndim != 2:
+            raise ValueError(f"z must be [B, z_dim], got {tuple(z.shape)}")
+        if dist_var_tokens.ndim != 3:
+            raise ValueError(f"dist_var_tokens must be [B, p, d_var], got {tuple(dist_var_tokens.shape)}")
+
+        B, p, _ = dist_var_tokens.shape
+
+        # z_expand: [B, p, z_dim]
+        z_expand = z.unsqueeze(1).expand(-1, p, -1)
+
+        # u: [B, p, z_dim + d_var]
+        u = torch.cat([z_expand, dist_var_tokens], dim=-1)
+
+        # h: [B, p, d_e]
+        h = self.in_proj(u)
+        h = self.decoder_context(h)
+
+        # w_hat: [B, p]
+        w_hat = self.out_head(h).squeeze(-1)
+        return w_hat
+
+
+class MiniPatchVAE(nn.Module):
+    """
+    Patch-local VAE.
+
+    Methods:
+    - encode(w_patch, dist_var_tokens) -> mu, logvar
+    - decode(z, dist_var_tokens) -> w_hat
+    - encode_patch(w_patch, dist_var_tokens) -> patch_token (for BigWeightVAE)
+    """
+
+    def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.encoder = MiniPatchEncoder(d_var=d_var, cfg=cfg)
+        self.decoder = MiniPatchDecoder(d_var=d_var, cfg=cfg)
+
+    @staticmethod
+    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        # mu/logvar: [B, z_dim] -> z: [B, z_dim]
+        eps = torch.randn_like(mu)
+        return mu + eps * torch.exp(0.5 * logvar)
+
+    @staticmethod
+    def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        # mu/logvar: [B, z_dim] -> scalar
+        kl = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1.0 - logvar, dim=-1)
+        return kl.mean()
+
+    def encode(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.encoder.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+
+    def decode(self, z: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
+        return self.decoder(z=z, dist_var_tokens=dist_var_tokens)
+
+    def encode_patch(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
+        return self.encoder.encode_patch(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+
+    def forward(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # w_patch: [B, p], dist_var_tokens: [B, p, d_var]
+        mu, logvar = self.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+        z = self.reparameterize(mu=mu, logvar=logvar)
+        w_hat = self.decode(z=z, dist_var_tokens=dist_var_tokens)
+        return w_hat, mu, logvar, z
 
 
 @dataclass(slots=True)
 class EncoderConfig:
-    n_row_layers: int = 2
     self_attn_mode: str = "full"  # {"full", "cls_only"}
+    cross_attend_only_cls: bool = True
 
 
 @dataclass(slots=True)
+class BigVAEConfig:
+    d_model: int = 256
+    d_lat: int = 256
+    num_latents: int = 32
+    num_encoder_layers: int = 4
+    num_decoder_layers: int = 4
+    n_heads: int = 8
+    ffn_mult: float = 4.0
+    dropout: float = 0.0
+    pos_fourier_dim: int = 64
+    encoder: EncoderConfig = field(default_factory=EncoderConfig)
+
+
+# Backward-compat placeholder (not used by BigWeightVAE internals).
+@dataclass(slots=True)
 class ResamplerConfig:
-    n_layers: int = 2
+    n_layers: int = 0
 
 
 @dataclass(slots=True)
 class ModelConfig:
-    k: int
-    k_mlp: int
-    patch_size: int  # P
-    d_tok: int
-    m_lat: int
-    d_lat: int
-    n_heads: int = 4
-    pos_fourier_dim: int = 32
-    row_mlp_mult: float = 4.0
-    resampler_mlp_mult: float = 4.0
-    decoder_mlp_mult: float = 2.0
-    dropout: float = 0.0
-    encoder: EncoderConfig = field(default_factory=EncoderConfig)
-    resampler: ResamplerConfig = field(default_factory=ResamplerConfig)
+    patch_size: int = 16
+    distribution: DistributionConfig = field(default_factory=DistributionConfig)
+    mini_vae: MiniVAEConfig = field(default_factory=MiniVAEConfig)
+    big_vae: BigVAEConfig = field(default_factory=BigVAEConfig)
+    beta: float = 1e-3
+    mini_encoder_ckpt_path: str = ""
 
 
-class RowMixerBlock(nn.Module):
-    """Row mixer on tokens_rows [d_out, 1+n_patches, d_tok] with per-output independence."""
+class LocalOutputSelfAttentionBlock(nn.Module):
+    """Local attention within one output-column token group."""
 
-    def __init__(
-        self,
-        d_tok: int,
-        n_heads: int,
-        mlp_mult: float,
-        dropout: float,
-        self_attn_mode: str,
-    ) -> None:
+    def __init__(self, d_model: int, n_heads: int, ffn_mult: float, dropout: float, self_attn_mode: str) -> None:
         super().__init__()
         if self_attn_mode not in {"full", "cls_only"}:
             raise ValueError(f"encoder.self_attn_mode must be 'full' or 'cls_only', got {self_attn_mode}")
-        if d_tok % n_heads != 0:
-            raise ValueError(f"d_tok ({d_tok}) must be divisible by n_heads ({n_heads})")
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
 
         self.self_attn_mode = self_attn_mode
-        hidden = max(1, int(d_tok * mlp_mult))
-
-        self.attn = nn.MultiheadAttention(d_tok, n_heads, dropout=dropout, batch_first=True)
+        self.norm_attn = nn.LayerNorm(d_model)
+        self.norm_ffn = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-        self.norm_full_attn = nn.LayerNorm(d_tok)
-        self.norm_full_ffn = nn.LayerNorm(d_tok)
-        self.full_ffn = MLP(d_tok, hidden, d_tok, dropout=dropout)
+        self.full_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.cls_to_all_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.patch_to_cls_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
 
-        self.norm_cls_kv = nn.LayerNorm(d_tok)
-        self.norm_cls_ffn = nn.LayerNorm(d_tok)
-        self.cls_ffn = MLP(d_tok, hidden, d_tok, dropout=dropout)
+        hidden = max(1, int(d_model * ffn_mult))
+        self.ffn = MLP(d_model, hidden, d_model, dropout=dropout)
 
-        self.norm_patch_ffn = nn.LayerNorm(d_tok)
-        self.patch_ffn = MLP(d_tok, hidden, d_tok, dropout=dropout)
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        # tokens: [B_group, 1 + T, d_model]
+        h = self.norm_attn(tokens)
 
-    def forward(self, tokens_rows: torch.Tensor) -> torch.Tensor:
-        # tokens_rows: [d_out, L, d_tok], L = 1 + n_patches
         if self.self_attn_mode == "full":
-            h = self.norm_full_attn(tokens_rows)
-            attn_out, _ = self.attn(h, h, h, need_weights=False)
-            tokens_rows = tokens_rows + self.dropout(attn_out)
-            tokens_rows = tokens_rows + self.dropout(self.full_ffn(self.norm_full_ffn(tokens_rows)))
-            return tokens_rows
+            attn_out, _ = self.full_attn(h, h, h, need_weights=False)
+            tokens = tokens + self.dropout(attn_out)
+        else:
+            # CLS query attends to all tokens.
+            # cls_q: [B_group, 1, d_model]
+            cls_q = h[:, 0:1, :]
+            cls_out, _ = self.cls_to_all_attn(cls_q, h, h, need_weights=False)
 
-        kv = self.norm_cls_kv(tokens_rows)
-        cls_q = kv[:, 0:1, :]
-        cls_attn, _ = self.attn(cls_q, kv, kv, need_weights=False)
+            # Patch queries attend only to CLS.
+            # patch_q: [B_group, T, d_model]
+            patch_q = h[:, 1:, :]
+            patch_out, _ = self.patch_to_cls_attn(patch_q, cls_q, cls_q, need_weights=False)
 
-        cls = tokens_rows[:, 0:1, :] + self.dropout(cls_attn)
-        cls = cls + self.dropout(self.cls_ffn(self.norm_cls_ffn(cls)))
+            cls_res = tokens[:, 0:1, :] + self.dropout(cls_out)
+            patch_res = tokens[:, 1:, :] + self.dropout(patch_out)
+            tokens = torch.cat([cls_res, patch_res], dim=1)
 
-        patches = tokens_rows[:, 1:, :]
-        patches = patches + self.dropout(self.patch_ffn(self.norm_patch_ffn(patches)))
-
-        return torch.cat([cls, patches], dim=1)
+        tokens = tokens + self.dropout(self.ffn(self.norm_ffn(tokens)))
+        return tokens
 
 
-class PerceiverResamplerLayer(nn.Module):
-    def __init__(self, d_lat: int, n_heads: int, mlp_mult: float, dropout: float) -> None:
+class LatentEncoderLayer(nn.Module):
+    """
+    One big-encoder block:
+    1) local per-output attention over [CLS_o, patches_o]
+    2) latents cross-attend to token K/V (CLS only or all tokens)
+    3) latent self-attention
+    4) latent FFN
+    """
+
+    def __init__(self, d_model: int, d_lat: int, n_heads: int, ffn_mult: float, dropout: float, self_attn_mode: str) -> None:
         super().__init__()
         if d_lat % n_heads != 0:
             raise ValueError(f"d_lat ({d_lat}) must be divisible by n_heads ({n_heads})")
 
-        hidden = max(1, int(d_lat * mlp_mult))
-        self.dropout = nn.Dropout(dropout)
+        self.local_block = LocalOutputSelfAttentionBlock(
+            d_model=d_model,
+            n_heads=n_heads,
+            ffn_mult=ffn_mult,
+            dropout=dropout,
+            self_attn_mode=self_attn_mode,
+        )
 
         self.norm_cross_q = nn.LayerNorm(d_lat)
-        self.norm_cross_kv = nn.LayerNorm(d_lat)
-        self.cross_attn = nn.MultiheadAttention(d_lat, n_heads, dropout=dropout, batch_first=True)
+        self.norm_cross_kv = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_lat,
+            num_heads=n_heads,
+            kdim=d_model,
+            vdim=d_model,
+            dropout=dropout,
+            batch_first=True,
+        )
 
-        self.norm_self = nn.LayerNorm(d_lat)
-        self.self_attn = nn.MultiheadAttention(d_lat, n_heads, dropout=dropout, batch_first=True)
+        self.norm_lat_self = nn.LayerNorm(d_lat)
+        self.lat_self_attn = nn.MultiheadAttention(d_lat, n_heads, dropout=dropout, batch_first=True)
 
-        self.norm_ffn = nn.LayerNorm(d_lat)
-        self.ffn = MLP(d_lat, hidden, d_lat, dropout=dropout)
+        self.norm_lat_ffn = nn.LayerNorm(d_lat)
+        hidden = max(1, int(d_lat * ffn_mult))
+        self.lat_ffn = MLP(d_lat, hidden, d_lat, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, latents: torch.Tensor, cls_context: torch.Tensor) -> torch.Tensor:
-        # latents: [1, m_lat, d_lat]
-        # cls_context: [1, d_out, d_lat] (keys/values from CLS_all only)
-        q = self.norm_cross_q(latents)
-        kv = self.norm_cross_kv(cls_context)
-        cross_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+    def forward(
+        self,
+        tokens_by_output: torch.Tensor,
+        latents: torch.Tensor,
+        cross_attend_only_cls: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # tokens_by_output: [B, d_out, 1 + T, d_model]
+        # latents: [B, L, d_lat]
+        B, d_out, L_local, d_model = tokens_by_output.shape
+
+        # Local self-attention per output group.
+        local_in = tokens_by_output.view(B * d_out, L_local, d_model)  # [B*d_out, 1+T, d_model]
+        local_out = self.local_block(local_in)  # [B*d_out, 1+T, d_model]
+        tokens = local_out.view(B, d_out, L_local, d_model)  # [B, d_out, 1+T, d_model]
+
+        # K/V source for latent cross-attention.
+        if cross_attend_only_cls:
+            kv = tokens[:, :, 0, :]  # [B, d_out, d_model]
+        else:
+            kv = tokens.reshape(B, d_out * L_local, d_model)  # [B, d_out*(1+T), d_model]
+
+        q = self.norm_cross_q(latents)  # [B, L, d_lat]
+        kv_norm = self.norm_cross_kv(kv)  # [B, S, d_model]
+        cross_out, _ = self.cross_attn(q, kv_norm, kv_norm, need_weights=False)
         latents = latents + self.dropout(cross_out)
 
-        h = self.norm_self(latents)
-        self_out, _ = self.self_attn(h, h, h, need_weights=False)
-        latents = latents + self.dropout(self_out)
+        lat_norm = self.norm_lat_self(latents)
+        lat_self_out, _ = self.lat_self_attn(lat_norm, lat_norm, lat_norm, need_weights=False)
+        latents = latents + self.dropout(lat_self_out)
 
-        latents = latents + self.dropout(self.ffn(self.norm_ffn(latents)))
-        return latents
+        latents = latents + self.dropout(self.lat_ffn(self.norm_lat_ffn(latents)))
+        return tokens, latents
 
 
 class DecoderCrossBlock(nn.Module):
-    """Cross-attention query->latents with no query self-attention."""
+    """Decoder block with query->latent cross-attention only (no q-q self-attention)."""
 
-    def __init__(self, d_lat: int, n_heads: int, mlp_mult: float, dropout: float) -> None:
+    def __init__(self, d_model: int, d_lat: int, n_heads: int, ffn_mult: float, dropout: float) -> None:
         super().__init__()
-        if d_lat % n_heads != 0:
-            raise ValueError(f"d_lat ({d_lat}) must be divisible by n_heads ({n_heads})")
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
 
-        hidden = max(1, int(d_lat * mlp_mult))
-        self.dropout = nn.Dropout(dropout)
-        self.norm_q = nn.LayerNorm(d_lat)
+        self.norm_q = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_lat)
-        self.attn = nn.MultiheadAttention(d_lat, n_heads, dropout=dropout, batch_first=True)
-        self.norm_ffn = nn.LayerNorm(d_lat)
-        self.ffn = MLP(d_lat, hidden, d_lat, dropout=dropout)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            kdim=d_lat,
+            vdim=d_lat,
+            dropout=dropout,
+            batch_first=True,
+        )
 
-    def forward(self, q_flat: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
-        # q_flat: [d_out*n_patches, 1, d_lat]
-        # latents: [m_lat, d_lat]
-        b = q_flat.shape[0]
-        kv = self.norm_kv(latents).unsqueeze(0).expand(b, -1, -1)
-        q = self.norm_q(q_flat)
-        cross_out, _ = self.attn(q, kv, kv, need_weights=False)
-        q_flat = q_flat + self.dropout(cross_out)
-        q_flat = q_flat + self.dropout(self.ffn(self.norm_ffn(q_flat)))
-        return q_flat
+        self.norm_ffn = nn.LayerNorm(d_model)
+        hidden = max(1, int(d_model * ffn_mult))
+        self.ffn = MLP(d_model, hidden, d_model, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, q_tokens: torch.Tensor, z_latents: torch.Tensor) -> torch.Tensor:
+        # q_tokens: [B, Q, d_model]
+        # z_latents: [B, L, d_lat]
+        q = self.norm_q(q_tokens)
+        kv = self.norm_kv(z_latents)
+        cross_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+        q_tokens = q_tokens + self.dropout(cross_out)
+        q_tokens = q_tokens + self.dropout(self.ffn(self.norm_ffn(q_tokens)))
+        return q_tokens
 
 
-class WeightQuantileVAE(nn.Module):
+class BigWeightVAE(nn.Module):
     """
-    Fast encoder-decoder for W [d_in, d_out], conditioned on quantiles of X [n, d_in].
-    Returns: (W_hat [d_in, d_out], kl_loss scalar, aux_dict).
+    Full matrix VAE.
+
+    Input:
+    - W: [B, d_in, d_out] or [d_in, d_out]
+    - X: [B, n, d_in] or [n, d_in]
+
+    Output:
+    - W_hat: same rank as W input
+    - mu: [B, L, d_lat] (or [L, d_lat] for unbatched input)
+    - logvar: [B, L, d_lat] (or [L, d_lat] for unbatched input)
     """
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         self.cfg = cfg
 
-        if cfg.encoder.self_attn_mode not in {"full", "cls_only"}:
-            raise ValueError(
-                f"encoder.self_attn_mode must be in {{'full', 'cls_only'}}, got {cfg.encoder.self_attn_mode}"
-            )
-        if cfg.d_tok % cfg.n_heads != 0:
-            raise ValueError(f"d_tok ({cfg.d_tok}) must be divisible by n_heads ({cfg.n_heads})")
-        if cfg.d_lat % cfg.n_heads != 0:
-            raise ValueError(f"d_lat ({cfg.d_lat}) must be divisible by n_heads ({cfg.n_heads})")
+        p = cfg.patch_size
+        d_var = cfg.distribution.d_var
+        d_dist = cfg.distribution.d_dist
 
-        P = cfg.patch_size
-        self.input_distribution_encoder = InputDistributionEncoder(
-            k=cfg.k,
-            k_mlp=cfg.k_mlp,
-            dropout=cfg.dropout,
-        )
+        self.distribution_encoder = InputDistributionEncodingModule(cfg.distribution)
+        self.mini_patch_encoder = MiniPatchEncoder(d_var=d_var, cfg=cfg.mini_vae)
 
-        # Shared MLPHead over all (j, p): [k_mlp + P] -> d_tok -> d_tok
-        self.patch_mlp_head = nn.Sequential(
-            nn.Linear(cfg.k_mlp + P, cfg.d_tok),
-            nn.GELU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.d_tok, cfg.d_tok),
-            nn.Dropout(cfg.dropout),
-        )
+        d_patch = cfg.mini_vae.d_patch
+        d_model = cfg.big_vae.d_model
+        d_lat = cfg.big_vae.d_lat
 
-        # CLS token: learned base + deterministic output-index embedding projected to d_tok.
-        self.cls_base = nn.Parameter(torch.zeros(cfg.d_tok))
-        self.output_index_proj = nn.Linear(cfg.pos_fourier_dim, cfg.d_tok)
+        if d_model % cfg.big_vae.n_heads != 0:
+            raise ValueError(f"big_vae.d_model ({d_model}) must be divisible by big_vae.n_heads ({cfg.big_vae.n_heads})")
+        if d_lat % cfg.big_vae.n_heads != 0:
+            raise ValueError(f"big_vae.d_lat ({d_lat}) must be divisible by big_vae.n_heads ({cfg.big_vae.n_heads})")
 
-        self.row_mixers = nn.ModuleList(
+        # Patch token projection after concat([mini_patch_token, dist_patch_embed]).
+        self.patch_token_proj = nn.Linear(d_patch + d_dist, d_model)
+
+        # One learned CLS token expanded per output column.
+        self.cls_token = nn.Parameter(torch.zeros(d_model))
+
+        self.encoder_layers = nn.ModuleList(
             [
-                RowMixerBlock(
-                    d_tok=cfg.d_tok,
-                    n_heads=cfg.n_heads,
-                    mlp_mult=cfg.row_mlp_mult,
-                    dropout=cfg.dropout,
-                    self_attn_mode=cfg.encoder.self_attn_mode,
+                LatentEncoderLayer(
+                    d_model=d_model,
+                    d_lat=d_lat,
+                    n_heads=cfg.big_vae.n_heads,
+                    ffn_mult=cfg.big_vae.ffn_mult,
+                    dropout=cfg.big_vae.dropout,
+                    self_attn_mode=cfg.big_vae.encoder.self_attn_mode,
                 )
-                for _ in range(cfg.encoder.n_row_layers)
+                for _ in range(max(1, cfg.big_vae.num_encoder_layers))
             ]
         )
 
-        # Perceiver resampler over CLS_all only.
-        self.cls_to_lat = nn.Linear(cfg.d_tok, cfg.d_lat)
-        self.latent_base = nn.Parameter(torch.randn(cfg.m_lat, cfg.d_lat) * 0.02)
-        self.resampler_layers = nn.ModuleList(
+        # Global latent base: [L, d_lat]
+        self.latent_base = nn.Parameter(torch.randn(cfg.big_vae.num_latents, d_lat) * 0.02)
+
+        self.to_mu = nn.Linear(d_lat, d_lat)
+        self.to_logvar = nn.Linear(d_lat, d_lat)
+
+        # Decoder query construction with deterministic (o, t) positional encoding.
+        self.pos_proj = nn.Linear(2 * cfg.big_vae.pos_fourier_dim, d_model)
+        self.query_proj = nn.Linear(d_model + d_dist, d_model)
+
+        self.decoder_layers = nn.ModuleList(
             [
-                PerceiverResamplerLayer(
-                    d_lat=cfg.d_lat,
-                    n_heads=cfg.n_heads,
-                    mlp_mult=cfg.resampler_mlp_mult,
-                    dropout=cfg.dropout,
+                DecoderCrossBlock(
+                    d_model=d_model,
+                    d_lat=d_lat,
+                    n_heads=cfg.big_vae.n_heads,
+                    ffn_mult=cfg.big_vae.ffn_mult,
+                    dropout=cfg.big_vae.dropout,
                 )
-                for _ in range(cfg.resampler.n_layers)
+                for _ in range(max(1, cfg.big_vae.num_decoder_layers))
             ]
         )
 
-        # VAE heads on Z [m_lat, d_lat]
-        self.to_mu = nn.Linear(cfg.d_lat, cfg.d_lat)
-        self.to_logvar = nn.Linear(cfg.d_lat, cfg.d_lat)
-
-        # Decoder query position (patch index + output index): deterministic embedding + learned projection.
-        self.decoder_query_base = nn.Parameter(torch.zeros(cfg.d_tok))
-        self.decoder_pos_proj = nn.Linear(2 * cfg.pos_fourier_dim, cfg.d_tok)
-        self.decoder_q_to_lat = nn.Linear(cfg.d_tok, cfg.d_lat)
-        self.decoder_cross = DecoderCrossBlock(
-            d_lat=cfg.d_lat,
-            n_heads=cfg.n_heads,
-            mlp_mult=cfg.decoder_mlp_mult,
-            dropout=cfg.dropout,
-        )
-        dec_hidden = max(1, int(cfg.d_lat * cfg.decoder_mlp_mult))
-        self.patch_decoder = nn.Sequential(
-            nn.Linear(cfg.d_lat, dec_hidden),
+        self.patch_decode_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
             nn.GELU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(dec_hidden, cfg.patch_size),
+            nn.Dropout(cfg.big_vae.dropout),
+            nn.Linear(d_model, p),
         )
 
-    def _compute_quantiles(self, X: torch.Tensor) -> torch.Tensor:
-        # X: [n, d_in] -> Q: [k, d_in], with tau_i = (i+0.5)/k
-        k = self.cfg.k
-        q_dtype = torch.float32 if X.dtype in {torch.float16, torch.bfloat16} else X.dtype
-        X_q = X.to(dtype=q_dtype)
-        tau = (torch.arange(k, device=X.device, dtype=q_dtype) + 0.5) / float(k)
-        Q = torch.quantile(X_q, q=tau, dim=0)
-        return Q
+        if cfg.mini_encoder_ckpt_path:
+            self.load_pretrained_mini_encoder(cfg.mini_encoder_ckpt_path)
 
-    def _patchify_weights(self, W: torch.Tensor, d_in: int, d_out: int, n_patches: int) -> torch.Tensor:
-        # W: [d_in, d_out] -> W_patches: [d_out, n_patches, P]
-        P = self.cfg.patch_size
-        d_in_pad = n_patches * P
-        W_pad = torch.zeros(d_in_pad, d_out, device=W.device, dtype=W.dtype)
-        W_pad[:d_in, :] = W
-        W_patches = W_pad.transpose(0, 1).contiguous().view(d_out, n_patches, P)
-        return W_patches
+    def load_pretrained_mini_encoder(self, checkpoint_path: str) -> None:
+        path = Path(checkpoint_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Mini-VAE checkpoint not found: {checkpoint_path}")
 
-    def _build_cls_tokens(self, d_out: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        # CLS_j = cls_base + proj(sinusoidal(output_index=j))
-        out_idx = torch.arange(d_out, device=device, dtype=torch.float32)
-        out_pos = sinusoidal_embedding(out_idx, self.cfg.pos_fourier_dim).to(dtype=dtype)
-        cls_pos = self.output_index_proj(out_pos)  # [d_out, d_tok]
-        cls = self.cls_base.to(dtype=dtype).unsqueeze(0) + cls_pos
-        return cls
+        state = torch.load(path, map_location="cpu")
+        if isinstance(state, dict) and "model_state" in state:
+            state = state["model_state"]
 
-    def _build_decoder_queries(
-        self, d_out: int, n_patches: int, dtype: torch.dtype, device: torch.device
-    ) -> torch.Tensor:
-        # q_{j,p} = decoder_query_base + proj(pos_embed(p_index, j_index))
-        j_idx = torch.arange(d_out, device=device)
-        p_idx = torch.arange(n_patches, device=device)
-        j_grid, p_grid = torch.meshgrid(j_idx, p_idx, indexing="ij")
+        if not isinstance(state, dict):
+            raise ValueError("Unsupported checkpoint format: expected state dict or {'model_state': state_dict}")
 
-        p_emb = sinusoidal_embedding(p_grid.to(torch.float32), self.cfg.pos_fourier_dim)
-        j_emb = sinusoidal_embedding(j_grid.to(torch.float32), self.cfg.pos_fourier_dim)
-        pos_pair = torch.cat([p_emb, j_emb], dim=-1).to(dtype=dtype)
+        # Accept either plain encoder state_dict or full MiniPatchVAE with 'encoder.' prefix.
+        if any(k.startswith("encoder.") for k in state.keys()):
+            enc_state = {k[len("encoder.") :]: v for k, v in state.items() if k.startswith("encoder.")}
+        else:
+            enc_state = state
 
-        q_pos = self.decoder_pos_proj(pos_pair)  # [d_out, n_patches, d_tok]
-        q_dec = self.decoder_query_base.to(dtype=dtype).view(1, 1, -1) + q_pos
-        return q_dec
+        missing, unexpected = self.mini_patch_encoder.load_state_dict(enc_state, strict=False)
+        if missing:
+            print(f"[BigWeightVAE] mini encoder missing keys: {missing}")
+        if unexpected:
+            print(f"[BigWeightVAE] mini encoder unexpected keys: {unexpected}")
 
-    def forward(self, X: torch.Tensor, W: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
-        # X: [n, d_in], W: [d_in, d_out]
-        if X.ndim != 2 or W.ndim != 2:
-            raise ValueError(f"Expected X and W to be rank-2, got X.ndim={X.ndim}, W.ndim={W.ndim}")
-
-        d_in_x = X.shape[1]
-        d_in, d_out = W.shape
-        if d_in_x != d_in:
-            raise ValueError(f"X has d_in={d_in_x}, but W has d_in={d_in}")
-
-        device = self.cls_base.device
-        dtype = self.cls_base.dtype
-        X = X.to(device=device, dtype=dtype)
-        W = W.to(device=device, dtype=dtype)
-
-        P = self.cfg.patch_size
-        # Part A: quantiles computed once and input-distribution encoding computed once for all d_out.
-        Q = self._compute_quantiles(X).to(dtype=dtype)  # [k, d_in]
-        Q_feature_major = Q.transpose(0, 1).contiguous()  # [d_in, k]
-        dist_patches, dist_flat, n_patches, d_in_pad = self.input_distribution_encoder(
-            Q_feature_major=Q_feature_major,
-            P=P,
-        )  # [n_patches, k_mlp]
-
-        # Part B: patchify W and build patch tokens with shared MLPHead.
-        W_patches = self._patchify_weights(W=W, d_in=d_in, d_out=d_out, n_patches=n_patches)  # [d_out, n_patches, P]
-        dist_shared = dist_patches.unsqueeze(0).expand(d_out, -1, -1)  # [d_out, n_patches, k_mlp]
-        v = torch.cat([dist_shared, W_patches], dim=-1)  # [d_out, n_patches, k_mlp+P]
-        patch_tokens = self.patch_mlp_head(v)  # [d_out, n_patches, d_tok]
-
-        # Part C: row encoder with CLS_j and row-local mixing.
-        cls_tokens = self._build_cls_tokens(d_out=d_out, dtype=dtype, device=device)  # [d_out, d_tok]
-        tokens_rows = torch.cat([cls_tokens.unsqueeze(1), patch_tokens], dim=1)  # [d_out, 1+n_patches, d_tok]
-        for block in self.row_mixers:
-            tokens_rows = block(tokens_rows)
-        CLS_all = tokens_rows[:, 0, :]  # [d_out, d_tok]
-
-        # Part D: Perceiver resampler over CLS_all only.
-        cls_context = self.cls_to_lat(CLS_all).unsqueeze(0)  # [1, d_out, d_lat]
-        latents = self.latent_base.unsqueeze(0).to(dtype=dtype)  # [1, m_lat, d_lat]
-        for layer in self.resampler_layers:
-            latents = layer(latents, cls_context)
-        Z = latents.squeeze(0)  # [m_lat, d_lat]
-
-        mu = self.to_mu(Z)  # [m_lat, d_lat]
-        logvar = self.to_logvar(Z)  # [m_lat, d_lat]
+    @staticmethod
+    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        # mu/logvar: [B, L, d_lat] -> z: [B, L, d_lat]
         eps = torch.randn_like(mu)
-        Z_sample = mu + eps * torch.exp(0.5 * logvar)  # reparameterization
-        kl_per_token = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1.0 - logvar, dim=-1)
-        kl_loss = kl_per_token.mean()
+        return mu + eps * torch.exp(0.5 * logvar)
 
-        # Part E: decoder queries (p_index, j_index) -> cross-attn to latents (no query self-attn).
-        Q_dec = self._build_decoder_queries(d_out=d_out, n_patches=n_patches, dtype=dtype, device=device)
-        q_lat = self.decoder_q_to_lat(Q_dec)  # [d_out, n_patches, d_lat]
-        q_flat = q_lat.contiguous().view(d_out * n_patches, 1, self.cfg.d_lat)
-        q_flat = self.decoder_cross(q_flat, Z_sample)
+    @staticmethod
+    def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        # mu/logvar: [B, L, d_lat] or [L, d_lat] -> scalar
+        if mu.ndim == 2:
+            kl = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1.0 - logvar, dim=-1)  # [L]
+            return kl.mean()
+        kl = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1.0 - logvar, dim=-1)  # [B, L]
+        return kl.mean()
 
-        dec_tokens = q_flat.view(d_out, n_patches, self.cfg.d_lat)
-        W_patches_hat = self.patch_decoder(dec_tokens)  # [d_out, n_patches, P]
+    @staticmethod
+    def operator_recon_loss(X: torch.Tensor, W: torch.Tensor, W_hat: torch.Tensor) -> torch.Tensor:
+        # Linear operator loss: MSE(X @ W, X @ W_hat)
+        # X: [B, n, d_in] or [n, d_in]
+        # W/W_hat: [B, d_in, d_out] or [d_in, d_out]
+        if X.ndim == 2:
+            y = X @ W  # [n, d_out]
+            y_hat = X @ W_hat  # [n, d_out]
+            return F.mse_loss(y_hat, y)
 
-        # Invert patchify: [d_out, n_patches, P] -> [d_in, d_out]
-        W_hat_pad = W_patches_hat.contiguous().view(d_out, d_in_pad).transpose(0, 1)
-        W_hat = W_hat_pad[:d_in, :]
+        y = torch.matmul(X, W)  # [B, n, d_out]
+        y_hat = torch.matmul(X, W_hat)  # [B, n, d_out]
+        return F.mse_loss(y_hat, y)
 
-        aux_dict: dict[str, object] = {
-            "self_attn_mode": self.cfg.encoder.self_attn_mode,
-            "Q_shape": tuple(Q.shape),
-            "Q_feature_major_shape": tuple(Q_feature_major.shape),
-            "dist_patches_shape": tuple(dist_patches.shape),
-            "dist_flat_shape": tuple(dist_flat.shape),
-            "W_patches_shape": tuple(W_patches.shape),
-            "tokens_rows_shape": tuple(tokens_rows.shape),
-            "CLS_all_shape": tuple(CLS_all.shape),
-            "Z_shape": tuple(Z.shape),
-            "Q_dec_shape": tuple(Q_dec.shape),
-            "W_patches_hat_shape": tuple(W_patches_hat.shape),
-            "n_patches": n_patches,
-            "d_in_pad": d_in_pad,
-        }
-        return W_hat, kl_loss, aux_dict
+    @staticmethod
+    def _build_patch_indices(d_in: int, patch_size: int, device: torch.device) -> tuple[torch.Tensor, int, int]:
+        # patch_idx_t: [T, p], T=ceil(d_in/p), values clamped into [0, d_in-1]
+        T = (d_in + patch_size - 1) // patch_size
+        d_in_pad = T * patch_size
+        patch_idx_t = torch.arange(d_in_pad, device=device, dtype=torch.long).view(T, patch_size)
+        patch_idx_t = patch_idx_t.clamp(max=max(0, d_in - 1))
+        return patch_idx_t, T, d_in_pad
+
+    def forward(self, W: torch.Tensor, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # W: [B, d_in, d_out] or [d_in, d_out]
+        # X: [B, n, d_in] or [n, d_in]
+        if W.ndim not in {2, 3}:
+            raise ValueError(f"W must be rank-2 or rank-3, got {tuple(W.shape)}")
+        if X.ndim not in {2, 3}:
+            raise ValueError(f"X must be rank-2 or rank-3, got {tuple(X.shape)}")
+
+        squeeze_batch = W.ndim == 2
+        if squeeze_batch != (X.ndim == 2):
+            raise ValueError(f"W and X must be both batched or both unbatched, got W={tuple(W.shape)}, X={tuple(X.shape)}")
+
+        if squeeze_batch:
+            W = W.unsqueeze(0)  # [1, d_in, d_out]
+            X = X.unsqueeze(0)  # [1, n, d_in]
+
+        B, d_in, d_out = W.shape
+        Bx, n, d_in_x = X.shape
+        if Bx != B or d_in_x != d_in:
+            raise ValueError(f"Shape mismatch: W={tuple(W.shape)}, X={tuple(X.shape)}")
+
+        device = W.device
+        dtype = W.dtype
+
+        p = self.cfg.patch_size
+        patch_idx_t, T, d_in_pad = self._build_patch_indices(d_in=d_in, patch_size=p, device=device)
+
+        # ---------------------------------------------------------------------
+        # 1) Distribution reuse per input patch t (independent of output o).
+        # ---------------------------------------------------------------------
+        # patch_idx_bt: [B, T, p]
+        patch_idx_bt = patch_idx_t.unsqueeze(0).expand(B, -1, -1).contiguous()
+
+        # Flatten (B, T) for one batched pass through distribution encoder.
+        # X_rep: [B*T, n, d_in], patch_idx_flat: [B*T, p]
+        X_rep = X.unsqueeze(1).expand(B, T, n, d_in).reshape(B * T, n, d_in)
+        patch_idx_flat = patch_idx_bt.reshape(B * T, p)
+
+        # dist_var_flat: [B*T, p, d_var]
+        # dist_patch_flat: [B*T, d_dist]
+        dist_var_flat, dist_patch_flat = self.distribution_encoder(X_rep, patch_idx_flat)
+
+        # dist_var_by_patch: [B, T, p, d_var]
+        # dist_patch_by_patch: [B, T, d_dist]
+        d_var = self.cfg.distribution.d_var
+        d_dist = self.cfg.distribution.d_dist
+        dist_var_by_patch = dist_var_flat.view(B, T, p, d_var)
+        dist_patch_by_patch = dist_patch_flat.view(B, T, d_dist)
+
+        # ---------------------------------------------------------------------
+        # 2) Patchify W over d_in for each output column.
+        # ---------------------------------------------------------------------
+        # W_pad: [B, d_in_pad, d_out]
+        W_pad = torch.zeros(B, d_in_pad, d_out, device=device, dtype=dtype)
+        W_pad[:, :d_in, :] = W
+
+        # w_patches: [B, d_out, T, p]
+        w_patches = W_pad.transpose(1, 2).contiguous().view(B, d_out, T, p)
+
+        # ---------------------------------------------------------------------
+        # 3) Patch embedding using pretrained mini encoder + dist patch embed.
+        # ---------------------------------------------------------------------
+        # dist_var_expanded: [B, d_out, T, p, d_var]
+        dist_var_expanded = dist_var_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1, -1)
+
+        # Flatten per-(o,t) for shared mini encoder pass.
+        # w_flat: [B*d_out*T, p]
+        # dist_var_token_flat: [B*d_out*T, p, d_var]
+        w_flat = w_patches.reshape(B * d_out * T, p)
+        dist_var_token_flat = dist_var_expanded.reshape(B * d_out * T, p, d_var)
+
+        # patch_token_raw_flat: [B*d_out*T, d_patch]
+        patch_token_raw_flat = self.mini_patch_encoder.encode_patch(w_patch=w_flat, dist_var_tokens=dist_var_token_flat)
+        d_patch = self.cfg.mini_vae.d_patch
+
+        # patch_token_raw: [B, d_out, T, d_patch]
+        patch_token_raw = patch_token_raw_flat.view(B, d_out, T, d_patch)
+
+        # dist_patch_expanded: [B, d_out, T, d_dist]
+        dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
+
+        # patch_token_cat: [B, d_out, T, d_patch + d_dist]
+        patch_token_cat = torch.cat([patch_token_raw, dist_patch_expanded], dim=-1)
+
+        # patch_tokens: [B, d_out, T, d_model]
+        patch_tokens = self.patch_token_proj(patch_token_cat)
+
+        # CLS per output column.
+        # cls_tokens: [B, d_out, 1, d_model]
+        cls_tokens = self.cls_token.view(1, 1, 1, -1).expand(B, d_out, 1, -1)
+
+        # tokens_by_output: [B, d_out, 1 + T, d_model]
+        tokens_by_output = torch.cat([cls_tokens, patch_tokens], dim=2)
+
+        # ---------------------------------------------------------------------
+        # 4) Global latent encoder with local group attention + latent bottleneck.
+        # ---------------------------------------------------------------------
+        # latents: [B, L, d_lat]
+        latents = self.latent_base.unsqueeze(0).expand(B, -1, -1)
+
+        for enc_layer in self.encoder_layers:
+            tokens_by_output, latents = enc_layer(
+                tokens_by_output=tokens_by_output,
+                latents=latents,
+                cross_attend_only_cls=self.cfg.big_vae.encoder.cross_attend_only_cls,
+            )
+
+        # Posterior params on latents.
+        # mu/logvar: [B, L, d_lat]
+        mu = self.to_mu(latents)
+        logvar = self.to_logvar(latents)
+        z_latents = self.reparameterize(mu=mu, logvar=logvar)
+
+        # ---------------------------------------------------------------------
+        # 5) Decoder with per-(o,t) queries, no query self-attention.
+        # ---------------------------------------------------------------------
+        o_idx = torch.arange(d_out, device=device)
+        t_idx = torch.arange(T, device=device)
+        o_grid, t_grid = torch.meshgrid(o_idx, t_idx, indexing="ij")  # [d_out, T]
+
+        pos_dim = self.cfg.big_vae.pos_fourier_dim
+        pos_o = sinusoidal_embedding(o_grid.to(torch.float32), pos_dim)  # [d_out, T, pos_dim]
+        pos_t = sinusoidal_embedding(t_grid.to(torch.float32), pos_dim)  # [d_out, T, pos_dim]
+        pos_ot = torch.cat([pos_o, pos_t], dim=-1)  # [d_out, T, 2*pos_dim]
+
+        # q_base: [B, d_out, T, d_model]
+        q_base = self.pos_proj(pos_ot).unsqueeze(0).expand(B, -1, -1, -1)
+
+        # q_cond_cat: [B, d_out, T, d_model + d_dist]
+        q_cond_cat = torch.cat([q_base, dist_patch_expanded], dim=-1)
+
+        # q_tokens: [B, d_out*T, d_model]
+        q_tokens = self.query_proj(q_cond_cat).reshape(B, d_out * T, self.cfg.big_vae.d_model)
+
+        for dec_layer in self.decoder_layers:
+            q_tokens = dec_layer(q_tokens=q_tokens, z_latents=z_latents)
+
+        # w_hat_patch_flat: [B, d_out*T, p]
+        w_hat_patch_flat = self.patch_decode_head(q_tokens)
+
+        # w_hat_patches: [B, d_out, T, p]
+        w_hat_patches = w_hat_patch_flat.view(B, d_out, T, p)
+
+        # Stitch back to matrix shape.
+        # W_hat_pad: [B, d_in_pad, d_out]
+        W_hat_pad = w_hat_patches.view(B, d_out, d_in_pad).transpose(1, 2)
+
+        # W_hat: [B, d_in, d_out]
+        W_hat = W_hat_pad[:, :d_in, :]
+
+        if squeeze_batch:
+            return W_hat.squeeze(0), mu.squeeze(0), logvar.squeeze(0)
+
+        return W_hat, mu, logvar
 
 
-def _minimal_shape_test() -> None:
+# Backward-compat alias used in other files.
+WeightQuantileVAE = BigWeightVAE
+
+
+def smoke_test_big_weight_vae() -> None:
     torch.manual_seed(0)
 
-    n = 32
-    d_in = 65
-    d_out = 7
-    k = 8
-    k_mlp = 24
-    P = 16
-    d_tok = 64
-    m_lat = 32
-    d_lat = 64
-
-    X = torch.randn(n, d_in)
-    W = torch.randn(d_in, d_out)
-
-    out_shapes: list[tuple[int, int]] = []
-    for mode in ("full", "cls_only"):
-        cfg = ModelConfig(
-            k=k,
-            k_mlp=k_mlp,
-            patch_size=P,
-            d_tok=d_tok,
-            m_lat=m_lat,
-            d_lat=d_lat,
+    cfg = ModelConfig(
+        patch_size=16,
+        distribution=DistributionConfig(k_s=16, Kq=32, d_var=128, d_dist=128),
+        mini_vae=MiniVAEConfig(z_dim=64, d_e=128, num_attn_layers_encoder=2, num_layers_decoder=2, n_heads=4, d_patch=64),
+        big_vae=BigVAEConfig(
+            d_model=256,
+            d_lat=256,
+            num_latents=16,
+            num_encoder_layers=2,
+            num_decoder_layers=2,
             n_heads=8,
-            encoder=EncoderConfig(n_row_layers=2, self_attn_mode=mode),
-            resampler=ResamplerConfig(n_layers=2),
-            dropout=0.0,
-        )
-        model = WeightQuantileVAE(cfg)
-        W_hat, kl_loss, aux = model(X, W)
+            encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
+        ),
+    )
 
-        assert tuple(W_hat.shape) == (d_in, d_out), f"{mode}: bad W_hat shape {tuple(W_hat.shape)}"
-        assert kl_loss.ndim == 0, f"{mode}: kl_loss must be scalar, got ndim={kl_loss.ndim}"
-        assert aux["Q_shape"] == (k, d_in), f"{mode}: bad Q shape {aux['Q_shape']}"
-        assert aux["dist_patches_shape"] == ((d_in + P - 1) // P, k_mlp), (
-            f"{mode}: bad dist_patches shape {aux['dist_patches_shape']}"
-        )
-        out_shapes.append(tuple(W_hat.shape))
+    model = BigWeightVAE(cfg)
 
-    assert out_shapes[0] == out_shapes[1] == (d_in, d_out)
+    B, n, d_in, d_out = 2, 32, 65, 7
+    X = torch.randn(B, n, d_in)
+    W = torch.randn(B, d_in, d_out)
+
+    W_hat, mu, logvar = model(W, X)
+
+    print("W shape:", tuple(W.shape))
+    print("X shape:", tuple(X.shape))
+    print("W_hat shape:", tuple(W_hat.shape))
+    print("mu shape:", tuple(mu.shape))
+    print("logvar shape:", tuple(logvar.shape))
 
 
 if __name__ == "__main__":
-    _minimal_shape_test()
+    smoke_test_big_weight_vae()
