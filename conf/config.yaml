@@ -1,7 +1,7 @@
 defaults:
   - data: test_dataset
-  - collector: interleaved
-  - streaming: none
+  - data/collector: interleaved
+  - data/streaming: none
   - train: default
   - model: weight_quantile_vae
   - _self_

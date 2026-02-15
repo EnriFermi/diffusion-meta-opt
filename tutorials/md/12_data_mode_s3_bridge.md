@@ -3,7 +3,7 @@
 Collector публикует финальные chunk-файлы в S3, training скачивает и потребляет.
 
 Профиль:
-- `streaming=s3_bridge_streaming`
+- `data/streaming=s3_bridge_streaming`
 
 ## Когда использовать
 
@@ -15,7 +15,7 @@ Collector публикует финальные chunk-файлы в S3, training
 
 ```bash
 pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
-  streaming=s3_bridge_streaming \
+  data/streaming=s3_bridge_streaming \
   streaming.s3.bucket=YOUR_BUCKET \
   streaming.s3.prefix=diffusion-meta-opt/streaming \
   train.device=cuda:0 \

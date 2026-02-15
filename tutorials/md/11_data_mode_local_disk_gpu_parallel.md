@@ -3,7 +3,7 @@
 Collector пишет финальные chunk-файлы на локальный диск, training читает их через `ChunkReader`.
 
 Профиль по умолчанию для этого режима:
-- `streaming=gpu_parallel_streaming`
+- `data/streaming=gpu_parallel_streaming`
 
 ## Когда использовать
 
@@ -15,7 +15,7 @@ Collector пишет финальные chunk-файлы на локальный
 
 ```bash
 pipenv run python -m dataset.shared.demo_streaming_local \
-  streaming=gpu_parallel_streaming \
+  data/streaming=gpu_parallel_streaming \
   train.device=cuda:0 \
   collector.device=cuda:1 \
   collector.mode=auto \

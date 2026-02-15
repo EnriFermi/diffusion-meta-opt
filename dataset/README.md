@@ -65,7 +65,7 @@ Local streaming demo:
 
 ```bash
 pipenv run python -m dataset.shared.demo_streaming_local \
-  streaming=gpu_parallel_streaming \
+  data/streaming=gpu_parallel_streaming \
   train.device=cuda:0 \
   collector.device=cuda:1 \
   collector.mode=auto
@@ -75,7 +75,7 @@ S3 bridge streaming demo:
 
 ```bash
 pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
-  streaming=s3_bridge_streaming \
+  data/streaming=s3_bridge_streaming \
   streaming.s3.bucket=YOUR_BUCKET \
   train.device=cuda:0 \
   collector.device=cuda:1 \

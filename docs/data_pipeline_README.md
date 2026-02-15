@@ -96,18 +96,18 @@ dataset/
 
 `defaults`:
 - `data: test_dataset`
-- `collector: interleaved`
-- `streaming: none`
+- `data/collector: interleaved`
+- `data/streaming: none`
 - `_self_`
 
 Ключевые секции:
 - `hf.token`, `hf.hf_home`, `hf.datasets_cache`, `hf.hub_cache`
 - `train.device`
 - `data.*` (через профиль `conf/data/*.yaml`)
-- `collector.*` (через профиль `conf/collector/*.yaml`)
-- `streaming.*` (через профиль `conf/streaming/*.yaml`)
+- `collector.*` (через профиль `conf/data/collector/*.yaml`)
+- `streaming.*` (через профиль `conf/data/streaming/*.yaml`)
 
-## 4.2 Профили streaming (`conf/streaming/*`)
+## 4.2 Профили streaming (`conf/data/streaming/*`)
 
 ### `none.yaml`
 - `streaming.mode=none`
@@ -502,7 +502,7 @@ pipenv run python -m dataset.shared.demo_end_to_end \
 
 ```bash
 pipenv run python -m dataset.shared.demo_streaming_local \
-  streaming=gpu_parallel_streaming \
+  data/streaming=gpu_parallel_streaming \
   train.device=cuda:0 \
   collector.device=cuda:1 \
   collector.mode=auto
@@ -512,7 +512,7 @@ pipenv run python -m dataset.shared.demo_streaming_local \
 
 ```bash
 pipenv run python -m dataset.shared.demo_streaming_s3_bridge \
-  streaming=s3_bridge_streaming \
+  data/streaming=s3_bridge_streaming \
   streaming.s3.bucket=YOUR_BUCKET \
   train.device=cuda:0 \
   collector.device=cuda:1 \

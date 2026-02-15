@@ -9,12 +9,12 @@
 - Всё в памяти (очередь).
 - Подходит для локальной отладки и коротких запусков.
 
-2. `streaming.mode=local_disk` (профиль `streaming=gpu_parallel_streaming`):
+2. `streaming.mode=local_disk` (профиль `data/streaming=gpu_parallel_streaming`):
 - Collector пишет финальные chunk-файлы на локальный диск.
 - Training читает эти chunk-файлы.
 - Подходит для single-node multi-GPU и DDP.
 
-3. `streaming.mode=s3_bridge` (профиль `streaming=s3_bridge_streaming`):
+3. `streaming.mode=s3_bridge` (профиль `data/streaming=s3_bridge_streaming`):
 - Producer (collector) публикует chunks в S3.
 - Consumer (training) забирает и потребляет.
 - Подходит для разделённых машин.

@@ -12,7 +12,7 @@
 
 ```bash
 pipenv run python -m dataset.shared.demo_end_to_end \
-  streaming=none \
+  data/streaming=none \
   train.device=cuda:0 \
   collector.device=null \
   collector.mode=auto \
