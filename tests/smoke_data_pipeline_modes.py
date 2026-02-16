@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 from hydra import compose, initialize_config_dir
-from omegaconf import DictConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -28,7 +28,6 @@ DEFAULT_FULL_DATASET_LIST = [
     "cord_v2",
     "doclaynet_v11",
     "docvqa_1200",
-    "dtd_textures",
     "eurosat_rgb",
     "funsd",
     "mapillary_vistas_v2",
@@ -38,7 +37,6 @@ DEFAULT_FULL_DATASET_LIST = [
     "scene_parse_150",
     "stanford_cars",
     "visual_genome",
-    "wider_face",
 ]
 
 
@@ -50,7 +48,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-profile",
         default=DEFAULT_FULL_DATASET_PROFILE,
-        help="Hydra data profile from conf/data/<profile>.yaml (default: all datasets except flickr30k)",
+        help="Hydra data profile from conf/data/<profile>.yaml (default: streaming-safe set without flickr30k)",
     )
 
     parser.add_argument("--data-root", default="./data")
@@ -151,7 +149,12 @@ def _parse_dataset_model_map(items: list[str]) -> dict[str, list[str]]:
 def _build_overrides(args: argparse.Namespace) -> list[str]:
     run_tag = str(args.run_tag).strip() if args.run_tag else f"run_{int(time.time())}"
     cli_datasets = [item.strip() for item in str(args.datasets).split(",") if item.strip()]
-    datasets = cli_datasets if cli_datasets else DEFAULT_FULL_DATASET_LIST
+    if cli_datasets:
+        datasets = cli_datasets
+    else:
+        datasets = _resolve_profile_enabled_datasets(args.data_profile)
+        if not datasets:
+            datasets = list(DEFAULT_FULL_DATASET_LIST)
 
     overrides: list[str] = [
         f"data={args.data_profile}",
@@ -227,6 +230,30 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
             overrides.append(f"streaming.s3.endpoint_url={args.s3_endpoint_url}")
 
     return overrides
+
+
+def _resolve_profile_enabled_datasets(profile_name: str) -> list[str]:
+    profile_path = _project_root() / "conf" / "data" / f"{profile_name}.yaml"
+    if not profile_path.exists():
+        return []
+
+    try:
+        profile_cfg = OmegaConf.load(profile_path)
+    except Exception:
+        return []
+
+    enabled = profile_cfg.get("enabled_datasets")
+    if not isinstance(enabled, (list, tuple, ListConfig)):
+        return []
+
+    datasets: list[str] = []
+    for value in enabled:
+        name = str(value).strip()
+        if not name:
+            continue
+        datasets.append(name)
+
+    return datasets
 
 
 def _weight_preview(weight: torch.Tensor, rows: int, cols: int) -> list[list[float]]:

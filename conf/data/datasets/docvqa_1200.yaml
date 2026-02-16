@@ -15,9 +15,10 @@ hf:
   repo: nielsr/docvqa_1200_examples
   subset: null
   split: train
-  streaming: false
+  streaming: true
   shuffle_buffer: 1000
   trust_remote_code: false
+  stream_via_datasets_server: true
 
 schema:
   image_mode: image_field
@@ -26,7 +27,7 @@ schema:
   url_field: null
   url_field_candidates: []
   id_field: id
-  extra_fields: [query, answers, words, bounding_boxes, answer]
+  extra_fields: [query, answers]
 
 cache:
   num_chunks_kept: 2

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import datasets
 from datasets import load_dataset
 
 from dataset.data_raw.core.config import to_plain_dict
@@ -56,6 +57,9 @@ def load_hf_dataset(cfg: Any, token: str | None, seed: int):
     if streaming and hasattr(dataset, "shuffle"):
         shuffle_buffer = int(hf_cfg.get("shuffle_buffer", 10_000))
         dataset = dataset.shuffle(seed=seed, buffer_size=shuffle_buffer)
+        if bool(hf_cfg.get("stream_via_datasets_server", False)):
+            dataset = _disable_streaming_image_decode(dataset=dataset, cfg=plain)
+        dataset = _project_streaming_columns(dataset=dataset, cfg=plain)
 
     return dataset
 
@@ -90,3 +94,92 @@ def _select_split(dataset: Any, preferred: str) -> str:
             return name
 
     return keys[0]
+
+
+def _disable_streaming_image_decode(dataset: Any, cfg: dict[str, Any]) -> Any:
+    schema = cfg.get("schema") or {}
+    if str(schema.get("image_mode", "image_field")) != "image_field":
+        return dataset
+
+    candidates: list[str] = []
+    primary = schema.get("image_field")
+    if isinstance(primary, str) and primary:
+        candidates.append(primary)
+
+    for value in schema.get("image_field_candidates", []):
+        if isinstance(value, str) and value and value not in candidates:
+            candidates.append(value)
+
+    for fallback in ("image", "img", "jpg", "png"):
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    available: set[str] = set()
+    column_names = getattr(dataset, "column_names", None)
+    if isinstance(column_names, list):
+        available.update(str(value) for value in column_names)
+    features = getattr(dataset, "features", None)
+    if isinstance(features, dict):
+        available.update(str(value) for value in features.keys())
+
+    for column_name in candidates:
+        if available and column_name not in available:
+            continue
+        try:
+            dataset = dataset.cast_column(column_name, datasets.Image(decode=False))
+            LOGGER.debug("HF streaming decode disabled for column '%s'", column_name)
+        except Exception:
+            continue
+
+    return dataset
+
+
+def _project_streaming_columns(dataset: Any, cfg: dict[str, Any]) -> Any:
+    schema = cfg.get("schema") or {}
+    requested: list[str] = []
+
+    for key in (
+        "image_field",
+        "url_field",
+        "id_field",
+    ):
+        value = schema.get(key)
+        if isinstance(value, str) and value:
+            requested.append(value)
+
+    for key in (
+        "image_field_candidates",
+        "url_field_candidates",
+        "extra_fields",
+    ):
+        for value in schema.get(key, []):
+            if isinstance(value, str) and value:
+                requested.append(value)
+
+    requested.extend(["image", "img", "id", "image_id"])
+
+    dedup_requested: list[str] = []
+    for value in requested:
+        if value not in dedup_requested:
+            dedup_requested.append(value)
+
+    available: set[str] = set()
+    column_names = getattr(dataset, "column_names", None)
+    if isinstance(column_names, list):
+        available.update(str(value) for value in column_names)
+
+    features = getattr(dataset, "features", None)
+    if isinstance(features, dict):
+        available.update(str(value) for value in features.keys())
+
+    if not available:
+        return dataset
+
+    selected = [name for name in dedup_requested if name in available]
+    if not selected:
+        return dataset
+
+    try:
+        return dataset.select_columns(selected)
+    except Exception:
+        return dataset

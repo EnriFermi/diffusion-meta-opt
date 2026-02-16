@@ -1,4 +1,6 @@
-# Full raw-data profile: all configured datasets except flickr30k.
+# Full raw-data profile for smoke: streaming-stable datasets except flickr30k.
+# Excluded from this profile:
+# - dtd_textures, wider_face: HF scripts require full-archive materialization.
 
 path: ${oc.env:DATA_ROOT,./data/datasets}
 seed: 42
@@ -17,7 +19,6 @@ enabled_datasets:
   - cord_v2
   - doclaynet_v11
   - docvqa_1200
-  - dtd_textures
   - eurosat_rgb
   - funsd
   - mapillary_vistas_v2
@@ -27,6 +28,5 @@ enabled_datasets:
   - scene_parse_150
   - stanford_cars
   - visual_genome
-  - wider_face
 
 dataset_overrides: {}

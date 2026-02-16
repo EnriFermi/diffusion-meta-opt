@@ -15,18 +15,19 @@ hf:
   repo: cvdl/oxford-pets
   subset: null
   split: train
-  streaming: false
+  streaming: true
   shuffle_buffer: 1000
   trust_remote_code: false
+  stream_via_datasets_server: true
 
 schema:
   image_mode: image_field
-  image_field: image
-  image_field_candidates: [image, img, pixel_values, jpg, png]
+  image_field: img
+  image_field_candidates: [img, image, pixel_values, jpg, png]
   url_field: null
   url_field_candidates: []
   id_field: null
-  extra_fields: [label, segmentation_mask, bbox]
+  extra_fields: [bbox, class, category]
 
 cache:
   num_chunks_kept: 2

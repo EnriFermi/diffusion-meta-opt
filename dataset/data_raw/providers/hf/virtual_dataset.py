@@ -16,6 +16,7 @@ from dataset.data_raw.core.fs_utils import ensure_dir, read_json, utc_now_iso, w
 from dataset.data_raw.core.image_utils import decode_to_pil, load_image
 from dataset.data_raw.core.types import ImageSample
 from dataset.data_raw.providers.hf.auth import init_hf_auth
+from dataset.data_raw.providers.hf.datasets_server_sampler import DatasetServerSampler
 from dataset.data_raw.providers.hf.hf_loader import load_hf_dataset
 from dataset.data_raw.providers.hf.url_fetch import fetch_image_to_cache
 from dataset.logging_utils import configure_root_logging
@@ -39,6 +40,7 @@ class HFVirtualDataset(BaseVirtualDataset):
         cache_cfg = self.cfg_dict.get("cache", {})
         self.num_chunks_kept = int(cache_cfg.get("num_chunks_kept", 2))
         self.chunk_cache = ChunkCache(self.dataset_root, num_chunks_kept=self.num_chunks_kept)
+        self.chunk_cache.cleanup_incomplete_chunks()
 
         worker_cfg = self.cfg_dict.get("worker", {})
         self.get_timeout_s = float(worker_cfg.get("get_timeout_s", 5.0))
@@ -362,20 +364,48 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
     max_chunk_build_seconds = float(worker_cfg.get("max_chunk_build_seconds", 20.0))
 
     cache = ChunkCache(dataset_root=dataset_root, num_chunks_kept=num_chunks_kept)
+    cleaned = cache.cleanup_incomplete_chunks()
+    if cleaned:
+        logger.info("Removed %s incomplete chunks at worker startup for dataset=%s", len(cleaned), dataset_name)
 
     rng = random.Random(seed + int(time.time()))
 
-    try:
-        dataset = load_hf_dataset(dataset_cfg, token=token, seed=seed)
-    except Exception as exc:
-        message = _format_dataset_load_error(dataset_cfg=dataset_cfg, exc=exc)
-        logger.exception("Dataset load failed for %s", dataset_name)
-        _emit_event(events_queue, {"type": "error", "dataset": dataset_name, "message": message})
-        return
-
     streaming = bool(dataset_cfg.get("hf", {}).get("streaming", False))
-    dataset_size = _safe_len(dataset) if not streaming else None
-    iterator = iter(dataset) if streaming else None
+    dataset = None
+    dataset_server_sampler: DatasetServerSampler | None = None
+    hf_local = dataset_cfg.get("hf", {})
+    if streaming and bool(hf_local.get("stream_via_datasets_server", False)):
+        try:
+            dataset_server_sampler = DatasetServerSampler(
+                repo=str(hf_local.get("repo")),
+                split=str(hf_local.get("split", "train")),
+                subset=hf_local.get("subset"),
+                token=token,
+                seed=seed,
+                timeout_s=max(5.0, float(request_timeout_s)),
+                max_retries=max(1, int(max_retries)),
+            )
+            logger.info(
+                "Using datasets-server sampler for dataset=%s config=%s split=%s num_examples=%s",
+                dataset_name,
+                dataset_server_sampler.config,
+                dataset_server_sampler.split,
+                dataset_server_sampler.num_examples,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("datasets-server sampler init failed for %s: %s. Falling back to load_dataset streaming.", dataset_name, exc)
+
+    if dataset_server_sampler is None:
+        try:
+            dataset = load_hf_dataset(dataset_cfg, token=token, seed=seed)
+        except Exception as exc:
+            message = _format_dataset_load_error(dataset_cfg=dataset_cfg, exc=exc)
+            logger.exception("Dataset load failed for %s", dataset_name)
+            _emit_event(events_queue, {"type": "error", "dataset": dataset_name, "message": message})
+            return
+
+    dataset_size = _safe_len(dataset) if (dataset is not None and not streaming) else None
+    iterator = iter(dataset) if (dataset is not None and streaming) else None
     stream_counter = 0
 
     logger.info("Worker started for dataset=%s streaming=%s", dataset_name, streaming)
@@ -415,16 +445,22 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
                     )
                     break
 
-                record, sample_id, iterator, stream_counter = _next_record(
-                    dataset=dataset,
-                    dataset_cfg=dataset_cfg,
-                    rng=rng,
-                    dataset_size=dataset_size,
-                    iterator=iterator,
-                    stream_counter=stream_counter,
-                    token=token,
-                    seed=seed,
-                )
+                try:
+                    record, sample_id, iterator, stream_counter = _next_record(
+                        dataset=dataset,
+                        dataset_cfg=dataset_cfg,
+                        rng=rng,
+                        dataset_size=dataset_size,
+                        iterator=iterator,
+                        stream_counter=stream_counter,
+                        token=token,
+                        seed=seed,
+                        dataset_server_sampler=dataset_server_sampler,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Record fetch failed for dataset=%s: %s", dataset_name, exc)
+                    time.sleep(max(0.1, idle_sleep_s))
+                    continue
                 if record is None:
                     continue
 
@@ -469,7 +505,7 @@ def _safe_len(dataset: Any) -> int | None:
 
 
 def _next_record(
-    dataset: Any,
+    dataset: Any | None,
     dataset_cfg: dict[str, Any],
     rng: random.Random,
     dataset_size: int | None,
@@ -477,12 +513,21 @@ def _next_record(
     stream_counter: int,
     token: str | None,
     seed: int,
+    dataset_server_sampler: DatasetServerSampler | None = None,
 ) -> tuple[dict[str, Any] | None, str | int, Any, int]:
     hf_cfg = dataset_cfg.get("hf", {})
     schema = dataset_cfg.get("schema", {})
     id_field = schema.get("id_field")
 
+    if dataset_server_sampler is not None:
+        record, server_sample_id = dataset_server_sampler.next_record()
+        stream_counter += 1
+        sample_id = _extract_sample_id(record, id_field=id_field, fallback=server_sample_id)
+        return record, sample_id, iterator, stream_counter
+
     if bool(hf_cfg.get("streaming", False)):
+        if dataset is None:
+            return None, "unknown", iterator, stream_counter
         if iterator is None:
             iterator = iter(dataset)
         try:
@@ -534,8 +579,15 @@ def _materialize_image(
         field = _resolve_image_field(record, schema)
         if field is None:
             return None
-        image = decode_to_pil(record[field])
-        image_path = cache.save_image(sample_id=sample_id, image=image, chunk_id=chunk_id)
+        image_value = record[field]
+        image_path = _materialize_image_field_value(
+            image_value=image_value,
+            sample_id=sample_id,
+            cache=cache,
+            chunk_id=chunk_id,
+            timeout=timeout,
+            retries=retries,
+        )
     elif mode == "url_field":
         url = _resolve_url(record, schema)
         if not url:
@@ -560,6 +612,52 @@ def _materialize_image(
             item_meta[extra_key] = _safe_meta_value(record[extra_key])
 
     return image_path, item_meta
+
+
+def _materialize_image_field_value(
+    image_value: Any,
+    sample_id: str | int,
+    cache: ChunkCache,
+    chunk_id: str,
+    timeout: int,
+    retries: int,
+) -> Path | None:
+    # `datasets.Image(decode=False)` may produce dict payloads with `bytes`, `path` or `src`.
+    if isinstance(image_value, dict):
+        bytes_value = image_value.get("bytes")
+        if bytes_value is not None:
+            image = decode_to_pil(bytes_value)
+            return cache.save_image(sample_id=sample_id, image=image, chunk_id=chunk_id)
+
+        for key in ("path", "src", "url"):
+            url_like = image_value.get(key)
+            if isinstance(url_like, str) and url_like.startswith(("http://", "https://")):
+                return fetch_image_to_cache(
+                    url=url_like,
+                    cache=cache,
+                    sample_key=sample_id,
+                    timeout=timeout,
+                    retries=retries,
+                    chunk_id=chunk_id,
+                )
+
+        path_value = image_value.get("path")
+        if isinstance(path_value, str) and path_value:
+            image = decode_to_pil({"path": path_value})
+            return cache.save_image(sample_id=sample_id, image=image, chunk_id=chunk_id)
+
+    if isinstance(image_value, str) and image_value.startswith(("http://", "https://")):
+        return fetch_image_to_cache(
+            url=image_value,
+            cache=cache,
+            sample_key=sample_id,
+            timeout=timeout,
+            retries=retries,
+            chunk_id=chunk_id,
+        )
+
+    image = decode_to_pil(image_value)
+    return cache.save_image(sample_id=sample_id, image=image, chunk_id=chunk_id)
 
 
 def _resolve_image_field(record: dict[str, Any], schema: dict[str, Any]) -> str | None:
