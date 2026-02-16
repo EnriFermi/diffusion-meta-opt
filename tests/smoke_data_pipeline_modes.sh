@@ -23,22 +23,26 @@ set -euo pipefail
 
 SCRIPT="tests/smoke_data_pipeline_modes.py"
 COMMON_ARGS=(
-  --data-profile "all_datasets_no_flickr30k"
+  --data-profile "kaggle_smoke"
+  --datasets "cord_v2,docvqa_1200,oxford_pets,stanford_cars"
   --data-root "./data"
-  --predownload
-  --chunk-size-samples 8
-  --raw-chunk-size-images 16
+  --chunk-size-samples 4
+  --raw-chunk-size-images 8
   --raw-num-chunks-kept 2
-  --xy-samples-random-slice 32
-  --target-samples 20
-  --turnover-probe-samples 24
-  --turnover-probe-timeout-seconds 240
-  --timeout-seconds 300
+  --xy-samples-random-slice 16
+  --target-samples 8
+  --turnover-probe-samples 8
+  --turnover-probe-timeout-seconds 120
+  --timeout-seconds 180
+  --dataset-model cord_v2=clip_vit_b32
+  --dataset-model docvqa_1200=clip_vit_b32
+  --dataset-model oxford_pets=clip_vit_b32
+  --dataset-model stanford_cars=clip_vit_b32
   --hf-token "$HF_TOKEN"
 )
 
 # -----------------------------------------------------------------------------
-# (1) MODE=none (in-memory) [АКТИВЕН ПО УМОЛЧАНИЮ]
+# (1) MODE=none (in-memory)
 # -----------------------------------------------------------------------------
 # pipenv run python "$SCRIPT" \
 #   --mode none \
@@ -48,16 +52,16 @@ COMMON_ARGS=(
 #   "${COMMON_ARGS[@]}"
 
 # -----------------------------------------------------------------------------
-# (2) MODE=local_disk (chunk streaming на локальном диске)
+# (2) MODE=local_disk (chunk streaming на локальном диске) [АКТИВЕН ПО УМОЛЧАНИЮ]
 # -----------------------------------------------------------------------------
-python "$SCRIPT" \
+pipenv run python "$SCRIPT" \
   --mode local_disk \
   --train-device "cuda:0" \
   --collector-device "cuda:1" \
   --collector-mode "auto" \
-  --chunk-size-samples 64 \
-  --local-ready-store-max-chunks 40 \
-  --local-refill-after-consumed-chunks 20 \
+  --chunk-size-samples 8 \
+  --local-ready-store-max-chunks 12 \
+  --local-refill-after-consumed-chunks 6 \
   "${COMMON_ARGS[@]}"
 
 # -----------------------------------------------------------------------------
