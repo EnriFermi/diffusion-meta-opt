@@ -48,6 +48,7 @@ def resolve_streaming_cfg(cfg: dict[str, Any] | None) -> dict[str, Any]:
     # Canonical consumer keys.
     consumer_cfg.setdefault("cache_dir", None)
     consumer_cfg.setdefault("prefetch_max_chunks", 16)
+    consumer_cfg.setdefault("randomize_chunk_order", False)
     consumer_cfg.setdefault("randomize_within_chunk", True)
     consumer_cfg.setdefault("random_seed", None)
 
@@ -131,6 +132,7 @@ def build_chunk_reader(streaming_cfg: dict[str, Any], store: ChunkStore) -> Chun
         prefetch_max_chunks=int(consumer_cfg.get("prefetch_max_chunks", 16)),
         delete_remote_after=str(consumer_cfg.get("delete_remote_after", "consume")),
         distributed_cfg=dict(streaming_cfg.get("distributed", {})),
+        randomize_chunk_order=bool(consumer_cfg.get("randomize_chunk_order", False)),
         randomize_within_chunk=bool(consumer_cfg.get("randomize_within_chunk", True)),
         random_seed=int(consumer_cfg["random_seed"]) if consumer_cfg.get("random_seed") is not None else None,
     )

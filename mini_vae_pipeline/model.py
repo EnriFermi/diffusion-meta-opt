@@ -1,0 +1,266 @@
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from omegaconf import DictConfig
+
+from models.weight_quantile_vae import DistributionConfig, InputDistributionEncodingModule, MiniPatchVAE, MiniVAEConfig
+
+
+def build_distribution_config(cfg: DictConfig, section: str = "mini_model") -> DistributionConfig:
+    model_cfg = cfg.get(section, {})
+    dist_cfg = model_cfg.get("distribution", {})
+
+    return DistributionConfig(
+        k_s=int(dist_cfg.get("k_s", 16)),
+        Kq=int(dist_cfg.get("Kq", 32)),
+        d_var=int(dist_cfg.get("d_var", 128)),
+        d_dist=int(dist_cfg.get("d_dist", 128)),
+        num_var_attn_layers=int(dist_cfg.get("num_var_attn_layers", 2)),
+        var_attn_heads=int(dist_cfg.get("var_attn_heads", 4)),
+        dcn_num_cross_layers=int(dist_cfg.get("dcn_num_cross_layers", 3)),
+        dcn_deep_hidden=int(dist_cfg.get("dcn_deep_hidden", 0)),
+        dcn_deep_layers=int(dist_cfg.get("dcn_deep_layers", 0)),
+        dropout=float(dist_cfg.get("dropout", 0.0)),
+    )
+
+
+def build_mini_vae_config(cfg: DictConfig, section: str = "mini_model") -> MiniVAEConfig:
+    model_cfg = cfg.get(section, {})
+    mini_cfg = model_cfg.get("mini_vae", {})
+
+    return MiniVAEConfig(
+        z_dim=int(mini_cfg.get("z_dim", 64)),
+        d_e=int(mini_cfg.get("d_e", 128)),
+        pos_dim=int(mini_cfg.get("pos_dim", 32)),
+        num_attn_layers_encoder=int(mini_cfg.get("num_attn_layers_encoder", 2)),
+        num_layers_decoder=int(mini_cfg.get("num_layers_decoder", 2)),
+        n_heads=int(mini_cfg.get("n_heads", 4)),
+        d_patch=int(mini_cfg.get("d_patch", 64)),
+        dropout=float(mini_cfg.get("dropout", 0.0)),
+    )
+
+
+class MiniPatchTrainingModel(nn.Module):
+    """Joint module for MiniPatchVAE pretraining with structure/behavior/contrastive objectives."""
+
+    def __init__(self, distribution_cfg: DistributionConfig, mini_cfg: MiniVAEConfig) -> None:
+        super().__init__()
+        self.distribution_encoder = InputDistributionEncodingModule(distribution_cfg)
+        self.mini_vae = MiniPatchVAE(d_var=distribution_cfg.d_var, cfg=mini_cfg)
+
+    @staticmethod
+    def patch_behavioral_mse(X_patch: torch.Tensor, w_patch: torch.Tensor, w_hat: torch.Tensor) -> torch.Tensor:
+        # X_patch: [B_p, n, p], w_patch/w_hat: [B_p, p]
+        y = torch.einsum("bnp,bp->bn", X_patch, w_patch)
+        y_hat = torch.einsum("bnp,bp->bn", X_patch, w_hat)
+        return F.mse_loss(y_hat, y)
+
+    @staticmethod
+    def nt_xent_loss(z_view1: torch.Tensor, z_view2: torch.Tensor, temperature: float) -> torch.Tensor:
+        if z_view1.ndim != 2 or z_view2.ndim != 2:
+            raise ValueError(
+                f"NT-Xent expects rank-2 tensors, got {tuple(z_view1.shape)} and {tuple(z_view2.shape)}"
+            )
+        if z_view1.shape != z_view2.shape:
+            raise ValueError(
+                f"NT-Xent expects same shapes, got {tuple(z_view1.shape)} and {tuple(z_view2.shape)}"
+            )
+
+        batch = int(z_view1.shape[0])
+        if batch < 2:
+            return z_view1.new_zeros(())
+
+        temp = max(float(temperature), 1e-6)
+        reps = torch.cat(
+            [
+                F.normalize(z_view1, p=2, dim=-1),
+                F.normalize(z_view2, p=2, dim=-1),
+            ],
+            dim=0,
+        )  # [2B, d]
+        logits = torch.matmul(reps, reps.transpose(0, 1)) / temp
+
+        diag_mask = torch.eye(logits.shape[0], dtype=torch.bool, device=logits.device)
+        logits = logits.masked_fill(diag_mask, torch.finfo(logits.dtype).min)
+
+        pos_idx = torch.arange(batch, device=logits.device, dtype=torch.long)
+        pos_idx = torch.cat([pos_idx + batch, pos_idx], dim=0)  # [2B]
+
+        log_prob = F.log_softmax(logits, dim=1)
+        row_idx = torch.arange(2 * batch, device=logits.device, dtype=torch.long)
+        return -log_prob[row_idx, pos_idx].mean()
+
+    @staticmethod
+    def function_preserving_linear_view(
+        x_layer: torch.Tensor,
+        W_layer: torch.Tensor,
+        *,
+        permute_inputs: bool,
+        sign_flip_inputs: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # x_layer: [n, d_in], W_layer: [d_in, d_out]
+        if x_layer.ndim != 2 or W_layer.ndim != 2:
+            raise ValueError(
+                f"Expected x_layer=[n,d_in], W_layer=[d_in,d_out], got {tuple(x_layer.shape)} and {tuple(W_layer.shape)}"
+            )
+        if x_layer.shape[1] != W_layer.shape[0]:
+            raise ValueError(f"Shape mismatch: x_layer={tuple(x_layer.shape)} W_layer={tuple(W_layer.shape)}")
+
+        x_aug = x_layer
+        W_aug = W_layer
+        d_in = int(x_layer.shape[1])
+
+        if permute_inputs and d_in > 1:
+            perm = torch.randperm(d_in, device=x_layer.device)
+            x_aug = x_aug.index_select(1, perm)
+            W_aug = W_aug.index_select(0, perm)
+
+        if sign_flip_inputs:
+            sign_bits = torch.randint(0, 2, (d_in,), device=x_layer.device)
+            signs = sign_bits.to(dtype=x_aug.dtype) * 2.0 - 1.0  # {-1, +1}
+            x_aug = x_aug * signs.unsqueeze(0)
+            W_aug = W_aug * signs.unsqueeze(1)
+
+        return x_aug.contiguous(), W_aug.contiguous()
+
+    @staticmethod
+    def build_patch_batch_from_layer(
+        x_layer: torch.Tensor,
+        W_layer: torch.Tensor,
+        patch_idx: torch.Tensor,
+        out_idx: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # x_layer: [n, d_in], W_layer: [d_in, d_out]
+        # patch_idx: [B_p, p], out_idx: [B_p]
+        if x_layer.ndim != 2 or W_layer.ndim != 2:
+            raise ValueError(
+                f"Expected x_layer=[n,d_in], W_layer=[d_in,d_out], got {tuple(x_layer.shape)} and {tuple(W_layer.shape)}"
+            )
+        if patch_idx.ndim != 2:
+            raise ValueError(f"patch_idx must be [B_p,p], got {tuple(patch_idx.shape)}")
+        if out_idx.ndim != 1:
+            raise ValueError(f"out_idx must be [B_p], got {tuple(out_idx.shape)}")
+
+        n, d_in = x_layer.shape
+        d_in_w, d_out = W_layer.shape
+        if d_in_w != d_in:
+            raise ValueError(f"Shape mismatch: x_layer={tuple(x_layer.shape)} W_layer={tuple(W_layer.shape)}")
+
+        batch_patches, _ = patch_idx.shape
+        if out_idx.shape[0] != batch_patches:
+            raise ValueError(
+                f"out_idx length ({int(out_idx.shape[0])}) must match patch_idx batch ({batch_patches})"
+            )
+
+        patch_idx_safe = patch_idx.to(dtype=torch.long, device=x_layer.device).clamp(min=0, max=max(0, d_in - 1))
+        out_idx_safe = out_idx.to(dtype=torch.long, device=x_layer.device).clamp(min=0, max=max(0, d_out - 1))
+
+        X_full = x_layer.unsqueeze(0).expand(batch_patches, -1, -1).contiguous()
+        X_patch = X_full.gather(dim=2, index=patch_idx_safe.unsqueeze(1).expand(-1, n, -1))
+
+        W_col = W_layer.transpose(0, 1).index_select(0, out_idx_safe).contiguous()  # [B_p, d_in]
+        w_patch = W_col.gather(dim=1, index=patch_idx_safe)
+        return X_full, X_patch, w_patch
+
+    def contrastive_loss(
+        self,
+        *,
+        X_full: torch.Tensor,
+        patch_idx: torch.Tensor,
+        out_idx: torch.Tensor | None,
+        W_full: torch.Tensor | None,
+        alpha: float,
+        temperature: float,
+        permute_inputs: bool,
+        sign_flip_inputs: bool,
+    ) -> torch.Tensor:
+        if float(alpha) <= 0.0:
+            return X_full.new_zeros(())
+
+        if W_full is None or out_idx is None:
+            return X_full.new_zeros(())
+
+        if X_full.ndim != 3:
+            raise ValueError(f"X_full must be [B_p,n,d_in], got {tuple(X_full.shape)}")
+        if W_full.ndim != 2:
+            raise ValueError(f"W_full must be [d_in,d_out], got {tuple(W_full.shape)}")
+
+        # sample_patch_batch currently replicates one layer input x across patch-batch.
+        x_layer = X_full[0]
+
+        x_view1, W_view1 = self.function_preserving_linear_view(
+            x_layer=x_layer,
+            W_layer=W_full,
+            permute_inputs=permute_inputs,
+            sign_flip_inputs=sign_flip_inputs,
+        )
+        x_view2, W_view2 = self.function_preserving_linear_view(
+            x_layer=x_layer,
+            W_layer=W_full,
+            permute_inputs=permute_inputs,
+            sign_flip_inputs=sign_flip_inputs,
+        )
+
+        X_full_view1, _, w_patch_view1 = self.build_patch_batch_from_layer(
+            x_layer=x_view1,
+            W_layer=W_view1,
+            patch_idx=patch_idx,
+            out_idx=out_idx,
+        )
+        X_full_view2, _, w_patch_view2 = self.build_patch_batch_from_layer(
+            x_layer=x_view2,
+            W_layer=W_view2,
+            patch_idx=patch_idx,
+            out_idx=out_idx,
+        )
+
+        dist_var_view1, _ = self.distribution_encoder(X=X_full_view1, patch_idx=patch_idx)
+        dist_var_view2, _ = self.distribution_encoder(X=X_full_view2, patch_idx=patch_idx)
+
+        mu_view1, _ = self.mini_vae.encode(w_patch=w_patch_view1, dist_var_tokens=dist_var_view1)
+        mu_view2, _ = self.mini_vae.encode(w_patch=w_patch_view2, dist_var_tokens=dist_var_view2)
+        return self.nt_xent_loss(mu_view1, mu_view2, temperature=temperature)
+
+    def forward(
+        self,
+        X_full: torch.Tensor,
+        X_patch: torch.Tensor,
+        w_patch: torch.Tensor,
+        patch_idx: torch.Tensor,
+        kl_beta: float,
+        alpha: float,
+        beta: float,
+        contrastive_temperature: float,
+        contrastive_permute_inputs: bool,
+        contrastive_sign_flip_inputs: bool,
+        W_full: torch.Tensor | None = None,
+        out_idx: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # X_full: [B_p, n, d_in]
+        # X_patch: [B_p, n, p]
+        # w_patch: [B_p, p]
+        # patch_idx: [B_p, p]
+        dist_var_tokens, _ = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
+        w_hat, mu, logvar, _ = self.mini_vae(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+
+        structural_loss = F.mse_loss(w_hat, w_patch)
+        behavioral_loss = self.patch_behavioral_mse(X_patch=X_patch, w_patch=w_patch, w_hat=w_hat)
+        recon_mix_loss = float(beta) * structural_loss + (1.0 - float(beta)) * behavioral_loss
+
+        contrastive_loss = self.contrastive_loss(
+            X_full=X_full,
+            patch_idx=patch_idx,
+            out_idx=out_idx,
+            W_full=W_full,
+            alpha=alpha,
+            temperature=contrastive_temperature,
+            permute_inputs=contrastive_permute_inputs,
+            sign_flip_inputs=contrastive_sign_flip_inputs,
+        )
+
+        kl_loss = self.mini_vae.kl_loss(mu=mu, logvar=logvar)
+        total_core_loss = float(alpha) * contrastive_loss + (1.0 - float(alpha)) * recon_mix_loss
+        total_loss = total_core_loss + float(kl_beta) * kl_loss
+        return total_loss, structural_loss, behavioral_loss, contrastive_loss, recon_mix_loss, kl_loss

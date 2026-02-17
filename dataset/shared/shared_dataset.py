@@ -52,6 +52,16 @@ class SharedModelDataset(torch.utils.data.IterableDataset):
     def cache_size(self) -> int:
         return self.collector.cache_size()
 
+    def debug_snapshot(self, preview: int = 5) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "streaming_mode": self.collector.streaming_mode,
+            "cache_metric": self.cache_size(),
+        }
+
+        if self.collector.streaming_mode != "none" and self._reader is not None:
+            payload["reader"] = self._reader.debug_snapshot(preview=preview)
+        return payload
+
     def close(self) -> None:
         if self._reader is not None:
             self._reader.close()

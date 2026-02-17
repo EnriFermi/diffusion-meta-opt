@@ -105,7 +105,7 @@ class DCNv2(nn.Module):
 @dataclass(slots=True)
 class DistributionConfig:
     k_s: int = 16
-    Kq: int = 32
+    Kq: int = 32  # Legacy field; not used in current quantile-conv path.
     d_var: int = 128
     d_dist: int = 128
     num_var_attn_layers: int = 2
@@ -132,18 +132,21 @@ class InputDistributionEncodingModule(nn.Module):
     def __init__(self, cfg: DistributionConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        if cfg.k_s < 2:
-            raise ValueError(f"k_s must be >= 2 to enforce quantile normalization endpoints, got {cfg.k_s}")
+        if cfg.k_s < 3:
+            raise ValueError(
+                f"k_s must be >= 3 for kernel_size=3 quantile conv (output length k_s-2), got {cfg.k_s}"
+            )
 
         if cfg.d_var % cfg.var_attn_heads != 0:
             raise ValueError(f"d_var ({cfg.d_var}) must be divisible by var_attn_heads ({cfg.var_attn_heads})")
 
-        # Conv along quantile axis only, shared across variables (via reshape to [B*p, 1, k_s]).
-        self.quantile_conv = nn.Conv1d(in_channels=1, out_channels=cfg.Kq, kernel_size=3, padding=1)
+        # Single-channel conv along quantile axis (no padding).
+        # [B*p, 1, k_s] -> [B*p, 1, k_s - 2]
+        self.quantile_conv = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=3, padding=0)
 
-        # Shared per-variable MLP: (Kq + 2) -> d_var.
+        # Shared per-variable MLP: ((k_s - 2) + 2) -> d_var.
         self.var_mlp = nn.Sequential(
-            nn.Linear(cfg.Kq + 2, cfg.d_var),
+            nn.Linear(cfg.k_s, cfg.d_var),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
             nn.Linear(cfg.d_var, cfg.d_var),
@@ -224,11 +227,11 @@ class InputDistributionEncodingModule(nn.Module):
         q_var_major = q.permute(0, 2, 1).contiguous()
         q_conv_in = q_var_major.view(B * p, 1, self.cfg.k_s)
 
-        # q_conv_seq: [B*p, Kq, k_s] -> q_conv: [B, p, Kq]
+        # q_conv_seq: [B*p, 1, k_s - 2] -> q_conv: [B, p, k_s - 2]
         q_conv_seq = self.quantile_conv(q_conv_in)
-        q_conv = q_conv_seq.mean(dim=-1).view(B, p, self.cfg.Kq)
+        q_conv = q_conv_seq.squeeze(1).reshape(B, p, self.cfg.k_s - 2)
 
-        # Per-variable features: [B, p, Kq + 2]
+        # Per-variable features: [B, p, (k_s - 2) + 2] = [B, p, k_s]
         f = torch.cat([q_conv, mu_log.unsqueeze(-1), sigma_log.unsqueeze(-1)], dim=-1)
 
         # Shared var MLP: [B, p, d_var]
@@ -250,6 +253,7 @@ class InputDistributionEncodingModule(nn.Module):
 class MiniVAEConfig:
     z_dim: int = 64
     d_e: int = 128
+    pos_dim: int = 32
     num_attn_layers_encoder: int = 2
     num_layers_decoder: int = 2
     n_heads: int = 4
@@ -267,10 +271,12 @@ class MiniPatchEncoder(nn.Module):
 
         if cfg.d_e % cfg.n_heads != 0:
             raise ValueError(f"mini d_e ({cfg.d_e}) must be divisible by n_heads ({cfg.n_heads})")
+        if cfg.pos_dim <= 0:
+            raise ValueError(f"mini pos_dim must be positive, got {cfg.pos_dim}")
 
-        # Per-element embed: (1 + d_var) -> d_e.
+        # Per-element embed: (1 + d_var + pos_dim) -> d_e.
         self.elem_embed = nn.Sequential(
-            nn.Linear(1 + d_var, cfg.d_e),
+            nn.Linear(1 + d_var + cfg.pos_dim, cfg.d_e),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
             nn.Linear(cfg.d_e, cfg.d_e),
@@ -286,6 +292,8 @@ class MiniPatchEncoder(nn.Module):
             activation="gelu",
         )
         self.set_encoder = nn.TransformerEncoder(enc_layer, num_layers=max(1, cfg.num_attn_layers_encoder))
+        self.cls_token = nn.Parameter(torch.zeros(cfg.d_e))
+        self.head_norm = nn.LayerNorm(cfg.d_e)
 
         self.to_mu = nn.Linear(cfg.d_e, cfg.z_dim)
         self.to_logvar = nn.Linear(cfg.d_e, cfg.z_dim)
@@ -310,17 +318,27 @@ class MiniPatchEncoder(nn.Module):
         if d_var != self.d_var:
             raise ValueError(f"dist_var_tokens last dim must be {self.d_var}, got {d_var}")
 
-        # T: [B, p, 1 + d_var]
-        t = torch.cat([w_patch.unsqueeze(-1), dist_var_tokens], dim=-1)
+        # Deterministic per-position embedding: [p, pos_dim] -> [B, p, pos_dim]
+        pos = sinusoidal_embedding(torch.arange(p, device=w_patch.device), dim=self.cfg.pos_dim).to(dtype=w_patch.dtype)
+        pos_expand = pos.unsqueeze(0).expand(B, -1, -1)
+
+        # T: [B, p, 1 + d_var + pos_dim]
+        t = torch.cat([w_patch.unsqueeze(-1), dist_var_tokens, pos_expand], dim=-1)
 
         # E: [B, p, d_e]
         e = self.elem_embed(t)
 
-        # E_ctx: [B, p, d_e]
-        e_ctx = self.set_encoder(e)
+        # Prepend learnable CLS token and use its output as sequence summary.
+        # cls: [B, 1, d_e], enc_in: [B, 1 + p, d_e]
+        cls = self.cls_token.to(dtype=e.dtype).view(1, 1, -1).expand(B, 1, -1)
+        enc_in = torch.cat([cls, e], dim=1)
 
-        # h: [B, d_e]
-        h = e_ctx.mean(dim=1)
+        # E_ctx: [B, 1 + p, d_e]
+        e_ctx = self.set_encoder(enc_in)
+
+        # h: [B, d_e] from CLS readout.
+        h = e_ctx[:, 0, :]
+        h = self.head_norm(h)
 
         # mu/logvar: [B, z_dim]
         mu = self.to_mu(h)
@@ -335,16 +353,16 @@ class MiniPatchEncoder(nn.Module):
 
 
 class MiniPatchDecoder(nn.Module):
-    """Per-element decoder conditioned on z and dist_var_tokens."""
+    """Per-element decoder conditioned on z only."""
 
-    def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
+    def __init__(self, cfg: MiniVAEConfig) -> None:
         super().__init__()
         self.cfg = cfg
 
         if cfg.d_e % cfg.n_heads != 0:
             raise ValueError(f"mini d_e ({cfg.d_e}) must be divisible by n_heads ({cfg.n_heads})")
 
-        self.in_proj = nn.Linear(cfg.z_dim + d_var, cfg.d_e)
+        self.in_proj = nn.Linear(cfg.z_dim, cfg.d_e)
 
         if cfg.num_layers_decoder > 0:
             dec_layer = nn.TransformerEncoderLayer(
@@ -366,24 +384,20 @@ class MiniPatchDecoder(nn.Module):
             nn.Linear(cfg.d_e, 1),
         )
 
-    def forward(self, z: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, patch_size: int) -> torch.Tensor:
         # z: [B, z_dim]
-        # dist_var_tokens: [B, p, d_var]
+        # patch_size: p
         if z.ndim != 2:
             raise ValueError(f"z must be [B, z_dim], got {tuple(z.shape)}")
-        if dist_var_tokens.ndim != 3:
-            raise ValueError(f"dist_var_tokens must be [B, p, d_var], got {tuple(dist_var_tokens.shape)}")
-
-        B, p, _ = dist_var_tokens.shape
-
-        # z_expand: [B, p, z_dim]
-        z_expand = z.unsqueeze(1).expand(-1, p, -1)
-
-        # u: [B, p, z_dim + d_var]
-        u = torch.cat([z_expand, dist_var_tokens], dim=-1)
+        if patch_size <= 0:
+            raise ValueError(f"patch_size must be positive, got {patch_size}")
 
         # h: [B, p, d_e]
-        h = self.in_proj(u)
+        B = z.shape[0]
+        p = int(patch_size)
+        z_token = self.in_proj(z).unsqueeze(1)  # [B, 1, d_e]
+        pos = sinusoidal_embedding(torch.arange(p, device=z.device), dim=self.cfg.d_e).to(dtype=z.dtype)  # [p, d_e]
+        h = z_token + pos.unsqueeze(0).expand(B, -1, -1)
         h = self.decoder_context(h)
 
         # w_hat: [B, p]
@@ -397,7 +411,7 @@ class MiniPatchVAE(nn.Module):
 
     Methods:
     - encode(w_patch, dist_var_tokens) -> mu, logvar
-    - decode(z, dist_var_tokens) -> w_hat
+    - decode(z, patch_size) -> w_hat
     - encode_patch(w_patch, dist_var_tokens) -> patch_token (for BigWeightVAE)
     """
 
@@ -405,7 +419,7 @@ class MiniPatchVAE(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.encoder = MiniPatchEncoder(d_var=d_var, cfg=cfg)
-        self.decoder = MiniPatchDecoder(d_var=d_var, cfg=cfg)
+        self.decoder = MiniPatchDecoder(cfg=cfg)
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -422,8 +436,8 @@ class MiniPatchVAE(nn.Module):
     def encode(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.encoder.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
 
-    def decode(self, z: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
-        return self.decoder(z=z, dist_var_tokens=dist_var_tokens)
+    def decode(self, z: torch.Tensor, patch_size: int) -> torch.Tensor:
+        return self.decoder(z=z, patch_size=patch_size)
 
     def encode_patch(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
         return self.encoder.encode_patch(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
@@ -432,7 +446,7 @@ class MiniPatchVAE(nn.Module):
         # w_patch: [B, p], dist_var_tokens: [B, p, d_var]
         mu, logvar = self.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
         z = self.reparameterize(mu=mu, logvar=logvar)
-        w_hat = self.decode(z=z, dist_var_tokens=dist_var_tokens)
+        w_hat = self.decode(z=z, patch_size=w_patch.shape[1])
         return w_hat, mu, logvar, z
 
 

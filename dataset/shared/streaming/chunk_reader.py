@@ -31,6 +31,7 @@ class ChunkReader:
         prefetch_max_chunks: int,
         delete_remote_after: str,
         distributed_cfg: dict[str, Any] | None,
+        randomize_chunk_order: bool = False,
         randomize_within_chunk: bool = True,
         random_seed: int | None = None,
     ) -> None:
@@ -46,6 +47,7 @@ class ChunkReader:
         self.distributed: DistributedSettings = resolve_distributed_settings(distributed_cfg)
 
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.randomize_chunk_order = bool(randomize_chunk_order)
         self.randomize_within_chunk = bool(randomize_within_chunk)
         self._rng = random.Random(random_seed if random_seed is not None else time.time_ns())
 
@@ -108,6 +110,33 @@ class ChunkReader:
             except Exception:
                 pass
 
+    def debug_snapshot(self, preview: int = 5) -> dict[str, Any]:
+        preview_int = max(1, int(preview))
+        pending_items = list(self._pending_chunks)
+        pending_chunk_ids = [item.ref.chunk_id for item in pending_items[:preview_int]]
+        active_chunk_id = self._active_chunk.ref.chunk_id if self._active_chunk is not None else None
+
+        active_total = len(self._active_samples)
+        active_remaining = max(0, active_total - int(self._active_index))
+
+        local_cache_files = [
+            path.name
+            for path in self.cache_dir.iterdir()
+            if path.is_file() and not path.name.endswith(".tmp")
+        ]
+        local_cache_files.sort()
+
+        return {
+            "pending_chunks_count": len(pending_items),
+            "pending_chunk_ids_head": pending_chunk_ids,
+            "active_chunk_id": active_chunk_id,
+            "active_samples_total": int(active_total),
+            "active_samples_remaining": int(active_remaining),
+            "known_chunk_ids_count": int(len(self._known_chunk_ids)),
+            "local_cache_files_count": int(len(local_cache_files)),
+            "local_cache_files_head": local_cache_files[:preview_int],
+        }
+
     def _rotate_chunk(self) -> None:
         self._finalize_active_chunk()
         self._prefetch_once()
@@ -134,7 +163,10 @@ class ChunkReader:
             if not refs:
                 return
 
-            ref = refs[0]
+            if self.randomize_chunk_order:
+                ref = self._rng.choice(refs)
+            else:
+                ref = refs[0]
             self._known_chunk_ids.add(ref.chunk_id)
 
             target = self.cache_dir / _chunk_filename(ref)
