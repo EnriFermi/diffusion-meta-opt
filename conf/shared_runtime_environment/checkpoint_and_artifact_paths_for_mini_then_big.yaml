@@ -1,0 +1,4 @@
+training_artifacts:
+  mini_vae_checkpoint_dir: ./checkpoints/mini_patch_vae
+  big_vae_checkpoint_dir: ./checkpoints/weight_quantile_vae
+  mini_encoder_latest_checkpoint: ${training_artifacts.mini_vae_checkpoint_dir}/mini_encoder_latest.pt

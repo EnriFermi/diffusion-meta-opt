@@ -1,0 +1,10 @@
+seed: 42
+output_format: pil
+image_size: 224
+log_level: INFO
+max_loaded_models: 1
+
+dataset_config_dirs:
+  - conf/data/datasets
+
+dataset_overrides: {}

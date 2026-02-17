@@ -1,0 +1,4 @@
+mode: s3_bridge
+
+producer:
+  refill_after_consumed_chunks: 250

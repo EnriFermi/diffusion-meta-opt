@@ -1,16 +1,6 @@
-from .weight_quantile_vae import (
-    BigVAEConfig,
-    BigWeightVAE,
-    DCNv2,
-    DistributionConfig,
-    EncoderConfig,
-    InputDistributionEncodingModule,
-    MiniPatchVAE,
-    MiniVAEConfig,
-    ModelConfig,
-    ResamplerConfig,
-    WeightQuantileVAE,
-)
+from .big_weight_vae import BigVAEConfig, BigWeightVAE, EncoderConfig, ModelConfig, ResamplerConfig, WeightQuantileVAE
+from .distribution_encoder import DCNv2, DistributionConfig, InputDistributionEncodingModule
+from .mini_patch_vae import MiniPatchVAE, MiniVAEConfig
 
 __all__ = [
     "InputDistributionEncodingModule",

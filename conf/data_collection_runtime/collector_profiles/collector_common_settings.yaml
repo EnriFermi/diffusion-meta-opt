@@ -1,0 +1,34 @@
+enabled: true
+device: null
+mode: auto
+max_loaded_models: 1
+pin_gpu: false
+release_device_on_unload: true
+empty_cuda_cache_on_unload: true
+
+# round_robin_shuffled | weighted_random
+model_selection_strategy: round_robin_shuffled
+jobs_per_selected_model: 1
+
+# uniform_random | weighted_random
+dataset_sampling_strategy: weighted_random
+max_dataset_fraction_per_batch: 0.6
+
+num_inflight_jobs: 1
+status_emit_interval_s: 2.0
+status_queue_max_items: 2048
+
+in_memory_buffer:
+  capacity_samples: 3000
+  fill_target_samples: 3000
+  low_watermark_samples: 1500
+
+interleaved_schedule:
+  collect_every_n_train_steps: 30
+  collector_jobs_per_cycle: 1
+
+layer_output_splitting:
+  # Mandatory positive integer.
+  # If layer rows N <= xy_samples_random_slice -> keep full x/y.
+  # If N > xy_samples_random_slice -> keep random linked x/y pairs of this size.
+  xy_samples_random_slice: 256

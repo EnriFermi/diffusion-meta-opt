@@ -1,7 +1,3 @@
-patch_size: 16
-beta: 0.001
-mini_encoder_ckpt_path: ""
-
 distribution:
   k_s: 16
   Kq: 32
@@ -17,22 +13,9 @@ distribution:
 mini_vae:
   z_dim: 64
   d_e: 128
+  pos_dim: 32
   num_attn_layers_encoder: 2
   num_layers_decoder: 2
   n_heads: 4
   d_patch: 64
   dropout: 0.0
-
-big_vae:
-  d_model: 256
-  d_lat: 256
-  num_latents: 32
-  num_encoder_layers: 4
-  num_decoder_layers: 4
-  n_heads: 8
-  ffn_mult: 4.0
-  dropout: 0.0
-  pos_fourier_dim: 64
-  encoder:
-    self_attn_mode: full
-    cross_attend_only_cls: true

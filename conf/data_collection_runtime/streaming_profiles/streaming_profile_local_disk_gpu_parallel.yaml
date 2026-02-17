@@ -1,0 +1,8 @@
+mode: local_disk
+
+producer:
+  ready_store_max_chunks: 400
+  refill_after_consumed_chunks: 200
+
+consumer:
+  randomize_chunk_order: true
