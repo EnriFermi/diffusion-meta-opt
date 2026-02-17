@@ -6,7 +6,7 @@ defaults:
   - /data_collection_runtime/data_profiles@data: data_profile_for_mini_vae_training
 
   - /data_collection_runtime/collector_profiles@collector: collector_common_settings
-  - /data_collection_runtime/collector_profiles@collector: collector_profile_interleaved
+  - /data_collection_runtime/collector_profiles@collector: collector_profile_async_gpu1
 
   - /data_collection_runtime/streaming_profiles@streaming: streaming_common_settings
   - /data_collection_runtime/streaming_profiles@streaming: streaming_profile_local_disk_gpu_parallel
