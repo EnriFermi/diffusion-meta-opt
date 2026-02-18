@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
 # Запускайте из корня репозитория.
 # В этом файле 3 готовых smoke-вызова:
@@ -22,24 +22,6 @@ set -euo pipefail
 : "${HF_TOKEN:?Set HF_TOKEN before running this script (export HF_TOKEN=hf_...)}"
 
 SCRIPT="tests/smoke_data_pipeline_modes.py"
-COMMON_ARGS=(
-  --data-profile "kaggle_smoke"
-  --datasets "cord_v2,docvqa_1200,oxford_pets,stanford_cars"
-  --data-root "./data"
-  --chunk-size-samples 4
-  --raw-chunk-size-images 8
-  --raw-num-chunks-kept 2
-  --xy-samples-random-slice 16
-  --target-samples 8
-  --turnover-probe-samples 8
-  --turnover-probe-timeout-seconds 120
-  --timeout-seconds 180
-  --dataset-model cord_v2=clip_vit_b32
-  --dataset-model docvqa_1200=clip_vit_b32
-  --dataset-model oxford_pets=clip_vit_b32
-  --dataset-model stanford_cars=clip_vit_b32
-  --hf-token "$HF_TOKEN"
-)
 
 # -----------------------------------------------------------------------------
 # (1) MODE=none (in-memory)
@@ -49,7 +31,22 @@ COMMON_ARGS=(
 #   --train-device "cuda:0" \
 #   --collector-device "null" \
 #   --collector-mode "auto" \
-#   "${COMMON_ARGS[@]}"
+#   --data-profile "kaggle_smoke" \
+#   --datasets "cord_v2,docvqa_1200,oxford_pets,stanford_cars" \
+#   --data-root "./data" \
+#   --chunk-size-samples 4 \
+#   --raw-chunk-size-images 8 \
+#   --raw-num-chunks-kept 2 \
+#   --xy-samples-random-slice 16 \
+#   --target-samples 8 \
+#   --turnover-probe-samples 8 \
+#   --turnover-probe-timeout-seconds 120 \
+#   --timeout-seconds 180 \
+#   --dataset-model cord_v2=clip_vit_b32 \
+#   --dataset-model docvqa_1200=clip_vit_b32 \
+#   --dataset-model oxford_pets=clip_vit_b32 \
+#   --dataset-model stanford_cars=clip_vit_b32 \
+#   --hf-token "$HF_TOKEN"
 
 # -----------------------------------------------------------------------------
 # (2) MODE=local_disk (chunk streaming на локальном диске) [АКТИВЕН ПО УМОЛЧАНИЮ]
@@ -62,7 +59,22 @@ pipenv run python "$SCRIPT" \
   --chunk-size-samples 8 \
   --local-ready-store-max-chunks 12 \
   --local-refill-after-consumed-chunks 6 \
-  "${COMMON_ARGS[@]}"
+  --data-profile "kaggle_smoke" \
+  --datasets "cord_v2,docvqa_1200,oxford_pets,stanford_cars" \
+  --data-root "./data" \
+  --chunk-size-samples 4 \
+  --raw-chunk-size-images 8 \
+  --raw-num-chunks-kept 2 \
+  --xy-samples-random-slice 16 \
+  --target-samples 8 \
+  --turnover-probe-samples 8 \
+  --turnover-probe-timeout-seconds 120 \
+  --timeout-seconds 180 \
+  --dataset-model cord_v2=clip_vit_b32 \
+  --dataset-model docvqa_1200=clip_vit_b32 \
+  --dataset-model oxford_pets=clip_vit_b32 \
+  --dataset-model stanford_cars=clip_vit_b32 \
+  --hf-token "$HF_TOKEN"
 
 # -----------------------------------------------------------------------------
 # (3) MODE=s3_bridge (producer/consumer через S3)
@@ -85,4 +97,19 @@ pipenv run python "$SCRIPT" \
 #   --s3-region "us-east-1" \
 #   --s3-max-remote-chunks 100 \
 #   --delete-remote-after consume \
-#   "${COMMON_ARGS[@]}"
+#   --data-profile "kaggle_smoke" \
+#   --datasets "cord_v2,docvqa_1200,oxford_pets,stanford_cars" \
+#   --data-root "./data" \
+#   --chunk-size-samples 4 \
+#   --raw-chunk-size-images 8 \
+#   --raw-num-chunks-kept 2 \
+#   --xy-samples-random-slice 16 \
+#   --target-samples 8 \
+#   --turnover-probe-samples 8 \
+#   --turnover-probe-timeout-seconds 120 \
+#   --timeout-seconds 180 \
+#   --dataset-model cord_v2=clip_vit_b32 \
+#   --dataset-model docvqa_1200=clip_vit_b32 \
+#   --dataset-model oxford_pets=clip_vit_b32 \
+#   --dataset-model stanford_cars=clip_vit_b32 \
+#   --hf-token "$HF_TOKEN"
