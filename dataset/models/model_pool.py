@@ -3,14 +3,16 @@ from __future__ import annotations
 import logging
 import traceback
 from collections import OrderedDict
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from dataset.data_raw.core.config import to_plain_dict
 from dataset.models.base_virtual_model import BaseVirtualModel
 from dataset.models.model_runner import merge_layer_records
 from dataset.models.registry import create_model
 from dataset.models.types import LayerIORecord
-from dataset.shared.load_report import LoadReportWriter
+
+if TYPE_CHECKING:
+    from dataset.shared.load_report import LoadReportWriter
 
 
 class ModelPool:
