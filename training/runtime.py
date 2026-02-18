@@ -133,7 +133,8 @@ def maybe_compile_model(
 
     compile_mode = str(cfg[section].get(compile_mode_key, "max-autotune"))
     logger.info("Compiling %s with torch.compile(mode=%s)", label, compile_mode)
-    return torch.compile(model, mode=compile_mode, dynamic=True)
+    dynamic = bool(cfg[section].get("compile_dynamic", True))
+    return torch.compile(model, mode=compile_mode, dynamic=dynamic)
 
 
 def resolve_amp(cfg: DictConfig, device: torch.device, *, section: str, amp_key: str = "amp") -> tuple[bool, torch.dtype | None]:

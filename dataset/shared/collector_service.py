@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import traceback
 import time
 from abc import ABC, abstractmethod
 from collections import Counter, deque
@@ -22,6 +23,7 @@ from dataset.shared.compatibility_index import (
     resolve_collector_mode,
     resolve_train_device,
 )
+from dataset.shared.load_report import LoadReportWriter
 from dataset.shared.model_scheduler import ModelScheduler
 from dataset.shared.raw_dataset_pool import RawDatasetPool
 from dataset.shared.streaming.factory import (
@@ -260,6 +262,7 @@ class CollectorService:
         self._model_pool: ModelPool | None = None
         self._scheduler: ModelScheduler | None = None
         self._sink: _SampleSink | None = None
+        self._load_report = LoadReportWriter(self.cfg_dict)
 
         self._model_run_id = 0
         self._jobs_total = 0
@@ -561,52 +564,81 @@ class CollectorService:
         if not collectable_models:
             raise ValueError("No collectable models found in CompatibilityIndex")
 
-        self._raw_pool = RawDatasetPool(cfg=self.cfg, index=self.compat_index)
-        self._raw_pool.start()
-
-        collector_cfg = self.cfg_dict.get("collector", {})
-        max_loaded = int(collector_cfg.get("max_loaded_models", 1))
-        pin_gpu = bool(collector_cfg.get("pin_gpu", self.is_async_mode))
-
-        release_cfg = collector_cfg.get("release_device_on_unload")
-        if release_cfg is None:
-            release_device_on_unload = not pin_gpu
-        else:
-            release_device_on_unload = bool(release_cfg)
-
-        empty_cfg = collector_cfg.get("empty_cuda_cache_on_unload")
-        if empty_cfg is None:
-            empty_cuda_cache_on_unload = not pin_gpu
-        else:
-            empty_cuda_cache_on_unload = bool(empty_cfg)
-
-        runtime_device = self.collector_device
-        if runtime_device is None:
-            runtime_device = self.train_device
-
-        self._model_pool = ModelPool(
-            global_cfg=self.cfg,
-            model_cfgs=model_cfgs,
-            device_override=runtime_device,
-            max_loaded_models=max_loaded,
-            runtime_local_only=bool(collector_cfg.get("runtime_local_only", False)),
-            release_device_on_unload=release_device_on_unload,
-            empty_cuda_cache_on_unload=empty_cuda_cache_on_unload,
+        expected_datasets = sorted(str(name) for name in self.compat_index.dataset_cfgs.keys())
+        self._load_report.set_expected(datasets=expected_datasets, models=collectable_models)
+        self._load_report.mark_runtime_event(
+            "runtime_init_start",
+            {
+                "collector_mode": self.collector_mode,
+                "streaming_mode": self.streaming_mode,
+                "collector_device": self.collector_device,
+                "train_device": self.train_device,
+            },
+        )
+        self.logger.info(
+            "Load report paths: summary=%s events=%s",
+            self._load_report.summary_path,
+            self._load_report.events_path,
         )
 
-        data_cfg = self.cfg_dict.get("data") or {}
-        seed = int(data_cfg.get("seed", 0))
+        try:
+            self._raw_pool = RawDatasetPool(cfg=self.cfg, index=self.compat_index, load_report=self._load_report)
+            self._raw_pool.start()
 
-        self._scheduler = ModelScheduler(
-            model_names=collectable_models,
-            model_weights=self.compat_index.get_model_weights(),
-            policy=self.model_selection_strategy,
-            burst_jobs=self.jobs_per_selected_model,
-            seed=seed,
-        )
+            collector_cfg = self.cfg_dict.get("collector", {})
+            max_loaded = int(collector_cfg.get("max_loaded_models", 1))
+            pin_gpu = bool(collector_cfg.get("pin_gpu", self.is_async_mode))
 
-        self._sink = self._build_sink()
-        self._runtime_ready = True
+            release_cfg = collector_cfg.get("release_device_on_unload")
+            if release_cfg is None:
+                release_device_on_unload = not pin_gpu
+            else:
+                release_device_on_unload = bool(release_cfg)
+
+            empty_cfg = collector_cfg.get("empty_cuda_cache_on_unload")
+            if empty_cfg is None:
+                empty_cuda_cache_on_unload = not pin_gpu
+            else:
+                empty_cuda_cache_on_unload = bool(empty_cfg)
+
+            runtime_device = self.collector_device
+            if runtime_device is None:
+                runtime_device = self.train_device
+
+            self._model_pool = ModelPool(
+                global_cfg=self.cfg,
+                model_cfgs=model_cfgs,
+                device_override=runtime_device,
+                max_loaded_models=max_loaded,
+                runtime_local_only=bool(collector_cfg.get("runtime_local_only", False)),
+                release_device_on_unload=release_device_on_unload,
+                empty_cuda_cache_on_unload=empty_cuda_cache_on_unload,
+                load_report=self._load_report,
+            )
+
+            data_cfg = self.cfg_dict.get("data") or {}
+            seed = int(data_cfg.get("seed", 0))
+
+            self._scheduler = ModelScheduler(
+                model_names=collectable_models,
+                model_weights=self.compat_index.get_model_weights(),
+                policy=self.model_selection_strategy,
+                burst_jobs=self.jobs_per_selected_model,
+                seed=seed,
+            )
+
+            self._sink = self._build_sink()
+            self._runtime_ready = True
+            self._load_report.mark_runtime_event("runtime_init_ready")
+        except Exception as exc:
+            self._load_report.mark_runtime_event(
+                "runtime_init_failed",
+                {
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            )
+            raise
 
     def _build_sink(self) -> _SampleSink:
         if self.streaming_mode == "none":

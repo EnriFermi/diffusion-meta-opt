@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
+import traceback
 from collections import Counter
 from typing import Any
 
@@ -12,16 +13,23 @@ from dataset.data_raw.providers.hf import register_all_adapters
 from dataset.data_raw.providers.hf.auth import init_hf_auth, validate_gated_datasets_token
 from dataset.data_raw.registry import create_dataset
 from dataset.shared.compatibility_index import CompatibilityIndex
+from dataset.shared.load_report import LoadReportWriter
 from dataset.shared.types import MixedImageMeta
 
 
 class RawDatasetPool:
     """Manage raw virtual datasets and provide mixed PIL sampling."""
 
-    def __init__(self, cfg: DictConfig | dict[str, Any], index: CompatibilityIndex) -> None:
+    def __init__(
+        self,
+        cfg: DictConfig | dict[str, Any],
+        index: CompatibilityIndex,
+        load_report: LoadReportWriter | None = None,
+    ) -> None:
         self.cfg = cfg
         self.cfg_dict = to_plain_dict(cfg)
         self.index = index
+        self.load_report = load_report
 
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -49,15 +57,36 @@ class RawDatasetPool:
             ds_cfg_runtime = to_plain_dict(ds_cfg)
             ds_cfg_runtime["runtime_logging"] = runtime_logging
 
-            dataset = create_dataset(
-                name=dataset_name,
-                cfg=ds_cfg_runtime,
-                global_root=self.data_root,
-                seed=self.seed,
-                hf_cfg=hf_cfg,
-            )
+            try:
+                dataset = create_dataset(
+                    name=dataset_name,
+                    cfg=ds_cfg_runtime,
+                    global_root=self.data_root,
+                    seed=self.seed,
+                    hf_cfg=hf_cfg,
+                )
+            except Exception as exc:
+                if self.load_report is not None:
+                    self.load_report.mark_dataset_failed(
+                        dataset_name=dataset_name,
+                        phase="create",
+                        error=str(exc),
+                        traceback_text=traceback.format_exc(),
+                    )
+                raise
+
             self.datasets[dataset_name] = dataset
             self.dataset_weights[dataset_name] = float(ds_cfg_runtime.get("sampling_weight", 1.0))
+            if self.load_report is not None:
+                self.load_report.mark_dataset_loaded(
+                    dataset_name=dataset_name,
+                    phase="create",
+                    details={
+                        "sampling_weight": float(ds_cfg_runtime.get("sampling_weight", 1.0)),
+                        "collector_device": ds_cfg_runtime.get("collector_device"),
+                        "models": list(ds_cfg_runtime.get("models", [])),
+                    },
+                )
 
         if not self.datasets:
             raise ValueError("RawDatasetPool has no enabled datasets")
@@ -70,7 +99,19 @@ class RawDatasetPool:
 
         for dataset_name, dataset in self.datasets.items():
             self.logger.info("Starting raw dataset worker: %s", dataset_name)
-            dataset.start()
+            try:
+                dataset.start()
+                if self.load_report is not None:
+                    self.load_report.mark_dataset_loaded(dataset_name=dataset_name, phase="start")
+            except Exception as exc:
+                if self.load_report is not None:
+                    self.load_report.mark_dataset_failed(
+                        dataset_name=dataset_name,
+                        phase="start",
+                        error=str(exc),
+                        traceback_text=traceback.format_exc(),
+                    )
+                raise
 
         self._started = True
 
