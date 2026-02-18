@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 import contextlib
-import inspect
 import logging
-import math
 import os
-import random
-import socket
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -15,144 +11,116 @@ import hydra
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+
 from dataset import data_pipeline, setup_logging
 from dataset.logging_utils import LOG_PATH_ENV, resolve_log_path
-from models.weight_quantile_vae import EncoderConfig, ModelConfig, ResamplerConfig, WeightQuantileVAE
-
+from models.weight_quantile_vae import (
+    BigVAEConfig,
+    DistributionConfig,
+    EncoderConfig,
+    MiniVAEConfig,
+    ModelConfig,
+    WeightQuantileVAE,
+)
+from training.optim import build_adamw_optimizer, build_cosine_scheduler
+from training.runtime import (
+    autocast_context as runtime_autocast_context,
+    find_free_port as runtime_find_free_port,
+    get_rank_logger,
+    maybe_compile_model,
+    resolve_amp as runtime_resolve_amp,
+    resolve_backend as runtime_resolve_backend,
+    resolve_device as runtime_resolve_device,
+    resolve_world_size as runtime_resolve_world_size,
+    seed_everything as runtime_seed_everything,
+    set_speed_optimizations as runtime_set_speed_optimizations,
+)
 
 def _logger(name: str, rank: int) -> logging.Logger:
-    return logging.getLogger(f"{name}.rank{rank}")
+    return get_rank_logger(name, rank)
 
 
 def _seed_everything(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    runtime_seed_everything(seed)
 
 
 def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+    return runtime_find_free_port()
 
 
 def _resolve_world_size(cfg: DictConfig) -> int:
-    train_cfg = cfg.train
-    distributed_mode = str(train_cfg.get("distributed", "auto")).strip().lower()
-    num_gpus_req = int(train_cfg.get("num_gpus", 0))
-
-    if distributed_mode in {"false", "0", "off", "no"}:
-        return 1
-
-    if not torch.cuda.is_available():
-        return 1
-
-    num_available = int(torch.cuda.device_count())
-    if num_available <= 1:
-        return 1
-
-    if num_gpus_req > 0:
-        num_available = min(num_available, num_gpus_req)
-
-    if distributed_mode in {"true", "1", "on", "yes"} and num_available < 2:
-        raise ValueError("train.distributed=true requires at least 2 visible CUDA devices")
-
-    return max(1, num_available)
+    return runtime_resolve_world_size(cfg, section="train", error_prefix="train")
 
 
 def _resolve_backend(cfg: DictConfig, device: torch.device) -> str:
-    raw = str(cfg.train.get("backend", "auto")).lower()
-    if raw != "auto":
-        return raw
-    if device.type == "cuda":
-        return "nccl"
-    return "gloo"
+    return runtime_resolve_backend(cfg, device, section="train")
 
 
 def _resolve_device(cfg: DictConfig, rank: int, world_size: int) -> torch.device:
-    if torch.cuda.is_available():
-        if world_size > 1:
-            dev = torch.device(f"cuda:{rank}")
-        else:
-            wanted = str(cfg.train.get("device", "cuda:0"))
-            if wanted.startswith("cuda"):
-                dev = torch.device(wanted)
-            else:
-                dev = torch.device("cuda:0")
-        torch.cuda.set_device(dev)
-        return dev
-
-    return torch.device("cpu")
+    return runtime_resolve_device(cfg, rank, world_size, section="train")
 
 
 def _set_speed_optimizations(cfg: DictConfig, device: torch.device) -> None:
-    tf32 = bool(cfg.train.get("tf32", True))
-    cudnn_benchmark = bool(cfg.train.get("cudnn_benchmark", True))
-
-    if hasattr(torch, "set_float32_matmul_precision"):
-        torch.set_float32_matmul_precision("high")
-
-    if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = tf32
-        torch.backends.cudnn.allow_tf32 = tf32
-        torch.backends.cudnn.benchmark = cudnn_benchmark
-
-        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-            torch.backends.cuda.enable_flash_sdp(True)
-        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-        if hasattr(torch.backends.cuda, "enable_math_sdp"):
-            torch.backends.cuda.enable_math_sdp(True)
+    runtime_set_speed_optimizations(cfg, device, section="train")
 
 
 def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
-    model_cfg = cfg.get("model")
-    if model_cfg is None:
-        # Backward compatibility with older config layout.
-        model_cfg = cfg.train.get("model", {})
+    model_cfg = cfg.get("model", {})
 
-    encoder_cfg = model_cfg.get("encoder", {})
-    resampler_cfg = model_cfg.get("resampler", {})
+    dist_cfg = model_cfg.get("distribution", {})
+    mini_cfg = model_cfg.get("mini_vae", {})
+    big_cfg = model_cfg.get("big_vae", {})
+    enc_cfg = big_cfg.get("encoder", {})
 
     return ModelConfig(
-        k=int(model_cfg.get("k", 8)),
-        k_mlp=int(model_cfg.get("k_mlp", 24)),
         patch_size=int(model_cfg.get("patch_size", 16)),
-        d_tok=int(model_cfg.get("d_tok", 64)),
-        m_lat=int(model_cfg.get("m_lat", 32)),
-        d_lat=int(model_cfg.get("d_lat", 64)),
-        n_heads=int(model_cfg.get("n_heads", 8)),
-        pos_fourier_dim=int(model_cfg.get("pos_fourier_dim", 32)),
-        row_mlp_mult=float(model_cfg.get("row_mlp_mult", 4.0)),
-        resampler_mlp_mult=float(model_cfg.get("resampler_mlp_mult", 4.0)),
-        decoder_mlp_mult=float(model_cfg.get("decoder_mlp_mult", 2.0)),
-        dropout=float(model_cfg.get("dropout", 0.0)),
-        encoder=EncoderConfig(
-            n_row_layers=int(encoder_cfg.get("n_row_layers", 2)),
-            self_attn_mode=str(encoder_cfg.get("self_attn_mode", "full")),
+        beta=float(model_cfg.get("beta", 1e-3)),
+        mini_encoder_ckpt_path=str(model_cfg.get("mini_encoder_ckpt_path", "")),
+        distribution=DistributionConfig(
+            k_s=int(dist_cfg.get("k_s", 16)),
+            Kq=int(dist_cfg.get("Kq", 32)),
+            d_var=int(dist_cfg.get("d_var", 128)),
+            d_dist=int(dist_cfg.get("d_dist", 128)),
+            num_var_attn_layers=int(dist_cfg.get("num_var_attn_layers", 2)),
+            var_attn_heads=int(dist_cfg.get("var_attn_heads", 4)),
+            dcn_num_cross_layers=int(dist_cfg.get("dcn_num_cross_layers", 3)),
+            dcn_deep_hidden=int(dist_cfg.get("dcn_deep_hidden", 0)),
+            dcn_deep_layers=int(dist_cfg.get("dcn_deep_layers", 0)),
+            dropout=float(dist_cfg.get("dropout", 0.0)),
         ),
-        resampler=ResamplerConfig(
-            n_layers=int(resampler_cfg.get("n_layers", 2)),
+        mini_vae=MiniVAEConfig(
+            z_dim=int(mini_cfg.get("z_dim", 64)),
+            d_e=int(mini_cfg.get("d_e", 128)),
+            num_attn_layers_encoder=int(mini_cfg.get("num_attn_layers_encoder", 2)),
+            num_layers_decoder=int(mini_cfg.get("num_layers_decoder", 2)),
+            n_heads=int(mini_cfg.get("n_heads", 4)),
+            d_patch=int(mini_cfg.get("d_patch", 64)),
+            dropout=float(mini_cfg.get("dropout", 0.0)),
+        ),
+        big_vae=BigVAEConfig(
+            d_model=int(big_cfg.get("d_model", 256)),
+            d_lat=int(big_cfg.get("d_lat", 256)),
+            num_latents=int(big_cfg.get("num_latents", 32)),
+            num_encoder_layers=int(big_cfg.get("num_encoder_layers", 4)),
+            num_decoder_layers=int(big_cfg.get("num_decoder_layers", 4)),
+            n_heads=int(big_cfg.get("n_heads", 8)),
+            ffn_mult=float(big_cfg.get("ffn_mult", 4.0)),
+            dropout=float(big_cfg.get("dropout", 0.0)),
+            pos_fourier_dim=int(big_cfg.get("pos_fourier_dim", 64)),
+            encoder=EncoderConfig(
+                self_attn_mode=str(enc_cfg.get("self_attn_mode", "full")),
+                cross_attend_only_cls=bool(enc_cfg.get("cross_attend_only_cls", True)),
+            ),
         ),
     )
 
 
 def _maybe_compile(model: torch.nn.Module, cfg: DictConfig, logger: logging.Logger) -> torch.nn.Module:
-    if not bool(cfg.train.get("compile", False)):
-        return model
-    if not hasattr(torch, "compile"):
-        logger.warning("torch.compile is unavailable in this PyTorch version; continuing without compile")
-        return model
-
-    compile_mode = str(cfg.train.get("compile_mode", "max-autotune"))
-    logger.info("Compiling model with torch.compile(mode=%s)", compile_mode)
-    return torch.compile(model, mode=compile_mode, dynamic=True)
+    return maybe_compile_model(model, cfg, logger, section="train", label="model")
 
 
 def _build_optimizer(
@@ -160,71 +128,33 @@ def _build_optimizer(
     cfg: DictConfig,
     device: torch.device,
 ) -> torch.optim.Optimizer:
-    train_cfg = cfg.train
-    lr = float(train_cfg.get("lr", 3e-4))
-    weight_decay = float(train_cfg.get("weight_decay", 0.01))
-
-    betas_cfg = train_cfg.get("betas", [0.9, 0.95])
-    beta1 = float(betas_cfg[0])
-    beta2 = float(betas_cfg[1])
-    eps = float(train_cfg.get("eps", 1e-8))
-
-    kwargs: dict[str, Any] = {
-        "lr": lr,
-        "weight_decay": weight_decay,
-        "betas": (beta1, beta2),
-        "eps": eps,
-    }
-
-    params = inspect.signature(torch.optim.AdamW).parameters
-    if "fused" in params and device.type == "cuda":
-        kwargs["fused"] = True
-    if "foreach" in params:
-        kwargs["foreach"] = True
-
-    return torch.optim.AdamW(model.parameters(), **kwargs)
+    return build_adamw_optimizer(
+        model=model,
+        cfg=cfg,
+        device=device,
+        section="train",
+        default_lr=3e-4,
+        default_weight_decay=0.01,
+    )
 
 
 def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: DictConfig) -> torch.optim.lr_scheduler.LambdaLR:
-    max_steps = max(1, int(cfg.train.get("max_steps", 1000)))
-    warmup_steps = max(0, int(cfg.train.get("warmup_steps", 100)))
-    min_lr_ratio = float(cfg.train.get("min_lr_ratio", 0.1))
-
-    def lr_lambda(step_idx: int) -> float:
-        if warmup_steps > 0 and step_idx < warmup_steps:
-            return float(step_idx + 1) / float(warmup_steps)
-
-        progress = (step_idx - warmup_steps) / float(max(1, max_steps - warmup_steps))
-        progress = min(max(progress, 0.0), 1.0)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    return build_cosine_scheduler(
+        optimizer=optimizer,
+        cfg=cfg,
+        section="train",
+        default_max_steps=1000,
+        default_warmup_steps=100,
+        default_min_lr_ratio=0.1,
+    )
 
 
 def _resolve_amp(cfg: DictConfig, device: torch.device) -> tuple[bool, torch.dtype | None]:
-    mode = str(cfg.train.get("amp", "auto")).lower()
-    if device.type != "cuda" or mode in {"off", "false", "0", "none"}:
-        return False, None
-
-    if mode == "auto":
-        if torch.cuda.is_bf16_supported():
-            return True, torch.bfloat16
-        return True, torch.float16
-
-    if mode in {"bf16", "bfloat16"}:
-        return True, torch.bfloat16
-
-    if mode in {"fp16", "float16", "half"}:
-        return True, torch.float16
-
-    raise ValueError(f"Unsupported train.amp={mode}")
+    return runtime_resolve_amp(cfg, device, section="train")
 
 
 def _autocast_context(enabled: bool, dtype: torch.dtype | None) -> contextlib.AbstractContextManager:
-    if not enabled or dtype is None:
-        return contextlib.nullcontext()
-    return torch.autocast(device_type="cuda", dtype=dtype)
+    return runtime_autocast_context(enabled, dtype)
 
 
 def _save_checkpoint(
@@ -521,8 +451,9 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
 
                     with no_sync_ctx:
                         with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
-                            W_hat, kl_loss, _ = model(x, W)
-                            recon_loss = F.mse_loss(W_hat, W)
+                            W_hat, mu, logvar = model(W, x)
+                            recon_loss = WeightQuantileVAE.operator_recon_loss(x, W, W_hat)
+                            kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
                             total_loss = recon_loss + kl_beta * kl_loss
                             loss_for_backward = total_loss / grad_accum_steps
 
@@ -639,7 +570,7 @@ def _spawn_entry(rank: int, world_size: int, cfg_dict: dict[str, Any], master_ad
     _run_worker(rank=rank, world_size=world_size, cfg_dict=cfg_dict, master_addr=master_addr, master_port=master_port)
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="config")
+@hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
     # Freeze one shared log path before spawning worker processes.
     if not os.environ.get(LOG_PATH_ENV):

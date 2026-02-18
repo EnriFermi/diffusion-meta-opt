@@ -1,0 +1,39 @@
+name: rvl_cdip
+description: "Document image classification (RVL-CDIP)."
+enabled: true
+gated: false
+sampling_weight: 1.0
+models:
+  - donut_rvlcdip
+  - trocr_large_printed
+collector_device: null
+
+hf:
+  repo: aharley/rvl_cdip
+  subset: null
+  split: train
+  streaming: true
+  shuffle_buffer: 1000
+  trust_remote_code: false
+
+schema:
+  image_mode: image_field
+  image_field: image
+  image_field_candidates: [image, img, pixel_values, jpg, png]
+  url_field: null
+  url_field_candidates: []
+  id_field: null
+  extra_fields: [label]
+
+cache:
+  num_chunks_kept: 2
+  chunk_size_images: 256
+
+worker:
+  idle_sleep_s: 0.5
+  get_timeout_s: 5.0
+  request_timeout_s: 10
+  max_retries: 2
+  max_worker_restarts: 5
+
+licensing_note: "Use according to RVL-CDIP / HF dataset card terms."

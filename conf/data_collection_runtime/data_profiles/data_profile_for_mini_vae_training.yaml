@@ -1,0 +1,11 @@
+path: ${oc.env:DATA_ROOT,./data}
+
+enabled_datasets:
+  - coco2017
+  - cc12m
+  - visual_genome
+  - scene_parse_150
+
+cli:
+  batch_size: 8
+  num_batches: 1

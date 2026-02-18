@@ -1,0 +1,9 @@
+max_steps: 1000
+grad_accum_steps: 1
+
+warmup_steps: 100
+min_lr_ratio: 0.1
+kl_beta: 0.001
+
+checkpoint_every: 200
+checkpoint_dir: ${training_artifacts.big_vae_checkpoint_dir}

@@ -1,0 +1,36 @@
+path: ${oc.env:DATA_ROOT,./data/datasets}
+
+enabled_datasets:
+  - sun397
+  - food101
+  - rvl_cdip
+  - chexpert
+  - openimages_v7
+  - pascal_voc_2012
+
+dataset_overrides:
+  sun397:
+    models:
+      - vit_large_p16_224
+      - clip_vit_l14
+  food101:
+    models:
+      - siglip_so400m_p14_384
+      - vit_large_p16_224
+  rvl_cdip:
+    models:
+      - donut_rvlcdip
+      - trocr_large_printed
+  chexpert:
+    # CheXpert source images are grayscale; runtime decode converts to RGB (1->3 channels).
+    models:
+      - vit_large_p16_224
+      - clip_vit_l14
+  openimages_v7:
+    models:
+      - detr_resnet50
+      - clip_vit_l14
+  pascal_voc_2012:
+    models:
+      - segformer_b5_cityscapes
+      - detr_resnet50

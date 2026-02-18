@@ -1,0 +1,23 @@
+name: detr_resnet50
+provider: transformers
+runner: hf_dense_runner
+model_family: dense
+architecture: detr
+hf_repo: facebook/detr-resnet-50
+revision: null
+gated: false
+cache_subdir: models/${.name}
+batch_size: 8
+sampling_weight: 1.0
+device: auto
+dtype: float32
+run_mode: full
+hook_filter:
+  include_regex: null
+  exclude_regex: null
+limits:
+  max_records_per_layer: 120000
+  max_layers: null
+preprocess:
+  processor: auto
+trust_remote_code: false

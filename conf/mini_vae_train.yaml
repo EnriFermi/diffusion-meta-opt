@@ -1,0 +1,3 @@
+defaults:
+  - /run_profiles: train_mini_vae
+  - _self_

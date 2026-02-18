@@ -15,6 +15,7 @@ torch = "*"
 torchvision = "*"
 transformers = "*"
 boto3 = "*"
+comet-ml = "*"
 
 [dev-packages]
 pytest = "*"

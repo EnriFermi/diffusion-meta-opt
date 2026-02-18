@@ -4,8 +4,9 @@ import logging
 import multiprocessing as mp
 import time
 from abc import ABC, abstractmethod
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import asdict
+from queue import Empty, Full
 from typing import Any
 
 from omegaconf import DictConfig
@@ -15,7 +16,12 @@ from dataset.logging_utils import configure_root_logging
 from dataset.models.model_pool import ModelPool
 from dataset.shared.atomizer import atomize
 from dataset.shared.cache import SharedSampleCache
-from dataset.shared.compatibility_index import CompatibilityIndex, normalize_device, resolve_collector_mode
+from dataset.shared.compatibility_index import (
+    CompatibilityIndex,
+    normalize_device,
+    resolve_collector_mode,
+    resolve_train_device,
+)
 from dataset.shared.model_scheduler import ModelScheduler
 from dataset.shared.raw_dataset_pool import RawDatasetPool
 from dataset.shared.streaming.factory import (
@@ -180,7 +186,12 @@ class _ChunkedSampleSink(_SampleSink):
 class CollectorService:
     """Model-first collector orchestration with async and interleaved modes."""
 
-    def __init__(self, cfg: DictConfig | dict[str, Any], cache: SharedSampleCache | None = None) -> None:
+    def __init__(
+        self,
+        cfg: DictConfig | dict[str, Any],
+        cache: SharedSampleCache | None = None,
+        status_queue: Any | None = None,
+    ) -> None:
         self.cfg = cfg
         self.cfg_dict = to_plain_dict(cfg)
 
@@ -211,7 +222,7 @@ class CollectorService:
             )
 
         self.collector_device = normalize_device(collector_cfg.get("device"))
-        self.train_device = normalize_device(self.cfg_dict.get("train", {}).get("device"))
+        self.train_device = resolve_train_device(self.cfg_dict)
 
         if self.collector_mode == "async":
             if self.collector_device is None:
@@ -224,6 +235,8 @@ class CollectorService:
         self.dataset_sampling_strategy = str(collector_cfg.get("dataset_sampling_strategy", "weighted_random"))
         self.max_dataset_fraction_per_batch = float(collector_cfg.get("max_dataset_fraction_per_batch", 0.6))
         self.num_inflight_jobs = max(1, int(collector_cfg.get("num_inflight_jobs", 2)))
+        self.status_emit_interval_s = max(0.1, float(collector_cfg.get("status_emit_interval_s", 2.0)))
+        self.status_queue_max_items = max(16, int(collector_cfg.get("status_queue_max_items", 2048)))
 
         self.interleaved_cfg = collector_cfg.get("interleaved_schedule", {})
         self.interleaved_every_n_steps = max(
@@ -256,10 +269,39 @@ class CollectorService:
         self._ctx = mp.get_context("spawn")
         self._stop_event: Any | None = None
         self._process: mp.Process | None = None
+        self._status_queue: Any | None = status_queue
+        self._last_status_emit_ts = 0.0
+        self._async_last_status: dict[str, Any] | None = None
+        self._async_recent_jobs: deque[dict[str, Any]] = deque(maxlen=128)
+        self._async_events_dropped = 0
 
     @property
     def is_async_mode(self) -> bool:
         return self.collector_mode == "async"
+
+    def is_async_process_alive(self) -> bool:
+        if not self.is_async_mode:
+            return True
+        return bool(self._process is not None and self._process.is_alive())
+
+    def assert_healthy(self) -> None:
+        """
+        Fail fast when async collector process has exited.
+
+        Without this guard, consumers may block forever waiting for new samples
+        after collector crash.
+        """
+        if not self.is_async_mode:
+            return
+
+        self._drain_status_queue()
+        if self._process is None:
+            return
+        if self._process.is_alive():
+            return
+
+        exit_code = self._process.exitcode
+        raise RuntimeError(f"Async collector process exited unexpectedly (exitcode={exit_code})")
 
     def predownload_models(self) -> None:
         model_cfgs = self.compat_index.get_model_cfgs()
@@ -298,6 +340,13 @@ class CollectorService:
                 self._process.join(timeout=3)
             self._process = None
 
+        if self._status_queue is not None:
+            try:
+                self._status_queue.close()
+            except Exception:
+                pass
+            self._status_queue = None
+
         self._shutdown_runtime_components()
 
     def run_forever(self, stop_event: Any | None = None) -> None:
@@ -318,6 +367,8 @@ class CollectorService:
                     self.collect_one_job()
             else:
                 time.sleep(0.1)
+
+            self._maybe_emit_status_event(event_type="heartbeat")
 
     def collect_burst(self, num_jobs: int) -> list[CollectorJobStats]:
         self._ensure_runtime_ready()
@@ -426,10 +477,18 @@ class CollectorService:
             self.cache_size(),
             self.streaming_mode,
         )
+        self._emit_status_event(event_type="job", job_stats=stats)
 
         return stats
 
     def cache_size(self) -> int:
+        if self.is_async_mode and not self._runtime_ready:
+            self._drain_status_queue()
+        if self.is_async_mode and self._sink is None and self._async_last_status is not None:
+            cache_size_value = self._async_last_status.get("cache_size")
+            if cache_size_value is not None:
+                return int(cache_size_value)
+
         if self.streaming_mode == "none":
             if self.cache is None:
                 return 0
@@ -452,7 +511,10 @@ class CollectorService:
         return build_chunk_reader(self.streaming_cfg, store)
 
     def stats(self) -> dict[str, Any]:
-        return {
+        if self.is_async_mode and not self._runtime_ready:
+            self._drain_status_queue()
+
+        payload = {
             "mode": self.collector_mode,
             "streaming_mode": self.streaming_mode,
             "collector_device": self.collector_device,
@@ -463,7 +525,32 @@ class CollectorService:
             "items_emitted": self._items_emitted,
             "scheduler": self._scheduler.stats() if self._scheduler else None,
             "sink": self._sink.stats() if self._sink else None,
+            "status_emit_interval_s": self.status_emit_interval_s,
+            "status_queue_max_items": self.status_queue_max_items,
         }
+
+        if self.is_async_mode:
+            payload["async_process_alive"] = bool(self._process is not None and self._process.is_alive())
+            payload["async_events_dropped"] = int(self._async_events_dropped)
+            payload["async_recent_jobs"] = list(self._async_recent_jobs)
+            payload["async_last_status"] = self._async_last_status
+
+            if self._async_last_status is not None:
+                payload["cache_size"] = int(self._async_last_status.get("cache_size", payload["cache_size"]))
+                payload["jobs_total"] = int(self._async_last_status.get("jobs_total", payload["jobs_total"]))
+                payload["items_emitted"] = int(self._async_last_status.get("items_emitted", payload["items_emitted"]))
+                queue_jobs = self._async_last_status.get("jobs_by_model")
+                if isinstance(queue_jobs, dict):
+                    payload["jobs_by_model"] = {
+                        str(name): int(value)
+                        for name, value in queue_jobs.items()
+                    }
+                if payload["scheduler"] is None:
+                    payload["scheduler"] = self._async_last_status.get("scheduler")
+                if payload["sink"] is None:
+                    payload["sink"] = self._async_last_status.get("sink")
+
+        return payload
 
     def _ensure_runtime_ready(self) -> None:
         if self._runtime_ready:
@@ -502,7 +589,7 @@ class CollectorService:
             model_cfgs=model_cfgs,
             device_override=runtime_device,
             max_loaded_models=max_loaded,
-            runtime_local_only=True,
+            runtime_local_only=bool(collector_cfg.get("runtime_local_only", False)),
             release_device_on_unload=release_device_on_unload,
             empty_cuda_cache_on_unload=empty_cuda_cache_on_unload,
         )
@@ -569,10 +656,12 @@ class CollectorService:
         self._stop_event = self._ctx.Event()
         cfg_dict = to_plain_dict(self.cfg)
         cache_arg = self.cache if self.streaming_mode == "none" else None
+        if self._status_queue is None:
+            self._status_queue = self._ctx.Queue(maxsize=self.status_queue_max_items)
 
         self._process = self._ctx.Process(
             target=collector_process_main,
-            args=(cfg_dict, cache_arg, self._stop_event),
+            args=(cfg_dict, cache_arg, self._stop_event, self._status_queue),
             daemon=False,  # must be False: collector spawns dataset workers (daemon cannot have children)
             name="collector_service",
         )
@@ -582,6 +671,101 @@ class CollectorService:
     def _next_run_id(self) -> int:
         self._model_run_id += 1
         return self._model_run_id
+
+    def _maybe_emit_status_event(self, event_type: str) -> None:
+        now = time.time()
+        if now - self._last_status_emit_ts < self.status_emit_interval_s:
+            return
+        self._emit_status_event(event_type=event_type, job_stats=None)
+
+    def _emit_status_event(self, event_type: str, job_stats: CollectorJobStats | None) -> None:
+        if self._status_queue is None:
+            return
+
+        payload: dict[str, Any] = {
+            "type": str(event_type),
+            "timestamp": float(time.time()),
+            "mode": self.collector_mode,
+            "streaming_mode": self.streaming_mode,
+            "cache_size": int(self.cache_size()),
+            "jobs_total": int(self._jobs_total),
+            "jobs_by_model": {name: int(value) for name, value in self._jobs_by_model.items()},
+            "items_emitted": int(self._items_emitted),
+            "scheduler": self._scheduler.stats() if self._scheduler else None,
+            "sink": self._sink.stats() if self._sink else None,
+            "events_dropped": int(self._async_events_dropped),
+        }
+        if job_stats is not None:
+            payload["job_stats"] = asdict(job_stats)
+
+        try:
+            self._status_queue.put_nowait(payload)
+            self._last_status_emit_ts = payload["timestamp"]
+        except Full:
+            self._async_events_dropped += 1
+        except Exception:
+            pass
+
+    def _drain_status_queue(self) -> None:
+        if self._status_queue is None:
+            return
+
+        while True:
+            try:
+                payload = self._status_queue.get_nowait()
+            except Empty:
+                break
+            except Exception:
+                break
+
+            if not isinstance(payload, dict):
+                continue
+
+            self._async_last_status = payload
+            jobs_total = payload.get("jobs_total")
+            if jobs_total is not None:
+                try:
+                    self._jobs_total = max(self._jobs_total, int(jobs_total))
+                except Exception:
+                    pass
+
+            items_emitted = payload.get("items_emitted")
+            if items_emitted is not None:
+                try:
+                    self._items_emitted = max(self._items_emitted, int(items_emitted))
+                except Exception:
+                    pass
+
+            jobs_by_model = payload.get("jobs_by_model")
+            if isinstance(jobs_by_model, dict):
+                counter: Counter[str] = Counter()
+                for name, value in jobs_by_model.items():
+                    try:
+                        counter[str(name)] = int(value)
+                    except Exception:
+                        continue
+                if counter:
+                    self._jobs_by_model = counter
+
+            job_stats = payload.get("job_stats")
+            if isinstance(job_stats, dict):
+                sanitized = {
+                    "timestamp": payload.get("timestamp"),
+                    "model_name": str(job_stats.get("model_name", "")),
+                    "num_images": int(job_stats.get("num_images", 0)),
+                    "num_layers": int(job_stats.get("num_layers", 0)),
+                    "num_samples_emitted": int(job_stats.get("num_samples_emitted", 0)),
+                    "dataset_mix": job_stats.get("dataset_mix", {}),
+                    "duration_s": float(job_stats.get("duration_s", 0.0)),
+                }
+                self._async_recent_jobs.append(sanitized)
+
+            dropped = payload.get("events_dropped")
+            if dropped is not None:
+                try:
+                    self._async_events_dropped = max(self._async_events_dropped, int(dropped))
+                except Exception:
+                    pass
 
     @staticmethod
     def _validate_layer_output_splitting(atom_cfg: dict[str, Any]) -> None:
@@ -598,12 +782,17 @@ class CollectorService:
             raise ValueError("collector.layer_output_splitting.xy_samples_random_slice must be a positive integer")
 
 
-def collector_process_main(cfg_dict: dict[str, Any], cache: SharedSampleCache | None, stop_event: Any) -> None:
+def collector_process_main(
+    cfg_dict: dict[str, Any],
+    cache: SharedSampleCache | None,
+    stop_event: Any,
+    status_queue: Any | None = None,
+) -> None:
     log_path = configure_root_logging(cfg=cfg_dict, rank=0, force=True)
     logger = logging.getLogger("collector_process")
     logger.info("Run log file: %s", log_path)
 
-    service = CollectorService(cfg=cfg_dict, cache=cache)
+    service = CollectorService(cfg=cfg_dict, cache=cache, status_queue=status_queue)
     try:
         service.run_forever(stop_event=stop_event)
     except KeyboardInterrupt:

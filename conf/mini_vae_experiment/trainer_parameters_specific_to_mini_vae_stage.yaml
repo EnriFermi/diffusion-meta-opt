@@ -1,0 +1,75 @@
+distributed: false
+
+max_steps: 50000
+grad_accum_steps: 2
+patches_per_sample: 32
+
+warmup_steps: 1000
+min_lr_ratio: 0.05
+kl_beta: 0.005
+
+checkpoint_every: 500
+checkpoint_dir: ${training_artifacts.mini_vae_checkpoint_dir}
+
+loss:
+  # Composite objective:
+  # L_total = alpha * L_con + (1-alpha) * (beta * L_str + (1-beta) * L_beh)
+  alpha: 0.0
+  beta: 0.5
+  contrastive_temperature: 0.07
+  # Function-preserving views for NT-Xent positives.
+  contrastive_permute_inputs: true
+  contrastive_sign_flip_inputs: true
+  # Queries for L_beh are sourced from collector/model-zoo data stream.
+  # Avoid replacing them with purely random synthetic queries.
+
+test_eval:
+  enabled: true
+  every_steps: 1000
+  num_batches: 8
+  run_on_last_step: true
+
+  # Profile from conf/data_collection_runtime/data_profiles.
+  data_profile: data_profile_for_hf_assets_test
+  # Optional explicit data root override for test profile.
+  data_path: null
+
+  # Dedicated collector/runtime for test-eval.
+  # By default test collector inherits train collector.device.
+  # This allows running both collectors on one GPU, while test collector is started on-demand only.
+  collector_mode: interleaved
+  collector_device: null
+  streaming_mode: none
+  predownload_models: false
+  collect_every_n_steps: 1
+  collector_jobs_per_cycle: 1
+  jobs_per_selected_model: 1
+  num_inflight_jobs: 1
+  in_memory_buffer:
+    capacity_samples: 256
+    fill_target_samples: 64
+    low_watermark_samples: 32
+
+  # Sampling and watchdog settings for fetching test batches.
+  max_x_rows: null
+  timeout_seconds: 300.0
+  poll_sleep_seconds: 0.05
+
+telemetry:
+  local:
+    status_every_steps: 10
+    status_every_seconds: 30.0
+    status_window_steps: 100
+    chunk_preview_count: 5
+    recent_job_preview_count: 10
+    save_jsonl: true
+    jsonl_path: ${training_artifacts.mini_vae_checkpoint_dir}/runtime_status.jsonl
+  comet:
+    enabled: false
+    api_key: ${oc.env:COMET_API_KEY,""}
+    workspace: ${oc.env:COMET_WORKSPACE,""}
+    project_name: mini_patch_vae
+    experiment_name: ""
+    tags: []
+    offline_directory: ""
+    log_code: false

@@ -1,0 +1,22 @@
+name: clip_vit_l14
+provider: transformers
+runner: hf_clip_runner
+model_family: clip
+hf_repo: openai/clip-vit-large-patch14
+revision: null
+gated: false
+cache_subdir: models/${.name}
+batch_size: 16
+sampling_weight: 1.0
+device: auto
+dtype: float16
+run_mode: vision_only
+hook_filter:
+  include_regex: "^vision_model\\."
+  exclude_regex: null
+limits:
+  max_records_per_layer: 200000
+  max_layers: null
+preprocess:
+  processor: auto
+trust_remote_code: false

@@ -206,7 +206,7 @@ def resolve_collector_mode(cfg: dict[str, Any]) -> str:
         return mode
 
     collector_device = normalize_device(collector_cfg.get("device"))
-    train_device = normalize_device(cfg.get("train", {}).get("device"))
+    train_device = resolve_train_device(cfg)
 
     if collector_device is None:
         return "interleaved"
@@ -215,6 +215,20 @@ def resolve_collector_mode(cfg: dict[str, Any]) -> str:
     if collector_device == train_device:
         return "interleaved"
     return "async"
+
+
+def resolve_train_device(cfg: dict[str, Any]) -> str | None:
+    mini_train_cfg = cfg.get("mini_train")
+    if isinstance(mini_train_cfg, dict):
+        mini_train_device = normalize_device(mini_train_cfg.get("device"))
+        if mini_train_device is not None:
+            return mini_train_device
+
+    train_cfg = cfg.get("train")
+    if isinstance(train_cfg, dict):
+        return normalize_device(train_cfg.get("device"))
+
+    return None
 
 
 def normalize_device(value: Any) -> str | None:
