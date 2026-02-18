@@ -1,7 +1,7 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$ROOT_DIR"
 
 # Примеры:
@@ -13,16 +13,12 @@ cd "$ROOT_DIR"
 # Корневой конфиг: conf/mini_vae_train.yaml (run_profiles/train_mini_vae).
 # Все аргументы передаются как обычные Hydra-overrides.
 
-HYDRA_ARGS=("$@")
-
-if [[ -n "${PIPENV_ACTIVE:-}" ]]; then
-  python -m experiments.train_mini_vae "${HYDRA_ARGS[@]}"
-  exit 0
+if [ -n "${PIPENV_ACTIVE:-}" ]; then
+  exec python -m experiments.train_mini_vae "$@"
 fi
 
 if command -v pipenv >/dev/null 2>&1; then
-  pipenv run python -m experiments.train_mini_vae "${HYDRA_ARGS[@]}"
-  exit 0
+  exec pipenv run python -m experiments.train_mini_vae "$@"
 fi
 
-python -m experiments.train_mini_vae "${HYDRA_ARGS[@]}"
+exec python -m experiments.train_mini_vae "$@"
