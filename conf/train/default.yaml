@@ -21,7 +21,7 @@ kl_beta: 0.001
 grad_clip_norm: 1.0
 
 amp: auto
-compile: false
+compile: true
 compile_mode: max-autotune
 tf32: true
 cudnn_benchmark: true
