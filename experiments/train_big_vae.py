@@ -11,7 +11,7 @@ import hydra
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -39,6 +39,31 @@ from training.runtime import (
     seed_everything as runtime_seed_everything,
     set_speed_optimizations as runtime_set_speed_optimizations,
 )
+
+
+def _promote_run_profile_to_root(cfg: DictConfig) -> None:
+    run_profiles_cfg = cfg.get("run_profiles")
+    if not isinstance(run_profiles_cfg, (dict, DictConfig)):
+        return
+
+    expected_sections = (
+        "data",
+        "collector",
+        "streaming",
+        "train",
+        "model",
+        "training_artifacts",
+        "logging",
+        "hf",
+        "models",
+    )
+    with open_dict(cfg):
+        for section in expected_sections:
+            if section in cfg:
+                continue
+            if section in run_profiles_cfg:
+                cfg[section] = run_profiles_cfg[section]
+
 
 def _logger(name: str, rank: int) -> logging.Logger:
     return get_rank_logger(name, rank)
@@ -294,6 +319,7 @@ def _fetch_batch(
 
 def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr: str, master_port: int) -> None:
     cfg = OmegaConf.create(cfg_dict)
+    _promote_run_profile_to_root(cfg)
     setup_logging(cfg, rank=rank)
     logger = _logger("train", rank=rank)
     if rank == 0:
@@ -572,6 +598,7 @@ def _spawn_entry(rank: int, world_size: int, cfg_dict: dict[str, Any], master_ad
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
+    _promote_run_profile_to_root(cfg)
     # Freeze one shared log path before spawning worker processes.
     if not os.environ.get(LOG_PATH_ENV):
         os.environ[LOG_PATH_ENV] = str(resolve_log_path(cfg))

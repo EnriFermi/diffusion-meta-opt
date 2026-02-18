@@ -55,6 +55,36 @@ def get_logger(name: str, rank: int) -> logging.Logger:
     return get_rank_logger(name, rank)
 
 
+def promote_run_profile_to_root(cfg: DictConfig) -> None:
+    """
+    Backward-compatible fallback for Hydra package/layout mismatches.
+
+    Some compositions may place runtime sections under `run_profiles.*` instead
+    of root keys expected by training entrypoints.
+    """
+    run_profiles_cfg = cfg.get("run_profiles")
+    if not isinstance(run_profiles_cfg, (dict, DictConfig)):
+        return
+
+    expected_sections = (
+        "data",
+        "collector",
+        "streaming",
+        "mini_train",
+        "mini_model",
+        "training_artifacts",
+        "logging",
+        "hf",
+        "models",
+    )
+    with open_dict(cfg):
+        for section in expected_sections:
+            if section in cfg:
+                continue
+            if section in run_profiles_cfg:
+                cfg[section] = run_profiles_cfg[section]
+
+
 class CometTracker:
     def __init__(self, cfg: DictConfig, logger: logging.Logger, rank: int) -> None:
         self.logger = logger
@@ -1018,6 +1048,7 @@ def save_checkpoint(
 # ---------------------------
 def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr: str, master_port: int) -> None:
     cfg = OmegaConf.create(cfg_dict)
+    promote_run_profile_to_root(cfg)
     setup_logging(cfg, rank=rank)
     logger = get_logger("mini_vae_train", rank=rank)
     if rank == 0:
@@ -1767,6 +1798,7 @@ def spawn_entry(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
 
 @hydra.main(version_base=None, config_path="../conf", config_name="mini_vae_train")
 def main(cfg: DictConfig) -> None:
+    promote_run_profile_to_root(cfg)
     world_size = resolve_world_size(cfg)
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     assert isinstance(cfg_dict, dict)

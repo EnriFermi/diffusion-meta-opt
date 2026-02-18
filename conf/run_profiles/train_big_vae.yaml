@@ -1,3 +1,4 @@
+# @package _global_
 defaults:
   - /shared_runtime_environment: global_app_hydra_logging_and_model_registry
 
