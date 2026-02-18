@@ -13,7 +13,7 @@ from dataset.data_raw.providers.hf import register_all_adapters
 from dataset.data_raw.providers.hf.auth import init_hf_auth, validate_gated_datasets_token
 from dataset.data_raw.registry import create_dataset
 from dataset.shared.compatibility_index import CompatibilityIndex
-from dataset.shared.load_report import LoadReportWriter
+from .load_report import LoadReportWriter
 from dataset.shared.types import MixedImageMeta
 
 

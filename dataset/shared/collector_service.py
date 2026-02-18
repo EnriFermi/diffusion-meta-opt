@@ -23,7 +23,7 @@ from dataset.shared.compatibility_index import (
     resolve_collector_mode,
     resolve_train_device,
 )
-from dataset.shared.load_report import LoadReportWriter
+from .load_report import LoadReportWriter
 from dataset.shared.model_scheduler import ModelScheduler
 from dataset.shared.raw_dataset_pool import RawDatasetPool
 from dataset.shared.streaming.factory import (
