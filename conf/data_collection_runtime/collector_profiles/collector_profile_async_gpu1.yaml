@@ -1,3 +1,7 @@
+defaults:
+  - collector_common_settings
+  - _self_
+
 # Async collection profile pinned to cuda:1.
 mode: auto
 device: "cuda:1"

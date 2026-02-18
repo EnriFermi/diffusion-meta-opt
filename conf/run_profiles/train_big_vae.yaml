@@ -1,12 +1,9 @@
 # @package _global_
 defaults:
-  - /shared_runtime_environment: global_app_hydra_logging_and_model_registry
-
-  - /data_collection_runtime/data_profiles@data: data_profile_common_settings
-
-  - /data_collection_runtime/collector_profiles@collector: collector_common_settings
-
-  - /data_collection_runtime/streaming_profiles@streaming: streaming_common_settings
+  - /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
+  - /data_collection_runtime/data_profiles@data: data_profile_for_big_vae_training
+  - /data_collection_runtime/collector_profiles@collector: collector_profile_interleaved
+  - /data_collection_runtime/streaming_profiles@streaming: streaming_profile_none
 
   - /shared_training_parameters@train: trainer_execution_common
   - /big_vae_experiment@train: trainer_parameters_specific_to_big_vae_stage
@@ -15,11 +12,6 @@ defaults:
   - /big_vae_experiment@model: model_parameters_specific_to_big_vae_stage
 
   - _self_
-
-  - override /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
-  - override /data_collection_runtime/data_profiles@data: data_profile_for_big_vae_training
-  - override /data_collection_runtime/collector_profiles@collector: collector_profile_interleaved
-  - override /data_collection_runtime/streaming_profiles@streaming: streaming_profile_none
 
 hydra:
   job:

@@ -1,3 +1,8 @@
+# @package _global_
+defaults:
+  - global_app_hydra_logging_and_model_registry
+  - _self_
+
 training_artifacts:
   mini_vae_checkpoint_dir: ./checkpoints/mini_patch_vae
   big_vae_checkpoint_dir: ./checkpoints/weight_quantile_vae

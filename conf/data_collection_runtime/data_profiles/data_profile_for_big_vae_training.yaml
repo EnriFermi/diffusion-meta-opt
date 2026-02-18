@@ -1,3 +1,7 @@
+defaults:
+  - data_profile_common_settings
+  - _self_
+
 path: ${oc.env:DATA_ROOT,./data/datasets}
 
 enabled_datasets:

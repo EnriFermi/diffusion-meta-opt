@@ -1,3 +1,4 @@
+# @package _global_
 hf:
   token: ${oc.env:HF_TOKEN,""}
   hf_home: ${data.path}/hf_home
