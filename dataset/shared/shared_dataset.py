@@ -25,7 +25,11 @@ class SharedModelDataset(torch.utils.data.IterableDataset):
             if self.collector.streaming_mode == "none":
                 if self.collector.cache is None:
                     raise RuntimeError("Collector has no in-memory cache for streaming.mode=none")
-                sample = self.collector.cache.get(block=True)
+                try:
+                    sample = self.collector.cache.get(block=True, timeout=1.0)
+                except Empty:
+                    self.collector.assert_healthy()
+                    continue
                 yield sample
                 continue
 
@@ -33,6 +37,7 @@ class SharedModelDataset(torch.utils.data.IterableDataset):
             try:
                 sample = reader.next_sample(block=True, timeout=1.0)
             except Empty:
+                self.collector.assert_healthy()
                 continue
             yield sample
 

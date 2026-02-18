@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -168,6 +168,134 @@ class JsonlStatusWriter:
         line = json.dumps(payload, ensure_ascii=False, default=str)
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
+
+
+# ---------------------------
+# Test-eval helpers
+# ---------------------------
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _resolve_data_profile_path(profile_name: str) -> Path:
+    raw = str(profile_name).strip()
+    if not raw:
+        raise ValueError("mini_train.test_eval.data_profile must be non-empty")
+
+    root = _project_root()
+    with_ext = raw if raw.endswith(".yaml") else f"{raw}.yaml"
+    candidate_paths: list[Path] = []
+
+    given = Path(raw)
+    if given.is_absolute():
+        candidate_paths.append(given if given.suffix else given.with_suffix(".yaml"))
+    else:
+        candidate_paths.append(root / "conf" / "data_collection_runtime" / "data_profiles" / with_ext)
+        candidate_paths.append(root / "conf" / with_ext)
+        candidate_paths.append(root / with_ext)
+
+    for path in candidate_paths:
+        if path.exists():
+            return path
+
+    options = ", ".join(str(path) for path in candidate_paths)
+    raise FileNotFoundError(f"Could not find mini_train.test_eval.data_profile='{raw}'. Tried: {options}")
+
+
+def build_test_eval_runtime_cfg(cfg: DictConfig, logger: logging.Logger) -> DictConfig | None:
+    test_eval_cfg = cfg.mini_train.get("test_eval", {})
+    if not isinstance(test_eval_cfg, (dict, DictConfig)):
+        raise TypeError("mini_train.test_eval must be a mapping")
+    if not bool(test_eval_cfg.get("enabled", False)):
+        return None
+
+    profile_name = str(test_eval_cfg.get("data_profile", "data_profile_for_hf_assets_test")).strip()
+    profile_path = _resolve_data_profile_path(profile_name)
+    profile_cfg = OmegaConf.load(profile_path)
+    profile_payload = OmegaConf.to_container(profile_cfg, resolve=False)
+    if not isinstance(profile_payload, dict):
+        raise TypeError(f"Invalid test data profile payload in {profile_path}: {type(profile_payload)}")
+
+    enabled_datasets = profile_payload.get("enabled_datasets", [])
+    if not isinstance(enabled_datasets, list) or not enabled_datasets:
+        raise ValueError(f"{profile_path} must define a non-empty enabled_datasets list")
+
+    runtime_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    with open_dict(runtime_cfg):
+        runtime_cfg.data.enabled_datasets = [str(name) for name in enabled_datasets]
+        runtime_cfg.data.dataset_overrides = profile_payload.get("dataset_overrides", {}) or {}
+
+        profile_data_path = profile_payload.get("path")
+        if profile_data_path not in (None, ""):
+            runtime_cfg.data.path = profile_data_path
+
+        override_data_path = test_eval_cfg.get("data_path")
+        if override_data_path not in (None, ""):
+            runtime_cfg.data.path = str(override_data_path)
+
+        collector_mode = test_eval_cfg.get("collector_mode")
+        if collector_mode is None or str(collector_mode).strip().lower() in {"", "none", "null"}:
+            runtime_cfg.collector.mode = "interleaved"
+        else:
+            runtime_cfg.collector.mode = str(collector_mode)
+
+        collector_device_default: object = object()
+        collector_device = test_eval_cfg.get("collector_device", collector_device_default)
+        train_collector_device = cfg.collector.get("device")
+        collector_device_text = (
+            str(collector_device).strip().lower() if collector_device is not collector_device_default else ""
+        )
+        if collector_device is collector_device_default or collector_device is None or collector_device_text in {
+            "",
+            "none",
+            "null",
+        }:
+            runtime_cfg.collector.device = train_collector_device
+        else:
+            runtime_cfg.collector.device = collector_device
+
+        runtime_cfg.collector.max_loaded_models = 1
+        runtime_cfg.collector.jobs_per_selected_model = max(1, int(test_eval_cfg.get("jobs_per_selected_model", 1)))
+        runtime_cfg.collector.num_inflight_jobs = max(1, int(test_eval_cfg.get("num_inflight_jobs", 1)))
+
+        in_memory_cfg = test_eval_cfg.get("in_memory_buffer", {})
+        if not isinstance(in_memory_cfg, dict):
+            in_memory_cfg = {}
+        if runtime_cfg.collector.get("in_memory_buffer") is None:
+            runtime_cfg.collector.in_memory_buffer = {}
+        capacity_samples = max(1, int(in_memory_cfg.get("capacity_samples", 256)))
+        fill_target_samples = max(1, int(in_memory_cfg.get("fill_target_samples", 64)))
+        low_watermark_samples = max(1, int(in_memory_cfg.get("low_watermark_samples", 32)))
+        fill_target_samples = min(fill_target_samples, capacity_samples)
+        low_watermark_samples = min(low_watermark_samples, fill_target_samples)
+        runtime_cfg.collector.in_memory_buffer.capacity_samples = capacity_samples
+        runtime_cfg.collector.in_memory_buffer.fill_target_samples = fill_target_samples
+        runtime_cfg.collector.in_memory_buffer.low_watermark_samples = low_watermark_samples
+
+        if runtime_cfg.collector.get("interleaved_schedule") is None:
+            runtime_cfg.collector.interleaved_schedule = {}
+        runtime_cfg.collector.interleaved_schedule.collect_every_n_train_steps = max(
+            1, int(test_eval_cfg.get("collect_every_n_steps", 1))
+        )
+        runtime_cfg.collector.interleaved_schedule.collector_jobs_per_cycle = max(
+            1, int(test_eval_cfg.get("collector_jobs_per_cycle", 1))
+        )
+
+        streaming_mode = test_eval_cfg.get("streaming_mode")
+        if streaming_mode is None or str(streaming_mode).strip().lower() in {"", "none", "null"}:
+            runtime_cfg.streaming.mode = "none"
+        else:
+            runtime_cfg.streaming.mode = str(streaming_mode)
+
+    logger.info(
+        "Configured test-eval runtime: profile=%s datasets=%s collector_mode=%s collector_device=%s streaming_mode=%s",
+        profile_path,
+        runtime_cfg.data.enabled_datasets,
+        runtime_cfg.collector.mode,
+        runtime_cfg.collector.device,
+        runtime_cfg.streaming.mode,
+    )
+    return runtime_cfg
 
 
 # ---------------------------
@@ -429,9 +557,7 @@ def next_valid_sample(
     max_x_rows: int,
     logger: logging.Logger,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-    attempts = 0
-    while True:
-        sample = next(dataset_iter)
+    def _prepare_sample(sample: SharedSample) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]] | None:
         x = sample.x
         W = sample.weight
 
@@ -446,20 +572,195 @@ def next_valid_sample(
             and W.shape[1] > 0
         )
         if not valid:
+            return None
+
+        x_out = x.detach().to(dtype=torch.float32, device="cpu", copy=True).contiguous()
+        W_out = W.detach().to(dtype=torch.float32, device="cpu", copy=True).contiguous()
+        if max_x_rows > 0 and x_out.shape[0] > max_x_rows:
+            keep = torch.randperm(x_out.shape[0])[:max_x_rows]
+            x_out = x_out[keep]
+
+        return x_out, W_out, extract_sample_debug_info(sample)
+
+    attempts = 0
+    while True:
+        sample = next(dataset_iter)
+        prepared = _prepare_sample(sample)
+        if prepared is None:
             attempts += 1
             if attempts % 100 == 0:
                 logger.warning("Skipping invalid sample repeatedly; attempts=%s", attempts)
             continue
+        return prepared
 
-        x = x.detach().to(dtype=torch.float32, device="cpu", copy=True).contiguous()
-        W = W.detach().to(dtype=torch.float32, device="cpu", copy=True).contiguous()
 
-        if max_x_rows > 0 and x.shape[0] > max_x_rows:
-            keep = torch.randperm(x.shape[0])[:max_x_rows]
-            x = x[keep]
+def next_valid_sample_for_eval(
+    dataset: SharedModelDataset,
+    collector: CollectorService,
+    max_x_rows: int,
+    timeout_seconds: float,
+    poll_sleep_seconds: float,
+    logger: logging.Logger,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    deadline = time.time() + max(1.0, float(timeout_seconds))
+    attempts = 0
+    probe_step = 0
 
-        sample_info = extract_sample_debug_info(sample)
-        return x, W, sample_info
+    while True:
+        if time.time() > deadline:
+            raise TimeoutError("Timed out waiting for test-eval sample")
+
+        if not collector.is_async_mode:
+            dataset.maybe_collect(probe_step)
+
+        sample = dataset.try_next_sample()
+        probe_step += 1
+        if sample is None:
+            time.sleep(max(0.001, float(poll_sleep_seconds)))
+            continue
+
+        x = sample.x
+        W = sample.weight
+        valid = (
+            torch.is_tensor(x)
+            and torch.is_tensor(W)
+            and x.ndim == 2
+            and W.ndim == 2
+            and x.shape[1] == W.shape[0]
+            and x.shape[0] > 0
+            and W.shape[0] > 0
+            and W.shape[1] > 0
+        )
+        if not valid:
+            attempts += 1
+            if attempts % 100 == 0:
+                logger.warning("Skipping invalid test sample repeatedly; attempts=%s", attempts)
+            continue
+
+        x_out = x.detach().to(dtype=torch.float32, device="cpu", copy=True).contiguous()
+        W_out = W.detach().to(dtype=torch.float32, device="cpu", copy=True).contiguous()
+        if max_x_rows > 0 and x_out.shape[0] > max_x_rows:
+            keep = torch.randperm(x_out.shape[0])[:max_x_rows]
+            x_out = x_out[keep]
+
+        return x_out, W_out, extract_sample_debug_info(sample)
+
+
+def run_test_eval(
+    model: nn.Module,
+    dataset: SharedModelDataset,
+    collector: CollectorService,
+    device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype | None,
+    patch_size: int,
+    patches_per_sample: int,
+    kl_beta: float,
+    alpha: float,
+    beta: float,
+    contrastive_temperature: float,
+    contrastive_permute_inputs: bool,
+    contrastive_sign_flip_inputs: bool,
+    num_batches: int,
+    max_x_rows: int,
+    timeout_seconds: float,
+    poll_sleep_seconds: float,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    eval_model = model.module if isinstance(model, DDP) else model
+    was_training = bool(eval_model.training)
+    eval_model.eval()
+
+    loss_sum = 0.0
+    structural_sum = 0.0
+    behavioral_sum = 0.0
+    contrastive_sum = 0.0
+    recon_mix_sum = 0.0
+    kl_sum = 0.0
+    x_rows_sum = 0.0
+
+    model_counter: Counter[str] = Counter()
+    dataset_counter: Counter[str] = Counter()
+    layer_counter: Counter[str] = Counter()
+
+    started = time.time()
+    try:
+        with torch.no_grad():
+            for _ in range(max(1, int(num_batches))):
+                x_cpu, W_cpu, sample_info = next_valid_sample_for_eval(
+                    dataset=dataset,
+                    collector=collector,
+                    max_x_rows=max_x_rows,
+                    timeout_seconds=timeout_seconds,
+                    poll_sleep_seconds=poll_sleep_seconds,
+                    logger=logger,
+                )
+                x = x_cpu.to(device=device, non_blocking=True)
+                W = W_cpu.to(device=device, non_blocking=True)
+
+                X_full, X_patch, w_patch, patch_idx, out_idx = sample_patch_batch(
+                    x=x,
+                    W=W,
+                    patch_size=patch_size,
+                    patches_per_sample=patches_per_sample,
+                )
+                with autocast_context(enabled=amp_enabled, dtype=amp_dtype):
+                    total_loss, structural_loss, behavioral_loss, contrastive_loss, recon_mix_loss, kl_loss = eval_model(
+                        X_full=X_full,
+                        X_patch=X_patch,
+                        w_patch=w_patch,
+                        patch_idx=patch_idx,
+                        kl_beta=kl_beta,
+                        alpha=alpha,
+                        beta=beta,
+                        contrastive_temperature=contrastive_temperature,
+                        contrastive_permute_inputs=contrastive_permute_inputs,
+                        contrastive_sign_flip_inputs=contrastive_sign_flip_inputs,
+                        W_full=W,
+                        out_idx=out_idx,
+                    )
+
+                loss_sum += float(total_loss.detach().item())
+                structural_sum += float(structural_loss.detach().item())
+                behavioral_sum += float(behavioral_loss.detach().item())
+                contrastive_sum += float(contrastive_loss.detach().item())
+                recon_mix_sum += float(recon_mix_loss.detach().item())
+                kl_sum += float(kl_loss.detach().item())
+                x_rows_sum += float(sample_info.get("x_rows") or 0)
+
+                model_name = sample_info.get("model_name")
+                layer_name = sample_info.get("layer_name")
+                if model_name is not None:
+                    model_counter[str(model_name)] += 1
+                if layer_name is not None:
+                    layer_counter[str(layer_name)] += 1
+                for ds_name in sample_info.get("datasets", []):
+                    dataset_counter[str(ds_name)] += 1
+    finally:
+        if was_training:
+            eval_model.train()
+
+    n = float(max(1, int(num_batches)))
+    duration_s = max(1e-6, time.time() - started)
+    return {
+        "num_batches": int(num_batches),
+        "duration_s": float(duration_s),
+        "metrics": {
+            "loss": loss_sum / n,
+            "structural": structural_sum / n,
+            "behavioral": behavioral_sum / n,
+            "contrastive": contrastive_sum / n,
+            "recon_mix": recon_mix_sum / n,
+            "kl": kl_sum / n,
+            "x_rows": x_rows_sum / n,
+            "batches_per_sec": n / duration_s,
+        },
+        "sample_mix": {
+            "models_top": counter_top(model_counter, 10),
+            "datasets_top": counter_top(dataset_counter, 10),
+            "layers_top": counter_top(layer_counter, 10),
+        },
+    }
 
 
 def broadcast_tensor_2d(
@@ -748,8 +1049,13 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
         cfg.streaming.distributed.rank_env = "RANK"
         cfg.streaming.distributed.world_size_env = "WORLD_SIZE"
         cfg.streaming.distributed.shard_by = str(cfg.streaming.distributed.get("shard_by", "chunk"))
-        base_cache_dir = str(cfg.streaming.consumer.get("local_cache_dir", "./data/streaming/cache/consumer"))
-        cfg.streaming.consumer.local_cache_dir = str(Path(base_cache_dir) / f"rank_{rank}")
+        base_cache_dir = str(
+            cfg.streaming.consumer.get(
+                "cache_dir",
+                cfg.streaming.consumer.get("local_cache_dir", "./data/streaming/cache/consumer"),
+            )
+        )
+        cfg.streaming.consumer.cache_dir = str(Path(base_cache_dir) / f"rank_{rank}")
 
     logger.info(
         "Runtime: device=%s distributed=%s world_size=%s streaming_mode=%s dataset_sharding=%s",
@@ -770,6 +1076,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
         collector: CollectorService | None = None
         dataset: SharedModelDataset | None = None
         dataset_iter: Iterator[SharedSample] | None = None
+        test_eval_runtime_cfg: DictConfig | None = None
+        test_eval_predownload = False
 
         with contextlib.ExitStack() as stack:
             if rank == 0:
@@ -785,6 +1093,12 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     )
                 )
                 dataset_iter = iter(dataset)
+
+            if rank == 0:
+                test_eval_runtime_cfg = build_test_eval_runtime_cfg(cfg=cfg, logger=logger)
+                if test_eval_runtime_cfg is not None:
+                    test_eval_cfg_local = cfg.mini_train.get("test_eval", {})
+                    test_eval_predownload = bool(test_eval_cfg_local.get("predownload_models", False))
 
             distribution_cfg = build_distribution_config(cfg)
             mini_cfg = build_mini_vae_config(cfg)
@@ -860,6 +1174,37 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
             patch_size = int(cfg.mini_model.get("patch_size", 64))
             log_every = max(1, int(cfg.mini_train.get("log_every", 10)))
             checkpoint_every = max(1, int(cfg.mini_train.get("checkpoint_every", 200)))
+
+            test_eval_cfg = cfg.mini_train.get("test_eval", {})
+            if not isinstance(test_eval_cfg, (dict, DictConfig)):
+                raise TypeError("mini_train.test_eval must be a mapping")
+            test_eval_requested = bool(test_eval_cfg.get("enabled", False))
+            test_eval_every_steps = max(1, int(test_eval_cfg.get("every_steps", 1000)))
+            test_eval_num_batches = max(1, int(test_eval_cfg.get("num_batches", 8)))
+            test_eval_timeout_seconds = max(1.0, float(test_eval_cfg.get("timeout_seconds", 300.0)))
+            test_eval_poll_sleep_seconds = max(0.001, float(test_eval_cfg.get("poll_sleep_seconds", 0.05)))
+            test_eval_run_on_last_step = bool(test_eval_cfg.get("run_on_last_step", True))
+            raw_test_eval_max_x_rows = test_eval_cfg.get("max_x_rows")
+            text_test_eval_max_x_rows = str(raw_test_eval_max_x_rows).strip().lower() if raw_test_eval_max_x_rows is not None else ""
+            if raw_test_eval_max_x_rows is None or text_test_eval_max_x_rows in {"", "none", "null"}:
+                test_eval_max_x_rows = max_x_rows
+            else:
+                test_eval_max_x_rows = int(raw_test_eval_max_x_rows)
+            if test_eval_max_x_rows < 0:
+                test_eval_max_x_rows = 0
+
+            if test_eval_requested and rank == 0 and test_eval_runtime_cfg is None:
+                raise RuntimeError("mini_train.test_eval is enabled but test-eval runtime config was not initialized")
+
+            if test_eval_requested and rank == 0:
+                logger.info(
+                    "Test-eval enabled: every_steps=%s num_batches=%s run_on_last_step=%s timeout=%.1fs max_x_rows=%s",
+                    test_eval_every_steps,
+                    test_eval_num_batches,
+                    test_eval_run_on_last_step,
+                    test_eval_timeout_seconds,
+                    test_eval_max_x_rows,
+                )
 
             loss_window = 0.0
             structural_window = 0.0
@@ -1285,6 +1630,108 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     step_backward_ms_window = 0.0
                     step_opt_ms_window = 0.0
                     t0 = time.time()
+
+                run_test_eval_this_step = test_eval_requested and (
+                    (global_step % test_eval_every_steps == 0)
+                    or (test_eval_run_on_last_step and global_step == max_steps)
+                )
+                if run_test_eval_this_step and is_distributed:
+                    dist.barrier()
+
+                if run_test_eval_this_step and rank == 0:
+                    eval_started = time.time()
+                    try:
+                        if test_eval_runtime_cfg is None:
+                            raise RuntimeError("test_eval runtime config is None")
+
+                        with data_pipeline(
+                            test_eval_runtime_cfg,
+                            start_collector=True,
+                            predownload_models=test_eval_predownload,
+                            logger=logger,
+                        ) as (test_dataset, test_collector):
+                            test_eval_report = run_test_eval(
+                                model=model,
+                                dataset=test_dataset,
+                                collector=test_collector,
+                                device=device,
+                                amp_enabled=amp_enabled,
+                                amp_dtype=amp_dtype,
+                                patch_size=patch_size,
+                                patches_per_sample=patches_per_sample,
+                                kl_beta=kl_beta,
+                                alpha=alpha,
+                                beta=beta,
+                                contrastive_temperature=contrastive_temperature,
+                                contrastive_permute_inputs=contrastive_permute_inputs,
+                                contrastive_sign_flip_inputs=contrastive_sign_flip_inputs,
+                                num_batches=test_eval_num_batches,
+                                max_x_rows=test_eval_max_x_rows,
+                                timeout_seconds=test_eval_timeout_seconds,
+                                poll_sleep_seconds=test_eval_poll_sleep_seconds,
+                                logger=logger,
+                            )
+
+                        metrics = test_eval_report.get("metrics", {})
+                        sample_mix = test_eval_report.get("sample_mix", {})
+                        duration_s = float(test_eval_report.get("duration_s", time.time() - eval_started))
+                        logger.info(
+                            "test_eval step=%s batches=%s loss=%.6f str=%.6f beh=%.6f con=%.6f recon_mix=%.6f kl=%.6f "
+                            "x_rows=%.2f bps=%.2f duration=%.2fs",
+                            global_step,
+                            int(test_eval_report.get("num_batches", test_eval_num_batches)),
+                            float(metrics.get("loss", 0.0)),
+                            float(metrics.get("structural", 0.0)),
+                            float(metrics.get("behavioral", 0.0)),
+                            float(metrics.get("contrastive", 0.0)),
+                            float(metrics.get("recon_mix", 0.0)),
+                            float(metrics.get("kl", 0.0)),
+                            float(metrics.get("x_rows", 0.0)),
+                            float(metrics.get("batches_per_sec", 0.0)),
+                            duration_s,
+                        )
+                        logger.info(
+                            "test_eval_mix step=%s models=%s datasets=%s layers=%s",
+                            global_step,
+                            sample_mix.get("models_top", []),
+                            sample_mix.get("datasets_top", []),
+                            sample_mix.get("layers_top", []),
+                        )
+
+                        status_writer.write(
+                            {
+                                "step": int(global_step),
+                                "timestamp": float(time.time()),
+                                "test_eval": test_eval_report,
+                            }
+                        )
+                        if comet_tracker is not None and comet_tracker.enabled:
+                            comet_tracker.log_metrics(
+                                {
+                                    "test/loss": float(metrics.get("loss", 0.0)),
+                                    "test/structural": float(metrics.get("structural", 0.0)),
+                                    "test/behavioral": float(metrics.get("behavioral", 0.0)),
+                                    "test/contrastive": float(metrics.get("contrastive", 0.0)),
+                                    "test/recon_mix": float(metrics.get("recon_mix", 0.0)),
+                                    "test/kl": float(metrics.get("kl", 0.0)),
+                                    "test/x_rows": float(metrics.get("x_rows", 0.0)),
+                                    "test/batches_per_sec": float(metrics.get("batches_per_sec", 0.0)),
+                                    "test/duration_s": float(duration_s),
+                                },
+                                step=global_step,
+                            )
+                    except Exception as exc:
+                        logger.exception("test_eval failed at step=%s: %s", global_step, exc)
+                        status_writer.write(
+                            {
+                                "step": int(global_step),
+                                "timestamp": float(time.time()),
+                                "test_eval_error": str(exc),
+                            }
+                        )
+
+                if run_test_eval_this_step and is_distributed:
+                    dist.barrier()
 
                 if rank == 0 and (global_step % checkpoint_every == 0 or global_step == max_steps):
                     save_checkpoint(

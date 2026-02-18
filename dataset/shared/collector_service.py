@@ -279,6 +279,30 @@ class CollectorService:
     def is_async_mode(self) -> bool:
         return self.collector_mode == "async"
 
+    def is_async_process_alive(self) -> bool:
+        if not self.is_async_mode:
+            return True
+        return bool(self._process is not None and self._process.is_alive())
+
+    def assert_healthy(self) -> None:
+        """
+        Fail fast when async collector process has exited.
+
+        Without this guard, consumers may block forever waiting for new samples
+        after collector crash.
+        """
+        if not self.is_async_mode:
+            return
+
+        self._drain_status_queue()
+        if self._process is None:
+            return
+        if self._process.is_alive():
+            return
+
+        exit_code = self._process.exitcode
+        raise RuntimeError(f"Async collector process exited unexpectedly (exitcode={exit_code})")
+
     def predownload_models(self) -> None:
         model_cfgs = self.compat_index.get_model_cfgs()
         models = self.compat_index.get_models()
@@ -565,7 +589,7 @@ class CollectorService:
             model_cfgs=model_cfgs,
             device_override=runtime_device,
             max_loaded_models=max_loaded,
-            runtime_local_only=True,
+            runtime_local_only=bool(collector_cfg.get("runtime_local_only", False)),
             release_device_on_unload=release_device_on_unload,
             empty_cuda_cache_on_unload=empty_cuda_cache_on_unload,
         )

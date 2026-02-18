@@ -1,0 +1,23 @@
+name: trocr_large_printed
+provider: transformers
+runner: hf_encdec_runner
+model_family: trocr
+architecture: trocr
+hf_repo: microsoft/trocr-large-printed
+revision: null
+gated: false
+cache_subdir: models/${.name}
+batch_size: 8
+sampling_weight: 1.0
+device: auto
+dtype: float32
+run_mode: encoder_only
+hook_filter:
+  include_regex: "^encoder\\."
+  exclude_regex: null
+limits:
+  max_records_per_layer: 120000
+  max_layers: null
+preprocess:
+  processor: auto
+trust_remote_code: false

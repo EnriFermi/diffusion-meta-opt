@@ -8,26 +8,38 @@ from dataset.models.providers.transformers.hf_base_runner import HFBaseRunner
 
 
 class HFDenseRunner(HFBaseRunner):
-    """Dense prediction runner (Mask2Former / GroundingDINO)."""
+    """Dense prediction runner (Mask2Former / GroundingDINO / DETR / SegFormer)."""
 
     def __init__(self, cfg: Any, global_cfg: Any) -> None:
         super().__init__(cfg=cfg, global_cfg=global_cfg)
         self.architecture = str(self.cfg_dict.get("architecture", "mask2former")).lower()
 
     def _load_model(self, token: str | None) -> Any:
-        from transformers import GroundingDinoForObjectDetection, Mask2FormerForUniversalSegmentation
+        from transformers import (
+            DetrForObjectDetection,
+            GroundingDinoForObjectDetection,
+            Mask2FormerForUniversalSegmentation,
+            SegformerForSemanticSegmentation,
+        )
 
         if self.architecture == "grounding_dino":
             return self._from_pretrained(GroundingDinoForObjectDetection, token=token)
         if self.architecture == "mask2former":
             return self._from_pretrained(Mask2FormerForUniversalSegmentation, token=token)
+        if self.architecture == "detr":
+            return self._from_pretrained(DetrForObjectDetection, token=token)
+        if self.architecture == "segformer":
+            return self._from_pretrained(SegformerForSemanticSegmentation, token=token)
 
         raise ValueError(f"Unsupported dense architecture='{self.architecture}' for {self.name}")
 
     def _load_processor(self, token: str | None) -> Any:
-        from transformers import AutoProcessor
+        from transformers import AutoImageProcessor, AutoProcessor
 
-        return self._from_pretrained(AutoProcessor, token=token)
+        try:
+            return self._from_pretrained(AutoProcessor, token=token)
+        except Exception:
+            return self._from_pretrained(AutoImageProcessor, token=token)
 
     def prepare_inputs(self, batch_pil: list[Image.Image]) -> dict[str, Any]:
         if self.architecture == "grounding_dino":

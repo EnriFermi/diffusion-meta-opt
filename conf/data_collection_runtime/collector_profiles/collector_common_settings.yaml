@@ -5,6 +5,9 @@ max_loaded_models: 1
 pin_gpu: false
 release_device_on_unload: true
 empty_cuda_cache_on_unload: true
+# If true, collector runs with local_files_only=true for HF assets.
+# Keep false for cold-start compatibility on fresh machines.
+runtime_local_only: false
 
 # round_robin_shuffled | weighted_random
 model_selection_strategy: round_robin_shuffled
