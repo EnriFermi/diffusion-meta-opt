@@ -1,3 +1,7 @@
+defaults:
+  - streaming_common_settings
+  - _self_
+
 mode: s3_bridge
 
 producer:

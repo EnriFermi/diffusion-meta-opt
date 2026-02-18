@@ -10,7 +10,7 @@
   - artifact/checkpoint path conventions (mini -> big)
 
 - `data_collection_runtime/`
-  - `data_profiles/`: what datasets/profile to use
+  - `data_profiles/`: what datasets/profile to use (e.g. `data_profile_for_big_vae_training`, `data_profile_for_hf_assets_test`)
   - `collector_profiles/`: collector runtime behavior
   - `streaming_profiles/`: chunk transport/storage runtime
 
