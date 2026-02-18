@@ -1,15 +1,11 @@
 defaults:
   - /shared_runtime_environment: global_app_hydra_logging_and_model_registry
-  - override /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
 
   - /data_collection_runtime/data_profiles@data: data_profile_common_settings
-  - override /data_collection_runtime/data_profiles@data: data_profile_for_mini_vae_training
 
   - /data_collection_runtime/collector_profiles@collector: collector_common_settings
-  - override /data_collection_runtime/collector_profiles@collector: collector_profile_async_gpu1
 
   - /data_collection_runtime/streaming_profiles@streaming: streaming_common_settings
-  - override /data_collection_runtime/streaming_profiles@streaming: streaming_profile_local_disk_gpu_parallel
 
   - /shared_training_parameters@mini_train: trainer_execution_common
   - /mini_vae_experiment@mini_train: trainer_parameters_specific_to_mini_vae_stage
@@ -18,6 +14,11 @@ defaults:
   - /mini_vae_experiment@mini_model: model_parameters_specific_to_mini_vae_stage
 
   - _self_
+
+  - override /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
+  - override /data_collection_runtime/data_profiles@data: data_profile_for_mini_vae_training
+  - override /data_collection_runtime/collector_profiles@collector: collector_profile_async_gpu1
+  - override /data_collection_runtime/streaming_profiles@streaming: streaming_profile_local_disk_gpu_parallel
 
 hydra:
   job:
