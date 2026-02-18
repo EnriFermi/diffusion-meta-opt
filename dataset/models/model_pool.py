@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 from collections import OrderedDict
 from typing import Any
 
@@ -9,6 +10,7 @@ from dataset.models.base_virtual_model import BaseVirtualModel
 from dataset.models.model_runner import merge_layer_records
 from dataset.models.registry import create_model
 from dataset.models.types import LayerIORecord
+from dataset.shared.load_report import LoadReportWriter
 
 
 class ModelPool:
@@ -23,10 +25,12 @@ class ModelPool:
         runtime_local_only: bool,
         release_device_on_unload: bool = True,
         empty_cuda_cache_on_unload: bool = True,
+        load_report: LoadReportWriter | None = None,
     ) -> None:
         self.global_cfg = global_cfg
         self.global_cfg_dict = to_plain_dict(global_cfg)
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.load_report = load_report
 
         self.model_cfgs: dict[str, dict[str, Any]] = {
             str(name): to_plain_dict(cfg) for name, cfg in model_cfgs.items()
@@ -110,8 +114,35 @@ class ModelPool:
         runtime_cfg["release_device_on_unload"] = self.release_device_on_unload
         runtime_cfg["empty_cuda_cache_on_unload"] = self.empty_cuda_cache_on_unload
 
-        model = create_model(model_name, cfg=runtime_cfg, global_cfg=self.global_cfg)
-        model.load()
+        model: BaseVirtualModel | None = None
+        try:
+            model = create_model(model_name, cfg=runtime_cfg, global_cfg=self.global_cfg)
+            model.load()
+        except Exception as exc:
+            if model is not None:
+                try:
+                    model.unload()
+                except Exception:
+                    pass
+
+            if self.load_report is not None:
+                self.load_report.mark_model_failed(
+                    model_name=model_name,
+                    phase="load",
+                    error=str(exc),
+                    traceback_text=traceback.format_exc(),
+                )
+            raise
+
+        if self.load_report is not None:
+            self.load_report.mark_model_loaded(
+                model_name=model_name,
+                phase="load",
+                details={
+                    "device": runtime_cfg.get("device"),
+                    "local_files_only": bool(runtime_cfg.get("local_files_only", False)),
+                },
+            )
 
         self._loaded_models[model_name] = model
         self._touch(model_name)

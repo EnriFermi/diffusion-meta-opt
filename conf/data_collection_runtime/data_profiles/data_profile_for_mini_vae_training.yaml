@@ -5,10 +5,50 @@ defaults:
 path: ${oc.env:DATA_ROOT,./data}
 
 enabled_datasets:
-  - coco2017
-  - cc12m
-  - visual_genome
+  - bdd100k
   - scene_parse_150
+  - oxford_pets
+  - stanford_cars
+
+dataset_overrides:
+  # Keep mini-train profile on datasets with materialized image fields
+  # (instead of brittle external URL-only corpora like cc12m/visual_genome).
+  bdd100k:
+    models:
+      - clip_vit_b32
+      - deit_base
+      - dinov2_base
+      - swinv2_base
+    cache:
+      chunk_size_images: 128
+      num_chunks_kept: 3
+  scene_parse_150:
+    models:
+      - swinv2_base
+      - deit_base
+      - beit_base
+    cache:
+      chunk_size_images: 128
+      num_chunks_kept: 3
+  oxford_pets:
+    models:
+      - clip_vit_b32
+      - siglip_base_p16_384
+      - dinov2_base
+      - deit_base
+    cache:
+      chunk_size_images: 128
+      num_chunks_kept: 3
+  stanford_cars:
+    models:
+      - clip_vit_b32
+      - siglip_base_p16_384
+      - dinov2_base
+      - deit_base
+      - beit_base
+    cache:
+      chunk_size_images: 128
+      num_chunks_kept: 3
 
 cli:
   batch_size: 8

@@ -9,6 +9,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _quantile_over_samples(X_q: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """
+    Compile-friendly quantile over sample axis.
+
+    X_q: [B, n, p]
+    q: [k]
+    returns: [k, B, p]
+    """
+    if X_q.ndim != 3:
+        raise ValueError(f"X_q must be [B,n,p], got {tuple(X_q.shape)}")
+    if q.ndim != 1:
+        raise ValueError(f"q must be rank-1, got {tuple(q.shape)}")
+
+    sorted_vals, _ = torch.sort(X_q, dim=1)
+    n = sorted_vals.shape[1]
+    k = q.shape[0]
+
+    q = q.to(device=X_q.device, dtype=X_q.dtype).clamp(0.0, 1.0)
+    pos = q * (n - 1)
+
+    lower = torch.floor(pos).to(dtype=torch.long)
+    upper = torch.ceil(pos).to(dtype=torch.long)
+    alpha = (pos - lower.to(dtype=X_q.dtype)).view(1, k, 1)
+
+    B, _, p = sorted_vals.shape
+    lower_idx = lower.view(1, k, 1).expand(B, k, p)
+    upper_idx = upper.view(1, k, 1).expand(B, k, p)
+
+    lower_vals = sorted_vals.gather(dim=1, index=lower_idx)
+    upper_vals = sorted_vals.gather(dim=1, index=upper_idx)
+    q_vals = lower_vals + (upper_vals - lower_vals) * alpha
+    return q_vals.permute(1, 0, 2).contiguous()
+
+
 def sinusoidal_embedding(indices: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
     """Deterministic sinusoidal embedding for arbitrary-sized integer grids."""
     if dim <= 0:
@@ -198,7 +232,7 @@ class InputDistributionEncodingModule(nn.Module):
         # Quantiles over sample axis n.
         # q_raw: [k_s, B, p] -> q: [B, k_s, p]
         X_q = X_I.to(torch.float32)
-        q_raw = torch.quantile(X_q, q=self.quantile_probs.to(X_q.device), dim=1)
+        q_raw = _quantile_over_samples(X_q, self.quantile_probs.to(X_q.device))
         q = q_raw.permute(1, 0, 2).contiguous()
 
         # Normalize quantiles per variable into [-1, 1] scale.
