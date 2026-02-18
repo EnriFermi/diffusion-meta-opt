@@ -38,10 +38,13 @@ def build_adamw_optimizer(
     }
 
     params = inspect.signature(torch.optim.AdamW).parameters
-    if "fused" in params and device.type == "cuda":
-        kwargs["fused"] = True
+    use_fused = "fused" in params and device.type == "cuda"
+    use_foreach = "foreach" in params and not use_fused
+
+    if "fused" in params:
+        kwargs["fused"] = use_fused
     if "foreach" in params:
-        kwargs["foreach"] = True
+        kwargs["foreach"] = use_foreach
 
     return torch.optim.AdamW(model.parameters(), **kwargs)
 
