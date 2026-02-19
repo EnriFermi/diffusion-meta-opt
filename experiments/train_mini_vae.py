@@ -695,6 +695,57 @@ def next_valid_sample_for_eval(
         return x_out, W_out, extract_sample_debug_info(sample)
 
 
+ABLATION_METRIC_KEYS: tuple[str, ...] = (
+    "decoder_random_latent_structural",
+    "decoder_random_latent_behavioral",
+    "decoder_random_latent_recon_mix",
+    "random_dist_structural",
+    "random_dist_behavioral",
+    "random_dist_recon_mix",
+    "random_dist_kl",
+    "random_dist_total",
+)
+
+
+def compute_ablation_metrics_for_batch(
+    eval_model: nn.Module,
+    *,
+    X_full: torch.Tensor,
+    X_patch: torch.Tensor,
+    w_patch: torch.Tensor,
+    patch_idx: torch.Tensor,
+    beta: float,
+    kl_beta: float,
+) -> dict[str, float]:
+    ablation_fn = getattr(eval_model, "ablation_losses", None)
+    if not callable(ablation_fn):
+        raise TypeError(
+            f"Expected model with callable ablation_losses(...), got {type(eval_model)}"
+        )
+
+    raw_payload = ablation_fn(
+        X_full=X_full,
+        X_patch=X_patch,
+        w_patch=w_patch,
+        patch_idx=patch_idx,
+        beta=beta,
+        kl_beta=kl_beta,
+    )
+    if not isinstance(raw_payload, dict):
+        raise TypeError(f"ablation_losses must return dict, got {type(raw_payload)}")
+
+    payload: dict[str, float] = {}
+    for key in ABLATION_METRIC_KEYS:
+        if key not in raw_payload:
+            raise KeyError(f"Missing ablation metric '{key}' in ablation_losses output")
+        value = raw_payload[key]
+        if torch.is_tensor(value):
+            payload[key] = float(value.detach().item())
+        else:
+            payload[key] = float(value)
+    return payload
+
+
 def run_test_eval(
     model: nn.Module,
     dataset: SharedModelDataset,
@@ -727,6 +778,7 @@ def run_test_eval(
     recon_mix_sum = 0.0
     kl_sum = 0.0
     x_rows_sum = 0.0
+    ablation_sums: dict[str, float] = {key: 0.0 for key in ABLATION_METRIC_KEYS}
 
     model_counter: Counter[str] = Counter()
     dataset_counter: Counter[str] = Counter()
@@ -768,6 +820,15 @@ def run_test_eval(
                         W_full=W,
                         out_idx=out_idx,
                     )
+                    ablation_metrics_batch = compute_ablation_metrics_for_batch(
+                        eval_model=eval_model,
+                        X_full=X_full,
+                        X_patch=X_patch,
+                        w_patch=w_patch,
+                        patch_idx=patch_idx,
+                        beta=beta,
+                        kl_beta=kl_beta,
+                    )
 
                 loss_sum += float(total_loss.detach().item())
                 structural_sum += float(structural_loss.detach().item())
@@ -776,6 +837,8 @@ def run_test_eval(
                 recon_mix_sum += float(recon_mix_loss.detach().item())
                 kl_sum += float(kl_loss.detach().item())
                 x_rows_sum += float(sample_info.get("x_rows") or 0)
+                for key in ABLATION_METRIC_KEYS:
+                    ablation_sums[key] += float(ablation_metrics_batch[key])
 
                 model_name = sample_info.get("model_name")
                 layer_name = sample_info.get("layer_name")
@@ -803,7 +866,112 @@ def run_test_eval(
             "kl": kl_sum / n,
             "x_rows": x_rows_sum / n,
             "batches_per_sec": n / duration_s,
+            "decoder_random_latent_structural": ablation_sums["decoder_random_latent_structural"] / n,
+            "decoder_random_latent_behavioral": ablation_sums["decoder_random_latent_behavioral"] / n,
+            "decoder_random_latent_recon_mix": ablation_sums["decoder_random_latent_recon_mix"] / n,
+            "random_dist_structural": ablation_sums["random_dist_structural"] / n,
+            "random_dist_behavioral": ablation_sums["random_dist_behavioral"] / n,
+            "random_dist_recon_mix": ablation_sums["random_dist_recon_mix"] / n,
+            "random_dist_kl": ablation_sums["random_dist_kl"] / n,
+            "random_dist_total": ablation_sums["random_dist_total"] / n,
         },
+        "sample_mix": {
+            "models_top": counter_top(model_counter, 10),
+            "datasets_top": counter_top(dataset_counter, 10),
+            "layers_top": counter_top(layer_counter, 10),
+        },
+    }
+
+
+def run_train_ablation_eval(
+    model: nn.Module,
+    dataset: SharedModelDataset,
+    collector: CollectorService,
+    device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype | None,
+    patch_size: int,
+    patches_per_sample: int,
+    kl_beta: float,
+    beta: float,
+    num_batches: int,
+    max_x_rows: int,
+    timeout_seconds: float,
+    poll_sleep_seconds: float,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    eval_model = model.module if isinstance(model, DDP) else model
+    was_training = bool(eval_model.training)
+    eval_model.eval()
+
+    ablation_sums: dict[str, float] = {key: 0.0 for key in ABLATION_METRIC_KEYS}
+    x_rows_sum = 0.0
+
+    model_counter: Counter[str] = Counter()
+    dataset_counter: Counter[str] = Counter()
+    layer_counter: Counter[str] = Counter()
+
+    started = time.time()
+    try:
+        with torch.no_grad():
+            for _ in range(max(1, int(num_batches))):
+                x_cpu, W_cpu, sample_info = next_valid_sample_for_eval(
+                    dataset=dataset,
+                    collector=collector,
+                    max_x_rows=max_x_rows,
+                    timeout_seconds=timeout_seconds,
+                    poll_sleep_seconds=poll_sleep_seconds,
+                    logger=logger,
+                )
+                x = x_cpu.to(device=device, non_blocking=True)
+                W = W_cpu.to(device=device, non_blocking=True)
+
+                X_full, X_patch, w_patch, patch_idx, _ = sample_patch_batch(
+                    x=x,
+                    W=W,
+                    patch_size=patch_size,
+                    patches_per_sample=patches_per_sample,
+                )
+                with autocast_context(enabled=amp_enabled, dtype=amp_dtype):
+                    ablation_metrics_batch = compute_ablation_metrics_for_batch(
+                        eval_model=eval_model,
+                        X_full=X_full,
+                        X_patch=X_patch,
+                        w_patch=w_patch,
+                        patch_idx=patch_idx,
+                        beta=beta,
+                        kl_beta=kl_beta,
+                    )
+
+                for key in ABLATION_METRIC_KEYS:
+                    ablation_sums[key] += float(ablation_metrics_batch[key])
+                x_rows_sum += float(sample_info.get("x_rows") or 0)
+
+                model_name = sample_info.get("model_name")
+                layer_name = sample_info.get("layer_name")
+                if model_name is not None:
+                    model_counter[str(model_name)] += 1
+                if layer_name is not None:
+                    layer_counter[str(layer_name)] += 1
+                for ds_name in sample_info.get("datasets", []):
+                    dataset_counter[str(ds_name)] += 1
+    finally:
+        if was_training:
+            eval_model.train()
+
+    n = float(max(1, int(num_batches)))
+    duration_s = max(1e-6, time.time() - started)
+    metrics: dict[str, float] = {
+        "x_rows": x_rows_sum / n,
+        "batches_per_sec": n / duration_s,
+    }
+    for key in ABLATION_METRIC_KEYS:
+        metrics[key] = ablation_sums[key] / n
+
+    return {
+        "num_batches": int(num_batches),
+        "duration_s": float(duration_s),
+        "metrics": metrics,
         "sample_mix": {
             "models_top": counter_top(model_counter, 10),
             "datasets_top": counter_top(dataset_counter, 10),
@@ -1256,6 +1424,44 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     test_eval_max_x_rows,
                 )
 
+            train_ablation_cfg = cfg.mini_train.get("train_ablation_eval", {})
+            if not isinstance(train_ablation_cfg, (dict, DictConfig)):
+                raise TypeError("mini_train.train_ablation_eval must be a mapping")
+            train_ablation_requested = bool(train_ablation_cfg.get("enabled", True))
+            train_ablation_every_steps = max(1, int(train_ablation_cfg.get("every_steps", 100)))
+            train_ablation_num_batches = max(1, int(train_ablation_cfg.get("num_batches", 4)))
+            train_ablation_timeout_seconds = max(1.0, float(train_ablation_cfg.get("timeout_seconds", 120.0)))
+            train_ablation_poll_sleep_seconds = max(
+                0.001,
+                float(train_ablation_cfg.get("poll_sleep_seconds", 0.05)),
+            )
+            train_ablation_run_on_last_step = bool(train_ablation_cfg.get("run_on_last_step", True))
+            raw_train_ablation_max_x_rows = train_ablation_cfg.get("max_x_rows")
+            text_train_ablation_max_x_rows = (
+                str(raw_train_ablation_max_x_rows).strip().lower()
+                if raw_train_ablation_max_x_rows is not None
+                else ""
+            )
+            if raw_train_ablation_max_x_rows is None or text_train_ablation_max_x_rows in {"", "none", "null"}:
+                train_ablation_max_x_rows = max_x_rows
+            else:
+                train_ablation_max_x_rows = int(raw_train_ablation_max_x_rows)
+            if train_ablation_max_x_rows < 0:
+                train_ablation_max_x_rows = 0
+
+            if train_ablation_requested and rank == 0 and (dataset is None or collector is None):
+                raise RuntimeError("mini_train.train_ablation_eval is enabled but train data pipeline is not initialized")
+
+            if train_ablation_requested and rank == 0:
+                logger.info(
+                    "Train-ablation-eval enabled: every_steps=%s num_batches=%s run_on_last_step=%s timeout=%.1fs max_x_rows=%s",
+                    train_ablation_every_steps,
+                    train_ablation_num_batches,
+                    train_ablation_run_on_last_step,
+                    train_ablation_timeout_seconds,
+                    train_ablation_max_x_rows,
+                )
+
             loss_window = 0.0
             structural_window = 0.0
             behavioral_window = 0.0
@@ -1683,6 +1889,112 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     patch_window.clear()
                     t0 = time.time()
 
+                run_train_ablation_this_step = train_ablation_requested and (
+                    (global_step % train_ablation_every_steps == 0)
+                    or (train_ablation_run_on_last_step and global_step == max_steps)
+                )
+                if run_train_ablation_this_step and is_distributed:
+                    dist.barrier()
+
+                if run_train_ablation_this_step and rank == 0:
+                    if dataset is None or collector is None:
+                        raise RuntimeError("train_ablation_eval requires initialized train dataset and collector")
+                    train_ablation_started = time.time()
+                    try:
+                        train_ablation_report = run_train_ablation_eval(
+                            model=model,
+                            dataset=dataset,
+                            collector=collector,
+                            device=device,
+                            amp_enabled=amp_enabled,
+                            amp_dtype=amp_dtype,
+                            patch_size=patch_size,
+                            patches_per_sample=patches_per_sample,
+                            kl_beta=kl_beta,
+                            beta=beta,
+                            num_batches=train_ablation_num_batches,
+                            max_x_rows=train_ablation_max_x_rows,
+                            timeout_seconds=train_ablation_timeout_seconds,
+                            poll_sleep_seconds=train_ablation_poll_sleep_seconds,
+                            logger=logger,
+                        )
+                        train_ablation_metrics = train_ablation_report.get("metrics", {})
+                        train_ablation_mix = train_ablation_report.get("sample_mix", {})
+                        train_ablation_duration_s = float(
+                            train_ablation_report.get("duration_s", time.time() - train_ablation_started)
+                        )
+                        logger.info(
+                            "train_ablation_eval step=%s batches=%s rand_z_recon=%.6f rand_dist_recon=%.6f rand_dist_kl=%.6f "
+                            "x_rows=%.2f bps=%.2f duration=%.2fs",
+                            global_step,
+                            int(train_ablation_report.get("num_batches", train_ablation_num_batches)),
+                            float(train_ablation_metrics.get("decoder_random_latent_recon_mix", 0.0)),
+                            float(train_ablation_metrics.get("random_dist_recon_mix", 0.0)),
+                            float(train_ablation_metrics.get("random_dist_kl", 0.0)),
+                            float(train_ablation_metrics.get("x_rows", 0.0)),
+                            float(train_ablation_metrics.get("batches_per_sec", 0.0)),
+                            train_ablation_duration_s,
+                        )
+                        logger.info(
+                            "train_ablation_eval_mix step=%s models=%s datasets=%s layers=%s",
+                            global_step,
+                            train_ablation_mix.get("models_top", []),
+                            train_ablation_mix.get("datasets_top", []),
+                            train_ablation_mix.get("layers_top", []),
+                        )
+                        status_writer.write(
+                            {
+                                "step": int(global_step),
+                                "timestamp": float(time.time()),
+                                "train_ablation_eval": train_ablation_report,
+                            }
+                        )
+                        if comet_tracker is not None and comet_tracker.enabled:
+                            comet_tracker.log_metrics(
+                                {
+                                    "train_eval/decoder_random_latent_structural": float(
+                                        train_ablation_metrics.get("decoder_random_latent_structural", 0.0)
+                                    ),
+                                    "train_eval/decoder_random_latent_behavioral": float(
+                                        train_ablation_metrics.get("decoder_random_latent_behavioral", 0.0)
+                                    ),
+                                    "train_eval/decoder_random_latent_recon_mix": float(
+                                        train_ablation_metrics.get("decoder_random_latent_recon_mix", 0.0)
+                                    ),
+                                    "train_eval/random_dist_structural": float(
+                                        train_ablation_metrics.get("random_dist_structural", 0.0)
+                                    ),
+                                    "train_eval/random_dist_behavioral": float(
+                                        train_ablation_metrics.get("random_dist_behavioral", 0.0)
+                                    ),
+                                    "train_eval/random_dist_recon_mix": float(
+                                        train_ablation_metrics.get("random_dist_recon_mix", 0.0)
+                                    ),
+                                    "train_eval/random_dist_kl": float(train_ablation_metrics.get("random_dist_kl", 0.0)),
+                                    "train_eval/random_dist_total": float(
+                                        train_ablation_metrics.get("random_dist_total", 0.0)
+                                    ),
+                                    "train_eval/x_rows": float(train_ablation_metrics.get("x_rows", 0.0)),
+                                    "train_eval/batches_per_sec": float(
+                                        train_ablation_metrics.get("batches_per_sec", 0.0)
+                                    ),
+                                    "train_eval/duration_s": float(train_ablation_duration_s),
+                                },
+                                step=global_step,
+                            )
+                    except Exception as exc:
+                        logger.exception("train_ablation_eval failed at step=%s: %s", global_step, exc)
+                        status_writer.write(
+                            {
+                                "step": int(global_step),
+                                "timestamp": float(time.time()),
+                                "train_ablation_eval_error": str(exc),
+                            }
+                        )
+
+                if run_train_ablation_this_step and is_distributed:
+                    dist.barrier()
+
                 run_test_eval_this_step = test_eval_requested and (
                     (global_step % test_eval_every_steps == 0)
                     or (test_eval_run_on_last_step and global_step == max_steps)
@@ -1743,6 +2055,14 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                             duration_s,
                         )
                         logger.info(
+                            "test_eval_ablation step=%s rand_z_recon=%.6f rand_dist_recon=%.6f rand_dist_kl=%.6f rand_dist_total=%.6f",
+                            global_step,
+                            float(metrics.get("decoder_random_latent_recon_mix", 0.0)),
+                            float(metrics.get("random_dist_recon_mix", 0.0)),
+                            float(metrics.get("random_dist_kl", 0.0)),
+                            float(metrics.get("random_dist_total", 0.0)),
+                        )
+                        logger.info(
                             "test_eval_mix step=%s models=%s datasets=%s layers=%s",
                             global_step,
                             sample_mix.get("models_top", []),
@@ -1766,6 +2086,20 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                                     "test/contrastive": float(metrics.get("contrastive", 0.0)),
                                     "test/recon_mix": float(metrics.get("recon_mix", 0.0)),
                                     "test/kl": float(metrics.get("kl", 0.0)),
+                                    "test/decoder_random_latent_structural": float(
+                                        metrics.get("decoder_random_latent_structural", 0.0)
+                                    ),
+                                    "test/decoder_random_latent_behavioral": float(
+                                        metrics.get("decoder_random_latent_behavioral", 0.0)
+                                    ),
+                                    "test/decoder_random_latent_recon_mix": float(
+                                        metrics.get("decoder_random_latent_recon_mix", 0.0)
+                                    ),
+                                    "test/random_dist_structural": float(metrics.get("random_dist_structural", 0.0)),
+                                    "test/random_dist_behavioral": float(metrics.get("random_dist_behavioral", 0.0)),
+                                    "test/random_dist_recon_mix": float(metrics.get("random_dist_recon_mix", 0.0)),
+                                    "test/random_dist_kl": float(metrics.get("random_dist_kl", 0.0)),
+                                    "test/random_dist_total": float(metrics.get("random_dist_total", 0.0)),
                                     "test/x_rows": float(metrics.get("x_rows", 0.0)),
                                     "test/batches_per_sec": float(metrics.get("batches_per_sec", 0.0)),
                                     "test/duration_s": float(duration_s),

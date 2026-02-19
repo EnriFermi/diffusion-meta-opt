@@ -272,3 +272,63 @@ class MiniPatchTrainingModel(nn.Module):
         total_core_loss = float(alpha) * contrastive_loss + (1.0 - float(alpha)) * recon_mix_loss
         total_loss = total_core_loss + float(kl_beta) * kl_loss
         return total_loss, structural_loss, behavioral_loss, contrastive_loss, recon_mix_loss, kl_loss
+
+    def ablation_losses(
+        self,
+        *,
+        X_full: torch.Tensor,
+        X_patch: torch.Tensor,
+        w_patch: torch.Tensor,
+        patch_idx: torch.Tensor,
+        beta: float,
+        kl_beta: float,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Auxiliary ablation losses for evaluating information content:
+        1) decoder_random_latent_*: decode from random z ~ N(0, I).
+        2) random_dist_*: full mini-VAE path with random dist_var_tokens instead of distribution encoder output.
+        """
+        dist_var_tokens, _ = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
+        mu_ref, _ = self.mini_vae.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+
+        patch_size = int(w_patch.shape[1])
+        beta_value = float(beta)
+        kl_beta_value = float(kl_beta)
+
+        # Decoder-only ablation: random latents.
+        z_random = torch.randn_like(mu_ref)
+        w_hat_rand_latent = self.mini_vae.decode(z=z_random, patch_size=patch_size)
+        structural_rand_latent = F.mse_loss(w_hat_rand_latent, w_patch)
+        behavioral_rand_latent = self.patch_behavioral_mse(
+            X_patch=X_patch,
+            w_patch=w_patch,
+            w_hat=w_hat_rand_latent,
+        )
+        recon_mix_rand_latent = beta_value * structural_rand_latent + (1.0 - beta_value) * behavioral_rand_latent
+
+        # Distribution ablation: random tokens replace distribution encoder output.
+        rand_dist_var_tokens = torch.randn_like(dist_var_tokens)
+        w_hat_rand_dist, mu_rand_dist, logvar_rand_dist, _ = self.mini_vae(
+            w_patch=w_patch,
+            dist_var_tokens=rand_dist_var_tokens,
+        )
+        structural_rand_dist = F.mse_loss(w_hat_rand_dist, w_patch)
+        behavioral_rand_dist = self.patch_behavioral_mse(
+            X_patch=X_patch,
+            w_patch=w_patch,
+            w_hat=w_hat_rand_dist,
+        )
+        recon_mix_rand_dist = beta_value * structural_rand_dist + (1.0 - beta_value) * behavioral_rand_dist
+        kl_rand_dist = self.mini_vae.kl_loss(mu=mu_rand_dist, logvar=logvar_rand_dist)
+        total_rand_dist = recon_mix_rand_dist + kl_beta_value * kl_rand_dist
+
+        return {
+            "decoder_random_latent_structural": structural_rand_latent,
+            "decoder_random_latent_behavioral": behavioral_rand_latent,
+            "decoder_random_latent_recon_mix": recon_mix_rand_latent,
+            "random_dist_structural": structural_rand_dist,
+            "random_dist_behavioral": behavioral_rand_dist,
+            "random_dist_recon_mix": recon_mix_rand_dist,
+            "random_dist_kl": kl_rand_dist,
+            "random_dist_total": total_rand_dist,
+        }
