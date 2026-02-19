@@ -125,16 +125,39 @@ def maybe_compile_model(
     compile_mode_key: str = "compile_mode",
     label: str = "model",
 ) -> torch.nn.Module:
-    if not bool(cfg[section].get(compile_key, False)):
+    compile_enabled = bool(cfg[section].get(compile_key, False))
+    if not compile_enabled:
         return model
     if not hasattr(torch, "compile"):
         logger.warning("torch.compile is unavailable in this PyTorch version; continuing without compile")
         return model
 
     compile_mode = str(cfg[section].get(compile_mode_key, "max-autotune"))
-    logger.info("Compiling %s with torch.compile(mode=%s)", label, compile_mode)
     dynamic = bool(cfg[section].get("compile_dynamic", True))
-    return torch.compile(model, mode=compile_mode, dynamic=dynamic)
+    backend = cfg[section].get("compile_backend")
+    backend_name = str(backend).strip() if backend is not None else ""
+
+    logger.info(
+        "Compiling %s with torch.compile(mode=%s, dynamic=%s%s)",
+        label,
+        compile_mode,
+        dynamic,
+        f", backend={backend_name}" if backend_name else "",
+    )
+
+    if compile_mode == "max-autotune" and dynamic:
+        logger.warning(
+            "%s.%s=max-autotune with %s.compile_dynamic=true can be unstable on some CUDA stacks; "
+            "prefer mode=reduce-overhead and compile_dynamic=false for stability",
+            section,
+            compile_mode_key,
+            section,
+        )
+
+    compile_kwargs: dict[str, object] = {"mode": compile_mode, "dynamic": dynamic}
+    if backend_name:
+        compile_kwargs["backend"] = backend_name
+    return torch.compile(model, **compile_kwargs)
 
 
 def resolve_amp(cfg: DictConfig, device: torch.device, *, section: str, amp_key: str = "amp") -> tuple[bool, torch.dtype | None]:
