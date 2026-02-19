@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import faulthandler
 import json
 import logging
 import math
@@ -38,6 +39,11 @@ from training.runtime import (
     seed_everything as runtime_seed_everything,
     set_speed_optimizations as runtime_set_speed_optimizations,
 )
+
+try:
+    faulthandler.enable(all_threads=True)
+except Exception:
+    pass
 
 
 # ---------------------------

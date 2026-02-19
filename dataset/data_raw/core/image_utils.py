@@ -5,12 +5,12 @@ import random
 from pathlib import Path
 from typing import Any
 
-import torch
 from PIL import Image
-from torchvision import transforms
 
 
 def seed_everything(seed: int) -> None:
+    import torch
+
     random.seed(seed)
     torch.manual_seed(seed)
     try:
@@ -58,7 +58,9 @@ def load_image(path: str | Path) -> Image.Image:
         return image.convert("RGB")
 
 
-def build_tensor_transform(image_size: int) -> transforms.Compose:
+def build_tensor_transform(image_size: int) -> Any:
+    from torchvision import transforms
+
     return transforms.Compose(
         [
             transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BILINEAR),

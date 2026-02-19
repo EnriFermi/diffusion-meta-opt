@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import random
+import signal
 import time
 from collections import deque
 from pathlib import Path
@@ -20,6 +23,57 @@ from dataset.data_raw.providers.hf.datasets_server_sampler import DatasetServerS
 from dataset.data_raw.providers.hf.hf_loader import load_hf_dataset
 from dataset.data_raw.providers.hf.url_fetch import fetch_image_to_cache
 from dataset.logging_utils import configure_root_logging
+
+_FAULT_HANDLER_FILES: list[Any] = []
+
+
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except Exception:
+        return f"SIG{signum}"
+
+
+def _format_process_exit(exit_code: int | None) -> str:
+    if exit_code is None:
+        return "exitcode=None"
+    if exit_code >= 0:
+        return f"exitcode={exit_code}"
+
+    signum = -int(exit_code)
+    reason = f"exitcode={exit_code} ({_signal_name(signum)}/{signum})"
+    if signum == getattr(signal, "SIGSEGV", -999):
+        reason += " [segmentation fault]"
+    elif signum == getattr(signal, "SIGABRT", -999):
+        reason += " [abort]"
+    elif signum == getattr(signal, "SIGBUS", -999):
+        reason += " [bus error]"
+    elif signum == getattr(signal, "SIGILL", -999):
+        reason += " [illegal instruction]"
+    elif signum == getattr(signal, "SIGFPE", -999):
+        reason += " [floating point exception]"
+    return reason
+
+
+def _enable_fault_handler_log(log_path: Path, *, label: str, logger: logging.Logger) -> Path | None:
+    fault_path = log_path.with_name(f"{log_path.stem}_fault_{label}_pid{os.getpid()}.log")
+    try:
+        handle = fault_path.open("a", encoding="utf-8", buffering=1)
+        handle.write(f"\n=== fault-handler start pid={os.getpid()} ts={time.time():.3f} ===\n")
+        faulthandler.enable(file=handle, all_threads=True)
+        for sig_name in ("SIGUSR1", "SIGUSR2"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                faulthandler.register(sig, file=handle, all_threads=True, chain=True)
+            except Exception:
+                continue
+        _FAULT_HANDLER_FILES.append(handle)
+        return fault_path
+    except Exception as exc:
+        logger.warning("Failed to initialize worker fault-handler log file: %s", exc)
+        return None
 
 
 class HFVirtualDataset(BaseVirtualDataset):
@@ -186,12 +240,16 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         if self._worker_restarts >= self.max_worker_restarts:
             if not self._worker_permanently_stopped:
-                self.logger.error("Worker exited with code %s", self._worker.exitcode)
+                exit_reason = _format_process_exit(self._worker.exitcode)
+                self.logger.error("Worker exited unexpectedly: %s", exit_reason)
                 self.logger.error("Max worker restarts reached: %s", self.max_worker_restarts)
+                self._last_worker_error = f"worker process terminated: {exit_reason}"
             self._worker_permanently_stopped = True
             return
 
-        self.logger.error("Worker exited with code %s", self._worker.exitcode)
+        exit_reason = _format_process_exit(self._worker.exitcode)
+        self.logger.error("Worker exited unexpectedly: %s", exit_reason)
+        self._last_worker_error = f"worker process terminated: {exit_reason}"
         self._worker_restarts += 1
         self._spawn_worker(force=True)
 
@@ -342,8 +400,11 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
     hf_cfg = to_plain_dict({"hf": worker_payload["hf_cfg"]})["hf"]
 
     dataset_name = str(dataset_cfg["name"])
+    log_path = _configure_logging(dataset_cfg)
     logger = logging.getLogger(f"dataset.worker.{dataset_name}")
-    _configure_logging(dataset_cfg)
+    fault_path = _enable_fault_handler_log(log_path, label=f"{dataset_name}_worker", logger=logger)
+    if fault_path is not None:
+        logger.info("Worker fault log file: %s", fault_path)
 
     top_cfg = {"hf": hf_cfg}
     allow_missing_token = not bool(dataset_cfg.get("gated", False))
@@ -728,9 +789,9 @@ def _format_dataset_load_error(dataset_cfg: dict[str, Any], exc: Exception) -> s
     return base
 
 
-def _configure_logging(dataset_cfg: dict[str, Any]) -> None:
+def _configure_logging(dataset_cfg: dict[str, Any]) -> Path:
     runtime_cfg = {
         "data": {"log_level": str(dataset_cfg.get("log_level", "INFO"))},
         "logging": dataset_cfg.get("runtime_logging", {}),
     }
-    configure_root_logging(cfg=runtime_cfg, rank=0, force=True)
+    return configure_root_logging(cfg=runtime_cfg, rank=0, force=True)
