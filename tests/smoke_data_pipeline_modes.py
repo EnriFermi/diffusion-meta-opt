@@ -48,7 +48,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-profile",
         default=DEFAULT_FULL_DATASET_PROFILE,
-        help="Hydra data profile from conf/data/<profile>.yaml (default: streaming-safe set without flickr30k)",
+        help=(
+            "Hydra data profile name from conf/data/<profile>.yaml "
+            "or conf/data_collection_runtime/data_profiles/<profile>.yaml "
+            "(default: streaming-safe set without flickr30k)"
+        ),
     )
 
     parser.add_argument("--data-root", default="./data")
@@ -165,18 +169,47 @@ def _parse_dataset_model_map(items: list[str]) -> dict[str, list[str]]:
     return mapping
 
 
+def _normalize_profile_name(profile_name: str) -> str:
+    name = str(profile_name).strip()
+    if name.endswith(".yaml"):
+        name = name[: -len(".yaml")]
+    return name
+
+
+def _resolve_data_profile(path_or_name: str) -> tuple[Path, str]:
+    profile_name = _normalize_profile_name(path_or_name)
+    if not profile_name:
+        raise ValueError("data profile name is empty")
+
+    root_conf = _project_root() / "conf"
+    conf_data_path = root_conf / "data" / f"{profile_name}.yaml"
+    if conf_data_path.exists():
+        # `data` is not in root defaults anymore, so append the group.
+        return conf_data_path, f"+data={profile_name}"
+
+    runtime_data_path = root_conf / "data_collection_runtime" / "data_profiles" / f"{profile_name}.yaml"
+    if runtime_data_path.exists():
+        return runtime_data_path, f"data_collection_runtime/data_profiles@data={profile_name}"
+
+    raise FileNotFoundError(
+        f"Unknown data profile '{path_or_name}'. "
+        f"Tried {conf_data_path} and {runtime_data_path}"
+    )
+
+
 def _build_overrides(args: argparse.Namespace) -> list[str]:
+    profile_path, profile_override = _resolve_data_profile(str(args.data_profile))
     run_tag = str(args.run_tag).strip() if args.run_tag else f"run_{int(time.time())}"
     cli_datasets = [item.strip() for item in str(args.datasets).split(",") if item.strip()]
     if cli_datasets:
         datasets = cli_datasets
     else:
-        datasets = _resolve_profile_enabled_datasets(args.data_profile)
+        datasets = _resolve_profile_enabled_datasets(profile_path)
         if not datasets:
             datasets = list(DEFAULT_FULL_DATASET_LIST)
 
     overrides: list[str] = [
-        f"data={args.data_profile}",
+        profile_override,
         f"data.path={args.data_root}",
         f"collector.mode={args.collector_mode}",
         f"collector.device={args.collector_device}",
@@ -251,11 +284,8 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
     return overrides
 
 
-def _resolve_profile_enabled_datasets(profile_name: str) -> list[str]:
-    profile_path = _project_root() / "conf" / "data" / f"{profile_name}.yaml"
-    if not profile_path.exists():
-        return []
-
+def _resolve_profile_enabled_datasets(profile_name: Path | str) -> list[str]:
+    profile_path = Path(profile_name)
     try:
         profile_cfg = OmegaConf.load(profile_path)
     except Exception:
