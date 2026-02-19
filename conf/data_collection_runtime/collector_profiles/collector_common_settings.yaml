@@ -21,6 +21,13 @@ num_inflight_jobs: 1
 status_emit_interval_s: 2.0
 status_queue_max_items: 2048
 
+diagnostics:
+  emit_resource_snapshot: true
+  resource_snapshot_max_children: 8
+  include_cgroup_on_failure: true
+  crash_report_enabled: true
+  crash_report_path: ./data/reports/collector_crash_report.json
+
 in_memory_buffer:
   capacity_samples: 3000
   fill_target_samples: 3000

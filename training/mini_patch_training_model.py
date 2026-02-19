@@ -58,6 +58,14 @@ class MiniPatchTrainingModel(nn.Module):
         return F.mse_loss(y_hat, y)
 
     @staticmethod
+    def reconstruction_scale_from_weight_norm(w_patch: torch.Tensor) -> torch.Tensor:
+        # Scale reconstruction terms by average target-patch norm.
+        # Clamp to >= 1.0 so scaling does not further shrink already small losses.
+        if w_patch.ndim != 2:
+            raise ValueError(f"w_patch must be [B, p], got {tuple(w_patch.shape)}")
+        return w_patch.norm(dim=1).mean().detach().clamp_min(1.0)
+
+    @staticmethod
     def nt_xent_loss(z_view1: torch.Tensor, z_view2: torch.Tensor, temperature: float) -> torch.Tensor:
         if z_view1.ndim != 2 or z_view2.ndim != 2:
             raise ValueError(
@@ -253,8 +261,9 @@ class MiniPatchTrainingModel(nn.Module):
         dist_var_tokens, _ = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
         w_hat, mu, logvar, _ = self.mini_vae(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
 
-        structural_loss = F.mse_loss(w_hat, w_patch)
-        behavioral_loss = self.patch_behavioral_mse(X_patch=X_patch, w_patch=w_patch, w_hat=w_hat)
+        recon_scale = self.reconstruction_scale_from_weight_norm(w_patch)
+        structural_loss = F.mse_loss(w_hat, w_patch) * recon_scale
+        behavioral_loss = self.patch_behavioral_mse(X_patch=X_patch, w_patch=w_patch, w_hat=w_hat) * recon_scale
         recon_mix_loss = float(beta) * structural_loss + (1.0 - float(beta)) * behavioral_loss
 
         contrastive_loss = self.contrastive_loss(
@@ -294,16 +303,17 @@ class MiniPatchTrainingModel(nn.Module):
         patch_size = int(w_patch.shape[1])
         beta_value = float(beta)
         kl_beta_value = float(kl_beta)
+        recon_scale = self.reconstruction_scale_from_weight_norm(w_patch)
 
         # Decoder-only ablation: random latents.
         z_random = torch.randn_like(mu_ref)
         w_hat_rand_latent = self.mini_vae.decode(z=z_random, patch_size=patch_size)
-        structural_rand_latent = F.mse_loss(w_hat_rand_latent, w_patch)
+        structural_rand_latent = F.mse_loss(w_hat_rand_latent, w_patch) * recon_scale
         behavioral_rand_latent = self.patch_behavioral_mse(
             X_patch=X_patch,
             w_patch=w_patch,
             w_hat=w_hat_rand_latent,
-        )
+        ) * recon_scale
         recon_mix_rand_latent = beta_value * structural_rand_latent + (1.0 - beta_value) * behavioral_rand_latent
 
         # Distribution ablation: random tokens replace distribution encoder output.
@@ -312,12 +322,12 @@ class MiniPatchTrainingModel(nn.Module):
             w_patch=w_patch,
             dist_var_tokens=rand_dist_var_tokens,
         )
-        structural_rand_dist = F.mse_loss(w_hat_rand_dist, w_patch)
+        structural_rand_dist = F.mse_loss(w_hat_rand_dist, w_patch) * recon_scale
         behavioral_rand_dist = self.patch_behavioral_mse(
             X_patch=X_patch,
             w_patch=w_patch,
             w_hat=w_hat_rand_dist,
-        )
+        ) * recon_scale
         recon_mix_rand_dist = beta_value * structural_rand_dist + (1.0 - beta_value) * behavioral_rand_dist
         kl_rand_dist = self.mini_vae.kl_loss(mu=mu_rand_dist, logvar=logvar_rand_dist)
         total_rand_dist = recon_mix_rand_dist + kl_beta_value * kl_rand_dist

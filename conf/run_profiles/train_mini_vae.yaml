@@ -16,3 +16,22 @@ defaults:
 hydra:
   job:
     name: train_mini_vae
+
+# Stability overrides for expanded mini-VAE train split.
+# Keep async collector, but reduce peak pressure to avoid collector SIGKILL/OOM.
+collector:
+  jobs_per_selected_model: 1
+  num_inflight_jobs: 1
+  release_device_on_unload: true
+  empty_cuda_cache_on_unload: true
+  diagnostics:
+    crash_report_enabled: true
+    crash_report_path: ./checkpoints/mini_patch_vae/collector_crash_report.json
+  layer_output_splitting:
+    xy_samples_random_slice: 256
+
+streaming:
+  chunk_size_samples: 32
+  producer:
+    ready_store_max_chunks: 200
+    refill_after_consumed_chunks: 100
