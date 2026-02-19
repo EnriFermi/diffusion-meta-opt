@@ -7,6 +7,9 @@ mode: local_disk
 producer:
   ready_store_max_chunks: 400
   refill_after_consumed_chunks: 200
+  # Keep window narrow so emitted samples quickly reach `chunk_size_samples`.
+  # Large values (e.g. inherited via refill window) can delay first ready chunks.
+  stripe_window_chunks: 1
 
 consumer:
   randomize_chunk_order: true

@@ -29,6 +29,8 @@ dataset_overrides:
       - swinv2_base
       - deit_base
       - beit_base
+    hf:
+      stream_via_datasets_server: true
     cache:
       chunk_size_images: 128
       num_chunks_kept: 3
