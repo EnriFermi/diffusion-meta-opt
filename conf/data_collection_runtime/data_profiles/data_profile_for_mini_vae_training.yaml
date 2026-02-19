@@ -19,6 +19,8 @@ dataset_overrides:
       - deit_base
       - dinov2_base
       - swinv2_base
+    hf:
+      stream_via_datasets_server: true
     cache:
       chunk_size_images: 128
       num_chunks_kept: 3
