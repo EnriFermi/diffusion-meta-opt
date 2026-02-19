@@ -25,10 +25,13 @@ dataset_overrides:
       chunk_size_images: 128
       num_chunks_kept: 3
   scene_parse_150:
+    sampling_weight: 0.3
     models:
       - swinv2_base
       - deit_base
       - beit_base
+    hf:
+      stream_via_datasets_server: true
     cache:
       chunk_size_images: 128
       num_chunks_kept: 3
