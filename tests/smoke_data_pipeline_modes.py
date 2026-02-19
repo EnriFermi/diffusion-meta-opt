@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import time
+import traceback
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from dataset.shared.collector_service import CollectorService
+from dataset.shared.compatibility_index import CompatibilityIndex, normalize_device, resolve_train_device
+from dataset.shared.atomizer import atomize
+from dataset.shared.types import MixedImageMeta
+from dataset.models.model_pool import ModelPool
 from dataset.shared.shared_dataset import SharedModelDataset
 from dataset.shared.streaming.factory import build_chunk_store, resolve_streaming_cfg
 
@@ -38,6 +43,12 @@ DEFAULT_FULL_DATASET_LIST = [
     "stanford_cars",
     "visual_genome",
 ]
+
+
+class PairCoverageError(RuntimeError):
+    def __init__(self, message: str, diagnostics: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 def _parse_args() -> argparse.Namespace:
@@ -104,6 +115,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--turnover-probe-timeout-seconds", type=int, default=180)
     parser.add_argument("--skip-turnover-probe", action="store_true")
     parser.add_argument("--diversity-window", type=int, default=128)
+    parser.add_argument(
+        "--pair-audit",
+        action="store_true",
+        help=(
+            "Deterministic one-shot check for every compatible dataset-model pair. "
+            "Always writes a report file with exactly one row per pair."
+        ),
+    )
+    parser.add_argument(
+        "--pair-audit-max-seconds",
+        type=int,
+        default=600,
+        help="Hard wall-clock budget for deterministic pair-audit mode.",
+    )
+    parser.add_argument(
+        "--pair-audit-sample-timeout-seconds",
+        type=float,
+        default=10.0,
+        help="Per-dataset sample fetch timeout used by pair-audit worker overrides.",
+    )
+    parser.add_argument(
+        "--pair-audit-report-path",
+        default="",
+        help="Output path for pair-audit JSON report. If empty, path is auto-generated under ./data/reports/.",
+    )
     parser.add_argument(
         "--pair-coverage-timeout-seconds",
         type=int,
@@ -236,6 +272,12 @@ def _build_overrides(args: argparse.Namespace) -> list[str]:
         overrides.append(
             f"+data.dataset_overrides.{dataset_name}.cache.num_chunks_kept={int(args.raw_num_chunks_kept)}"
         )
+        if bool(args.pair_audit):
+            sample_timeout = max(1.0, float(args.pair_audit_sample_timeout_seconds))
+            overrides.append(f"+data.dataset_overrides.{dataset_name}.worker.get_timeout_s={sample_timeout}")
+            overrides.append(f"+data.dataset_overrides.{dataset_name}.worker.startup_get_timeout_s={sample_timeout}")
+            overrides.append(f"+data.dataset_overrides.{dataset_name}.worker.request_timeout_s={max(1, int(sample_timeout))}")
+            overrides.append(f"+data.dataset_overrides.{dataset_name}.worker.max_worker_restarts=1")
 
     if args.mode == "local_disk":
         local_root = Path(args.data_root) / "streaming" / "local_disk_smoke" / run_tag
@@ -303,6 +345,236 @@ def _resolve_profile_enabled_datasets(profile_name: Path | str) -> list[str]:
         datasets.append(name)
 
     return datasets
+
+
+def _resolve_pair_audit_report_path(args: argparse.Namespace) -> Path:
+    raw = str(args.pair_audit_report_path).strip()
+    if raw:
+        out_path = Path(raw)
+    else:
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+        out_path = Path(args.data_root) / "reports" / f"pair_audit_{ts}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    return out_path
+
+
+def _write_report_file(path: Path, payload: dict[str, Any]) -> Path:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        return path
+    except Exception:
+        fallback_dir = Path("./data/reports")
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+        fallback_path = fallback_dir / f"pair_audit_fallback_{ts}.json"
+        payload = dict(payload)
+        payload["report_write_error"] = traceback.format_exc()
+        fallback_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        return fallback_path
+
+
+def _extract_dataset_runtime_error(raw_pool: Any, dataset_name: str) -> str:
+    dataset_obj = getattr(raw_pool, "datasets", {}).get(dataset_name)
+    if dataset_obj is None:
+        return "dataset object is missing in RawDatasetPool"
+
+    last_worker_error = getattr(dataset_obj, "_last_worker_error", None)
+    if isinstance(last_worker_error, str) and last_worker_error.strip():
+        return last_worker_error
+
+    try:
+        stats = dataset_obj.stats()
+    except Exception:
+        stats = {}
+    return f"no worker error details; stats={stats}"
+
+
+def _run_pair_audit(cfg: DictConfig, args: argparse.Namespace) -> dict[str, Any]:
+    started = time.time()
+    max_seconds = max(1.0, float(args.pair_audit_max_seconds))
+    report_path = _resolve_pair_audit_report_path(args)
+    sample_timeout_s = max(1.0, float(args.pair_audit_sample_timeout_seconds))
+
+    compat = CompatibilityIndex(cfg)
+    expected_pairs = sorted(
+        {
+        (str(dataset_name), str(model_name))
+        for model_name in compat.get_models()
+        for dataset_name in compat.get_datasets_for_model(model_name)
+        }
+    )
+
+    pair_rows: dict[tuple[str, str], dict[str, Any]] = {
+        pair: {
+            "dataset_name": pair[0],
+            "model_name": pair[1],
+            "status": "timeout",
+            "attempted": False,
+            "elapsed_s": None,
+            "sample_timeout_s": float(sample_timeout_s),
+            "error": "Not attempted",
+            "traceback": None,
+            "num_layer_records": 0,
+            "num_shared_samples": 0,
+        }
+        for pair in expected_pairs
+    }
+
+    cfg_plain = OmegaConf.to_container(cfg, resolve=True)
+    if not isinstance(cfg_plain, dict):
+        cfg_plain = {}
+    collector_cfg_plain = cfg_plain.get("collector", {})
+    if not isinstance(collector_cfg_plain, dict):
+        collector_cfg_plain = {}
+
+    runtime_device = normalize_device(collector_cfg_plain.get("device"))
+    if runtime_device is None:
+        runtime_device = resolve_train_device(cfg_plain)
+
+    atom_cfg = {}
+    if isinstance(collector_cfg_plain.get("layer_output_splitting"), dict):
+        atom_cfg = dict(collector_cfg_plain.get("layer_output_splitting") or {})
+    if "xy_samples_random_slice" not in atom_cfg:
+        atom_cfg["xy_samples_random_slice"] = 64
+
+    model_pool: ModelPool | None = None
+    raw_pool: Any | None = None
+    deadline_hit = False
+    global_error_traceback: str | None = None
+    global_error_message: str | None = None
+
+    try:
+        model_pool = ModelPool(
+            global_cfg=cfg,
+            model_cfgs=compat.get_model_cfgs(),
+            device_override=runtime_device,
+            max_loaded_models=max(1, int(collector_cfg_plain.get("max_loaded_models", 1))),
+            runtime_local_only=bool(collector_cfg_plain.get("runtime_local_only", False)),
+            release_device_on_unload=bool(collector_cfg_plain.get("release_device_on_unload", True)),
+            empty_cuda_cache_on_unload=bool(collector_cfg_plain.get("empty_cuda_cache_on_unload", True)),
+        )
+
+        from dataset.shared.raw_dataset_pool import RawDatasetPool
+
+        raw_pool = RawDatasetPool(cfg=cfg, index=compat)
+        raw_pool.start()
+
+        if bool(args.predownload):
+            model_pool.predownload_models(sorted(compat.get_models()))
+
+        ordered_pairs = sorted(expected_pairs, key=lambda item: (item[1], item[0]))
+        for dataset_name, model_name in ordered_pairs:
+            if (time.time() - started) >= max_seconds:
+                deadline_hit = True
+                break
+
+            row = pair_rows[(dataset_name, model_name)]
+            row["attempted"] = True
+            pair_started = time.time()
+            try:
+                pil_batch, source_ids, _ = raw_pool.get_pil_batch(dataset_name=dataset_name, n=1)
+                if not pil_batch:
+                    runtime_error = _extract_dataset_runtime_error(raw_pool=raw_pool, dataset_name=dataset_name)
+                    raise RuntimeError(
+                        f"Dataset returned zero images for dataset={dataset_name}; "
+                        f"sample_timeout_s={sample_timeout_s}. last_error={runtime_error}"
+                    )
+
+                layer_records = model_pool.run(model_name=model_name, pil_batch=pil_batch[:1])
+                if not layer_records:
+                    raise RuntimeError(f"Model run produced zero layer records for model={model_name}")
+
+                source_id = source_ids[0] if source_ids else "unknown"
+                image_meta_list = [MixedImageMeta(dataset_name=dataset_name, source_id=source_id)]
+                shared_samples_count = 0
+                for layer_record in layer_records:
+                    shared_samples_count += sum(
+                        1
+                        for _ in atomize(
+                            layer_record=layer_record,
+                            atom_cfg=atom_cfg,
+                            image_meta_list=image_meta_list,
+                            model_run_id=1,
+                        )
+                    )
+                    if shared_samples_count > 0:
+                        break
+
+                if shared_samples_count <= 0:
+                    raise RuntimeError(
+                        f"Atomizer produced zero SharedSample for pair dataset={dataset_name} model={model_name}"
+                    )
+
+                row["status"] = "success"
+                row["error"] = None
+                row["traceback"] = None
+                row["num_layer_records"] = int(len(layer_records))
+                row["num_shared_samples"] = int(shared_samples_count)
+            except Exception as exc:  # noqa: BLE001
+                row["status"] = "failed"
+                row["error"] = str(exc)
+                row["traceback"] = traceback.format_exc()
+                row["num_layer_records"] = int(row.get("num_layer_records", 0) or 0)
+                row["num_shared_samples"] = int(row.get("num_shared_samples", 0) or 0)
+            finally:
+                row["elapsed_s"] = round(max(0.0, float(time.time() - pair_started)), 3)
+    except Exception as exc:  # noqa: BLE001
+        global_error_message = str(exc)
+        global_error_traceback = traceback.format_exc()
+    finally:
+        if raw_pool is not None:
+            try:
+                raw_pool.shutdown()
+            except Exception:
+                pass
+        if model_pool is not None:
+            try:
+                model_pool.unload_all()
+            except Exception:
+                pass
+
+    elapsed_total = max(0.0, float(time.time() - started))
+
+    for pair in expected_pairs:
+        row = pair_rows[pair]
+        if row["status"] != "timeout":
+            continue
+        if global_error_message is not None:
+            row["status"] = "failed"
+            row["error"] = f"Pair audit aborted by global error: {global_error_message}"
+            row["traceback"] = global_error_traceback
+        elif deadline_hit:
+            row["error"] = "Global pair-audit deadline exceeded before attempt"
+            row["traceback"] = "Traceback (most recent call last):\nTimeoutError: global pair-audit deadline exceeded"
+        else:
+            row["error"] = "Pair was not attempted"
+            row["traceback"] = "Traceback (most recent call last):\nRuntimeError: pair was not attempted"
+
+    rows_ordered = [pair_rows[pair] for pair in sorted(pair_rows.keys())]
+    success_count = sum(1 for row in rows_ordered if row["status"] == "success")
+    failed_count = sum(1 for row in rows_ordered if row["status"] == "failed")
+    timeout_count = sum(1 for row in rows_ordered if row["status"] == "timeout")
+
+    payload = {
+        "ok": failed_count == 0 and timeout_count == 0 and success_count == len(rows_ordered),
+        "mode": "pair_audit",
+        "max_seconds": float(max_seconds),
+        "pair_sample_timeout_seconds": float(sample_timeout_s),
+        "elapsed_seconds": round(elapsed_total, 3),
+        "deadline_hit": bool(deadline_hit),
+        "global_error": global_error_message,
+        "total_pairs": int(len(rows_ordered)),
+        "success_count": int(success_count),
+        "failed_count": int(failed_count),
+        "timeout_count": int(timeout_count),
+        "report_path": str(report_path.resolve()),
+        "pairs": rows_ordered,
+    }
+
+    written_path = _write_report_file(report_path, payload)
+    payload["report_path"] = str(written_path.resolve())
+    return payload
 
 
 def _weight_preview(weight: torch.Tensor, rows: int, cols: int) -> list[list[float]]:
@@ -475,6 +747,7 @@ def _run_smoke(
     layer_counts: Counter[str] = Counter()
     dataset_counts: Counter[str] = Counter()
     pair_counts: Counter[tuple[str, str]] = Counter()
+    pair_first_seen_s: dict[tuple[str, str], float] = {}
     expected_pairs: set[tuple[str, str]] = {
         (str(dataset_name), str(model_name))
         for model_name in collector.compat_index.get_models()
@@ -487,6 +760,7 @@ def _run_smoke(
     started = time.time()
     step = 0
     turnover_report: dict[str, Any] | None = None
+    pair_coverage_elapsed_s = 0.0
 
     def _process_sample(sample: Any) -> None:
         nonlocal consumed, first_sample_summary
@@ -540,7 +814,10 @@ def _run_smoke(
                 sample_dataset_names.add(ds_name_text)
 
         for ds_name_text in sample_dataset_names:
-            pair_counts[(ds_name_text, model_name)] += 1
+            pair = (ds_name_text, model_name)
+            if pair_counts[pair] == 0:
+                pair_first_seen_s[pair] = max(0.0, float(time.time() - started))
+            pair_counts[pair] += 1
 
         consumed += 1
         all_consumed_samples.append(sample)
@@ -548,6 +825,23 @@ def _run_smoke(
     def _missing_pairs() -> list[tuple[str, str]]:
         observed = set(pair_counts.keys())
         return sorted(expected_pairs - observed)
+
+    def _pair_timing_payload(missing_pairs: list[tuple[str, str]], timed_out: bool) -> list[dict[str, Any]]:
+        missing_set = set(missing_pairs)
+        payload: list[dict[str, Any]] = []
+        for dataset_name, model_name in sorted(expected_pairs):
+            key = (dataset_name, model_name)
+            first_seen = pair_first_seen_s.get(key)
+            payload.append(
+                {
+                    "dataset_name": dataset_name,
+                    "model_name": model_name,
+                    "seen": first_seen is not None,
+                    "first_seen_s": round(float(first_seen), 3) if first_seen is not None else None,
+                    "timed_out": bool(timed_out and key in missing_set),
+                }
+            )
+        return payload
 
     try:
         if predownload:
@@ -620,11 +914,13 @@ def _run_smoke(
 
         if require_all_dataset_model_pairs:
             coverage_started = time.time()
+            coverage_timeout_hit = False
             missing_pairs = _missing_pairs()
             while missing_pairs:
                 elapsed = time.time() - coverage_started
                 remaining = float(pair_coverage_timeout_seconds) - elapsed
                 if remaining <= 0:
+                    coverage_timeout_hit = True
                     break
 
                 extra_need = max(1, min(16, len(missing_pairs)))
@@ -640,14 +936,34 @@ def _run_smoke(
                     _process_sample(sample)
                 missing_pairs = _missing_pairs()
 
+            pair_coverage_elapsed_s = max(0.0, float(time.time() - coverage_started))
             if missing_pairs:
-                preview = [f"{dataset_name}:{model_name}" for dataset_name, model_name in missing_pairs[:20]]
-                raise RuntimeError(
+                diagnostics = {
+                    "pair_coverage_timeout_seconds": float(pair_coverage_timeout_seconds),
+                    "pair_coverage_elapsed_seconds": round(pair_coverage_elapsed_s, 3),
+                    "dataset_model_pairs_expected_count": int(len(expected_pairs)),
+                    "dataset_model_pairs_observed_count": int(len(pair_counts)),
+                    "dataset_model_pairs_missing_count": int(len(missing_pairs)),
+                    "dataset_model_pairs_missing": [
+                        {"dataset_name": dataset_name, "model_name": model_name}
+                        for dataset_name, model_name in missing_pairs
+                    ],
+                    "dataset_model_pair_counts": [
+                        {"dataset_name": dataset_name, "model_name": model_name, "count": int(count)}
+                        for (dataset_name, model_name), count in sorted(pair_counts.items())
+                    ],
+                    "dataset_model_pair_timings": _pair_timing_payload(
+                        missing_pairs=missing_pairs,
+                        timed_out=coverage_timeout_hit,
+                    ),
+                }
+                raise PairCoverageError(
                     "Dataset-model coverage check failed: "
                     f"observed_pairs={len(pair_counts)}/{len(expected_pairs)}, "
-                    f"missing_pairs={len(missing_pairs)}, preview={preview}. "
+                    f"missing_pairs={len(missing_pairs)}. "
                     "Increase --target-samples and/or --pair-coverage-timeout-seconds "
-                    "or disable strict check with --allow-missing-dataset-model-pairs."
+                    "or disable strict check with --allow-missing-dataset-model-pairs.",
+                    diagnostics=diagnostics,
                 )
 
     finally:
@@ -679,6 +995,8 @@ def _run_smoke(
         "diversity": diversity_report,
         "turnover_probe": turnover_report,
         "dataset_model_pair_coverage_required": bool(require_all_dataset_model_pairs),
+        "pair_coverage_timeout_seconds": float(pair_coverage_timeout_seconds),
+        "pair_coverage_elapsed_seconds": round(float(pair_coverage_elapsed_s), 3),
         "dataset_model_pairs_expected_count": int(len(expected_pairs)),
         "dataset_model_pairs_observed_count": int(len(pair_counts)),
         "dataset_model_pairs_missing_count": int(len(missing_pairs_final)),
@@ -687,19 +1005,52 @@ def _run_smoke(
             for dataset_name, model_name in missing_pairs_final
         ],
         "dataset_model_pair_counts": pair_counts_serialized,
+        "dataset_model_pair_timings": _pair_timing_payload(
+            missing_pairs=missing_pairs_final,
+            timed_out=False,
+        ),
         "collector_stats": collector.stats(),
     }
 
 
 def main() -> int:
     args = _parse_args()
-    overrides = _build_overrides(args)
-    cfg = _load_cfg(overrides)
+    try:
+        overrides = _build_overrides(args)
+        cfg = _load_cfg(overrides)
+    except Exception as exc:
+        if bool(args.pair_audit):
+            report_path = _resolve_pair_audit_report_path(args)
+            payload = {
+                "ok": False,
+                "mode": "pair_audit",
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+                "total_pairs": 0,
+                "success_count": 0,
+                "failed_count": 0,
+                "timeout_count": 0,
+                "pairs": [],
+                "report_path": str(report_path.resolve()),
+            }
+            written_path = _write_report_file(report_path, payload)
+            payload["report_path"] = str(written_path.resolve())
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 0
+        payload = {"ok": False, "error": str(exc)}
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 1
 
     if args.print_config:
         from omegaconf import OmegaConf
 
         print(OmegaConf.to_yaml(cfg, resolve=True))
+
+    if bool(args.pair_audit):
+        result = _run_pair_audit(cfg=cfg, args=args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        # Pair-audit always returns structured report instead of throwing.
+        return 0
 
     try:
         result = _run_smoke(
@@ -727,6 +1078,8 @@ def main() -> int:
                 "Retry with --predownload or keep --predownload in smoke_data_pipeline_modes.sh."
             )
         payload: dict[str, Any] = {"ok": False, "error": message}
+        if isinstance(exc, PairCoverageError):
+            payload.update(exc.diagnostics)
         if hint:
             payload["hint"] = hint
         print(json.dumps(payload, indent=2, ensure_ascii=False))
