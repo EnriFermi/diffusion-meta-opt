@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import faulthandler
 import logging
 import multiprocessing as mp
+import os
+import signal
 import traceback
 import time
 from abc import ABC, abstractmethod
 from collections import Counter, deque
 from dataclasses import asdict
+from pathlib import Path
 from queue import Empty, Full
 from typing import Any
 
@@ -33,6 +37,57 @@ from dataset.shared.streaming.factory import (
     resolve_streaming_cfg,
 )
 from dataset.shared.types import CollectorJobStats, SharedSample
+
+_FAULT_HANDLER_FILES: list[Any] = []
+
+
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except Exception:
+        return f"SIG{signum}"
+
+
+def _format_process_exit(exit_code: int | None) -> str:
+    if exit_code is None:
+        return "exitcode=None"
+    if exit_code >= 0:
+        return f"exitcode={exit_code}"
+
+    signum = -int(exit_code)
+    reason = f"exitcode={exit_code} ({_signal_name(signum)}/{signum})"
+    if signum == getattr(signal, "SIGSEGV", -999):
+        reason += " [segmentation fault]"
+    elif signum == getattr(signal, "SIGABRT", -999):
+        reason += " [abort]"
+    elif signum == getattr(signal, "SIGBUS", -999):
+        reason += " [bus error]"
+    elif signum == getattr(signal, "SIGILL", -999):
+        reason += " [illegal instruction]"
+    elif signum == getattr(signal, "SIGFPE", -999):
+        reason += " [floating point exception]"
+    return reason
+
+
+def _enable_fault_handler_log(log_path: Path, *, label: str, logger: logging.Logger) -> Path | None:
+    fault_path = log_path.with_name(f"{log_path.stem}_fault_{label}_pid{os.getpid()}.log")
+    try:
+        handle = fault_path.open("a", encoding="utf-8", buffering=1)
+        handle.write(f"\n=== fault-handler start pid={os.getpid()} ts={time.time():.3f} ===\n")
+        faulthandler.enable(file=handle, all_threads=True)
+        for sig_name in ("SIGUSR1", "SIGUSR2"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                faulthandler.register(sig, file=handle, all_threads=True, chain=True)
+            except Exception:
+                continue
+        _FAULT_HANDLER_FILES.append(handle)
+        return fault_path
+    except Exception as exc:
+        logger.warning("Failed to initialize fault-handler log file: %s", exc)
+        return None
 
 
 class _SampleSink(ABC):
@@ -303,8 +358,8 @@ class CollectorService:
         if self._process.is_alive():
             return
 
-        exit_code = self._process.exitcode
-        raise RuntimeError(f"Async collector process exited unexpectedly (exitcode={exit_code})")
+        exit_reason = _format_process_exit(self._process.exitcode)
+        raise RuntimeError(f"Async collector process exited unexpectedly ({exit_reason})")
 
     def predownload_models(self) -> None:
         model_cfgs = self.compat_index.get_model_cfgs()
@@ -820,9 +875,17 @@ def collector_process_main(
     stop_event: Any,
     status_queue: Any | None = None,
 ) -> None:
+    try:
+        faulthandler.enable(all_threads=True)
+    except Exception:
+        pass
+
     log_path = configure_root_logging(cfg=cfg_dict, rank=0, force=True)
     logger = logging.getLogger("collector_process")
     logger.info("Run log file: %s", log_path)
+    fault_path = _enable_fault_handler_log(log_path, label="collector_process", logger=logger)
+    if fault_path is not None:
+        logger.info("Collector fault log file: %s", fault_path)
 
     service = CollectorService(cfg=cfg_dict, cache=cache, status_queue=status_queue)
     try:
