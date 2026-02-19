@@ -296,9 +296,13 @@ class CollectorService:
         self.status_queue_max_items = max(16, int(collector_cfg.get("status_queue_max_items", 2048)))
 
         self.interleaved_cfg = collector_cfg.get("interleaved_schedule", {})
+        collect_every_n_steps_cfg = self.interleaved_cfg.get(
+            "collect_every_n_train_steps",
+            self.interleaved_cfg.get("collect_every_n_steps", 30),
+        )
         self.interleaved_every_n_steps = max(
             1,
-            int(self.interleaved_cfg.get("collect_every_n_train_steps", 30)),
+            int(collect_every_n_steps_cfg),
         )
         self.interleaved_burst_jobs = max(
             1,

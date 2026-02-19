@@ -241,8 +241,9 @@ class InputDistributionEncodingModule(nn.Module):
         q_last = q[:, -1:, :]
         q_span = (q_last - q_first).clamp_min(1e-6)
         q = 2.0 * (q - q_first) / q_span - 1.0  # [B, k_s, p]
-        q[:, 0, :] = -1.0
-        q[:, -1, :] = 1.0
+        q_idx = torch.arange(q.shape[1], device=q.device, dtype=torch.long).view(1, -1, 1)
+        q = torch.where(q_idx == 0, q.new_full((), -1.0), q)
+        q = torch.where(q_idx == q.shape[1] - 1, q.new_full((), 1.0), q)
 
         # Mu/sigma (unconvolved): [B, p]
         mu = X_q.mean(dim=1)
