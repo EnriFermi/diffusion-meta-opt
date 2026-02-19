@@ -10,6 +10,12 @@ COMET_WORKSPACE_DEFAULT=""
 export COMET_API_KEY="${COMET_API_KEY:-$COMET_API_KEY_DEFAULT}"
 export COMET_WORKSPACE="${COMET_WORKSPACE:-$COMET_WORKSPACE_DEFAULT}"
 
+# If running inside a conda environment, prefer its runtime libraries.
+# This avoids C++ ABI mismatches (e.g. libstdc++ from system vs conda).
+if [ -n "${CONDA_PREFIX:-}" ]; then
+  export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
 # Примеры:
 #   ./train_mini_vae.sh
 #   HF_TOKEN=hf_xxx ./train_mini_vae.sh mini_train.device=cuda:0
@@ -20,6 +26,11 @@ export COMET_WORKSPACE="${COMET_WORKSPACE:-$COMET_WORKSPACE_DEFAULT}"
 # Все аргументы передаются как обычные Hydra-overrides.
 
 if [ -n "${PIPENV_ACTIVE:-}" ]; then
+  exec python -m experiments.train_mini_vae "$@"
+fi
+
+# Avoid mixing pipenv with an active conda runtime.
+if [ -n "${CONDA_PREFIX:-}" ]; then
   exec python -m experiments.train_mini_vae "$@"
 fi
 
