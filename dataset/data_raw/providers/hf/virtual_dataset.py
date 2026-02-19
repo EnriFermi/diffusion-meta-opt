@@ -525,15 +525,24 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
                 if record is None:
                     continue
 
-                materialized = _materialize_image(
-                    record=record,
-                    sample_id=sample_id,
-                    dataset_cfg=dataset_cfg,
-                    cache=cache,
-                    chunk_id=chunk_id,
-                    timeout=request_timeout_s,
-                    retries=max_retries,
-                )
+                try:
+                    materialized = _materialize_image(
+                        record=record,
+                        sample_id=sample_id,
+                        dataset_cfg=dataset_cfg,
+                        cache=cache,
+                        chunk_id=chunk_id,
+                        timeout=request_timeout_s,
+                        retries=max_retries,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Image materialization failed for dataset=%s sample_id=%s: %s",
+                        dataset_name,
+                        sample_id,
+                        exc,
+                    )
+                    continue
                 if materialized is None:
                     continue
 
