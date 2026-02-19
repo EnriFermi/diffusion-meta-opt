@@ -186,6 +186,18 @@ class HFVirtualDataset(BaseVirtualDataset):
         self._drain_worker_events()
         self._ensure_worker_alive()
 
+        worker_pid = None
+        worker_exitcode = None
+        if self._worker is not None:
+            try:
+                worker_pid = int(self._worker.pid) if self._worker.pid is not None else None
+            except Exception:
+                worker_pid = None
+            try:
+                worker_exitcode = self._worker.exitcode
+            except Exception:
+                worker_exitcode = None
+
         return {
             "dataset": self.name,
             "dataset_root": str(self.dataset_root),
@@ -193,7 +205,11 @@ class HFVirtualDataset(BaseVirtualDataset):
             "chunks_loaded": len(self._chunk_queue),
             "images_on_disk": self.chunk_cache.count_images(),
             "worker_alive": bool(self._worker and self._worker.is_alive()),
+            "worker_pid": worker_pid,
+            "worker_exitcode": worker_exitcode,
             "worker_restarts": self._worker_restarts,
+            "worker_permanently_stopped": bool(self._worker_permanently_stopped),
+            "worker_last_error": self._last_worker_error,
             "samples_served": self._served_samples,
         }
 

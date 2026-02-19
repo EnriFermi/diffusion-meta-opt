@@ -211,6 +211,35 @@ class RawDatasetPool:
             payload[dataset_name] = dataset.stats()
         return payload
 
+    def worker_processes(self) -> dict[str, dict[str, Any]]:
+        payload: dict[str, dict[str, Any]] = {}
+        for dataset_name, dataset in self.datasets.items():
+            try:
+                stats = dataset.stats()
+            except Exception as exc:
+                payload[str(dataset_name)] = {
+                    "worker_pid": None,
+                    "worker_alive": False,
+                    "worker_exitcode": None,
+                    "worker_restarts": 0,
+                    "worker_permanently_stopped": False,
+                    "worker_last_error": f"stats_error: {exc}",
+                }
+                continue
+
+            payload[str(dataset_name)] = {
+                "worker_pid": stats.get("worker_pid"),
+                "worker_alive": bool(stats.get("worker_alive", False)),
+                "worker_exitcode": stats.get("worker_exitcode"),
+                "worker_restarts": int(stats.get("worker_restarts", 0) or 0),
+                "worker_permanently_stopped": bool(stats.get("worker_permanently_stopped", False)),
+                "worker_last_error": stats.get("worker_last_error"),
+                "chunks_on_disk": int(stats.get("chunks_on_disk", 0) or 0),
+                "chunks_loaded": int(stats.get("chunks_loaded", 0) or 0),
+                "samples_served": int(stats.get("samples_served", 0) or 0),
+            }
+        return payload
+
     def _requires_hf_token(self) -> bool:
         return any(bool(cfg.get("gated", False)) for cfg in self.index.dataset_cfgs.values())
 
