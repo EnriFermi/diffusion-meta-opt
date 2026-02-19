@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from pathlib import Path
@@ -19,6 +20,7 @@ _TOKEN_PLACEHOLDERS = {
 
 _LOGIN_LOCK = threading.Lock()
 _LOGIN_DONE = False
+LOGGER = logging.getLogger(__name__)
 
 
 def get_hf_token(cfg: Any) -> str | None:
@@ -89,7 +91,25 @@ def init_hf_auth(cfg: Any, allow_missing_token: bool = False) -> str | None:
             if not _LOGIN_DONE:
                 from huggingface_hub import login
 
-                login(token=token, add_to_git_credential=False)
+                try:
+                    login(token=token, add_to_git_credential=False)
+                except Exception as exc:
+                    # HF `/whoami-v2` is rate-limited and may fail under many short-lived processes.
+                    # Keep going with explicit token in env; hub/datasets calls still receive auth.
+                    if _is_whoami_rate_limited(exc):
+                        LOGGER.warning(
+                            "HF login skipped due whoami-v2 rate limit; continuing with token from env. error=%s",
+                            exc,
+                        )
+                    else:
+                        raise
                 _LOGIN_DONE = True
 
     return token
+
+
+def _is_whoami_rate_limited(exc: Exception) -> bool:
+    text = str(exc).lower()
+    if "whoami-v2" not in text:
+        return False
+    return ("429" in text) or ("too many requests" in text) or ("rate limit" in text)
