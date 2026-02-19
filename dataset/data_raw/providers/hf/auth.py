@@ -96,9 +96,9 @@ def init_hf_auth(cfg: Any, allow_missing_token: bool = False) -> str | None:
                 except Exception as exc:
                     # HF `/whoami-v2` is rate-limited and may fail under many short-lived processes.
                     # Keep going with explicit token in env; hub/datasets calls still receive auth.
-                    if _is_whoami_rate_limited(exc):
+                    if _is_whoami_rate_limited(exc) or _is_stored_token_lookup_error(exc):
                         LOGGER.warning(
-                            "HF login skipped due whoami-v2 rate limit; continuing with token from env. error=%s",
+                            "HF login skipped due non-fatal auth cache issue; continuing with token from env. error=%s",
                             exc,
                         )
                     else:
@@ -113,3 +113,8 @@ def _is_whoami_rate_limited(exc: Exception) -> bool:
     if "whoami-v2" not in text:
         return False
     return ("429" in text) or ("too many requests" in text) or ("rate limit" in text)
+
+
+def _is_stored_token_lookup_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "stored_tokens" in text and "not found" in text and "token" in text

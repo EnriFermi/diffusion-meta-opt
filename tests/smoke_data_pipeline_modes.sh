@@ -7,13 +7,12 @@ set -eu
 # 2) local_disk
 # 3) s3_bridge
 #
-# По умолчанию активен только (1).
+# По умолчанию активен блок (2) с deterministic pair-audit.
 # Чтобы протестировать другой режим: раскомментируйте нужный блок,
 # а остальные оставьте закомментированными.
 #
-# Скрипт python дополнительно выполняет turnover-probe:
-# после базового smoke-прохода потребляет ещё объекты и проверяет,
-# что ready-чанки действительно обновляются (как у нормального streaming dataset).
+# В pair-audit режиме скрипт делает детерминированный one-shot по всем
+# совместимым парам dataset+model и пишет подробный JSON-отчет.
 
 # Hugging Face token: задайте через переменную окружения перед запуском:
 export HF_TOKEN="hf_..."
@@ -49,34 +48,59 @@ SCRIPT="tests/smoke_data_pipeline_modes.py"
 #   --hf-token "$HF_TOKEN"
 
 # -----------------------------------------------------------------------------
-# (2) MODE=local_disk (chunk streaming на локальном диске) [АКТИВЕН ПО УМОЛЧАНИЮ]
+# (2) MODE=local_disk + deterministic pair-audit [АКТИВЕН ПО УМОЛЧАНИЮ]
 # -----------------------------------------------------------------------------
-pipenv run python "$SCRIPT" \
+# Проверяет ВСЕ совместимые пары dataset+model из выбранного data-profile.
+# Для каждой пары в отчете будет ровно одна запись.
+# Общий hard-time budget: 10 минут.
+exec python "$SCRIPT" \
   --mode local_disk \
   --train-device "cuda:0" \
   --collector-device "cuda:1" \
   --collector-mode "auto" \
-  --chunk-size-samples 8 \
-  --local-ready-store-max-chunks 12 \
-  --local-refill-after-consumed-chunks 6 \
-  --data-profile "kaggle_smoke" \
-  --datasets "cord_v2,docvqa_1200,oxford_pets,stanford_cars" \
+  --pair-audit \
+  --pair-audit-max-seconds 600 \
+  --pair-audit-sample-timeout-seconds 8 \
+  --pair-audit-report-path "./data/reports/pair_audit_all_pairs.json" \
+  --data-profile "all_datasets_no_flickr30k" \
   --data-root "./data" \
-  --chunk-size-samples 4 \
-  --raw-chunk-size-images 8 \
+  --chunk-size-samples 8 \
+  --local-ready-store-max-chunks 48 \
+  --local-refill-after-consumed-chunks 24 \
+  --raw-chunk-size-images 16 \
   --raw-num-chunks-kept 2 \
-  --xy-samples-random-slice 16 \
-  --target-samples 8 \
-  --turnover-probe-samples 8 \
-  --turnover-probe-timeout-seconds 120 \
-  --require-all-dataset-model-pairs \
-  --pair-coverage-timeout-seconds 300 \
-  --timeout-seconds 180 \
-  --dataset-model cord_v2=clip_vit_b32 \
-  --dataset-model docvqa_1200=clip_vit_b32 \
-  --dataset-model oxford_pets=clip_vit_b32 \
-  --dataset-model stanford_cars=clip_vit_b32 \
+  --xy-samples-random-slice 64 \
+  --timeout-seconds 600 \
   --hf-token "$HF_TOKEN"
+
+# -----------------------------------------------------------------------------
+# (2b) MODE=local_disk, ПОЛНОЕ покрытие всех допустимых пар dataset+model
+# -----------------------------------------------------------------------------
+# ВАЖНО:
+# - Не задаём --datasets (берём весь профиль)
+# - Не задаём --dataset-model (не сужаем модели вручную)
+# - Используем более щедрые таймауты, т.к. комбинаций существенно больше
+#
+# pipenv run python "$SCRIPT" \
+#   --mode local_disk \
+#   --train-device "cuda:0" \
+#   --collector-device "cuda:1" \
+#   --collector-mode "auto" \
+#   --data-profile "all_datasets_no_flickr30k" \
+#   --data-root "./data" \
+#   --chunk-size-samples 8 \
+#   --local-ready-store-max-chunks 48 \
+#   --local-refill-after-consumed-chunks 24 \
+#   --raw-chunk-size-images 16 \
+#   --raw-num-chunks-kept 2 \
+#   --xy-samples-random-slice 64 \
+#   --target-samples 256 \
+#   --turnover-probe-samples 64 \
+#   --turnover-probe-timeout-seconds 600 \
+#   --require-all-dataset-model-pairs \
+#   --pair-coverage-timeout-seconds 5400 \
+#   --timeout-seconds 1800 \
+#   --hf-token "$HF_TOKEN"
 
 # -----------------------------------------------------------------------------
 # (3) MODE=s3_bridge (producer/consumer через S3)
