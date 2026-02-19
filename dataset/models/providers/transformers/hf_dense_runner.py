@@ -36,13 +36,20 @@ class HFDenseRunner(HFBaseRunner):
     def _load_processor(self, token: str | None) -> Any:
         from transformers import AutoImageProcessor, AutoProcessor
 
+        if self.architecture == "grounding_dino" and self.run_mode in {"vision_only", "encoder_only"}:
+            # Vision-only path does not need tokenizer/text processor.
+            try:
+                return self._from_pretrained(AutoImageProcessor, token=token)
+            except Exception:
+                return self._from_pretrained(AutoProcessor, token=token)
+
         try:
             return self._from_pretrained(AutoProcessor, token=token)
         except Exception:
             return self._from_pretrained(AutoImageProcessor, token=token)
 
     def prepare_inputs(self, batch_pil: list[Image.Image]) -> dict[str, Any]:
-        if self.architecture == "grounding_dino":
+        if self.architecture == "grounding_dino" and self.run_mode == "full":
             prompt = self._grounding_prompt()
             prompts = [prompt for _ in range(len(batch_pil))]
             payload = self._prepare_processor_payload(images=batch_pil, text=prompts, padding=True, truncation=True)
@@ -59,10 +66,38 @@ class HFDenseRunner(HFBaseRunner):
         if self.run_mode not in {"vision_only", "encoder_only", "full"}:
             raise ValueError(f"Unsupported run_mode='{self.run_mode}' for {self.name}")
 
-        # GroundingDINO requires text fields in forward; for vision-only we send a default prompt.
+        if self.architecture == "grounding_dino" and self.run_mode in {"vision_only", "encoder_only"}:
+            return self._run_grounding_dino_vision_only(model_inputs)
+
         return self._model(**model_inputs)
 
     def _grounding_prompt(self) -> str:
         if self.run_mode == "full":
             return str(self.cfg_dict.get("text_prompt", "a generic object"))
         return str(self.cfg_dict.get("dummy_text_prompt", "object"))
+
+    def _run_grounding_dino_vision_only(self, model_inputs: dict[str, Any]) -> Any:
+        if self._model is None:
+            raise RuntimeError(f"Model '{self.name}' is not loaded")
+
+        core_model = getattr(self._model, "model", None)
+        if core_model is None:
+            return self._model(**model_inputs)
+
+        backbone = getattr(core_model, "backbone", None)
+        if backbone is None:
+            return self._model(**model_inputs)
+
+        pixel_values = model_inputs.get("pixel_values")
+        if pixel_values is None:
+            raise KeyError(f"Missing 'pixel_values' for {self.name}")
+
+        forward_kwargs: dict[str, Any] = {"pixel_values": pixel_values}
+        if "pixel_mask" in model_inputs:
+            forward_kwargs["pixel_mask"] = model_inputs["pixel_mask"]
+
+        try:
+            return backbone(**forward_kwargs)
+        except TypeError:
+            forward_kwargs.pop("pixel_mask", None)
+            return backbone(**forward_kwargs)
