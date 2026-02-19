@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import faulthandler
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -39,6 +40,180 @@ from dataset.shared.streaming.factory import (
 from dataset.shared.types import CollectorJobStats, SharedSample
 
 _FAULT_HANDLER_FILES: list[Any] = []
+
+
+def _read_text_file(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _read_proc_status_fields(pid: int) -> dict[str, str]:
+    path = Path(f"/proc/{int(pid)}/status")
+    text = _read_text_file(path)
+    if not text:
+        return {}
+    payload: dict[str, str] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        payload[key.strip()] = value.strip()
+    return payload
+
+
+def _parse_kb_to_mb(raw_value: str | None) -> float | None:
+    if not raw_value:
+        return None
+    token = str(raw_value).strip().split(" ", 1)[0]
+    if not token:
+        return None
+    try:
+        return float(int(token) / 1024.0)
+    except Exception:
+        return None
+
+
+def _list_child_pids(pid: int) -> list[int]:
+    children_path = Path(f"/proc/{int(pid)}/task/{int(pid)}/children")
+    text = _read_text_file(children_path)
+    if not text:
+        return []
+    out: list[int] = []
+    for token in text.strip().split():
+        try:
+            out.append(int(token))
+        except Exception:
+            continue
+    return out
+
+
+def _collect_process_resource_snapshot(*, pid: int | None = None, max_children: int = 8) -> dict[str, Any]:
+    target_pid = int(os.getpid() if pid is None else pid)
+    payload: dict[str, Any] = {"pid": target_pid}
+
+    proc_fields = _read_proc_status_fields(target_pid)
+    if proc_fields:
+        payload["name"] = proc_fields.get("Name")
+        payload["state"] = proc_fields.get("State")
+        payload["threads"] = int(proc_fields.get("Threads", "0") or 0)
+        payload["rss_mb"] = _parse_kb_to_mb(proc_fields.get("VmRSS"))
+        payload["hwm_mb"] = _parse_kb_to_mb(proc_fields.get("VmHWM"))
+        payload["vms_mb"] = _parse_kb_to_mb(proc_fields.get("VmSize"))
+        payload["swap_mb"] = _parse_kb_to_mb(proc_fields.get("VmSwap"))
+
+    fd_dir = Path(f"/proc/{target_pid}/fd")
+    try:
+        payload["open_fds"] = len(list(fd_dir.iterdir()))
+    except Exception:
+        payload["open_fds"] = None
+
+    children = _list_child_pids(target_pid)
+    payload["children_count"] = int(len(children))
+    child_rows: list[dict[str, Any]] = []
+    children_rss_mb = 0.0
+    for child_pid in children[: max(0, int(max_children))]:
+        child_fields = _read_proc_status_fields(child_pid)
+        child_rss = _parse_kb_to_mb(child_fields.get("VmRSS")) if child_fields else None
+        if child_rss is not None:
+            children_rss_mb += float(child_rss)
+        child_rows.append(
+            {
+                "pid": int(child_pid),
+                "name": child_fields.get("Name") if child_fields else None,
+                "state": child_fields.get("State") if child_fields else None,
+                "rss_mb": child_rss,
+                "threads": int(child_fields.get("Threads", "0") or 0) if child_fields else None,
+            }
+        )
+    payload["children_rss_mb_sum"] = float(children_rss_mb)
+    if child_rows:
+        payload["children_head"] = child_rows
+    return payload
+
+
+def _read_cgroup_scalar(paths: list[str]) -> int | str | None:
+    for path_str in paths:
+        text = _read_text_file(Path(path_str))
+        if not text:
+            continue
+        token = text.strip().splitlines()[0].strip()
+        if not token:
+            continue
+        if token == "max":
+            return token
+        try:
+            return int(token)
+        except Exception:
+            continue
+    return None
+
+
+def _read_cgroup_memory_events() -> dict[str, int]:
+    candidates = [
+        "/sys/fs/cgroup/memory.events",
+        "/sys/fs/cgroup/memory/memory.events",
+    ]
+    for path_str in candidates:
+        text = _read_text_file(Path(path_str))
+        if not text:
+            continue
+        out: dict[str, int] = {}
+        for line in text.splitlines():
+            parts = line.strip().split()
+            if len(parts) != 2:
+                continue
+            key, raw_value = parts
+            try:
+                out[str(key)] = int(raw_value)
+            except Exception:
+                continue
+        if out:
+            return out
+    return {}
+
+
+def _read_cgroup_memory_snapshot() -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "events": _read_cgroup_memory_events(),
+        "memory_current_bytes": _read_cgroup_scalar(
+            ["/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"]
+        ),
+        "memory_max_bytes": _read_cgroup_scalar(
+            ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]
+        ),
+        "memory_swap_current_bytes": _read_cgroup_scalar(
+            ["/sys/fs/cgroup/memory.swap.current", "/sys/fs/cgroup/memory/memory.memsw.usage_in_bytes"]
+        ),
+        "memory_swap_max_bytes": _read_cgroup_scalar(
+            ["/sys/fs/cgroup/memory.swap.max", "/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes"]
+        ),
+    }
+    # Remove empty keys to keep status compact.
+    return {k: v for k, v in payload.items() if v not in (None, {}, "")}
+
+
+def _diff_counter_dict(current: dict[str, int], baseline: dict[str, int]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for key, value in current.items():
+        try:
+            out[str(key)] = int(value) - int(baseline.get(key, 0))
+        except Exception:
+            continue
+    return out
+
+
+def _write_json_report(path: Path, payload: dict[str, Any], logger: logging.Logger) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+            handle.write("\n")
+        tmp_path.replace(path)
+    except Exception as exc:
+        logger.warning("Failed to write collector crash report '%s': %s", path, exc)
 
 
 def _signal_name(signum: int) -> str:
@@ -294,6 +469,14 @@ class CollectorService:
         self.num_inflight_jobs = max(1, int(collector_cfg.get("num_inflight_jobs", 2)))
         self.status_emit_interval_s = max(0.1, float(collector_cfg.get("status_emit_interval_s", 2.0)))
         self.status_queue_max_items = max(16, int(collector_cfg.get("status_queue_max_items", 2048)))
+        diagnostics_cfg = collector_cfg.get("diagnostics", {})
+        self.emit_resource_snapshot = bool(diagnostics_cfg.get("emit_resource_snapshot", True))
+        self.resource_snapshot_max_children = max(0, int(diagnostics_cfg.get("resource_snapshot_max_children", 8)))
+        self.include_cgroup_on_failure = bool(diagnostics_cfg.get("include_cgroup_on_failure", True))
+        self.crash_report_enabled = bool(diagnostics_cfg.get("crash_report_enabled", True))
+        self.crash_report_path = Path(
+            str(diagnostics_cfg.get("crash_report_path", "./data/reports/collector_crash_report.json"))
+        )
 
         self.interleaved_cfg = collector_cfg.get("interleaved_schedule", {})
         collect_every_n_steps_cfg = self.interleaved_cfg.get(
@@ -336,6 +519,7 @@ class CollectorService:
         self._async_last_status: dict[str, Any] | None = None
         self._async_recent_jobs: deque[dict[str, Any]] = deque(maxlen=128)
         self._async_events_dropped = 0
+        self._cgroup_events_baseline = _read_cgroup_memory_events()
 
     @property
     def is_async_mode(self) -> bool:
@@ -362,8 +546,110 @@ class CollectorService:
         if self._process.is_alive():
             return
 
-        exit_reason = _format_process_exit(self._process.exitcode)
-        raise RuntimeError(f"Async collector process exited unexpectedly ({exit_reason})")
+        exit_code = self._process.exitcode
+        exit_reason = _format_process_exit(exit_code)
+        hint_parts: list[str] = []
+        cgroup_snapshot: dict[str, Any] = {}
+        if exit_code == -9:
+            hint_parts.append(
+                "collector received SIGKILL (often OOM / memory limit). "
+                "Try smaller collector load (jobs_per_selected_model=1, num_inflight_jobs=1, "
+                "smaller xy_samples_random_slice/chunk_size_samples)."
+            )
+            if self.include_cgroup_on_failure:
+                cgroup_snapshot = _read_cgroup_memory_snapshot()
+                cgroup_events = cgroup_snapshot.get("events")
+                if isinstance(cgroup_events, dict) and self._cgroup_events_baseline:
+                    try:
+                        cgroup_snapshot["events_delta"] = _diff_counter_dict(cgroup_events, self._cgroup_events_baseline)
+                    except Exception:
+                        pass
+                if cgroup_snapshot:
+                    try:
+                        hint_parts.append("cgroup=" + json.dumps(cgroup_snapshot, ensure_ascii=False))
+                    except Exception:
+                        pass
+        elif self.include_cgroup_on_failure:
+            cgroup_snapshot = _read_cgroup_memory_snapshot()
+
+        crash_report_payload = self._build_crash_report_payload(
+            exit_code=exit_code,
+            exit_reason=exit_reason,
+            cgroup_snapshot=cgroup_snapshot,
+        )
+        crash_report_written = self._maybe_write_crash_report(crash_report_payload)
+        if crash_report_written is not None:
+            hint_parts.append(f"crash_report_path={crash_report_written}")
+
+        if isinstance(self._async_last_status, dict):
+            try:
+                last_resource = self._async_last_status.get("resource")
+                hint_parts.append(
+                    "last_status="
+                    + json.dumps(
+                        {
+                            "collector_pid": self._async_last_status.get("collector_pid"),
+                            "cache_size": self._async_last_status.get("cache_size"),
+                            "jobs_total": self._async_last_status.get("jobs_total"),
+                            "items_emitted": self._async_last_status.get("items_emitted"),
+                            "sink": self._async_last_status.get("sink"),
+                            "resource": last_resource,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            except Exception:
+                pass
+
+        message = f"Async collector process exited unexpectedly ({exit_reason})"
+        if hint_parts:
+            message = f"{message}. {' '.join(hint_parts)}"
+        raise RuntimeError(message)
+
+    def _build_crash_report_payload(
+        self,
+        *,
+        exit_code: int | None,
+        exit_reason: str,
+        cgroup_snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        process_pid = int(self._process.pid) if self._process is not None and self._process.pid is not None else None
+        payload: dict[str, Any] = {
+            "timestamp": float(time.time()),
+            "exit_code": exit_code,
+            "exit_reason": exit_reason,
+            "collector_pid": process_pid,
+            "collector_mode": self.collector_mode,
+            "streaming_mode": self.streaming_mode,
+            "collector_device": self.collector_device,
+            "train_device": self.train_device,
+            "jobs_total": int(self._jobs_total),
+            "items_emitted": int(self._items_emitted),
+            "jobs_by_model": dict(self._jobs_by_model),
+            "cache_size": int(self.cache_size()),
+            "async_events_dropped": int(self._async_events_dropped),
+            "async_recent_jobs": list(self._async_recent_jobs),
+            "async_last_status": self._async_last_status,
+            "host_snapshot": _collect_process_resource_snapshot(
+                pid=os.getpid(),
+                max_children=self.resource_snapshot_max_children,
+            ),
+            "cgroup": cgroup_snapshot or {},
+            "cgroup_events_baseline": dict(self._cgroup_events_baseline),
+        }
+        if process_pid is not None:
+            payload["collector_process_snapshot"] = _collect_process_resource_snapshot(
+                pid=process_pid,
+                max_children=self.resource_snapshot_max_children,
+            )
+        return payload
+
+    def _maybe_write_crash_report(self, payload: dict[str, Any]) -> str | None:
+        if not self.crash_report_enabled:
+            return None
+        path = self.crash_report_path
+        _write_json_report(path, payload, logger=self.logger)
+        return str(path)
 
     def predownload_models(self) -> None:
         model_cfgs = self.compat_index.get_model_cfgs()
@@ -776,6 +1062,7 @@ class CollectorService:
         payload: dict[str, Any] = {
             "type": str(event_type),
             "timestamp": float(time.time()),
+            "collector_pid": int(os.getpid()),
             "mode": self.collector_mode,
             "streaming_mode": self.streaming_mode,
             "cache_size": int(self.cache_size()),
@@ -786,6 +1073,11 @@ class CollectorService:
             "sink": self._sink.stats() if self._sink else None,
             "events_dropped": int(self._async_events_dropped),
         }
+        if self.emit_resource_snapshot:
+            payload["resource"] = _collect_process_resource_snapshot(
+                pid=os.getpid(),
+                max_children=self.resource_snapshot_max_children,
+            )
         if job_stats is not None:
             payload["job_stats"] = asdict(job_stats)
 
