@@ -6,7 +6,8 @@ path: ${oc.env:DATA_ROOT,./data}
 
 enabled_datasets:
   - bdd100k
-  - scene_parse_150
+  # scene_parse_150 temporarily disabled:
+  # upstream image source (ADEChallengeData2016.zip) is flaky and can starve the cache.
   - oxford_pets
   - stanford_cars
 
@@ -19,17 +20,6 @@ dataset_overrides:
       - deit_base
       - dinov2_base
       - swinv2_base
-    hf:
-      stream_via_datasets_server: true
-    cache:
-      chunk_size_images: 128
-      num_chunks_kept: 3
-  scene_parse_150:
-    sampling_weight: 0.3
-    models:
-      - swinv2_base
-      - deit_base
-      - beit_base
     hf:
       stream_via_datasets_server: true
     cache:
