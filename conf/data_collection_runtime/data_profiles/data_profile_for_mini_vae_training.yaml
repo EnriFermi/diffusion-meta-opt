@@ -5,15 +5,16 @@ defaults:
 path: ${oc.env:DATA_ROOT,./data}
 
 enabled_datasets:
-  # Temporary isolation mode for debugging collector/training stability.
-  # Keep a single dataset to reduce runtime variability.
+  # Mini-VAE train split.
+  - cc12m
   - bdd100k
-  - oxford_pets
+  - scene_parse_150
+  - doclaynet_v11
+  - patchcamelyon
+  - eurosat_rgb
   - stanford_cars
 
 dataset_overrides:
-  # Keep mini-train profile on datasets with materialized image fields
-  # (instead of brittle external URL-only corpora like cc12m/visual_genome).
   bdd100k:
     models:
       - clip_vit_b32
@@ -22,15 +23,6 @@ dataset_overrides:
       - swinv2_base
     hf:
       stream_via_datasets_server: true
-    cache:
-      chunk_size_images: 128
-      num_chunks_kept: 3
-  oxford_pets:
-    models:
-      - clip_vit_b32
-      - siglip_base_p16_384
-      - dinov2_base
-      - deit_base
     cache:
       chunk_size_images: 128
       num_chunks_kept: 3

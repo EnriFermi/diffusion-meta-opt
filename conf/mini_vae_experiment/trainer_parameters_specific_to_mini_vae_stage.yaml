@@ -61,6 +61,15 @@ test_eval:
   timeout_seconds: 300.0
   poll_sleep_seconds: 0.05
 
+train_ablation_eval:
+  enabled: true
+  every_steps: 100
+  num_batches: 4
+  run_on_last_step: true
+  max_x_rows: null
+  timeout_seconds: 120.0
+  poll_sleep_seconds: 0.05
+
 telemetry:
   local:
     status_every_steps: 10
