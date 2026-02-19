@@ -216,6 +216,91 @@ def _write_json_report(path: Path, payload: dict[str, Any], logger: logging.Logg
         logger.warning("Failed to write collector crash report '%s': %s", path, exc)
 
 
+def _safe_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _annotate_dataset_workers_with_resource(
+    raw_pool_workers: dict[str, Any] | None,
+    resource_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(raw_pool_workers, dict):
+        return {}
+
+    children_by_pid: dict[int, dict[str, Any]] = {}
+    if isinstance(resource_payload, dict):
+        children = resource_payload.get("children_head")
+        if isinstance(children, list):
+            for row in children:
+                if not isinstance(row, dict):
+                    continue
+                pid = _safe_int(row.get("pid"))
+                if pid is None:
+                    continue
+                children_by_pid[pid] = row
+
+    payload: dict[str, Any] = {}
+    for dataset_name, info in raw_pool_workers.items():
+        if isinstance(info, dict):
+            row = dict(info)
+        else:
+            row = {"value": info}
+
+        worker_pid = _safe_int(row.get("worker_pid"))
+        if worker_pid is not None:
+            child = children_by_pid.get(worker_pid)
+            if isinstance(child, dict):
+                row["worker_rss_mb"] = child.get("rss_mb")
+                row["worker_state"] = child.get("state")
+                row["worker_threads"] = child.get("threads")
+                row["worker_name"] = child.get("name")
+        payload[str(dataset_name)] = row
+
+    return payload
+
+
+def _top_worker_rss(
+    dataset_workers: dict[str, Any] | None,
+    limit: int = 4,
+) -> list[dict[str, Any]]:
+    if not isinstance(dataset_workers, dict):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for dataset_name, info in dataset_workers.items():
+        if not isinstance(info, dict):
+            continue
+        rss_mb = _safe_float(info.get("worker_rss_mb"))
+        if rss_mb is None:
+            continue
+        rows.append(
+            {
+                "dataset": str(dataset_name),
+                "worker_pid": _safe_int(info.get("worker_pid")),
+                "worker_rss_mb": float(rss_mb),
+                "worker_state": info.get("worker_state"),
+                "worker_last_error": info.get("worker_last_error"),
+            }
+        )
+
+    rows.sort(key=lambda item: float(item.get("worker_rss_mb", 0.0)), reverse=True)
+    return rows[: max(1, int(limit))]
+
+
 def _signal_name(signum: int) -> str:
     try:
         return signal.Signals(signum).name
@@ -584,6 +669,8 @@ class CollectorService:
         if isinstance(self._async_last_status, dict):
             try:
                 last_resource = self._async_last_status.get("resource")
+                last_workers = self._async_last_status.get("raw_pool_workers")
+                top_workers = _top_worker_rss(last_workers, limit=4)
                 hint_parts.append(
                     "last_status="
                     + json.dumps(
@@ -594,6 +681,7 @@ class CollectorService:
                             "items_emitted": self._async_last_status.get("items_emitted"),
                             "sink": self._async_last_status.get("sink"),
                             "resource": last_resource,
+                            "top_dataset_workers_by_rss": top_workers,
                         },
                         ensure_ascii=False,
                     )
@@ -637,6 +725,16 @@ class CollectorService:
             "cgroup": cgroup_snapshot or {},
             "cgroup_events_baseline": dict(self._cgroup_events_baseline),
         }
+        if isinstance(self._async_last_status, dict):
+            raw_pool_workers = self._async_last_status.get("raw_pool_workers")
+            resource = self._async_last_status.get("resource")
+            dataset_workers = _annotate_dataset_workers_with_resource(
+                raw_pool_workers if isinstance(raw_pool_workers, dict) else None,
+                resource if isinstance(resource, dict) else None,
+            )
+            if dataset_workers:
+                payload["dataset_workers"] = dataset_workers
+                payload["dataset_workers_top_by_rss"] = _top_worker_rss(dataset_workers, limit=8)
         if process_pid is not None:
             payload["collector_process_snapshot"] = _collect_process_resource_snapshot(
                 pid=process_pid,
@@ -1078,6 +1176,15 @@ class CollectorService:
                 pid=os.getpid(),
                 max_children=self.resource_snapshot_max_children,
             )
+        if self._raw_pool is not None:
+            try:
+                raw_pool_workers = self._raw_pool.worker_processes()
+                payload["raw_pool_workers"] = _annotate_dataset_workers_with_resource(
+                    raw_pool_workers,
+                    payload.get("resource") if isinstance(payload.get("resource"), dict) else None,
+                )
+            except Exception as exc:
+                payload["raw_pool_workers_error"] = str(exc)
         if job_stats is not None:
             payload["job_stats"] = asdict(job_stats)
 
