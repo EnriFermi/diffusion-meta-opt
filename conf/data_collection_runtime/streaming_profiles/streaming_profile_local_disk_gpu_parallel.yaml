@@ -4,6 +4,9 @@ defaults:
 
 mode: local_disk
 
+# Make first ready chunks appear quickly; 256 is too heavy for layer-level samples.
+chunk_size_samples: 64
+
 producer:
   ready_store_max_chunks: 400
   refill_after_consumed_chunks: 200
