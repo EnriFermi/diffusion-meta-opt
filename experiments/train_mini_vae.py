@@ -17,7 +17,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf, open_dict
-from torch.cuda.amp import GradScaler
+
+try:
+    from torch.amp import GradScaler
+except Exception:  # pragma: no cover - compatibility for older PyTorch
+    from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dataset.shared.collector_service import CollectorService
@@ -108,7 +112,15 @@ class CometTracker:
         try:
             from comet_ml import Experiment, OfflineExperiment  # type: ignore
         except Exception as exc:
-            self.logger.warning("Comet is enabled but comet_ml is unavailable: %s", exc)
+            message = str(exc)
+            if "rpds.rpds" in message:
+                self.logger.warning(
+                    "Comet is enabled but comet_ml is unavailable: %s. "
+                    "Install missing dependency in active env: `python -m pip install -U rpds-py`",
+                    exc,
+                )
+            else:
+                self.logger.warning("Comet is enabled but comet_ml is unavailable: %s", exc)
             return
 
         api_key = str(comet_cfg.get("api_key", "")).strip()
@@ -310,9 +322,10 @@ def build_test_eval_runtime_cfg(cfg: DictConfig, logger: logging.Logger) -> Dict
 
         if runtime_cfg.collector.get("interleaved_schedule") is None:
             runtime_cfg.collector.interleaved_schedule = {}
-        runtime_cfg.collector.interleaved_schedule.collect_every_n_train_steps = max(
-            1, int(test_eval_cfg.get("collect_every_n_steps", 1))
-        )
+        collect_every_n_steps = max(1, int(test_eval_cfg.get("collect_every_n_steps", 1)))
+        runtime_cfg.collector.interleaved_schedule.collect_every_n_train_steps = collect_every_n_steps
+        # Keep both key variants in runtime config for compatibility across readers.
+        runtime_cfg.collector.interleaved_schedule.collect_every_n_steps = collect_every_n_steps
         runtime_cfg.collector.interleaved_schedule.collector_jobs_per_cycle = max(
             1, int(test_eval_cfg.get("collector_jobs_per_cycle", 1))
         )
@@ -1057,6 +1070,7 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
     promote_run_profile_to_root(cfg)
     setup_logging(cfg, rank=rank)
     logger = get_logger("mini_vae_train", rank=rank)
+    is_distributed = world_size > 1
     if rank == 0:
         logger.info("Starting MiniPatchVAE training entrypoint")
         logger.debug("Resolved config:\n%s", OmegaConf.to_yaml(cfg, resolve=True))
@@ -1076,7 +1090,6 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
     seed_everything(seed)
     set_speed_optimizations(cfg, device=device)
 
-    is_distributed = world_size > 1
     streaming_mode = str(cfg.streaming.get("mode", "none")).lower()
     dataset_sharding = bool(cfg.mini_train.get("use_dataset_sharding", True)) and is_distributed and streaming_mode != "none"
     use_broadcast = is_distributed and not dataset_sharding
@@ -1393,14 +1406,15 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                 if scaler.is_enabled():
                     scaler.unscale_(optimizer)
 
-                grad_stats = compute_grad_stats(model)
-                grad_global_before_clip = float(grad_stats.get("grad/global_norm", 0.0))
                 grad_clip_coef = 1.0
                 if grad_clip_norm > 0.0:
                     clip_return = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                     grad_global_before_clip = float(clip_return)
                     grad_clip_coef = min(1.0, float(grad_clip_norm) / max(1e-12, grad_global_before_clip))
                     grad_stats = compute_grad_stats(model)
+                else:
+                    grad_stats = compute_grad_stats(model)
+                    grad_global_before_clip = float(grad_stats.get("grad/global_norm", 0.0))
                 grad_stats["grad/global_norm_before_clip"] = grad_global_before_clip
                 grad_stats["grad/clip_coef"] = grad_clip_coef
 
@@ -1589,7 +1603,7 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                         "train/behavioral": float(avg_behavioral),
                         "train/contrastive": float(avg_contrastive),
                         "train/recon_mix": float(avg_recon_mix),
-                        "train/recon": float(avg_recon_mix),
+                        "train/recon": float(avg_structural),
                         "train/kl": float(avg_kl),
                         "train/loss_alpha": float(alpha),
                         "train/loss_beta": float(beta),
@@ -1666,6 +1680,7 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     step_forward_ms_window = 0.0
                     step_backward_ms_window = 0.0
                     step_opt_ms_window = 0.0
+                    patch_window.clear()
                     t0 = time.time()
 
                 run_test_eval_this_step = test_eval_requested and (
@@ -1788,7 +1803,7 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
         if comet_tracker is not None:
             comet_tracker.end()
 
-        if is_distributed:
+        if is_distributed and dist.is_initialized():
             try:
                 dist.barrier()
             except Exception:

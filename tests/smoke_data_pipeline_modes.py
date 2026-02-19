@@ -101,6 +101,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-turnover-probe", action="store_true")
     parser.add_argument("--diversity-window", type=int, default=128)
     parser.add_argument(
+        "--pair-coverage-timeout-seconds",
+        type=int,
+        default=300,
+        help="Additional timeout budget for ensuring every compatible dataset-model pair is observed at least once.",
+    )
+    parser.add_argument(
+        "--require-all-dataset-model-pairs",
+        dest="require_all_dataset_model_pairs",
+        action="store_true",
+        help="Require seeing every compatible dataset-model pair at least once.",
+    )
+    parser.add_argument(
+        "--allow-missing-dataset-model-pairs",
+        dest="require_all_dataset_model_pairs",
+        action="store_false",
+        help="Do not fail if some compatible dataset-model pairs were not observed.",
+    )
+    parser.set_defaults(require_all_dataset_model_pairs=True)
+    parser.add_argument(
         "--dump-first-weight",
         default=None,
         help="Optional path to save full first-sample weight tensor (.pt)",
@@ -368,7 +387,7 @@ def _consume_samples(
     collector: CollectorService,
     dataset: SharedModelDataset,
     need: int,
-    timeout_seconds: int,
+    timeout_seconds: float,
     poll_sleep: float,
     step_start: int,
 ) -> tuple[list[Any], int]:
@@ -416,6 +435,8 @@ def _run_smoke(
     skip_turnover_probe: bool,
     dump_first_weight: str | None,
     diversity_window: int,
+    pair_coverage_timeout_seconds: int,
+    require_all_dataset_model_pairs: bool,
 ) -> dict[str, Any]:
     collector = CollectorService(cfg)
     dataset = SharedModelDataset(collector)
@@ -423,6 +444,12 @@ def _run_smoke(
     model_counts: Counter[str] = Counter()
     layer_counts: Counter[str] = Counter()
     dataset_counts: Counter[str] = Counter()
+    pair_counts: Counter[tuple[str, str]] = Counter()
+    expected_pairs: set[tuple[str, str]] = {
+        (str(dataset_name), str(model_name))
+        for model_name in collector.compat_index.get_models()
+        for dataset_name in collector.compat_index.get_datasets_for_model(model_name)
+    }
 
     consumed = 0
     first_sample_summary: dict[str, Any] | None = None
@@ -430,6 +457,67 @@ def _run_smoke(
     started = time.time()
     step = 0
     turnover_report: dict[str, Any] | None = None
+
+    def _process_sample(sample: Any) -> None:
+        nonlocal consumed, first_sample_summary
+        if not torch.is_tensor(sample.x) or not torch.is_tensor(sample.y):
+            raise TypeError("SharedSample x/y must be tensors")
+        if not torch.is_tensor(sample.weight):
+            raise TypeError("SharedSample weight must be tensor")
+        if sample.x.dtype != torch.float32 or sample.y.dtype != torch.float32:
+            raise TypeError(f"Expected float32 tensors, got x={sample.x.dtype}, y={sample.y.dtype}")
+        if str(sample.x.device) != "cpu" or str(sample.y.device) != "cpu":
+            raise TypeError(f"Expected CPU tensors, got x={sample.x.device}, y={sample.y.device}")
+
+        if first_sample_summary is None:
+            weight = sample.weight.detach().to("cpu", dtype=torch.float32)
+
+            weight_dump_path = None
+            if dump_first_weight:
+                dump_path = Path(dump_first_weight)
+                dump_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(weight, dump_path)
+                weight_dump_path = str(dump_path.resolve())
+
+            first_sample_summary = {
+                "model_name": sample.model_name,
+                "layer_name": sample.layer_name,
+                "x_shape": tuple(sample.x.shape),
+                "y_shape": tuple(sample.y.shape),
+                "weight_shape": tuple(weight.shape),
+                "weight_dtype": str(weight.dtype),
+                "weight_device": str(weight.device),
+                "weight_l2_norm": float(weight.norm().item()),
+                "weight_preview": _weight_preview(
+                    weight=weight,
+                    rows=weight_preview_rows,
+                    cols=weight_preview_cols,
+                ),
+                "weight_dump_path": weight_dump_path,
+                "meta_keys": sorted(sample.meta.keys()),
+            }
+
+        model_name = str(sample.model_name)
+        model_counts[model_name] += 1
+        layer_counts[str(sample.layer_name)] += 1
+
+        sample_dataset_names: set[str] = set()
+        for item in sample.meta.get("image_meta", []):
+            ds_name = item.get("dataset_name")
+            if ds_name:
+                ds_name_text = str(ds_name)
+                dataset_counts[ds_name_text] += 1
+                sample_dataset_names.add(ds_name_text)
+
+        for ds_name_text in sample_dataset_names:
+            pair_counts[(ds_name_text, model_name)] += 1
+
+        consumed += 1
+        all_consumed_samples.append(sample)
+
+    def _missing_pairs() -> list[tuple[str, str]]:
+        observed = set(pair_counts.keys())
+        return sorted(expected_pairs - observed)
 
     try:
         if predownload:
@@ -447,52 +535,7 @@ def _run_smoke(
         )
 
         for sample in phase_items:
-            if not torch.is_tensor(sample.x) or not torch.is_tensor(sample.y):
-                raise TypeError("SharedSample x/y must be tensors")
-            if not torch.is_tensor(sample.weight):
-                raise TypeError("SharedSample weight must be tensor")
-            if sample.x.dtype != torch.float32 or sample.y.dtype != torch.float32:
-                raise TypeError(f"Expected float32 tensors, got x={sample.x.dtype}, y={sample.y.dtype}")
-            if str(sample.x.device) != "cpu" or str(sample.y.device) != "cpu":
-                raise TypeError(f"Expected CPU tensors, got x={sample.x.device}, y={sample.y.device}")
-
-            if first_sample_summary is None:
-                weight = sample.weight.detach().to("cpu", dtype=torch.float32)
-
-                weight_dump_path = None
-                if dump_first_weight:
-                    dump_path = Path(dump_first_weight)
-                    dump_path.parent.mkdir(parents=True, exist_ok=True)
-                    torch.save(weight, dump_path)
-                    weight_dump_path = str(dump_path.resolve())
-
-                first_sample_summary = {
-                    "model_name": sample.model_name,
-                    "layer_name": sample.layer_name,
-                    "x_shape": tuple(sample.x.shape),
-                    "y_shape": tuple(sample.y.shape),
-                    "weight_shape": tuple(weight.shape),
-                    "weight_dtype": str(weight.dtype),
-                    "weight_device": str(weight.device),
-                    "weight_l2_norm": float(weight.norm().item()),
-                    "weight_preview": _weight_preview(
-                        weight=weight,
-                        rows=weight_preview_rows,
-                        cols=weight_preview_cols,
-                    ),
-                    "weight_dump_path": weight_dump_path,
-                    "meta_keys": sorted(sample.meta.keys()),
-                }
-
-            model_counts[sample.model_name] += 1
-            layer_counts[sample.layer_name] += 1
-            for item in sample.meta.get("image_meta", []):
-                ds_name = item.get("dataset_name")
-                if ds_name:
-                    dataset_counts[str(ds_name)] += 1
-
-            consumed += 1
-            all_consumed_samples.append(sample)
+            _process_sample(sample)
 
         if (
             str(cfg.streaming.mode).lower() != "none"
@@ -521,7 +564,8 @@ def _run_smoke(
                     if item.meta.get("model_run_id") is not None
                 }
             )
-            all_consumed_samples.extend(probe_items)
+            for sample in probe_items:
+                _process_sample(sample)
 
             turnover_ok = bool(new_ids or removed_ids or after.get("ready_count") != before.get("ready_count"))
             turnover_report = {
@@ -544,6 +588,38 @@ def _run_smoke(
                     "Try smaller chunk sizes or larger turnover-probe-samples."
                 )
 
+        if require_all_dataset_model_pairs:
+            coverage_started = time.time()
+            missing_pairs = _missing_pairs()
+            while missing_pairs:
+                elapsed = time.time() - coverage_started
+                remaining = float(pair_coverage_timeout_seconds) - elapsed
+                if remaining <= 0:
+                    break
+
+                extra_need = max(1, min(16, len(missing_pairs)))
+                extra_items, step = _consume_samples(
+                    collector=collector,
+                    dataset=dataset,
+                    need=extra_need,
+                    timeout_seconds=remaining,
+                    poll_sleep=poll_sleep,
+                    step_start=step,
+                )
+                for sample in extra_items:
+                    _process_sample(sample)
+                missing_pairs = _missing_pairs()
+
+            if missing_pairs:
+                preview = [f"{dataset_name}:{model_name}" for dataset_name, model_name in missing_pairs[:20]]
+                raise RuntimeError(
+                    "Dataset-model coverage check failed: "
+                    f"observed_pairs={len(pair_counts)}/{len(expected_pairs)}, "
+                    f"missing_pairs={len(missing_pairs)}, preview={preview}. "
+                    "Increase --target-samples and/or --pair-coverage-timeout-seconds "
+                    "or disable strict check with --allow-missing-dataset-model-pairs."
+                )
+
     finally:
         dataset.close()
         collector.shutdown()
@@ -552,6 +628,11 @@ def _run_smoke(
         raise RuntimeError("Smoke run produced zero samples")
 
     diversity_report = _diversity_report(all_consumed_samples, window_size=int(diversity_window))
+    missing_pairs_final = _missing_pairs()
+    pair_counts_serialized = [
+        {"dataset_name": dataset_name, "model_name": model_name, "count": int(count)}
+        for (dataset_name, model_name), count in sorted(pair_counts.items())
+    ]
 
     return {
         "ok": True,
@@ -567,6 +648,15 @@ def _run_smoke(
         "first_sample": first_sample_summary,
         "diversity": diversity_report,
         "turnover_probe": turnover_report,
+        "dataset_model_pair_coverage_required": bool(require_all_dataset_model_pairs),
+        "dataset_model_pairs_expected_count": int(len(expected_pairs)),
+        "dataset_model_pairs_observed_count": int(len(pair_counts)),
+        "dataset_model_pairs_missing_count": int(len(missing_pairs_final)),
+        "dataset_model_pairs_missing": [
+            {"dataset_name": dataset_name, "model_name": model_name}
+            for dataset_name, model_name in missing_pairs_final
+        ],
+        "dataset_model_pair_counts": pair_counts_serialized,
         "collector_stats": collector.stats(),
     }
 
@@ -595,6 +685,8 @@ def main() -> int:
             skip_turnover_probe=bool(args.skip_turnover_probe),
             dump_first_weight=args.dump_first_weight,
             diversity_window=int(args.diversity_window),
+            pair_coverage_timeout_seconds=int(args.pair_coverage_timeout_seconds),
+            require_all_dataset_model_pairs=bool(args.require_all_dataset_model_pairs),
         )
     except Exception as exc:
         message = str(exc)

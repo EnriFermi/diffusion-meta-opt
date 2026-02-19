@@ -99,7 +99,7 @@ class MiniPatchTrainingModel(nn.Module):
         *,
         permute_inputs: bool,
         sign_flip_inputs: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # x_layer: [n, d_in], W_layer: [d_in, d_out]
         if x_layer.ndim != 2 or W_layer.ndim != 2:
             raise ValueError(
@@ -111,11 +111,14 @@ class MiniPatchTrainingModel(nn.Module):
         x_aug = x_layer
         W_aug = W_layer
         d_in = int(x_layer.shape[1])
+        orig_to_view_idx = torch.arange(d_in, device=x_layer.device, dtype=torch.long)
 
         if permute_inputs and d_in > 1:
             perm = torch.randperm(d_in, device=x_layer.device)
             x_aug = x_aug.index_select(1, perm)
             W_aug = W_aug.index_select(0, perm)
+            # orig_to_view_idx[i] gives the index in x_aug/W_aug for original input coordinate i.
+            orig_to_view_idx = torch.argsort(perm)
 
         if sign_flip_inputs:
             sign_bits = torch.randint(0, 2, (d_in,), device=x_layer.device)
@@ -123,7 +126,7 @@ class MiniPatchTrainingModel(nn.Module):
             x_aug = x_aug * signs.unsqueeze(0)
             W_aug = W_aug * signs.unsqueeze(1)
 
-        return x_aug.contiguous(), W_aug.contiguous()
+        return x_aug.contiguous(), W_aug.contiguous(), orig_to_view_idx
 
     @staticmethod
     def build_patch_batch_from_layer(
@@ -190,34 +193,39 @@ class MiniPatchTrainingModel(nn.Module):
         # sample_patch_batch currently replicates one layer input x across patch-batch.
         x_layer = X_full[0]
 
-        x_view1, W_view1 = self.function_preserving_linear_view(
+        d_in = int(W_full.shape[0])
+        patch_idx_base = patch_idx.to(dtype=torch.long, device=x_layer.device).clamp(min=0, max=max(0, d_in - 1))
+
+        x_view1, W_view1, orig_to_view1 = self.function_preserving_linear_view(
             x_layer=x_layer,
             W_layer=W_full,
             permute_inputs=permute_inputs,
             sign_flip_inputs=sign_flip_inputs,
         )
-        x_view2, W_view2 = self.function_preserving_linear_view(
+        x_view2, W_view2, orig_to_view2 = self.function_preserving_linear_view(
             x_layer=x_layer,
             W_layer=W_full,
             permute_inputs=permute_inputs,
             sign_flip_inputs=sign_flip_inputs,
         )
+        patch_idx_view1 = orig_to_view1[patch_idx_base]
+        patch_idx_view2 = orig_to_view2[patch_idx_base]
 
         X_full_view1, _, w_patch_view1 = self.build_patch_batch_from_layer(
             x_layer=x_view1,
             W_layer=W_view1,
-            patch_idx=patch_idx,
+            patch_idx=patch_idx_view1,
             out_idx=out_idx,
         )
         X_full_view2, _, w_patch_view2 = self.build_patch_batch_from_layer(
             x_layer=x_view2,
             W_layer=W_view2,
-            patch_idx=patch_idx,
+            patch_idx=patch_idx_view2,
             out_idx=out_idx,
         )
 
-        dist_var_view1, _ = self.distribution_encoder(X=X_full_view1, patch_idx=patch_idx)
-        dist_var_view2, _ = self.distribution_encoder(X=X_full_view2, patch_idx=patch_idx)
+        dist_var_view1, _ = self.distribution_encoder(X=X_full_view1, patch_idx=patch_idx_view1)
+        dist_var_view2, _ = self.distribution_encoder(X=X_full_view2, patch_idx=patch_idx_view2)
 
         mu_view1, _ = self.mini_vae.encode(w_patch=w_patch_view1, dist_var_tokens=dist_var_view1)
         mu_view2, _ = self.mini_vae.encode(w_patch=w_patch_view2, dist_var_tokens=dist_var_view2)

@@ -8,6 +8,8 @@ enabled_datasets:
   # Temporary isolation mode for debugging collector/training stability.
   # Keep a single dataset to reduce runtime variability.
   - bdd100k
+  - oxford_pets
+  - stanford_cars
 
 dataset_overrides:
   # Keep mini-train profile on datasets with materialized image fields

@@ -16,7 +16,7 @@ set -eu
 # что ready-чанки действительно обновляются (как у нормального streaming dataset).
 
 # Hugging Face token: задайте через переменную окружения перед запуском:
-#   export HF_TOKEN="hf_..."
+export HF_TOKEN="hf_..."
 # или передайте inline:
 #   HF_TOKEN="hf_..." bash tests/smoke_data_pipeline_modes.sh
 : "${HF_TOKEN:?Set HF_TOKEN before running this script (export HF_TOKEN=hf_...)}"
@@ -69,6 +69,8 @@ pipenv run python "$SCRIPT" \
   --target-samples 8 \
   --turnover-probe-samples 8 \
   --turnover-probe-timeout-seconds 120 \
+  --require-all-dataset-model-pairs \
+  --pair-coverage-timeout-seconds 300 \
   --timeout-seconds 180 \
   --dataset-model cord_v2=clip_vit_b32 \
   --dataset-model docvqa_1200=clip_vit_b32 \
