@@ -5,11 +5,9 @@ defaults:
 path: ${oc.env:DATA_ROOT,./data}
 
 enabled_datasets:
+  # Temporary isolation mode for debugging collector/training stability.
+  # Keep a single dataset to reduce runtime variability.
   - bdd100k
-  # scene_parse_150 temporarily disabled:
-  # upstream image source (ADEChallengeData2016.zip) is flaky and can starve the cache.
-  - oxford_pets
-  - stanford_cars
 
 dataset_overrides:
   # Keep mini-train profile on datasets with materialized image fields

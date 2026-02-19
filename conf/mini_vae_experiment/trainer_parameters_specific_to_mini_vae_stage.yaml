@@ -1,5 +1,11 @@
 distributed: false
 
+# Keep compile explicit in mini profile.
+# `max-autotune` + dynamic shapes can hit unstable inductor kernels on some setups.
+compile: false
+compile_mode: reduce-overhead
+compile_dynamic: false
+
 max_steps: 50000
 grad_accum_steps: 2
 patches_per_sample: 32
