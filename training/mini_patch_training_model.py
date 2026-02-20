@@ -40,6 +40,7 @@ def build_mini_vae_config(cfg: DictConfig, section: str = "mini_model") -> MiniV
         decoder_L_latents=int(mini_cfg.get("decoder_L_latents", 8)),
         decoder_use_dist_conditioning=bool(mini_cfg.get("decoder_use_dist_conditioning", True)),
         decoder_dist_mode=str(mini_cfg.get("decoder_dist_mode", "add")),
+        use_latent_sampling=bool(mini_cfg.get("use_latent_sampling", True)),
         n_heads=int(mini_cfg.get("n_heads", 4)),
         d_patch=int(mini_cfg.get("d_patch", 64)),
         dropout=float(mini_cfg.get("dropout", 0.0)),
