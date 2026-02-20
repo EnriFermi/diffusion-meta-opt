@@ -7,7 +7,7 @@ hf_repo: naver-clova-ix/donut-base
 revision: null
 gated: false
 cache_subdir: models/${.name}
-batch_size: 8
+batch_size: 1
 sampling_weight: 1.0
 device: auto
 dtype: float32
