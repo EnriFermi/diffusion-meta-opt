@@ -290,9 +290,8 @@ class MiniVAEConfig:
     d_e: int = 128
     pos_dim: int = 32
     num_attn_layers_encoder: int = 2
-    # Legacy field from transformer decoder; unused in bilinear decoder path.
     num_layers_decoder: int = 2
-    # Bilinear decoder rank r. If <= 0, uses z_dim.
+    # Legacy field from bilinear decoder path; ignored by current decoder.
     decoder_bilinear_rank: int = 0
     n_heads: int = 4
     d_patch: int = 64
@@ -391,28 +390,45 @@ class MiniPatchEncoder(nn.Module):
 
 
 class MiniPatchDecoder(nn.Module):
-    """Explicit bilinear decoder: w_hat = einsum('br,bpr->bp', z_rank, P_hat)."""
+    """Transformer decoder conditioned on latent z and per-position distribution tokens."""
 
     def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
         super().__init__()
         self.cfg = cfg
         self.d_var = int(d_var)
-        requested_rank = int(getattr(cfg, "decoder_bilinear_rank", 0))
-        self.rank = requested_rank if requested_rank > 0 else int(cfg.z_dim)
-        if self.rank <= 0:
-            raise ValueError(f"decoder bilinear rank must be positive, got {self.rank}")
 
-        if int(cfg.z_dim) == self.rank:
-            self.z_to_rank = nn.Identity()
-        else:
-            self.z_to_rank = nn.Linear(cfg.z_dim, self.rank)
+        if cfg.d_e % cfg.n_heads != 0:
+            raise ValueError(f"mini d_e ({cfg.d_e}) must be divisible by n_heads ({cfg.n_heads})")
+        if cfg.pos_dim <= 0:
+            raise ValueError(f"mini pos_dim must be positive, got {cfg.pos_dim}")
 
-        self.cond_to_basis = nn.Sequential(
+        self.z_to_hidden = nn.Sequential(
+            nn.Linear(cfg.z_dim, cfg.d_e),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+        )
+        self.cond_to_hidden = nn.Sequential(
             nn.Linear(self.d_var, cfg.d_e),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.d_e, self.rank),
         )
+        self.pos_to_hidden = nn.Sequential(
+            nn.Linear(cfg.pos_dim, cfg.d_e),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+        )
+
+        dec_layer = nn.TransformerEncoderLayer(
+            d_model=cfg.d_e,
+            nhead=cfg.n_heads,
+            dim_feedforward=max(4 * cfg.d_e, cfg.d_e),
+            dropout=cfg.dropout,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.decoder = nn.TransformerEncoder(dec_layer, num_layers=max(1, cfg.num_layers_decoder))
+        self.out_norm = nn.LayerNorm(cfg.d_e)
+        self.out_head = nn.Linear(cfg.d_e, 1)
 
     def forward(self, z: torch.Tensor, patch_size: int, dist_var_tokens: torch.Tensor) -> torch.Tensor:
         # z: [B, z_dim]
@@ -438,14 +454,18 @@ class MiniPatchDecoder(nn.Module):
         if d_var != self.d_var:
             raise ValueError(f"dist_var_tokens last dim must be {self.d_var}, got {d_var}")
 
-        # P_hat = g(dist_var_tokens): [B, p, r]
-        p_hat = self.cond_to_basis(dist_var_tokens)
-        z_rank = self.z_to_rank(z)
-        if p_hat.dtype != z_rank.dtype:
-            p_hat = p_hat.to(dtype=z_rank.dtype)
+        z_token = self.z_to_hidden(z).unsqueeze(1).expand(B, p, -1)
+        cond_token = self.cond_to_hidden(dist_var_tokens)
 
-        # w_hat_j = sum_l z_l * P_hat_{j,l}
-        w_hat = torch.einsum("br,bpr->bp", z_rank, p_hat)
+        pos = sinusoidal_embedding(
+            torch.arange(p, device=z.device),
+            dim=self.cfg.pos_dim,
+        ).to(dtype=z.dtype)
+        pos_token = self.pos_to_hidden(pos).unsqueeze(0).expand(B, -1, -1)
+
+        h = z_token + cond_token + pos_token
+        h = self.decoder(h)
+        w_hat = self.out_head(self.out_norm(h)).squeeze(-1)
         return w_hat
 
 
