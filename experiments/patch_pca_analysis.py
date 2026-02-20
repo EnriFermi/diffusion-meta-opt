@@ -203,6 +203,45 @@ def compute_group_pca(
     }
 
 
+def compute_projection_2d(patches: torch.Tensor) -> tuple[torch.Tensor, list[float]]:
+    """
+    Project patch matrix [N, D] to PCA-2D.
+
+    Returns:
+    - coords: [N, 2]
+    - explained_ratio: [pc1_ratio, pc2_ratio] (missing components are padded with 0.0)
+    """
+    if patches.ndim != 2:
+        raise ValueError(f"patches must be rank-2, got {tuple(patches.shape)}")
+    n, d = patches.shape
+    if n == 0:
+        return torch.empty((0, 2), dtype=torch.float32), [0.0, 0.0]
+
+    x = patches.to(dtype=torch.float32)
+    mean = x.mean(dim=0, keepdim=True)
+    x_centered = x - mean
+
+    if n < 2 or d < 1:
+        return torch.zeros((n, 2), dtype=torch.float32), [0.0, 0.0]
+
+    _, s, vh = torch.linalg.svd(x_centered, full_matrices=False)
+    rank = int(min(2, vh.shape[0], vh.shape[1]))
+    components = vh[:rank, :]  # [rank, D]
+    coords = x_centered @ components.transpose(0, 1)  # [N, rank]
+
+    if rank == 1:
+        coords = torch.cat([coords, torch.zeros_like(coords)], dim=1)
+
+    denom = max(1.0, float(n - 1))
+    total_variance = float((x_centered * x_centered).sum().item() / denom)
+    total_variance = max(total_variance, 1e-12)
+    explained_variance = (s[:rank] * s[:rank]) / denom
+    ratios = [float(v) for v in (explained_variance / total_variance).tolist()]
+    while len(ratios) < 2:
+        ratios.append(0.0)
+    return coords, ratios[:2]
+
+
 def _normalize_model_list(models: list[str]) -> list[str]:
     output: list[str] = []
     seen: set[str] = set()
@@ -328,6 +367,10 @@ def main() -> None:
     patches_by_layer: dict[str, list[torch.Tensor]] = defaultdict(list)
     patches_by_arch_layer: dict[str, list[torch.Tensor]] = defaultdict(list)
     patches_by_model: dict[str, list[torch.Tensor]] = defaultdict(list)
+    all_patch_chunks: list[torch.Tensor] = []
+    all_patch_model_labels: list[str] = []
+    all_patch_arch_labels: list[str] = []
+    all_patch_layer_labels: list[str] = []
 
     patch_count_by_group: Counter[str] = Counter()
     total_seen = 0
@@ -390,6 +433,12 @@ def main() -> None:
             arch = model_to_arch[model_name]
             layer_type = infer_layer_type(sample.layer_name)
             arch_layer = f"{arch}::{layer_type}"
+            num_patches = int(patches.shape[0])
+
+            all_patch_chunks.append(patches)
+            all_patch_model_labels.extend([model_name] * num_patches)
+            all_patch_arch_labels.extend([arch] * num_patches)
+            all_patch_layer_labels.extend([layer_type] * num_patches)
 
             # Keep bounded number of vectors per group.
             def _append_if_room(group_key: str, bucket: list[torch.Tensor]) -> None:
@@ -414,7 +463,7 @@ def main() -> None:
             arch_layer_counts[arch_layer] += 1
 
             total_kept_samples += 1
-            total_kept_patches += int(patches.shape[0])
+            total_kept_patches += num_patches
 
             if total_kept_samples % 25 == 0:
                 LOGGER.info(
@@ -497,7 +546,6 @@ def main() -> None:
     }
 
     summary_path = output_dir / "summary.json"
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     tensors_payload = {
         "meta": meta,
@@ -553,9 +601,91 @@ def main() -> None:
         for row in rows:
             writer.writerow(row)
 
+    all_points = _stack_or_empty(all_patch_chunks, int(args.patch_size))
+    plot_path = output_dir / "all_points_pca.png"
+    points_csv_path = output_dir / "all_points_pca2d.csv"
+    coords = torch.empty((0, 2), dtype=torch.float32)
+    explained = [0.0, 0.0]
+    global_plot_meta: dict[str, Any] = {
+        "num_points": int(all_points.shape[0]),
+        "plot_path": str(plot_path),
+        "points_csv_path": str(points_csv_path),
+        "pc1_explained_variance_ratio": 0.0,
+        "pc2_explained_variance_ratio": 0.0,
+        "plot_saved": False,
+    }
+    if int(all_points.shape[0]) > 0:
+        coords, explained = compute_projection_2d(all_points)
+        global_plot_meta["pc1_explained_variance_ratio"] = float(explained[0])
+        global_plot_meta["pc2_explained_variance_ratio"] = float(explained[1])
+
+    with points_csv_path.open("w", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["point_idx", "pc1", "pc2", "model", "architecture", "layer_type"],
+        )
+        writer.writeheader()
+        for idx in range(int(coords.shape[0])):
+            writer.writerow(
+                {
+                    "point_idx": idx,
+                    "pc1": float(coords[idx, 0].item()),
+                    "pc2": float(coords[idx, 1].item()),
+                    "model": all_patch_model_labels[idx],
+                    "architecture": all_patch_arch_labels[idx],
+                    "layer_type": all_patch_layer_labels[idx],
+                }
+            )
+
+    if int(coords.shape[0]) > 0:
+        try:
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            LOGGER.warning("Could not import matplotlib; skipping global PCA plot: %s", exc)
+        else:
+            coords_cpu = coords.cpu()
+            fig, ax = plt.subplots(figsize=(12, 9))
+
+            unique_arch = sorted(set(all_patch_arch_labels))
+            cmap = plt.get_cmap("tab20", max(1, len(unique_arch)))
+            for color_idx, arch in enumerate(unique_arch):
+                indices = [i for i, value in enumerate(all_patch_arch_labels) if value == arch]
+                if not indices:
+                    continue
+                idx_tensor = torch.tensor(indices, dtype=torch.long)
+                points = coords_cpu.index_select(0, idx_tensor)
+                ax.scatter(
+                    points[:, 0].numpy(),
+                    points[:, 1].numpy(),
+                    s=8,
+                    alpha=0.35,
+                    color=cmap(color_idx),
+                    label=arch,
+                    linewidths=0.0,
+                )
+
+            ax.set_title("PCA of Weight Patches (All Points, Single Plot)")
+            ax.set_xlabel(f"PC1 ({explained[0] * 100.0:.2f}% variance)")
+            ax.set_ylabel(f"PC2 ({explained[1] * 100.0:.2f}% variance)")
+            ax.grid(alpha=0.2)
+            if len(unique_arch) <= 20:
+                ax.legend(loc="best", fontsize=8, framealpha=0.9)
+            fig.tight_layout()
+            fig.savefig(plot_path, dpi=200)
+            plt.close(fig)
+            global_plot_meta["plot_saved"] = True
+
+    summary["global_all_points_plot"] = global_plot_meta
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
     LOGGER.info("Saved PCA summary to %s", summary_path)
     LOGGER.info("Saved PCA tensors to %s", tensors_path)
     LOGGER.info("Saved explained variance table to %s", csv_path)
+    LOGGER.info("Saved PCA point coordinates to %s", points_csv_path)
+    if global_plot_meta["plot_saved"]:
+        LOGGER.info("Saved all-points PCA plot to %s", plot_path)
+    else:
+        LOGGER.info("All-points PCA plot was not saved (matplotlib unavailable or no points)")
 
 
 if __name__ == "__main__":
