@@ -788,6 +788,7 @@ def main() -> None:
         "architecture_plot_saved": False,
         "layer_type_plot_saved": False,
         "error": None,
+        "matplotlib_available": bool(plt is not None),
     }
 
     num_all_points = int(all_points.shape[0])
@@ -883,14 +884,29 @@ def main() -> None:
     else:
         LOGGER.info("All-points PCA layer-type plot was not saved")
     LOGGER.info("Saved t-SNE point coordinates to %s", tsne_points_csv_path)
+    if not tsne_meta["computed"]:
+        LOGGER.info(
+            "t-SNE embedding was not computed: error=%s input_points=%s used_points=%s",
+            tsne_meta.get("error"),
+            tsne_meta.get("input_points"),
+            tsne_meta.get("used_points"),
+        )
     if tsne_meta["architecture_plot_saved"]:
         LOGGER.info("Saved all-points t-SNE architecture plot to %s", tsne_arch_plot_path)
     else:
-        LOGGER.info("All-points t-SNE architecture plot was not saved")
+        LOGGER.info(
+            "All-points t-SNE architecture plot was not saved (error=%s, matplotlib_available=%s)",
+            tsne_meta.get("error"),
+            tsne_meta.get("matplotlib_available"),
+        )
     if tsne_meta["layer_type_plot_saved"]:
         LOGGER.info("Saved all-points t-SNE layer-type plot to %s", tsne_layer_plot_path)
     else:
-        LOGGER.info("All-points t-SNE layer-type plot was not saved")
+        LOGGER.info(
+            "All-points t-SNE layer-type plot was not saved (error=%s, matplotlib_available=%s)",
+            tsne_meta.get("error"),
+            tsne_meta.get("matplotlib_available"),
+        )
 
 
 if __name__ == "__main__":
