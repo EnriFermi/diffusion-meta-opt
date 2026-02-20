@@ -67,6 +67,11 @@ def compose_cfg(config_name: str) -> DictConfig:
     conf_dir = Path(__file__).resolve().parents[1] / "conf"
     with initialize_config_dir(version_base=None, config_dir=str(conf_dir)):
         cfg = compose(config_name=config_name)
+    # Standalone scripts don't populate HydraConfig; avoid `${hydra:...}` in logging config.
+    with open_dict(cfg):
+        if "logging" in cfg:
+            cfg.logging.file_name = "patch_pca_analysis.log"
+            cfg.logging.file_path = f"{cfg.logging.dir}/{cfg.logging.file_name}"
     return cfg
 
 
