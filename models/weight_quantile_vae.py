@@ -556,20 +556,40 @@ class MiniPatchVAE(nn.Module):
         return w_hat, mu, logvar, z
 
 
-class MLPNoCompressionPatchEncoder(nn.Module):
-    """Debug encoder: 2-layer token MLP with latent size equal to patch size (no compression)."""
+class TransformerNoCompressionPatchEncoder(nn.Module):
+    """Debug encoder: mini-transformer without distribution conditioning, latent size equals patch size."""
 
     def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
         super().__init__()
         self.cfg = cfg
         self.d_var = int(d_var)
-        hidden = max(4, int(cfg.mlp_stub_hidden_dim))
-        self.token_mlp = nn.Sequential(
-            nn.Linear(1 + self.d_var, hidden),
+        if cfg.d_e % cfg.n_heads != 0:
+            raise ValueError(f"mini d_e ({cfg.d_e}) must be divisible by n_heads ({cfg.n_heads})")
+        if cfg.pos_dim <= 0:
+            raise ValueError(f"mini pos_dim must be positive, got {cfg.pos_dim}")
+
+        self.elem_embed = nn.Sequential(
+            nn.Linear(1 + cfg.pos_dim, cfg.d_e),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
-            nn.Linear(hidden, 1),
+            nn.Linear(cfg.d_e, cfg.d_e),
+            nn.Dropout(cfg.dropout),
         )
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=cfg.d_e,
+            nhead=cfg.n_heads,
+            dim_feedforward=max(4 * cfg.d_e, cfg.d_e),
+            dropout=cfg.dropout,
+            batch_first=True,
+            norm_first=True,
+            activation="gelu",
+        )
+        self.set_encoder = nn.TransformerEncoder(enc_layer, num_layers=max(1, cfg.num_attn_layers_encoder))
+        self.cls_token = nn.Parameter(torch.zeros(cfg.d_e))
+        self.token_norm = nn.LayerNorm(cfg.d_e)
+        self.to_mu_token = nn.Linear(cfg.d_e, 1)
+        self.to_logvar_token = nn.Linear(cfg.d_e, 1)
 
     def encode(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if w_patch.ndim != 2:
@@ -583,9 +603,20 @@ class MLPNoCompressionPatchEncoder(nn.Module):
         if int(dist_var_tokens.shape[2]) != self.d_var:
             raise ValueError(f"dist_var_tokens last dim must be {self.d_var}, got {int(dist_var_tokens.shape[2])}")
 
-        token_in = torch.cat([w_patch.unsqueeze(-1), dist_var_tokens], dim=-1)
-        mu = self.token_mlp(token_in).squeeze(-1)
-        logvar = torch.zeros_like(mu)
+        # Debug path: intentionally ignore distribution tokens to isolate model-only behavior.
+        pos = sinusoidal_embedding(torch.arange(p, device=w_patch.device), dim=self.cfg.pos_dim).to(dtype=w_patch.dtype)
+        pos_expand = pos.unsqueeze(0).expand(B, -1, -1)
+
+        token_in = torch.cat([w_patch.unsqueeze(-1), pos_expand], dim=-1)
+        e = self.elem_embed(token_in)
+
+        cls = self.cls_token.to(dtype=e.dtype).view(1, 1, -1).expand(B, 1, -1)
+        enc_in = torch.cat([cls, e], dim=1)
+        e_ctx = self.set_encoder(enc_in)
+
+        token_h = self.token_norm(e_ctx[:, 1:, :])
+        mu = self.to_mu_token(token_h).squeeze(-1)
+        logvar = self.to_logvar_token(token_h).squeeze(-1)
         return mu, logvar
 
     def encode_patch(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
@@ -646,7 +677,7 @@ class MLPNoCompressionPatchDecoder(nn.Module):
 class MiniPatchVAEStub(nn.Module):
     """
     Debug Mini-VAE replacement:
-    - encoder: 2-layer token MLP, latent has patch dimensionality (no compression)
+    - encoder: mini-transformer without distribution conditioning, latent has patch dimensionality (no compression)
     - decoder: 2-layer token MLP
     """
 
@@ -654,7 +685,7 @@ class MiniPatchVAEStub(nn.Module):
         super().__init__()
         self.cfg = cfg
         decoder_d_dist = int(d_dist) if d_dist is not None else int(d_var)
-        self.encoder = MLPNoCompressionPatchEncoder(d_var=d_var, cfg=cfg)
+        self.encoder = TransformerNoCompressionPatchEncoder(d_var=d_var, cfg=cfg)
         self.decoder = MLPNoCompressionPatchDecoder(d_dist=decoder_d_dist, cfg=cfg)
 
     @staticmethod
