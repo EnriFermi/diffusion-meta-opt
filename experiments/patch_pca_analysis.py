@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 from hydra import compose, initialize_config_dir
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from dataset.shared.collector_service import CollectorService
 from dataset.shared.compatibility_index import CompatibilityIndex
@@ -234,9 +234,12 @@ def _prepare_runtime_cfg(cfg: DictConfig, args: argparse.Namespace, models: list
     enabled_datasets = [str(name) for name in cfg.data.enabled_datasets]
     model_set = set(models)
 
-    dataset_overrides = cfg.data.get("dataset_overrides")
-    if dataset_overrides is None:
-        dataset_overrides = {}
+    dataset_overrides_raw = cfg.data.get("dataset_overrides")
+    if dataset_overrides_raw is None:
+        dataset_overrides: dict[str, Any] = {}
+    else:
+        plain = OmegaConf.to_container(dataset_overrides_raw, resolve=False)
+        dataset_overrides = dict(plain) if isinstance(plain, dict) else {}
 
     filtered_datasets: list[str] = []
     for dataset_name in enabled_datasets:
@@ -249,8 +252,11 @@ def _prepare_runtime_cfg(cfg: DictConfig, args: argparse.Namespace, models: list
         if not kept:
             continue
         filtered_datasets.append(dataset_name)
+        current_override = dataset_overrides.get(dataset_name, {})
+        if not isinstance(current_override, dict):
+            current_override = {}
         dataset_overrides[dataset_name] = {
-            **dict(dataset_overrides.get(dataset_name, {})),
+            **current_override,
             "models": kept,
         }
 
