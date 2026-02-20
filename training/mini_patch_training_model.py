@@ -71,10 +71,20 @@ class MiniPatchTrainingModel(nn.Module):
         return w_norm, scale
 
     @staticmethod
-    def patch_behavioral_mse(X_patch: torch.Tensor, w_patch: torch.Tensor, w_hat: torch.Tensor) -> torch.Tensor:
+    def patch_behavioral_mse(
+        X_patch: torch.Tensor,
+        w_patch: torch.Tensor,
+        w_hat: torch.Tensor,
+        eps: float = 1e-4,
+    ) -> torch.Tensor:
         # X_patch: [B_p, n, p], w_patch/w_hat: [B_p, p]
-        y = torch.einsum("bnp,bp->bn", X_patch, w_patch)
-        y_hat = torch.einsum("bnp,bp->bn", X_patch, w_hat)
+        if X_patch.ndim != 3:
+            raise ValueError(f"X_patch must be [B_p,n,p], got {tuple(X_patch.shape)}")
+        # Normalize X_patch per patch-sample so behavioral loss is less scale-sensitive to input activations.
+        x_scale = X_patch.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(float(eps))
+        X_patch_norm = X_patch / x_scale
+        y = torch.einsum("bnp,bp->bn", X_patch_norm, w_patch)
+        y_hat = torch.einsum("bnp,bp->bn", X_patch_norm, w_hat)
         return F.mse_loss(y_hat, y)
 
     @staticmethod
