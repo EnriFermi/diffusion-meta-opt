@@ -298,6 +298,8 @@ class MiniVAEConfig:
     decoder_use_dist_conditioning: bool = True
     decoder_dist_mode: str = "add"  # {"add", "concat"}
     use_latent_sampling: bool = True
+    implementation: str = "real"  # {"real", "mlp_stub"}
+    mlp_stub_hidden_dim: int = 256
     n_heads: int = 4
     d_patch: int = 64
     dropout: float = 0.0
@@ -545,6 +547,140 @@ class MiniPatchVAE(nn.Module):
         dist_patch_embed: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # w_patch: [B, p], dist_var_tokens: [B, p, d_var], dist_patch_embed: [B, d_dist] (optional)
+        mu, logvar = self.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+        if bool(self.cfg.use_latent_sampling):
+            z = self.reparameterize(mu=mu, logvar=logvar)
+        else:
+            z = mu
+        w_hat = self.decode(z=z, patch_size=w_patch.shape[1], dist_patch_embed=dist_patch_embed)
+        return w_hat, mu, logvar, z
+
+
+class MLPNoCompressionPatchEncoder(nn.Module):
+    """Debug encoder: 2-layer token MLP with latent size equal to patch size (no compression)."""
+
+    def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.d_var = int(d_var)
+        hidden = max(4, int(cfg.mlp_stub_hidden_dim))
+        self.token_mlp = nn.Sequential(
+            nn.Linear(1 + self.d_var, hidden),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(hidden, 1),
+        )
+
+    def encode(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if w_patch.ndim != 2:
+            raise ValueError(f"w_patch must be [B, p], got {tuple(w_patch.shape)}")
+        if dist_var_tokens.ndim != 3:
+            raise ValueError(f"dist_var_tokens must be [B, p, d_var], got {tuple(dist_var_tokens.shape)}")
+
+        B, p = w_patch.shape
+        if tuple(dist_var_tokens.shape[:2]) != (B, p):
+            raise ValueError(f"Shape mismatch: w_patch={tuple(w_patch.shape)} dist_var_tokens={tuple(dist_var_tokens.shape)}")
+        if int(dist_var_tokens.shape[2]) != self.d_var:
+            raise ValueError(f"dist_var_tokens last dim must be {self.d_var}, got {int(dist_var_tokens.shape[2])}")
+
+        token_in = torch.cat([w_patch.unsqueeze(-1), dist_var_tokens], dim=-1)
+        mu = self.token_mlp(token_in).squeeze(-1)
+        logvar = torch.zeros_like(mu)
+        return mu, logvar
+
+    def encode_patch(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
+        mu, _ = self.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+        target_dim = int(self.cfg.d_patch)
+        current_dim = int(mu.shape[1])
+        if current_dim == target_dim:
+            return mu
+        if current_dim > target_dim:
+            return mu[:, :target_dim]
+        pad = mu.new_zeros((mu.shape[0], target_dim - current_dim))
+        return torch.cat([mu, pad], dim=1)
+
+
+class MLPNoCompressionPatchDecoder(nn.Module):
+    """Debug decoder: 2-layer token MLP over z (plus optional dist scalar)."""
+
+    def __init__(self, d_dist: int, cfg: MiniVAEConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.use_dist_conditioning = bool(cfg.decoder_use_dist_conditioning)
+        hidden = max(4, int(cfg.mlp_stub_hidden_dim))
+        in_dim = 2 if self.use_dist_conditioning else 1
+        self.dist_scalar = nn.Linear(int(d_dist), 1) if self.use_dist_conditioning else None
+        self.token_mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, z: torch.Tensor, patch_size: int, dist_patch_embed: torch.Tensor | None = None) -> torch.Tensor:
+        if z.ndim != 2:
+            raise ValueError(f"z must be [B, z_dim_like], got {tuple(z.shape)}")
+        if patch_size <= 0:
+            raise ValueError(f"patch_size must be positive, got {patch_size}")
+
+        B, z_dim = z.shape
+        p = int(patch_size)
+        if z_dim >= p:
+            z_aligned = z[:, :p]
+        else:
+            pad = z.new_zeros((B, p - z_dim))
+            z_aligned = torch.cat([z, pad], dim=1)
+
+        token_in = z_aligned.unsqueeze(-1)
+        if self.use_dist_conditioning:
+            if self.dist_scalar is None or dist_patch_embed is None:
+                dist_token = token_in.new_zeros((B, p, 1))
+            else:
+                dist_token = self.dist_scalar(dist_patch_embed).unsqueeze(1).expand(-1, p, -1)
+            token_in = torch.cat([token_in, dist_token], dim=-1)
+
+        w_hat = self.token_mlp(token_in).squeeze(-1)
+        return w_hat
+
+
+class MiniPatchVAEStub(nn.Module):
+    """
+    Debug Mini-VAE replacement:
+    - encoder: 2-layer token MLP, latent has patch dimensionality (no compression)
+    - decoder: 2-layer token MLP
+    """
+
+    def __init__(self, d_var: int, cfg: MiniVAEConfig, d_dist: int | None = None) -> None:
+        super().__init__()
+        self.cfg = cfg
+        decoder_d_dist = int(d_dist) if d_dist is not None else int(d_var)
+        self.encoder = MLPNoCompressionPatchEncoder(d_var=d_var, cfg=cfg)
+        self.decoder = MLPNoCompressionPatchDecoder(d_dist=decoder_d_dist, cfg=cfg)
+
+    @staticmethod
+    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        eps = torch.randn_like(mu)
+        return mu + eps * torch.exp(0.5 * logvar)
+
+    @staticmethod
+    def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        return mu.new_zeros(())
+
+    def encode(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.encoder.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+
+    def decode(self, z: torch.Tensor, patch_size: int, dist_patch_embed: torch.Tensor | None = None) -> torch.Tensor:
+        return self.decoder(z=z, patch_size=patch_size, dist_patch_embed=dist_patch_embed)
+
+    def encode_patch(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
+        return self.encoder.encode_patch(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+
+    def forward(
+        self,
+        w_patch: torch.Tensor,
+        dist_var_tokens: torch.Tensor,
+        dist_patch_embed: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         mu, logvar = self.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
         if bool(self.cfg.use_latent_sampling):
             z = self.reparameterize(mu=mu, logvar=logvar)

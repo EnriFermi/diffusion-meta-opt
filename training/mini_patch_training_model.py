@@ -5,7 +5,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig
 
-from models.weight_quantile_vae import DistributionConfig, InputDistributionEncodingModule, MiniPatchVAE, MiniVAEConfig
+from models.weight_quantile_vae import (
+    DistributionConfig,
+    InputDistributionEncodingModule,
+    MiniPatchVAE,
+    MiniPatchVAEStub,
+    MiniVAEConfig,
+)
 
 
 def build_distribution_config(cfg: DictConfig, section: str = "mini_model") -> DistributionConfig:
@@ -41,6 +47,8 @@ def build_mini_vae_config(cfg: DictConfig, section: str = "mini_model") -> MiniV
         decoder_use_dist_conditioning=bool(mini_cfg.get("decoder_use_dist_conditioning", True)),
         decoder_dist_mode=str(mini_cfg.get("decoder_dist_mode", "add")),
         use_latent_sampling=bool(mini_cfg.get("use_latent_sampling", True)),
+        implementation=str(mini_cfg.get("implementation", "real")),
+        mlp_stub_hidden_dim=int(mini_cfg.get("mlp_stub_hidden_dim", 256)),
         n_heads=int(mini_cfg.get("n_heads", 4)),
         d_patch=int(mini_cfg.get("d_patch", 64)),
         dropout=float(mini_cfg.get("dropout", 0.0)),
@@ -53,7 +61,16 @@ class MiniPatchTrainingModel(nn.Module):
     def __init__(self, distribution_cfg: DistributionConfig, mini_cfg: MiniVAEConfig) -> None:
         super().__init__()
         self.distribution_encoder = InputDistributionEncodingModule(distribution_cfg)
-        self.mini_vae = MiniPatchVAE(d_var=distribution_cfg.d_var, cfg=mini_cfg, d_dist=distribution_cfg.d_dist)
+        impl = str(mini_cfg.implementation).strip().lower()
+        if impl in {"real", "full", "default"}:
+            self.mini_vae = MiniPatchVAE(d_var=distribution_cfg.d_var, cfg=mini_cfg, d_dist=distribution_cfg.d_dist)
+        elif impl in {"mlp_stub", "stub", "debug_mlp", "mlp_no_compression"}:
+            self.mini_vae = MiniPatchVAEStub(d_var=distribution_cfg.d_var, cfg=mini_cfg, d_dist=distribution_cfg.d_dist)
+        else:
+            raise ValueError(
+                f"Unsupported mini_vae.implementation='{mini_cfg.implementation}'. "
+                "Use one of: real, mlp_stub"
+            )
 
     @staticmethod
     def normalize_patch_weights(
