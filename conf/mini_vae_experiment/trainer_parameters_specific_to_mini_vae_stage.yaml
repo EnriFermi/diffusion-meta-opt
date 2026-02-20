@@ -7,7 +7,7 @@ compile_mode: reduce-overhead
 compile_dynamic: false
 
 max_steps: 50000
-grad_accum_steps: 2
+grad_accum_steps: 5
 patches_per_sample: 32
 
 warmup_steps: 1000
