@@ -677,6 +677,8 @@ def main() -> None:
                 ax.set_xlabel(f"PC1 ({explained[0] * 100.0:.2f}% variance)")
                 ax.set_ylabel(f"PC2 ({explained[1] * 100.0:.2f}% variance)")
                 ax.grid(alpha=0.2)
+                ax.set_xlim(-0.5, 0.5)
+                ax.set_ylim(-0.5, 0.5)
                 if len(unique_labels) <= 20:
                     ax.legend(loc="best", fontsize=8, framealpha=0.9)
                 fig.tight_layout()
