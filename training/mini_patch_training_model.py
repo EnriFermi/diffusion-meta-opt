@@ -36,6 +36,7 @@ def build_mini_vae_config(cfg: DictConfig, section: str = "mini_model") -> MiniV
         pos_dim=int(mini_cfg.get("pos_dim", 32)),
         num_attn_layers_encoder=int(mini_cfg.get("num_attn_layers_encoder", 2)),
         num_layers_decoder=int(mini_cfg.get("num_layers_decoder", 2)),
+        decoder_bilinear_rank=int(mini_cfg.get("decoder_bilinear_rank", 0)),
         n_heads=int(mini_cfg.get("n_heads", 4)),
         d_patch=int(mini_cfg.get("d_patch", 64)),
         dropout=float(mini_cfg.get("dropout", 0.0)),
