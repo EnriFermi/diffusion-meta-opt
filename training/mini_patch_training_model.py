@@ -37,6 +37,9 @@ def build_mini_vae_config(cfg: DictConfig, section: str = "mini_model") -> MiniV
         num_attn_layers_encoder=int(mini_cfg.get("num_attn_layers_encoder", 2)),
         num_layers_decoder=int(mini_cfg.get("num_layers_decoder", 2)),
         decoder_bilinear_rank=int(mini_cfg.get("decoder_bilinear_rank", 0)),
+        decoder_L_latents=int(mini_cfg.get("decoder_L_latents", 8)),
+        decoder_use_dist_conditioning=bool(mini_cfg.get("decoder_use_dist_conditioning", True)),
+        decoder_dist_mode=str(mini_cfg.get("decoder_dist_mode", "add")),
         n_heads=int(mini_cfg.get("n_heads", 4)),
         d_patch=int(mini_cfg.get("d_patch", 64)),
         dropout=float(mini_cfg.get("dropout", 0.0)),
@@ -49,7 +52,7 @@ class MiniPatchTrainingModel(nn.Module):
     def __init__(self, distribution_cfg: DistributionConfig, mini_cfg: MiniVAEConfig) -> None:
         super().__init__()
         self.distribution_encoder = InputDistributionEncodingModule(distribution_cfg)
-        self.mini_vae = MiniPatchVAE(d_var=distribution_cfg.d_var, cfg=mini_cfg)
+        self.mini_vae = MiniPatchVAE(d_var=distribution_cfg.d_var, cfg=mini_cfg, d_dist=distribution_cfg.d_dist)
 
     @staticmethod
     def normalize_patch_weights(
@@ -309,8 +312,12 @@ class MiniPatchTrainingModel(nn.Module):
             w_patch,
         )
         w_patch_unit = self.project_patch_weights_to_unit_sphere(w_patch_norm)
-        dist_var_tokens, _ = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
-        w_hat_raw, mu, logvar, _ = self.mini_vae(w_patch=w_patch_unit, dist_var_tokens=dist_var_tokens)
+        dist_var_tokens, dist_patch_embed = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
+        w_hat_raw, mu, logvar, _ = self.mini_vae(
+            w_patch=w_patch_unit,
+            dist_var_tokens=dist_var_tokens,
+            dist_patch_embed=dist_patch_embed,
+        )
         w_hat_unit = self.project_patch_weights_to_unit_sphere(w_hat_raw)
 
         structural_loss = F.mse_loss(w_hat_unit, w_patch_unit)
@@ -346,13 +353,14 @@ class MiniPatchTrainingModel(nn.Module):
         """
         Auxiliary ablation losses for evaluating information content:
         1) decoder_random_latent_*: decode from random z ~ N(0, I).
-        2) random_dist_*: full mini-VAE path with random dist_var_tokens instead of distribution encoder output.
+        2) random_dist_*: full mini-VAE path with random distribution conditioning
+           (both dist_var_tokens and dist_patch_embed) instead of encoder outputs.
         """
         w_patch_norm, _ = self.normalize_patch_weights(
             w_patch,
         )
         w_patch_unit = self.project_patch_weights_to_unit_sphere(w_patch_norm)
-        dist_var_tokens, _ = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
+        dist_var_tokens, dist_patch_embed = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
         mu_ref, _ = self.mini_vae.encode(w_patch=w_patch_unit, dist_var_tokens=dist_var_tokens)
 
         patch_size = int(w_patch.shape[1])
@@ -364,7 +372,7 @@ class MiniPatchTrainingModel(nn.Module):
         w_hat_rand_latent = self.mini_vae.decode(
             z=z_random,
             patch_size=patch_size,
-            dist_var_tokens=dist_var_tokens,
+            dist_patch_embed=dist_patch_embed,
         )
         w_hat_rand_latent_unit = self.project_patch_weights_to_unit_sphere(w_hat_rand_latent)
         structural_rand_latent = F.mse_loss(w_hat_rand_latent_unit, w_patch_unit)
@@ -377,9 +385,11 @@ class MiniPatchTrainingModel(nn.Module):
 
         # Distribution ablation: random tokens replace distribution encoder output.
         rand_dist_var_tokens = torch.randn_like(dist_var_tokens)
+        rand_dist_patch_embed = torch.randn_like(dist_patch_embed)
         w_hat_rand_dist_raw, mu_rand_dist, logvar_rand_dist, _ = self.mini_vae(
             w_patch=w_patch_unit,
             dist_var_tokens=rand_dist_var_tokens,
+            dist_patch_embed=rand_dist_patch_embed,
         )
         w_hat_rand_dist_unit = self.project_patch_weights_to_unit_sphere(w_hat_rand_dist_raw)
         structural_rand_dist = F.mse_loss(w_hat_rand_dist_unit, w_patch_unit)

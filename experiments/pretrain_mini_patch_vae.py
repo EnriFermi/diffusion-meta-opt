@@ -464,10 +464,11 @@ def _forward_patch_objective(
     patch_idx, w_patch, X_I, _ = sample_random_patches(W=W, X=X, patch_size=cfg.patch_size)
 
     # dist_var_tokens: [B, p, d_var]
-    # dist_patch_embed: [B, d_dist] (unused in this minimal mini-VAE loop)
-    dist_var_tokens, _ = dist_encoder(X=X, patch_idx=patch_idx)
+    # dist_patch_embed: [B, d_dist]
+    dist_var_tokens, dist_patch_embed = dist_encoder(X=X, patch_idx=patch_idx)
     if zero_dist_conditioning:
         dist_var_tokens = torch.zeros_like(dist_var_tokens)
+        dist_patch_embed = torch.zeros_like(dist_patch_embed)
 
     if randomize_latent:
         # Probe latent dependence: decode with random z while keeping conditioning fixed.
@@ -476,7 +477,7 @@ def _forward_patch_objective(
         w_hat = mini_vae.decode(
             z=z,
             patch_size=w_patch.shape[1],
-            dist_var_tokens=dist_var_tokens,
+            dist_patch_embed=dist_patch_embed,
         )
     elif deterministic_z:
         # Deterministic VAE pass: use z=mu without sampling noise.
@@ -484,11 +485,15 @@ def _forward_patch_objective(
         w_hat = mini_vae.decode(
             z=mu,
             patch_size=w_patch.shape[1],
-            dist_var_tokens=dist_var_tokens,
+            dist_patch_embed=dist_patch_embed,
         )
     else:
         # w_hat: [B, p], mu/logvar: [B, z_dim]
-        w_hat, mu, logvar, _ = mini_vae(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+        w_hat, mu, logvar, _ = mini_vae(
+            w_patch=w_patch,
+            dist_var_tokens=dist_var_tokens,
+            dist_patch_embed=dist_patch_embed,
+        )
 
     # Functional patch-local objective.
     # y/y_hat: [B, n]
@@ -811,7 +816,7 @@ def run_pretrain_stub(cfg: PretrainConfig) -> None:
         d_patch=cfg.mini_d_patch,
         dropout=cfg.mini_dropout,
     )
-    mini_vae = MiniPatchVAE(d_var=dist_cfg.d_var, cfg=mini_cfg).to(device)
+    mini_vae = MiniPatchVAE(d_var=dist_cfg.d_var, cfg=mini_cfg, d_dist=dist_cfg.d_dist).to(device)
     if cfg.xavier_init_enabled:
         _apply_xavier_init(dist_encoder)
         _apply_xavier_init(mini_vae)
