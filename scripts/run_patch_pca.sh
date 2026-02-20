@@ -1,23 +1,17 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${ROOT_DIR}"
+ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$ROOT_DIR"
 
-if [[ "$#" -gt 0 ]]; then
-  MODELS=("$@")
+if [ "$#" -gt 0 ]; then
+  MODELS="$*"
 else
-  MODELS=(
-    deit_base
-    dinov2_base
-    swinv2_base
-    donut_base
-    grounding_dino_tiny
-  )
+  MODELS="deit_base dinov2_base swinv2_base donut_base grounding_dino_tiny"
 fi
 
-python -m experiments.patch_pca_analysis \
-  --models "${MODELS[@]}" \
+set -- \
+  python -m experiments.patch_pca_analysis \
   --config-name "${PCA_CONFIG_NAME:-mini_vae_train}" \
   --output-dir "${PCA_OUTPUT_DIR:-data/reports/pca_patches}" \
   --patch-size "${PCA_PATCH_SIZE:-64}" \
@@ -30,7 +24,27 @@ python -m experiments.patch_pca_analysis \
   --seed "${PCA_SEED:-42}" \
   --streaming-mode "${PCA_STREAMING_MODE:-none}" \
   --collector-mode "${PCA_COLLECTOR_MODE:-async}" \
-  ${PCA_COLLECTOR_DEVICE:+--collector-device "${PCA_COLLECTOR_DEVICE}"} \
-  ${PCA_DATASETS:+--datasets ${PCA_DATASETS}} \
-  ${PCA_PREDOWNLOAD_MODELS:+--predownload-models}
+  --models
 
+for model_name in $MODELS; do
+  set -- "$@" "$model_name"
+done
+
+if [ -n "${PCA_COLLECTOR_DEVICE-}" ]; then
+  set -- "$@" --collector-device "$PCA_COLLECTOR_DEVICE"
+fi
+
+if [ -n "${PCA_DATASETS-}" ]; then
+  set -- "$@" --datasets
+  set -f
+  for dataset_name in $PCA_DATASETS; do
+    set -- "$@" "$dataset_name"
+  done
+  set +f
+fi
+
+if [ -n "${PCA_PREDOWNLOAD_MODELS-}" ]; then
+  set -- "$@" --predownload-models
+fi
+
+exec "$@"
