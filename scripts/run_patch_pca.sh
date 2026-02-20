@@ -17,6 +17,10 @@ set -- \
   --patch-size "${PCA_PATCH_SIZE:-64}" \
   --patches-per-sample "${PCA_PATCHES_PER_SAMPLE:-16}" \
   --components "${PCA_COMPONENTS:-8}" \
+  --tsne-max-points "${PCA_TSNE_MAX_POINTS:-5000}" \
+  --tsne-perplexity "${PCA_TSNE_PERPLEXITY:-30}" \
+  --tsne-learning-rate "${PCA_TSNE_LEARNING_RATE:-200}" \
+  --tsne-n-iter "${PCA_TSNE_N_ITER:-1000}" \
   --max-samples-per-model "${PCA_MAX_SAMPLES_PER_MODEL:-64}" \
   --max-total-samples "${PCA_MAX_TOTAL_SAMPLES:-1024}" \
   --max-patches-per-group "${PCA_MAX_PATCHES_PER_GROUP:-8192}" \
