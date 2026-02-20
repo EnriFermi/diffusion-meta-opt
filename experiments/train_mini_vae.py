@@ -1907,10 +1907,13 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                             with autocast_context(enabled=amp_enabled, dtype=amp_dtype):
                                 w_target_norm, w_scale = train_model.normalize_patch_weights(w_patch)
                                 w_target_unit = train_model.project_patch_weights_to_unit_sphere(w_target_norm)
-                                dist_var_tokens_dbg, _ = train_model.distribution_encoder(X=X_full, patch_idx=patch_idx)
+                                dist_var_tokens_dbg, dist_patch_embed_dbg = train_model.distribution_encoder(
+                                    X=X_full, patch_idx=patch_idx
+                                )
                                 w_pred_raw_dbg, _, _, _ = train_model.mini_vae(
                                     w_patch=w_target_unit,
                                     dist_var_tokens=dist_var_tokens_dbg,
+                                    dist_patch_embed=dist_patch_embed_dbg,
                                 )
                                 w_pred_unit = train_model.project_patch_weights_to_unit_sphere(w_pred_raw_dbg)
 

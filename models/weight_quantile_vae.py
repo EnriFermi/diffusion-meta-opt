@@ -293,6 +293,9 @@ class MiniVAEConfig:
     num_layers_decoder: int = 2
     # Legacy field from bilinear decoder path; ignored by current decoder.
     decoder_bilinear_rank: int = 0
+    decoder_L_latents: int = 8
+    decoder_use_dist_conditioning: bool = True
+    decoder_dist_mode: str = "add"  # {"add", "concat"}
     n_heads: int = 4
     d_patch: int = 64
     dropout: float = 0.0
@@ -389,84 +392,110 @@ class MiniPatchEncoder(nn.Module):
         return patch_token
 
 
-class MiniPatchDecoder(nn.Module):
-    """Transformer decoder conditioned on latent z and per-position distribution tokens."""
+class CrossAttnBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.q_norm = nn.LayerNorm(d_model)
+        self.kv_norm = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+        self.ffn_norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout),
+        )
 
-    def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
+    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        q_attn = self.q_norm(q)
+        kv_attn = self.kv_norm(kv)
+        attn_out, _ = self.cross_attn(q_attn, kv_attn, kv_attn, need_weights=False)
+        q = q + self.attn_dropout(attn_out)
+        q = q + self.ffn(self.ffn_norm(q))
+        return q
+
+
+class CrossAttnPatchDecoder(nn.Module):
+    """
+    Cross-attention decoder with forced latent dependence:
+    queries = positional tokens, keys/values = latent tokens from z (+ optional dist conditioning).
+    """
+
+    def __init__(self, d_dist: int, cfg: MiniVAEConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.d_var = int(d_var)
+        self.d_model = int(cfg.d_e)
+        self.n_heads = int(cfg.n_heads)
+        self.num_layers = max(1, int(cfg.num_layers_decoder))
+        self.L_latents = max(1, int(cfg.decoder_L_latents))
+        self.use_dist_conditioning = bool(cfg.decoder_use_dist_conditioning)
+        self.dist_mode = str(cfg.decoder_dist_mode).strip().lower()
+        self.d_dist = int(d_dist)
 
-        if cfg.d_e % cfg.n_heads != 0:
-            raise ValueError(f"mini d_e ({cfg.d_e}) must be divisible by n_heads ({cfg.n_heads})")
-        if cfg.pos_dim <= 0:
-            raise ValueError(f"mini pos_dim must be positive, got {cfg.pos_dim}")
+        if self.d_model % self.n_heads != 0:
+            raise ValueError(f"mini d_e ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
+        if self.dist_mode not in {"add", "concat"}:
+            raise ValueError(f"decoder_dist_mode must be 'add' or 'concat', got {self.dist_mode}")
 
-        self.z_to_hidden = nn.Sequential(
-            nn.Linear(cfg.z_dim, cfg.d_e),
+        self.z_to_latents = nn.Linear(int(cfg.z_dim), self.L_latents * self.d_model)
+        if self.use_dist_conditioning:
+            self.dist_to_latents = nn.Linear(self.d_dist, self.L_latents * self.d_model)
+        else:
+            self.dist_to_latents = None
+
+        self.blocks = nn.ModuleList(
+            [CrossAttnBlock(d_model=self.d_model, n_heads=self.n_heads, dropout=float(cfg.dropout)) for _ in range(self.num_layers)]
+        )
+
+        self.out_head = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model),
             nn.GELU(),
-            nn.Dropout(cfg.dropout),
-        )
-        self.cond_to_hidden = nn.Sequential(
-            nn.Linear(self.d_var, cfg.d_e),
-            nn.GELU(),
-            nn.Dropout(cfg.dropout),
-        )
-        self.pos_to_hidden = nn.Sequential(
-            nn.Linear(cfg.pos_dim, cfg.d_e),
-            nn.GELU(),
-            nn.Dropout(cfg.dropout),
+            nn.Linear(self.d_model, 1),
         )
 
-        dec_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_e,
-            nhead=cfg.n_heads,
-            dim_feedforward=max(4 * cfg.d_e, cfg.d_e),
-            dropout=cfg.dropout,
-            batch_first=True,
-            activation="gelu",
-        )
-        self.decoder = nn.TransformerEncoder(dec_layer, num_layers=max(1, cfg.num_layers_decoder))
-        self.out_norm = nn.LayerNorm(cfg.d_e)
-        self.out_head = nn.Linear(cfg.d_e, 1)
-
-    def forward(self, z: torch.Tensor, patch_size: int, dist_var_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, patch_size: int, dist_patch_embed: torch.Tensor | None = None) -> torch.Tensor:
         # z: [B, z_dim]
-        # dist_var_tokens: [B, p, d_var]
+        # dist_patch_embed: [B, d_dist] (optional)
         # patch_size: p
         if z.ndim != 2:
             raise ValueError(f"z must be [B, z_dim], got {tuple(z.shape)}")
         if patch_size <= 0:
             raise ValueError(f"patch_size must be positive, got {patch_size}")
-        if dist_var_tokens.ndim != 3:
-            raise ValueError(f"dist_var_tokens must be [B, p, d_var], got {tuple(dist_var_tokens.shape)}")
 
         B = z.shape[0]
         p = int(patch_size)
-        Bv, pv, d_var = dist_var_tokens.shape
-        if Bv != B:
-            raise ValueError(f"Batch mismatch: z={tuple(z.shape)} dist_var_tokens={tuple(dist_var_tokens.shape)}")
-        if pv != p:
-            raise ValueError(
-                f"patch_size mismatch: patch_size={p} but dist_var_tokens has p={pv} "
-                f"(shape={tuple(dist_var_tokens.shape)})"
-            )
-        if d_var != self.d_var:
-            raise ValueError(f"dist_var_tokens last dim must be {self.d_var}, got {d_var}")
 
-        z_token = self.z_to_hidden(z).unsqueeze(1).expand(B, p, -1)
-        cond_token = self.cond_to_hidden(dist_var_tokens)
+        lat = self.z_to_latents(z).view(B, self.L_latents, self.d_model)
+        if self.use_dist_conditioning and dist_patch_embed is not None and self.dist_to_latents is not None:
+            dist_lat = self.dist_to_latents(dist_patch_embed).view(B, self.L_latents, self.d_model)
+            if self.dist_mode == "add":
+                lat = lat + dist_lat
+            else:
+                lat = torch.cat([lat, dist_lat], dim=1)
 
-        pos = sinusoidal_embedding(
-            torch.arange(p, device=z.device),
-            dim=self.cfg.pos_dim,
-        ).to(dtype=z.dtype)
-        pos_token = self.pos_to_hidden(pos).unsqueeze(0).expand(B, -1, -1)
+        q_pos = sinusoidal_embedding(torch.arange(p, device=z.device), dim=self.d_model).to(dtype=z.dtype)
+        q = q_pos.unsqueeze(0).expand(B, -1, -1)
 
-        h = z_token + cond_token + pos_token
-        h = self.decoder(h)
-        w_hat = self.out_head(self.out_norm(h)).squeeze(-1)
+        for block in self.blocks:
+            q = block(q, lat)
+
+        w_hat = self.out_head(q).squeeze(-1)
         return w_hat
+
+
+class MiniPatchDecoder(CrossAttnPatchDecoder):
+    """Backward-compatible alias for cross-attention patch decoder."""
+
+    def __init__(self, d_var: int, cfg: MiniVAEConfig, d_dist: int | None = None) -> None:
+        super().__init__(d_dist=int(d_dist) if d_dist is not None else int(d_var), cfg=cfg)
 
 
 class MiniPatchVAE(nn.Module):
@@ -475,15 +504,15 @@ class MiniPatchVAE(nn.Module):
 
     Methods:
     - encode(w_patch, dist_var_tokens) -> mu, logvar
-    - decode(z, patch_size, dist_var_tokens) -> w_hat
+    - decode(z, patch_size, dist_patch_embed=None) -> w_hat
     - encode_patch(w_patch, dist_var_tokens) -> patch_token (for BigWeightVAE)
     """
 
-    def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
+    def __init__(self, d_var: int, cfg: MiniVAEConfig, d_dist: int | None = None) -> None:
         super().__init__()
         self.cfg = cfg
         self.encoder = MiniPatchEncoder(d_var=d_var, cfg=cfg)
-        self.decoder = MiniPatchDecoder(d_var=d_var, cfg=cfg)
+        self.decoder = CrossAttnPatchDecoder(d_dist=int(d_dist) if d_dist is not None else int(d_var), cfg=cfg)
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -500,17 +529,22 @@ class MiniPatchVAE(nn.Module):
     def encode(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.encoder.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
 
-    def decode(self, z: torch.Tensor, patch_size: int, dist_var_tokens: torch.Tensor) -> torch.Tensor:
-        return self.decoder(z=z, patch_size=patch_size, dist_var_tokens=dist_var_tokens)
+    def decode(self, z: torch.Tensor, patch_size: int, dist_patch_embed: torch.Tensor | None = None) -> torch.Tensor:
+        return self.decoder(z=z, patch_size=patch_size, dist_patch_embed=dist_patch_embed)
 
     def encode_patch(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
         return self.encoder.encode_patch(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
 
-    def forward(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # w_patch: [B, p], dist_var_tokens: [B, p, d_var]
+    def forward(
+        self,
+        w_patch: torch.Tensor,
+        dist_var_tokens: torch.Tensor,
+        dist_patch_embed: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # w_patch: [B, p], dist_var_tokens: [B, p, d_var], dist_patch_embed: [B, d_dist] (optional)
         mu, logvar = self.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
         z = self.reparameterize(mu=mu, logvar=logvar)
-        w_hat = self.decode(z=z, patch_size=w_patch.shape[1], dist_var_tokens=dist_var_tokens)
+        w_hat = self.decode(z=z, patch_size=w_patch.shape[1], dist_patch_embed=dist_patch_embed)
         return w_hat, mu, logvar, z
 
 
@@ -1015,6 +1049,32 @@ class BigWeightVAE(nn.Module):
 
 # Backward-compat alias used in other files.
 WeightQuantileVAE = BigWeightVAE
+
+
+def _smoke_test() -> None:
+    torch.manual_seed(0)
+    B, p, z_dim, d_dist = 4, 64, 32, 128
+    cfg = MiniVAEConfig(
+        z_dim=z_dim,
+        d_e=128,
+        num_layers_decoder=2,
+        n_heads=4,
+        decoder_L_latents=8,
+        decoder_use_dist_conditioning=True,
+        decoder_dist_mode="add",
+    )
+    decoder = CrossAttnPatchDecoder(d_dist=d_dist, cfg=cfg)
+    z = torch.randn(B, z_dim, requires_grad=True)
+    dist_patch_embed = torch.randn(B, d_dist)
+    w_hat = decoder(z=z, patch_size=p, dist_patch_embed=dist_patch_embed)
+    assert tuple(w_hat.shape) == (B, p), f"unexpected shape: {tuple(w_hat.shape)}"
+    loss = w_hat.pow(2).mean()
+    loss.backward()
+    grad_sum = 0.0
+    for param in decoder.z_to_latents.parameters():
+        if param.grad is not None:
+            grad_sum += float(param.grad.abs().sum().item())
+    assert grad_sum > 0.0, "expected non-zero grads for z_to_latents parameters"
 
 
 def smoke_test_big_weight_vae() -> None:
