@@ -54,7 +54,7 @@ class MiniPatchTrainingModel(nn.Module):
     def normalized_relative_mse(
         pred: torch.Tensor,
         target: torch.Tensor,
-        eps: float = 1e-8,
+        eps: float = 1e-4,
     ) -> torch.Tensor:
         """
         Scale-invariant MSE relative to target energy.
