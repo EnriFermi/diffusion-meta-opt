@@ -54,23 +54,33 @@ class LocalDiskChunkStore(ChunkStore):
         )
 
     def list_ready(self, limit: int | None = None) -> list[ChunkRef]:
-        files = [
-            path
-            for path in self.ready_dir.iterdir()
-            if path.is_file() and not path.name.endswith(".meta.json")
-        ]
-        files.sort(key=lambda item: (item.stat().st_mtime, item.name))
+        files_with_meta: list[tuple[float, str, Path]] = []
+        for path in self.ready_dir.iterdir():
+            if not _is_ready_chunk_file(path):
+                continue
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                # Concurrent rename/remove while scanning.
+                continue
+            files_with_meta.append((float(stat.st_mtime), path.name, path))
+
+        files_with_meta.sort(key=lambda item: (item[0], item[1]))
         if limit is not None:
-            files = files[: max(0, int(limit))]
+            files_with_meta = files_with_meta[: max(0, int(limit))]
 
         refs: list[ChunkRef] = []
-        for path in files:
+        for mtime, _, path in files_with_meta:
+            try:
+                size_bytes = int(path.stat().st_size)
+            except FileNotFoundError:
+                continue
             refs.append(
                 ChunkRef(
                     chunk_id=_chunk_id_from_filename(path.name),
                     uri=str(path),
-                    size_bytes=path.stat().st_size,
-                    created_at=path.stat().st_mtime,
+                    size_bytes=size_bytes,
+                    created_at=mtime,
                     backend_key=str(path),
                 )
             )
@@ -98,13 +108,11 @@ class LocalDiskChunkStore(ChunkStore):
             pass
 
     def count_ready(self) -> int:
-        return len(
-            [
-                path
-                for path in self.ready_dir.iterdir()
-                if path.is_file() and not path.name.endswith(".meta.json")
-            ]
-        )
+        count = 0
+        for path in self.ready_dir.iterdir():
+            if _is_ready_chunk_file(path):
+                count += 1
+        return count
 
     def capacity_state(self) -> dict[str, Any]:
         ready = self.count_ready()
@@ -123,7 +131,7 @@ class LocalDiskChunkStore(ChunkStore):
             [path.name for path in self.staging_dir.iterdir() if path.is_file()],
         )
         ready_files = sorted(
-            [path.name for path in self.ready_dir.iterdir() if path.is_file() and not path.name.endswith(".meta.json")],
+            [path.name for path in self.ready_dir.iterdir() if _is_ready_chunk_file(path)],
         )
         consumed_files = sorted(
             [path.name for path in self.consumed_dir.iterdir() if path.is_file()],
@@ -169,7 +177,7 @@ class LocalDiskChunkStore(ChunkStore):
             "ready_path": str(ready_path),
             "meta": meta,
         }
-        tmp_path = sidecar_path.with_suffix(".meta.json.tmp")
+        tmp_path = sidecar_path.with_name(sidecar_path.name + ".tmp")
         try:
             tmp_path.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
             tmp_path.replace(sidecar_path)
@@ -186,3 +194,18 @@ def _chunk_id_from_filename(name: str) -> str:
     if name.endswith(".pt"):
         return name[: -len(".pt")]
     return Path(name).stem
+
+
+def _is_ready_chunk_file(path: Path) -> bool:
+    try:
+        if not path.is_file():
+            return False
+    except FileNotFoundError:
+        return False
+
+    name = path.name
+    if name.endswith(".tmp"):
+        return False
+    if name.endswith(".meta.json"):
+        return False
+    return name.endswith(".pt") or name.endswith(".pt.gz")
