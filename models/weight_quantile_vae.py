@@ -297,6 +297,7 @@ class MiniVAEConfig:
     decoder_L_latents: int = 8
     decoder_use_dist_conditioning: bool = True
     decoder_dist_mode: str = "add"  # {"add", "concat"}
+    use_latent_sampling: bool = True
     n_heads: int = 4
     d_patch: int = 64
     dropout: float = 0.0
@@ -545,7 +546,10 @@ class MiniPatchVAE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # w_patch: [B, p], dist_var_tokens: [B, p, d_var], dist_patch_embed: [B, d_dist] (optional)
         mu, logvar = self.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
-        z = self.reparameterize(mu=mu, logvar=logvar)
+        if bool(self.cfg.use_latent_sampling):
+            z = self.reparameterize(mu=mu, logvar=logvar)
+        else:
+            z = mu
         w_hat = self.decode(z=z, patch_size=w_patch.shape[1], dist_patch_embed=dist_patch_embed)
         return w_hat, mu, logvar, z
 
