@@ -329,7 +329,11 @@ class MiniPatchTrainingModel(nn.Module):
 
         # Decoder-only ablation: random latents.
         z_random = torch.randn_like(mu_ref)
-        w_hat_rand_latent = self.mini_vae.decode(z=z_random, patch_size=patch_size)
+        w_hat_rand_latent = self.mini_vae.decode(
+            z=z_random,
+            patch_size=patch_size,
+            dist_var_tokens=dist_var_tokens,
+        )
         structural_rand_latent = self.normalized_relative_mse(w_hat_rand_latent, w_patch)
         behavioral_rand_latent = self.patch_behavioral_relative_mse(
             X_patch=X_patch,
