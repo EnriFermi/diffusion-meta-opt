@@ -301,6 +301,64 @@ def _top_worker_rss(
     return rows[: max(1, int(limit))]
 
 
+def _top_jobs_by_memory_field(
+    jobs: list[dict[str, Any]] | None,
+    *,
+    field: str,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    if not isinstance(jobs, list):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for row in jobs:
+        if not isinstance(row, dict):
+            continue
+        value = _safe_float(row.get(field))
+        if value is None:
+            continue
+        rows.append(
+            {
+                "timestamp": row.get("timestamp"),
+                "model_name": row.get("model_name"),
+                "duration_s": _safe_float(row.get("duration_s")),
+                "num_images": _safe_int(row.get("num_images")),
+                "num_layers": _safe_int(row.get("num_layers")),
+                "num_samples_emitted": _safe_int(row.get("num_samples_emitted")),
+                "field": field,
+                "value": float(value),
+            }
+        )
+    rows.sort(key=lambda item: float(item.get("value", 0.0)), reverse=True)
+    return rows[: max(1, int(limit))]
+
+
+def _extract_job_memory_markers(resource_snapshot: dict[str, Any] | None) -> dict[str, float | None]:
+    if not isinstance(resource_snapshot, dict):
+        return {
+            "rss_mb": None,
+            "hwm_mb": None,
+            "children_rss_mb_sum": None,
+        }
+    return {
+        "rss_mb": _safe_float(resource_snapshot.get("rss_mb")),
+        "hwm_mb": _safe_float(resource_snapshot.get("hwm_mb")),
+        "children_rss_mb_sum": _safe_float(resource_snapshot.get("children_rss_mb_sum")),
+    }
+
+
+def _delta_or_none(after: float | None, before: float | None) -> float | None:
+    if after is None or before is None:
+        return None
+    return float(after - before)
+
+
+def _fmt_mb(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):.1f}"
+
+
 def _signal_name(signum: int) -> str:
     try:
         return signal.Signals(signum).name
@@ -725,6 +783,16 @@ class CollectorService:
             "cgroup": cgroup_snapshot or {},
             "cgroup_events_baseline": dict(self._cgroup_events_baseline),
         }
+        payload["jobs_top_by_hwm_delta_mb"] = _top_jobs_by_memory_field(
+            payload.get("async_recent_jobs"),
+            field="memory_hwm_delta_mb",
+            limit=8,
+        )
+        payload["jobs_top_by_rss_delta_mb"] = _top_jobs_by_memory_field(
+            payload.get("async_recent_jobs"),
+            field="memory_rss_delta_mb",
+            limit=8,
+        )
         if isinstance(self._async_last_status, dict):
             raw_pool_workers = self._async_last_status.get("raw_pool_workers")
             resource = self._async_last_status.get("resource")
@@ -850,6 +918,43 @@ class CollectorService:
         assert self._model_pool is not None
         assert self._sink is not None
 
+        job_resource_before: dict[str, Any] | None = None
+        if self.emit_resource_snapshot:
+            job_resource_before = _collect_process_resource_snapshot(
+                pid=os.getpid(),
+                max_children=self.resource_snapshot_max_children,
+            )
+        job_memory_before = _extract_job_memory_markers(job_resource_before)
+
+        def _memory_payload_after() -> dict[str, float | None]:
+            job_resource_after: dict[str, Any] | None = None
+            if self.emit_resource_snapshot:
+                job_resource_after = _collect_process_resource_snapshot(
+                    pid=os.getpid(),
+                    max_children=self.resource_snapshot_max_children,
+                )
+            job_memory_after = _extract_job_memory_markers(job_resource_after)
+            return {
+                "memory_rss_before_mb": job_memory_before.get("rss_mb"),
+                "memory_rss_after_mb": job_memory_after.get("rss_mb"),
+                "memory_rss_delta_mb": _delta_or_none(
+                    job_memory_after.get("rss_mb"),
+                    job_memory_before.get("rss_mb"),
+                ),
+                "memory_hwm_before_mb": job_memory_before.get("hwm_mb"),
+                "memory_hwm_after_mb": job_memory_after.get("hwm_mb"),
+                "memory_hwm_delta_mb": _delta_or_none(
+                    job_memory_after.get("hwm_mb"),
+                    job_memory_before.get("hwm_mb"),
+                ),
+                "memory_children_rss_before_mb": job_memory_before.get("children_rss_mb_sum"),
+                "memory_children_rss_after_mb": job_memory_after.get("children_rss_mb_sum"),
+                "memory_children_rss_delta_mb": _delta_or_none(
+                    job_memory_after.get("children_rss_mb_sum"),
+                    job_memory_before.get("children_rss_mb_sum"),
+                ),
+            }
+
         if not self._sink.needs_fill():
             return CollectorJobStats(
                 model_name="none",
@@ -858,6 +963,7 @@ class CollectorService:
                 num_samples_emitted=0,
                 dataset_mix={},
                 duration_s=0.0,
+                **_memory_payload_after(),
             )
 
         started = time.time()
@@ -882,6 +988,7 @@ class CollectorService:
                 num_samples_emitted=0,
                 dataset_mix={},
                 duration_s=duration_s,
+                **_memory_payload_after(),
             )
 
         layer_records = self._model_pool.run(model_name=model_name, pil_batch=pil_batch)
@@ -912,16 +1019,22 @@ class CollectorService:
             num_samples_emitted=emitted,
             dataset_mix=dict(mix_counter),
             duration_s=duration_s,
+            **_memory_payload_after(),
         )
 
         self.logger.info(
-            "collector job model=%s images=%s layers=%s emitted=%s size=%s mode=%s",
+            "collector job model=%s images=%s layers=%s emitted=%s size=%s mode=%s "
+            "rss_after_mb=%s rss_delta_mb=%s hwm_delta_mb=%s child_rss_delta_mb=%s",
             model_name,
             stats.num_images,
             stats.num_layers,
             emitted,
             self.cache_size(),
             self.streaming_mode,
+            _fmt_mb(stats.memory_rss_after_mb),
+            _fmt_mb(stats.memory_rss_delta_mb),
+            _fmt_mb(stats.memory_hwm_delta_mb),
+            _fmt_mb(stats.memory_children_rss_delta_mb),
         )
         self._emit_status_event(event_type="job", job_stats=stats)
 
@@ -1247,6 +1360,15 @@ class CollectorService:
                     "num_samples_emitted": int(job_stats.get("num_samples_emitted", 0)),
                     "dataset_mix": job_stats.get("dataset_mix", {}),
                     "duration_s": float(job_stats.get("duration_s", 0.0)),
+                    "memory_rss_before_mb": _safe_float(job_stats.get("memory_rss_before_mb")),
+                    "memory_rss_after_mb": _safe_float(job_stats.get("memory_rss_after_mb")),
+                    "memory_rss_delta_mb": _safe_float(job_stats.get("memory_rss_delta_mb")),
+                    "memory_hwm_before_mb": _safe_float(job_stats.get("memory_hwm_before_mb")),
+                    "memory_hwm_after_mb": _safe_float(job_stats.get("memory_hwm_after_mb")),
+                    "memory_hwm_delta_mb": _safe_float(job_stats.get("memory_hwm_delta_mb")),
+                    "memory_children_rss_before_mb": _safe_float(job_stats.get("memory_children_rss_before_mb")),
+                    "memory_children_rss_after_mb": _safe_float(job_stats.get("memory_children_rss_after_mb")),
+                    "memory_children_rss_delta_mb": _safe_float(job_stats.get("memory_children_rss_delta_mb")),
                 }
                 self._async_recent_jobs.append(sanitized)
 
