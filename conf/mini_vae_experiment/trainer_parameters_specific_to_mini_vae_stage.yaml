@@ -88,3 +88,6 @@ telemetry:
     tags: []
     offline_directory: ""
     log_code: false
+    log_weight_snapshots: true
+    weight_snapshot_every_steps: 100
+    weight_snapshot_num_values: 16
