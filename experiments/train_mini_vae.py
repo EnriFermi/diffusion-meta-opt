@@ -1359,6 +1359,10 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                 enabled=bool(local_telemetry_cfg.get("save_jsonl", True)) and rank == 0,
             )
             comet_tracker = CometTracker(cfg=cfg, logger=logger, rank=rank)
+            comet_cfg = telemetry_cfg.get("comet", {})
+            comet_weight_snapshot_enabled = bool(comet_cfg.get("log_weight_snapshots", True))
+            comet_weight_snapshot_every_steps = max(1, int(comet_cfg.get("weight_snapshot_every_steps", 100)))
+            comet_weight_snapshot_num_values = max(1, int(comet_cfg.get("weight_snapshot_num_values", 16)))
 
             chunk_store = None
             if rank == 0 and collector is not None and str(collector.streaming_mode).lower() != "none":
@@ -1888,6 +1892,89 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     step_opt_ms_window = 0.0
                     patch_window.clear()
                     t0 = time.time()
+
+                run_comet_weight_snapshot = (
+                    rank == 0
+                    and comet_tracker is not None
+                    and comet_tracker.enabled
+                    and comet_weight_snapshot_enabled
+                    and (global_step % comet_weight_snapshot_every_steps == 0)
+                )
+                if run_comet_weight_snapshot:
+                    try:
+                        train_model = model.module if isinstance(model, DDP) else model
+                        with torch.no_grad():
+                            with autocast_context(enabled=amp_enabled, dtype=amp_dtype):
+                                w_target_norm, w_scale = train_model.normalize_patch_weights(w_patch)
+                                dist_var_tokens_dbg, _ = train_model.distribution_encoder(X=X_full, patch_idx=patch_idx)
+                                w_pred_dbg, _, _, _ = train_model.mini_vae(
+                                    w_patch=w_target_norm,
+                                    dist_var_tokens=dist_var_tokens_dbg,
+                                )
+
+                        w_target_fp32 = w_target_norm.detach().float()
+                        w_pred_fp32 = w_pred_dbg.detach().float()
+                        w_scale_fp32 = w_scale.detach().float()
+                        w_target_raw_fp32 = w_patch.detach().float()
+                        w_pred_raw_fp32 = w_pred_fp32 * w_scale_fp32
+                        pred_target_mse = float((w_pred_fp32 - w_target_fp32).pow(2).mean().item())
+                        pred_target_mse_raw = float((w_pred_raw_fp32 - w_target_raw_fp32).pow(2).mean().item())
+
+                        head_len = min(comet_weight_snapshot_num_values, int(w_target_fp32.shape[1]))
+                        pred_head = [float(v) for v in w_pred_fp32[0, :head_len].cpu().tolist()]
+                        target_head = [float(v) for v in w_target_fp32[0, :head_len].cpu().tolist()]
+                        diff_head = [float(p - t) for p, t in zip(pred_head, target_head)]
+                        pred_raw_head = [float(v) for v in w_pred_raw_fp32[0, :head_len].cpu().tolist()]
+                        target_raw_head = [float(v) for v in w_target_raw_fp32[0, :head_len].cpu().tolist()]
+                        diff_raw_head = [float(p - t) for p, t in zip(pred_raw_head, target_raw_head)]
+
+                        comet_tracker.log_metrics(
+                            {
+                                "train/weights_snapshot/mse_norm": pred_target_mse,
+                                "train/weights_snapshot/mse_raw": pred_target_mse_raw,
+                                "train/weights_snapshot/pred_mean": float(w_pred_fp32.mean().item()),
+                                "train/weights_snapshot/target_mean": float(w_target_fp32.mean().item()),
+                                "train/weights_snapshot/pred_std": float(w_pred_fp32.std(unbiased=False).item()),
+                                "train/weights_snapshot/target_std": float(w_target_fp32.std(unbiased=False).item()),
+                            },
+                            step=global_step,
+                        )
+                        comet_tracker.log_text(
+                            text=f"weights_snapshot_step_{global_step}",
+                            metadata={
+                                "step": int(global_step),
+                                "num_values": int(head_len),
+                                "pred_head_norm": pred_head,
+                                "target_head_norm": target_head,
+                                "diff_head_norm": diff_head,
+                                "pred_head_raw": pred_raw_head,
+                                "target_head_raw": target_raw_head,
+                                "diff_head_raw": diff_raw_head,
+                                "patch_idx_head": patch_idx_head,
+                                "out_idx_head": out_idx_head,
+                                "model_name": (sample_info_latest or {}).get("model_name"),
+                                "layer_name": (sample_info_latest or {}).get("layer_name"),
+                            },
+                        )
+                        status_writer.write(
+                            {
+                                "step": int(global_step),
+                                "timestamp": float(time.time()),
+                                "weights_snapshot": {
+                                    "mse_norm": pred_target_mse,
+                                    "mse_raw": pred_target_mse_raw,
+                                    "num_values": int(head_len),
+                                    "pred_head_norm": pred_head,
+                                    "target_head_norm": target_head,
+                                    "diff_head_norm": diff_head,
+                                    "pred_head_raw": pred_raw_head,
+                                    "target_head_raw": target_raw_head,
+                                    "diff_head_raw": diff_raw_head,
+                                },
+                            }
+                        )
+                    except Exception as exc:
+                        logger.warning("Comet weight snapshot log failed at step=%s: %s", global_step, exc)
 
                 run_train_ablation_this_step = train_ablation_requested and (
                     (global_step % train_ablation_every_steps == 0)
