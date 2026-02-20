@@ -388,16 +388,18 @@ class MiniPatchEncoder(nn.Module):
 
 
 class MiniPatchDecoder(nn.Module):
-    """Per-element decoder conditioned on z only."""
+    """Per-element decoder conditioned on z and distribution tokens."""
 
-    def __init__(self, cfg: MiniVAEConfig) -> None:
+    def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
         super().__init__()
         self.cfg = cfg
+        self.d_var = int(d_var)
 
         if cfg.d_e % cfg.n_heads != 0:
             raise ValueError(f"mini d_e ({cfg.d_e}) must be divisible by n_heads ({cfg.n_heads})")
 
-        self.in_proj = nn.Linear(cfg.z_dim, cfg.d_e)
+        self.z_proj = nn.Linear(cfg.z_dim, cfg.d_e)
+        self.cond_proj = nn.Linear(self.d_var, cfg.d_e)
 
         if cfg.num_layers_decoder > 0:
             dec_layer = nn.TransformerEncoderLayer(
@@ -419,20 +421,37 @@ class MiniPatchDecoder(nn.Module):
             nn.Linear(cfg.d_e, 1),
         )
 
-    def forward(self, z: torch.Tensor, patch_size: int) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, patch_size: int, dist_var_tokens: torch.Tensor) -> torch.Tensor:
         # z: [B, z_dim]
+        # dist_var_tokens: [B, p, d_var]
         # patch_size: p
         if z.ndim != 2:
             raise ValueError(f"z must be [B, z_dim], got {tuple(z.shape)}")
         if patch_size <= 0:
             raise ValueError(f"patch_size must be positive, got {patch_size}")
+        if dist_var_tokens.ndim != 3:
+            raise ValueError(f"dist_var_tokens must be [B, p, d_var], got {tuple(dist_var_tokens.shape)}")
 
-        # h: [B, p, d_e]
         B = z.shape[0]
         p = int(patch_size)
-        z_token = self.in_proj(z).unsqueeze(1)  # [B, 1, d_e]
+        Bv, pv, d_var = dist_var_tokens.shape
+        if Bv != B:
+            raise ValueError(f"Batch mismatch: z={tuple(z.shape)} dist_var_tokens={tuple(dist_var_tokens.shape)}")
+        if pv != p:
+            raise ValueError(
+                f"patch_size mismatch: patch_size={p} but dist_var_tokens has p={pv} "
+                f"(shape={tuple(dist_var_tokens.shape)})"
+            )
+        if d_var != self.d_var:
+            raise ValueError(f"dist_var_tokens last dim must be {self.d_var}, got {d_var}")
+
+        # h_i = z_token + cond_token_i + pos_i
+        z_token = self.z_proj(z).unsqueeze(1).expand(B, p, -1)  # [B, p, d_e]
+        cond_tokens = self.cond_proj(dist_var_tokens)  # [B, p, d_e]
+        if cond_tokens.dtype != z_token.dtype:
+            cond_tokens = cond_tokens.to(dtype=z_token.dtype)
         pos = sinusoidal_embedding(torch.arange(p, device=z.device), dim=self.cfg.d_e).to(dtype=z.dtype)  # [p, d_e]
-        h = z_token + pos.unsqueeze(0).expand(B, -1, -1)
+        h = z_token + cond_tokens + pos.unsqueeze(0).expand(B, -1, -1)
         h = self.decoder_context(h)
 
         # w_hat: [B, p]
@@ -446,7 +465,7 @@ class MiniPatchVAE(nn.Module):
 
     Methods:
     - encode(w_patch, dist_var_tokens) -> mu, logvar
-    - decode(z, patch_size) -> w_hat
+    - decode(z, patch_size, dist_var_tokens) -> w_hat
     - encode_patch(w_patch, dist_var_tokens) -> patch_token (for BigWeightVAE)
     """
 
@@ -454,7 +473,7 @@ class MiniPatchVAE(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.encoder = MiniPatchEncoder(d_var=d_var, cfg=cfg)
-        self.decoder = MiniPatchDecoder(cfg=cfg)
+        self.decoder = MiniPatchDecoder(d_var=d_var, cfg=cfg)
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -471,8 +490,8 @@ class MiniPatchVAE(nn.Module):
     def encode(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.encoder.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
 
-    def decode(self, z: torch.Tensor, patch_size: int) -> torch.Tensor:
-        return self.decoder(z=z, patch_size=patch_size)
+    def decode(self, z: torch.Tensor, patch_size: int, dist_var_tokens: torch.Tensor) -> torch.Tensor:
+        return self.decoder(z=z, patch_size=patch_size, dist_var_tokens=dist_var_tokens)
 
     def encode_patch(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
         return self.encoder.encode_patch(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
@@ -481,7 +500,7 @@ class MiniPatchVAE(nn.Module):
         # w_patch: [B, p], dist_var_tokens: [B, p, d_var]
         mu, logvar = self.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
         z = self.reparameterize(mu=mu, logvar=logvar)
-        w_hat = self.decode(z=z, patch_size=w_patch.shape[1])
+        w_hat = self.decode(z=z, patch_size=w_patch.shape[1], dist_var_tokens=dist_var_tokens)
         return w_hat, mu, logvar, z
 
 

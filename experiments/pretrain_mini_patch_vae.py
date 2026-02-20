@@ -473,11 +473,19 @@ def _forward_patch_objective(
         # Probe latent dependence: decode with random z while keeping conditioning fixed.
         mu, logvar = mini_vae.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
         z = torch.randn_like(mu)
-        w_hat = mini_vae.decode(z=z, patch_size=w_patch.shape[1])
+        w_hat = mini_vae.decode(
+            z=z,
+            patch_size=w_patch.shape[1],
+            dist_var_tokens=dist_var_tokens,
+        )
     elif deterministic_z:
         # Deterministic VAE pass: use z=mu without sampling noise.
         mu, logvar = mini_vae.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
-        w_hat = mini_vae.decode(z=mu, patch_size=w_patch.shape[1])
+        w_hat = mini_vae.decode(
+            z=mu,
+            patch_size=w_patch.shape[1],
+            dist_var_tokens=dist_var_tokens,
+        )
     else:
         # w_hat: [B, p], mu/logvar: [B, z_dim]
         w_hat, mu, logvar, _ = mini_vae(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
