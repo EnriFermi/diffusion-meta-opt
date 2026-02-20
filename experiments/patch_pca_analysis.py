@@ -26,7 +26,7 @@ LOGGER = logging.getLogger("patch_pca_analysis")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Collect random weight patches from selected models and compute PCA grouped by "
+            "Collect random weight patches from selected models and compute PCA/t-SNE grouped by "
             "architecture and layer type."
         )
     )
@@ -46,6 +46,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=64, help="Input-dimension patch size")
     parser.add_argument("--patches-per-sample", type=int, default=16, help="How many random patches per SharedSample")
     parser.add_argument("--components", type=int, default=8, help="Number of principal components to keep")
+    parser.add_argument(
+        "--tsne-max-points",
+        type=int,
+        default=5000,
+        help="Maximum number of points for t-SNE (uniformly sampled from collected patches)",
+    )
+    parser.add_argument("--tsne-perplexity", type=float, default=30.0, help="t-SNE perplexity")
+    parser.add_argument("--tsne-learning-rate", type=float, default=200.0, help="t-SNE learning rate")
+    parser.add_argument("--tsne-n-iter", type=int, default=1000, help="t-SNE optimization iterations")
     parser.add_argument("--max-samples-per-model", type=int, default=64, help="Max SharedSample items per model")
     parser.add_argument("--max-total-samples", type=int, default=1024, help="Global SharedSample cap")
     parser.add_argument("--max-patches-per-group", type=int, default=8192, help="Max patch vectors retained per group")
@@ -240,6 +249,43 @@ def compute_projection_2d(patches: torch.Tensor) -> tuple[torch.Tensor, list[flo
     while len(ratios) < 2:
         ratios.append(0.0)
     return coords, ratios[:2]
+
+
+def compute_tsne_projection_2d(
+    patches: torch.Tensor,
+    *,
+    perplexity: float,
+    learning_rate: float,
+    n_iter: int,
+    seed: int,
+) -> torch.Tensor:
+    if patches.ndim != 2:
+        raise ValueError(f"patches must be rank-2, got {tuple(patches.shape)}")
+    n, _ = patches.shape
+    if n < 3:
+        return torch.zeros((n, 2), dtype=torch.float32)
+
+    # Local import: keep script usable even without sklearn when t-SNE is not needed.
+    from sklearn.manifold import TSNE
+
+    x_np = patches.to(dtype=torch.float32, device="cpu").numpy()
+    safe_perplexity = max(1.0, min(float(perplexity), float(n - 1)))
+    common_kwargs: dict[str, Any] = {
+        "n_components": 2,
+        "perplexity": safe_perplexity,
+        "learning_rate": float(learning_rate),
+        "init": "pca",
+        "random_state": int(seed),
+    }
+
+    # sklearn API changed from n_iter -> max_iter in newer releases.
+    try:
+        tsne = TSNE(n_iter=int(n_iter), **common_kwargs)
+    except TypeError:
+        tsne = TSNE(max_iter=int(n_iter), **common_kwargs)
+
+    coords = tsne.fit_transform(x_np)
+    return torch.from_numpy(coords).to(dtype=torch.float32)
 
 
 def _normalize_model_list(models: list[str]) -> list[str]:
@@ -602,122 +648,249 @@ def main() -> None:
             writer.writerow(row)
 
     all_points = _stack_or_empty(all_patch_chunks, int(args.patch_size))
-    arch_plot_path = output_dir / "all_points_pca_by_architecture.png"
-    layer_plot_path = output_dir / "all_points_pca_by_layer_type.png"
-    plot_path = output_dir / "all_points_pca.png"
-    points_csv_path = output_dir / "all_points_pca2d.csv"
-    coords = torch.empty((0, 2), dtype=torch.float32)
-    explained = [0.0, 0.0]
+
+    # Optional plotting backend used by both PCA and t-SNE scatter plots.
+    plt = None
+    try:
+        import matplotlib.pyplot as plt  # type: ignore[assignment]
+    except Exception as exc:
+        LOGGER.warning("Could not import matplotlib; scatter plots will be skipped: %s", exc)
+
+    def _scatter_by_labels(
+        coords: torch.Tensor,
+        labels: list[str],
+        *,
+        title: str,
+        out_path: Path,
+        x_label: str,
+        y_label: str,
+    ) -> bool:
+        if plt is None or int(coords.shape[0]) == 0:
+            return False
+        unique_labels = sorted(set(labels))
+        if not unique_labels:
+            return False
+
+        coords_cpu = coords.cpu()
+        fig, ax = plt.subplots(figsize=(12, 9))
+        cmap = plt.get_cmap("tab20", max(1, len(unique_labels)))
+        for color_idx, label in enumerate(unique_labels):
+            indices = [i for i, value in enumerate(labels) if value == label]
+            if not indices:
+                continue
+            idx_tensor = torch.tensor(indices, dtype=torch.long)
+            points = coords_cpu.index_select(0, idx_tensor)
+            ax.scatter(
+                points[:, 0].numpy(),
+                points[:, 1].numpy(),
+                s=8,
+                alpha=0.35,
+                color=cmap(color_idx),
+                label=label,
+                linewidths=0.0,
+            )
+
+        ax.set_title(title)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+        ax.grid(alpha=0.2)
+        if len(unique_labels) <= 20:
+            ax.legend(loc="best", fontsize=8, framealpha=0.9)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return True
+
+    # ------------------------------- PCA -------------------------------
+    pca_arch_plot_path = output_dir / "all_points_pca_by_architecture.png"
+    pca_layer_plot_path = output_dir / "all_points_pca_by_layer_type.png"
+    pca_alias_plot_path = output_dir / "all_points_pca.png"
+    pca_points_csv_path = output_dir / "all_points_pca2d.csv"
+    pca_coords = torch.empty((0, 2), dtype=torch.float32)
+    pca_explained = [0.0, 0.0]
     global_plot_meta: dict[str, Any] = {
         "num_points": int(all_points.shape[0]),
-        "plot_path": str(plot_path),  # backward-compatible alias to architecture plot
-        "architecture_plot_path": str(arch_plot_path),
-        "layer_type_plot_path": str(layer_plot_path),
-        "points_csv_path": str(points_csv_path),
+        "plot_path": str(pca_alias_plot_path),  # backward-compatible alias to architecture plot
+        "architecture_plot_path": str(pca_arch_plot_path),
+        "layer_type_plot_path": str(pca_layer_plot_path),
+        "points_csv_path": str(pca_points_csv_path),
         "pc1_explained_variance_ratio": 0.0,
         "pc2_explained_variance_ratio": 0.0,
         "architecture_plot_saved": False,
         "layer_type_plot_saved": False,
     }
     if int(all_points.shape[0]) > 0:
-        coords, explained = compute_projection_2d(all_points)
-        global_plot_meta["pc1_explained_variance_ratio"] = float(explained[0])
-        global_plot_meta["pc2_explained_variance_ratio"] = float(explained[1])
+        pca_coords, pca_explained = compute_projection_2d(all_points)
+        global_plot_meta["pc1_explained_variance_ratio"] = float(pca_explained[0])
+        global_plot_meta["pc2_explained_variance_ratio"] = float(pca_explained[1])
 
-    with points_csv_path.open("w", encoding="utf-8") as handle:
+    with pca_points_csv_path.open("w", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=["point_idx", "pc1", "pc2", "model", "architecture", "layer_type"],
         )
         writer.writeheader()
-        for idx in range(int(coords.shape[0])):
+        for idx in range(int(pca_coords.shape[0])):
             writer.writerow(
                 {
                     "point_idx": idx,
-                    "pc1": float(coords[idx, 0].item()),
-                    "pc2": float(coords[idx, 1].item()),
+                    "pc1": float(pca_coords[idx, 0].item()),
+                    "pc2": float(pca_coords[idx, 1].item()),
                     "model": all_patch_model_labels[idx],
                     "architecture": all_patch_arch_labels[idx],
                     "layer_type": all_patch_layer_labels[idx],
                 }
             )
 
-    if int(coords.shape[0]) > 0:
+    pca_arch_saved = _scatter_by_labels(
+        pca_coords,
+        all_patch_arch_labels,
+        title="PCA of Weight Patches (Colored by Architecture)",
+        out_path=pca_arch_plot_path,
+        x_label=f"PC1 ({pca_explained[0] * 100.0:.2f}% variance)",
+        y_label=f"PC2 ({pca_explained[1] * 100.0:.2f}% variance)",
+    )
+    pca_layer_saved = _scatter_by_labels(
+        pca_coords,
+        all_patch_layer_labels,
+        title="PCA of Weight Patches (Colored by Layer Type)",
+        out_path=pca_layer_plot_path,
+        x_label=f"PC1 ({pca_explained[0] * 100.0:.2f}% variance)",
+        y_label=f"PC2 ({pca_explained[1] * 100.0:.2f}% variance)",
+    )
+    global_plot_meta["architecture_plot_saved"] = pca_arch_saved
+    global_plot_meta["layer_type_plot_saved"] = pca_layer_saved
+    if pca_arch_saved:
         try:
-            import matplotlib.pyplot as plt
-        except Exception as exc:
-            LOGGER.warning("Could not import matplotlib; skipping global PCA plot: %s", exc)
+            pca_alias_plot_path.write_bytes(pca_arch_plot_path.read_bytes())
+        except Exception:
+            pass
+
+    # ------------------------------- t-SNE -------------------------------
+    tsne_arch_plot_path = output_dir / "all_points_tsne_by_architecture.png"
+    tsne_layer_plot_path = output_dir / "all_points_tsne_by_layer_type.png"
+    tsne_points_csv_path = output_dir / "all_points_tsne2d.csv"
+    tsne_coords = torch.empty((0, 2), dtype=torch.float32)
+    tsne_model_labels: list[str] = []
+    tsne_arch_labels: list[str] = []
+    tsne_layer_labels: list[str] = []
+    tsne_meta: dict[str, Any] = {
+        "input_points": int(all_points.shape[0]),
+        "used_points": 0,
+        "max_points": int(args.tsne_max_points),
+        "perplexity": float(args.tsne_perplexity),
+        "learning_rate": float(args.tsne_learning_rate),
+        "n_iter": int(args.tsne_n_iter),
+        "points_csv_path": str(tsne_points_csv_path),
+        "architecture_plot_path": str(tsne_arch_plot_path),
+        "layer_type_plot_path": str(tsne_layer_plot_path),
+        "computed": False,
+        "architecture_plot_saved": False,
+        "layer_type_plot_saved": False,
+        "error": None,
+    }
+
+    num_all_points = int(all_points.shape[0])
+    if num_all_points >= 3 and int(args.tsne_max_points) != 0:
+        max_tsne_points = int(args.tsne_max_points)
+        if max_tsne_points < 0:
+            max_tsne_points = num_all_points
+        if 0 < max_tsne_points < num_all_points:
+            tsne_sample_gen = torch.Generator(device="cpu")
+            tsne_sample_gen.manual_seed(int(args.seed) + 1001)
+            sampled_idx = torch.randperm(num_all_points, generator=tsne_sample_gen)[:max_tsne_points]
+            sampled_idx_list = sampled_idx.tolist()
+            tsne_input = all_points.index_select(0, sampled_idx)
+            tsne_model_labels = [all_patch_model_labels[i] for i in sampled_idx_list]
+            tsne_arch_labels = [all_patch_arch_labels[i] for i in sampled_idx_list]
+            tsne_layer_labels = [all_patch_layer_labels[i] for i in sampled_idx_list]
         else:
-            coords_cpu = coords.cpu()
+            tsne_input = all_points
+            tsne_model_labels = list(all_patch_model_labels)
+            tsne_arch_labels = list(all_patch_arch_labels)
+            tsne_layer_labels = list(all_patch_layer_labels)
 
-            def _scatter_by_labels(labels: list[str], title: str, out_path: Path) -> bool:
-                unique_labels = sorted(set(labels))
-                if not unique_labels:
-                    return False
-
-                fig, ax = plt.subplots(figsize=(12, 9))
-                cmap = plt.get_cmap("tab20", max(1, len(unique_labels)))
-                for color_idx, label in enumerate(unique_labels):
-                    indices = [i for i, value in enumerate(labels) if value == label]
-                    if not indices:
-                        continue
-                    idx_tensor = torch.tensor(indices, dtype=torch.long)
-                    points = coords_cpu.index_select(0, idx_tensor)
-                    ax.scatter(
-                        points[:, 0].numpy(),
-                        points[:, 1].numpy(),
-                        s=8,
-                        alpha=0.35,
-                        color=cmap(color_idx),
-                        label=label,
-                        linewidths=0.0,
-                    )
-
-                ax.set_title(title)
-                ax.set_xlabel(f"PC1 ({explained[0] * 100.0:.2f}% variance)")
-                ax.set_ylabel(f"PC2 ({explained[1] * 100.0:.2f}% variance)")
-                ax.grid(alpha=0.2)
-                if len(unique_labels) <= 20:
-                    ax.legend(loc="best", fontsize=8, framealpha=0.9)
-                fig.tight_layout()
-                fig.savefig(out_path, dpi=200)
-                plt.close(fig)
-                return True
-
-            arch_saved = _scatter_by_labels(
-                labels=all_patch_arch_labels,
-                title="PCA of Weight Patches (Colored by Architecture)",
-                out_path=arch_plot_path,
+        tsne_meta["used_points"] = int(tsne_input.shape[0])
+        try:
+            tsne_coords = compute_tsne_projection_2d(
+                tsne_input,
+                perplexity=float(args.tsne_perplexity),
+                learning_rate=float(args.tsne_learning_rate),
+                n_iter=int(args.tsne_n_iter),
+                seed=int(args.seed),
             )
-            layer_saved = _scatter_by_labels(
-                labels=all_patch_layer_labels,
-                title="PCA of Weight Patches (Colored by Layer Type)",
-                out_path=layer_plot_path,
+            tsne_meta["computed"] = True
+        except Exception as exc:
+            tsne_meta["error"] = str(exc)
+            LOGGER.warning("Could not compute t-SNE projection: %s", exc)
+    elif num_all_points > 0:
+        tsne_meta["used_points"] = int(min(num_all_points, max(0, int(args.tsne_max_points))))
+        tsne_meta["error"] = "Not enough points for t-SNE (need at least 3)"
+    else:
+        tsne_meta["error"] = "No points collected"
+
+    with tsne_points_csv_path.open("w", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["point_idx", "tsne_1", "tsne_2", "model", "architecture", "layer_type"],
+        )
+        writer.writeheader()
+        for idx in range(int(tsne_coords.shape[0])):
+            writer.writerow(
+                {
+                    "point_idx": idx,
+                    "tsne_1": float(tsne_coords[idx, 0].item()),
+                    "tsne_2": float(tsne_coords[idx, 1].item()),
+                    "model": tsne_model_labels[idx],
+                    "architecture": tsne_arch_labels[idx],
+                    "layer_type": tsne_layer_labels[idx],
+                }
             )
-            global_plot_meta["architecture_plot_saved"] = arch_saved
-            global_plot_meta["layer_type_plot_saved"] = layer_saved
-            if arch_saved:
-                # Keep old path for compatibility with previous output consumers.
-                try:
-                    plot_path.write_bytes(arch_plot_path.read_bytes())
-                except Exception:
-                    pass
+
+    tsne_arch_saved = _scatter_by_labels(
+        tsne_coords,
+        tsne_arch_labels,
+        title="t-SNE of Weight Patches (Colored by Architecture)",
+        out_path=tsne_arch_plot_path,
+        x_label="t-SNE 1",
+        y_label="t-SNE 2",
+    )
+    tsne_layer_saved = _scatter_by_labels(
+        tsne_coords,
+        tsne_layer_labels,
+        title="t-SNE of Weight Patches (Colored by Layer Type)",
+        out_path=tsne_layer_plot_path,
+        x_label="t-SNE 1",
+        y_label="t-SNE 2",
+    )
+    tsne_meta["architecture_plot_saved"] = tsne_arch_saved
+    tsne_meta["layer_type_plot_saved"] = tsne_layer_saved
 
     summary["global_all_points_plot"] = global_plot_meta
+    summary["global_all_points_tsne"] = tsne_meta
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     LOGGER.info("Saved PCA summary to %s", summary_path)
     LOGGER.info("Saved PCA tensors to %s", tensors_path)
     LOGGER.info("Saved explained variance table to %s", csv_path)
-    LOGGER.info("Saved PCA point coordinates to %s", points_csv_path)
+    LOGGER.info("Saved PCA point coordinates to %s", pca_points_csv_path)
     if global_plot_meta["architecture_plot_saved"]:
-        LOGGER.info("Saved all-points PCA architecture plot to %s", arch_plot_path)
+        LOGGER.info("Saved all-points PCA architecture plot to %s", pca_arch_plot_path)
     else:
-        LOGGER.info("All-points PCA architecture plot was not saved (matplotlib unavailable or no points)")
+        LOGGER.info("All-points PCA architecture plot was not saved")
     if global_plot_meta["layer_type_plot_saved"]:
-        LOGGER.info("Saved all-points PCA layer-type plot to %s", layer_plot_path)
+        LOGGER.info("Saved all-points PCA layer-type plot to %s", pca_layer_plot_path)
     else:
-        LOGGER.info("All-points PCA layer-type plot was not saved (matplotlib unavailable or no points)")
+        LOGGER.info("All-points PCA layer-type plot was not saved")
+    LOGGER.info("Saved t-SNE point coordinates to %s", tsne_points_csv_path)
+    if tsne_meta["architecture_plot_saved"]:
+        LOGGER.info("Saved all-points t-SNE architecture plot to %s", tsne_arch_plot_path)
+    else:
+        LOGGER.info("All-points t-SNE architecture plot was not saved")
+    if tsne_meta["layer_type_plot_saved"]:
+        LOGGER.info("Saved all-points t-SNE layer-type plot to %s", tsne_layer_plot_path)
+    else:
+        LOGGER.info("All-points t-SNE layer-type plot was not saved")
 
 
 if __name__ == "__main__":
