@@ -14,6 +14,8 @@ mini_vae:
   d_e: 256
   num_attn_layers_encoder: 10
   num_layers_decoder: 4
+  implementation: mlp_stub
+  mlp_stub_hidden_dim: 256
   use_latent_sampling: false
   n_heads: 8
   dropout: 0.05
