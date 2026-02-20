@@ -52,43 +52,30 @@ class MiniPatchTrainingModel(nn.Module):
         self.mini_vae = MiniPatchVAE(d_var=distribution_cfg.d_var, cfg=mini_cfg)
 
     @staticmethod
-    def normalized_relative_mse(
-        pred: torch.Tensor,
-        target: torch.Tensor,
+    def normalize_patch_weights(
+        w_patch: torch.Tensor,
         eps: float = 1e-4,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Scale-invariant MSE relative to target energy.
+        Normalize patch weights per batch item using RMS scale.
 
-        For each batch item i:
-            rel_i = mean((pred_i - target_i)^2) / max(mean(target_i^2), eps)
-        Returns mean_i rel_i.
+        w_patch: [B, p]
+        returns:
+        - w_norm: [B, p]
+        - scale: [B, 1]
         """
-        if pred.shape != target.shape:
-            raise ValueError(f"pred/target shape mismatch: {tuple(pred.shape)} vs {tuple(target.shape)}")
-        if pred.ndim < 1:
-            raise ValueError(f"pred/target must have rank >= 1, got rank={pred.ndim}")
-
-        err2 = (pred - target).pow(2)
-        tgt2 = target.pow(2)
-
-        if pred.ndim == 1:
-            num = err2
-            den = tgt2
-        else:
-            reduce_dims = tuple(range(1, pred.ndim))
-            num = err2.mean(dim=reduce_dims)
-            den = tgt2.mean(dim=reduce_dims)
-
-        rel = num / den.clamp_min(float(eps))
-        return rel.mean()
+        if w_patch.ndim != 2:
+            raise ValueError(f"w_patch must be [B, p], got {tuple(w_patch.shape)}")
+        scale = w_patch.pow(2).mean(dim=1, keepdim=True).sqrt().clamp_min(float(eps))
+        w_norm = w_patch / scale
+        return w_norm, scale
 
     @staticmethod
-    def patch_behavioral_relative_mse(X_patch: torch.Tensor, w_patch: torch.Tensor, w_hat: torch.Tensor) -> torch.Tensor:
+    def patch_behavioral_mse(X_patch: torch.Tensor, w_patch: torch.Tensor, w_hat: torch.Tensor) -> torch.Tensor:
         # X_patch: [B_p, n, p], w_patch/w_hat: [B_p, p]
         y = torch.einsum("bnp,bp->bn", X_patch, w_patch)
         y_hat = torch.einsum("bnp,bp->bn", X_patch, w_hat)
-        return MiniPatchTrainingModel.normalized_relative_mse(y_hat, y)
+        return F.mse_loss(y_hat, y)
 
     @staticmethod
     def nt_xent_loss(z_view1: torch.Tensor, z_view2: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -257,11 +244,18 @@ class MiniPatchTrainingModel(nn.Module):
             out_idx=out_idx,
         )
 
+        w_patch_view1_norm, _ = self.normalize_patch_weights(
+            w_patch_view1,
+        )
+        w_patch_view2_norm, _ = self.normalize_patch_weights(
+            w_patch_view2,
+        )
+
         dist_var_view1, _ = self.distribution_encoder(X=X_full_view1, patch_idx=patch_idx_view1)
         dist_var_view2, _ = self.distribution_encoder(X=X_full_view2, patch_idx=patch_idx_view2)
 
-        mu_view1, _ = self.mini_vae.encode(w_patch=w_patch_view1, dist_var_tokens=dist_var_view1)
-        mu_view2, _ = self.mini_vae.encode(w_patch=w_patch_view2, dist_var_tokens=dist_var_view2)
+        mu_view1, _ = self.mini_vae.encode(w_patch=w_patch_view1_norm, dist_var_tokens=dist_var_view1)
+        mu_view2, _ = self.mini_vae.encode(w_patch=w_patch_view2_norm, dist_var_tokens=dist_var_view2)
         return self.nt_xent_loss(mu_view1, mu_view2, temperature=temperature)
 
     def forward(
@@ -283,11 +277,14 @@ class MiniPatchTrainingModel(nn.Module):
         # X_patch: [B_p, n, p]
         # w_patch: [B_p, p]
         # patch_idx: [B_p, p]
+        w_patch_norm, _ = self.normalize_patch_weights(
+            w_patch,
+        )
         dist_var_tokens, _ = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
-        w_hat, mu, logvar, _ = self.mini_vae(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+        w_hat, mu, logvar, _ = self.mini_vae(w_patch=w_patch_norm, dist_var_tokens=dist_var_tokens)
 
-        structural_loss = self.normalized_relative_mse(w_hat, w_patch)
-        behavioral_loss = self.patch_behavioral_relative_mse(X_patch=X_patch, w_patch=w_patch, w_hat=w_hat)
+        structural_loss = F.mse_loss(w_hat, w_patch_norm)
+        behavioral_loss = self.patch_behavioral_mse(X_patch=X_patch, w_patch=w_patch_norm, w_hat=w_hat)
         recon_mix_loss = float(beta) * structural_loss + (1.0 - float(beta)) * behavioral_loss
 
         contrastive_loss = self.contrastive_loss(
@@ -321,8 +318,11 @@ class MiniPatchTrainingModel(nn.Module):
         1) decoder_random_latent_*: decode from random z ~ N(0, I).
         2) random_dist_*: full mini-VAE path with random dist_var_tokens instead of distribution encoder output.
         """
+        w_patch_norm, _ = self.normalize_patch_weights(
+            w_patch,
+        )
         dist_var_tokens, _ = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
-        mu_ref, _ = self.mini_vae.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+        mu_ref, _ = self.mini_vae.encode(w_patch=w_patch_norm, dist_var_tokens=dist_var_tokens)
 
         patch_size = int(w_patch.shape[1])
         beta_value = float(beta)
@@ -335,10 +335,10 @@ class MiniPatchTrainingModel(nn.Module):
             patch_size=patch_size,
             dist_var_tokens=dist_var_tokens,
         )
-        structural_rand_latent = self.normalized_relative_mse(w_hat_rand_latent, w_patch)
-        behavioral_rand_latent = self.patch_behavioral_relative_mse(
+        structural_rand_latent = F.mse_loss(w_hat_rand_latent, w_patch_norm)
+        behavioral_rand_latent = self.patch_behavioral_mse(
             X_patch=X_patch,
-            w_patch=w_patch,
+            w_patch=w_patch_norm,
             w_hat=w_hat_rand_latent,
         )
         recon_mix_rand_latent = beta_value * structural_rand_latent + (1.0 - beta_value) * behavioral_rand_latent
@@ -346,13 +346,13 @@ class MiniPatchTrainingModel(nn.Module):
         # Distribution ablation: random tokens replace distribution encoder output.
         rand_dist_var_tokens = torch.randn_like(dist_var_tokens)
         w_hat_rand_dist, mu_rand_dist, logvar_rand_dist, _ = self.mini_vae(
-            w_patch=w_patch,
+            w_patch=w_patch_norm,
             dist_var_tokens=rand_dist_var_tokens,
         )
-        structural_rand_dist = self.normalized_relative_mse(w_hat_rand_dist, w_patch)
-        behavioral_rand_dist = self.patch_behavioral_relative_mse(
+        structural_rand_dist = F.mse_loss(w_hat_rand_dist, w_patch_norm)
+        behavioral_rand_dist = self.patch_behavioral_mse(
             X_patch=X_patch,
-            w_patch=w_patch,
+            w_patch=w_patch_norm,
             w_hat=w_hat_rand_dist,
         )
         recon_mix_rand_dist = beta_value * structural_rand_dist + (1.0 - beta_value) * behavioral_rand_dist
