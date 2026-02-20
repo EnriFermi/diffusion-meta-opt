@@ -12,16 +12,18 @@ patches_per_sample: 32
 
 warmup_steps: 1000
 min_lr_ratio: 0.05
-kl_beta: 0.005
 
 checkpoint_every: 500
 checkpoint_dir: ${training_artifacts.mini_vae_checkpoint_dir}
 
 loss:
   # Composite objective:
-  # L_total = alpha * L_con + (1-alpha) * (beta * L_str + (1-beta) * L_beh)
-  alpha: 0.0
-  beta: 0.5
+  # L_total = structural_coef * L_str + behavioral_coef * L_beh
+  #         + contrastive_coef * L_con + kl_coef * L_kl
+  structural_coef: 0.5
+  behavioral_coef: 0.5
+  contrastive_coef: 0.0
+  kl_coef: 0.005
   contrastive_temperature: 0.07
   # Function-preserving views for NT-Xent positives.
   contrastive_permute_inputs: true

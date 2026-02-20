@@ -714,8 +714,9 @@ def compute_ablation_metrics_for_batch(
     X_patch: torch.Tensor,
     w_patch: torch.Tensor,
     patch_idx: torch.Tensor,
-    beta: float,
-    kl_beta: float,
+    structural_coef: float,
+    behavioral_coef: float,
+    kl_coef: float,
 ) -> dict[str, float]:
     ablation_fn = getattr(eval_model, "ablation_losses", None)
     if not callable(ablation_fn):
@@ -728,8 +729,9 @@ def compute_ablation_metrics_for_batch(
         X_patch=X_patch,
         w_patch=w_patch,
         patch_idx=patch_idx,
-        beta=beta,
-        kl_beta=kl_beta,
+        structural_coef=structural_coef,
+        behavioral_coef=behavioral_coef,
+        kl_coef=kl_coef,
     )
     if not isinstance(raw_payload, dict):
         raise TypeError(f"ablation_losses must return dict, got {type(raw_payload)}")
@@ -755,9 +757,10 @@ def run_test_eval(
     amp_dtype: torch.dtype | None,
     patch_size: int,
     patches_per_sample: int,
-    kl_beta: float,
-    alpha: float,
-    beta: float,
+    structural_coef: float,
+    behavioral_coef: float,
+    contrastive_coef: float,
+    kl_coef: float,
     contrastive_temperature: float,
     contrastive_permute_inputs: bool,
     contrastive_sign_flip_inputs: bool,
@@ -811,9 +814,10 @@ def run_test_eval(
                         X_patch=X_patch,
                         w_patch=w_patch,
                         patch_idx=patch_idx,
-                        kl_beta=kl_beta,
-                        alpha=alpha,
-                        beta=beta,
+                        structural_coef=structural_coef,
+                        behavioral_coef=behavioral_coef,
+                        contrastive_coef=contrastive_coef,
+                        kl_coef=kl_coef,
                         contrastive_temperature=contrastive_temperature,
                         contrastive_permute_inputs=contrastive_permute_inputs,
                         contrastive_sign_flip_inputs=contrastive_sign_flip_inputs,
@@ -826,8 +830,9 @@ def run_test_eval(
                         X_patch=X_patch,
                         w_patch=w_patch,
                         patch_idx=patch_idx,
-                        beta=beta,
-                        kl_beta=kl_beta,
+                        structural_coef=structural_coef,
+                        behavioral_coef=behavioral_coef,
+                        kl_coef=kl_coef,
                     )
 
                 loss_sum += float(total_loss.detach().item())
@@ -892,8 +897,9 @@ def run_train_ablation_eval(
     amp_dtype: torch.dtype | None,
     patch_size: int,
     patches_per_sample: int,
-    kl_beta: float,
-    beta: float,
+    structural_coef: float,
+    behavioral_coef: float,
+    kl_coef: float,
     num_batches: int,
     max_x_rows: int,
     timeout_seconds: float,
@@ -939,8 +945,9 @@ def run_train_ablation_eval(
                         X_patch=X_patch,
                         w_patch=w_patch,
                         patch_idx=patch_idx,
-                        beta=beta,
-                        kl_beta=kl_beta,
+                        structural_coef=structural_coef,
+                        behavioral_coef=behavioral_coef,
+                        kl_coef=kl_coef,
                     )
 
                 for key in ABLATION_METRIC_KEYS:
@@ -1374,17 +1381,34 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
 
             max_steps = max(1, int(cfg.mini_train.get("max_steps", 1000)))
             grad_accum_steps = max(1, int(cfg.mini_train.get("grad_accum_steps", 1)))
-            kl_beta = float(cfg.mini_train.get("kl_beta", 1e-3))
             loss_cfg = cfg.mini_train.get("loss", {})
-            alpha = float(loss_cfg.get("alpha", 0.0))
-            beta = float(loss_cfg.get("beta", 0.5))
+            legacy_kl_beta = float(cfg.mini_train.get("kl_beta", 1e-3))
+            legacy_alpha = float(loss_cfg.get("alpha", 0.0))
+            legacy_beta = float(loss_cfg.get("beta", 0.5))
+            has_explicit_loss_coefs = any(
+                key in loss_cfg for key in ("structural_coef", "behavioral_coef", "contrastive_coef", "kl_coef")
+            )
+            if not has_explicit_loss_coefs:
+                if not (0.0 <= legacy_alpha <= 1.0):
+                    raise ValueError(f"mini_train.loss.alpha must be in [0,1], got {legacy_alpha}")
+                if not (0.0 <= legacy_beta <= 1.0):
+                    raise ValueError(f"mini_train.loss.beta must be in [0,1], got {legacy_beta}")
+
+            structural_coef = float(loss_cfg.get("structural_coef", (1.0 - legacy_alpha) * legacy_beta))
+            behavioral_coef = float(loss_cfg.get("behavioral_coef", (1.0 - legacy_alpha) * (1.0 - legacy_beta)))
+            contrastive_coef = float(loss_cfg.get("contrastive_coef", legacy_alpha))
+            kl_coef = float(loss_cfg.get("kl_coef", legacy_kl_beta))
             contrastive_temperature = float(loss_cfg.get("contrastive_temperature", 0.07))
             contrastive_permute_inputs = bool(loss_cfg.get("contrastive_permute_inputs", True))
             contrastive_sign_flip_inputs = bool(loss_cfg.get("contrastive_sign_flip_inputs", True))
-            if not (0.0 <= alpha <= 1.0):
-                raise ValueError(f"mini_train.loss.alpha must be in [0,1], got {alpha}")
-            if not (0.0 <= beta <= 1.0):
-                raise ValueError(f"mini_train.loss.beta must be in [0,1], got {beta}")
+            if structural_coef < 0.0:
+                raise ValueError(f"mini_train.loss.structural_coef must be >= 0, got {structural_coef}")
+            if behavioral_coef < 0.0:
+                raise ValueError(f"mini_train.loss.behavioral_coef must be >= 0, got {behavioral_coef}")
+            if contrastive_coef < 0.0:
+                raise ValueError(f"mini_train.loss.contrastive_coef must be >= 0, got {contrastive_coef}")
+            if kl_coef < 0.0:
+                raise ValueError(f"mini_train.loss.kl_coef must be >= 0, got {kl_coef}")
             if contrastive_temperature <= 0.0:
                 raise ValueError(
                     f"mini_train.loss.contrastive_temperature must be > 0, got {contrastive_temperature}"
@@ -1567,9 +1591,10 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                                 X_patch=X_patch,
                                 w_patch=w_patch,
                                 patch_idx=patch_idx,
-                                kl_beta=kl_beta,
-                                alpha=alpha,
-                                beta=beta,
+                                structural_coef=structural_coef,
+                                behavioral_coef=behavioral_coef,
+                                contrastive_coef=contrastive_coef,
+                                kl_coef=kl_coef,
                                 contrastive_temperature=contrastive_temperature,
                                 contrastive_permute_inputs=contrastive_permute_inputs,
                                 contrastive_sign_flip_inputs=contrastive_sign_flip_inputs,
@@ -1718,7 +1743,7 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
 
                     logger.info(
                         "step=%s/%s loss=%.6f str=%.6f beh=%.6f con=%.6f recon_mix=%.6f kl=%.6f "
-                        "alpha=%.3f beta=%.3f lr=%.6e steps/s=%.2f patches=%s cache=%s "
+                        "coef_str=%.3f coef_beh=%.3f coef_con=%.3f coef_kl=%.4f lr=%.6e steps/s=%.2f patches=%s cache=%s "
                         "t_fetch=%.2fms t_patch=%.2fms t_fwd=%.2fms t_bwd=%.2fms t_opt=%.2fms "
                         "grad_norm=%.4f grad_rms=%.6f clip=%.3f",
                         global_step,
@@ -1729,8 +1754,10 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                         avg_contrastive,
                         avg_recon_mix,
                         avg_kl,
-                        alpha,
-                        beta,
+                        structural_coef,
+                        behavioral_coef,
+                        contrastive_coef,
+                        kl_coef,
                         lr,
                         speed,
                         patches_per_sample,
@@ -1815,8 +1842,10 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                         "train/recon_mix": float(avg_recon_mix),
                         "train/recon": float(avg_structural),
                         "train/kl": float(avg_kl),
-                        "train/loss_alpha": float(alpha),
-                        "train/loss_beta": float(beta),
+                        "train/loss_structural_coef": float(structural_coef),
+                        "train/loss_behavioral_coef": float(behavioral_coef),
+                        "train/loss_contrastive_coef": float(contrastive_coef),
+                        "train/loss_kl_coef": float(kl_coef),
                         "train/lr": float(lr),
                         "train/steps_per_sec": float(speed),
                         "timing/fetch_ms": float(avg_fetch_ms),
@@ -2004,8 +2033,9 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                             amp_dtype=amp_dtype,
                             patch_size=patch_size,
                             patches_per_sample=patches_per_sample,
-                            kl_beta=kl_beta,
-                            beta=beta,
+                            structural_coef=structural_coef,
+                            behavioral_coef=behavioral_coef,
+                            kl_coef=kl_coef,
                             num_batches=train_ablation_num_batches,
                             max_x_rows=train_ablation_max_x_rows,
                             timeout_seconds=train_ablation_timeout_seconds,
@@ -2117,9 +2147,10 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                                 amp_dtype=amp_dtype,
                                 patch_size=patch_size,
                                 patches_per_sample=patches_per_sample,
-                                kl_beta=kl_beta,
-                                alpha=alpha,
-                                beta=beta,
+                                structural_coef=structural_coef,
+                                behavioral_coef=behavioral_coef,
+                                contrastive_coef=contrastive_coef,
+                                kl_coef=kl_coef,
                                 contrastive_temperature=contrastive_temperature,
                                 contrastive_permute_inputs=contrastive_permute_inputs,
                                 contrastive_sign_flip_inputs=contrastive_sign_flip_inputs,

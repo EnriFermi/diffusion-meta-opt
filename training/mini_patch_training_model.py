@@ -223,12 +223,12 @@ class MiniPatchTrainingModel(nn.Module):
         patch_idx: torch.Tensor,
         out_idx: torch.Tensor | None,
         W_full: torch.Tensor | None,
-        alpha: float,
+        contrastive_coef: float,
         temperature: float,
         permute_inputs: bool,
         sign_flip_inputs: bool,
     ) -> torch.Tensor:
-        if float(alpha) <= 0.0:
+        if float(contrastive_coef) <= 0.0:
             return X_full.new_zeros(())
 
         if W_full is None or out_idx is None:
@@ -295,9 +295,10 @@ class MiniPatchTrainingModel(nn.Module):
         X_patch: torch.Tensor,
         w_patch: torch.Tensor,
         patch_idx: torch.Tensor,
-        kl_beta: float,
-        alpha: float,
-        beta: float,
+        structural_coef: float,
+        behavioral_coef: float,
+        contrastive_coef: float,
+        kl_coef: float,
         contrastive_temperature: float,
         contrastive_permute_inputs: bool,
         contrastive_sign_flip_inputs: bool,
@@ -322,22 +323,21 @@ class MiniPatchTrainingModel(nn.Module):
 
         structural_loss = F.mse_loss(w_hat_unit, w_patch_unit)
         behavioral_loss = self.patch_behavioral_mse(X_patch=X_patch, w_patch=w_patch_unit, w_hat=w_hat_unit)
-        recon_mix_loss = float(beta) * structural_loss + (1.0 - float(beta)) * behavioral_loss
+        recon_mix_loss = float(structural_coef) * structural_loss + float(behavioral_coef) * behavioral_loss
 
         contrastive_loss = self.contrastive_loss(
             X_full=X_full,
             patch_idx=patch_idx,
             out_idx=out_idx,
             W_full=W_full,
-            alpha=alpha,
+            contrastive_coef=contrastive_coef,
             temperature=contrastive_temperature,
             permute_inputs=contrastive_permute_inputs,
             sign_flip_inputs=contrastive_sign_flip_inputs,
         )
 
         kl_loss = self.mini_vae.kl_loss(mu=mu, logvar=logvar)
-        total_core_loss = float(alpha) * contrastive_loss + (1.0 - float(alpha)) * recon_mix_loss
-        total_loss = total_core_loss + float(kl_beta) * kl_loss
+        total_loss = recon_mix_loss + float(contrastive_coef) * contrastive_loss + float(kl_coef) * kl_loss
         return total_loss, structural_loss, behavioral_loss, contrastive_loss, recon_mix_loss, kl_loss
 
     def ablation_losses(
@@ -347,8 +347,9 @@ class MiniPatchTrainingModel(nn.Module):
         X_patch: torch.Tensor,
         w_patch: torch.Tensor,
         patch_idx: torch.Tensor,
-        beta: float,
-        kl_beta: float,
+        structural_coef: float,
+        behavioral_coef: float,
+        kl_coef: float,
     ) -> dict[str, torch.Tensor]:
         """
         Auxiliary ablation losses for evaluating information content:
@@ -364,8 +365,9 @@ class MiniPatchTrainingModel(nn.Module):
         mu_ref, _ = self.mini_vae.encode(w_patch=w_patch_unit, dist_var_tokens=dist_var_tokens)
 
         patch_size = int(w_patch.shape[1])
-        beta_value = float(beta)
-        kl_beta_value = float(kl_beta)
+        structural_coef_value = float(structural_coef)
+        behavioral_coef_value = float(behavioral_coef)
+        kl_coef_value = float(kl_coef)
 
         # Decoder-only ablation: random latents.
         z_random = torch.randn_like(mu_ref)
@@ -381,7 +383,9 @@ class MiniPatchTrainingModel(nn.Module):
             w_patch=w_patch_unit,
             w_hat=w_hat_rand_latent_unit,
         )
-        recon_mix_rand_latent = beta_value * structural_rand_latent + (1.0 - beta_value) * behavioral_rand_latent
+        recon_mix_rand_latent = (
+            structural_coef_value * structural_rand_latent + behavioral_coef_value * behavioral_rand_latent
+        )
 
         # Distribution ablation: random tokens replace distribution encoder output.
         rand_dist_var_tokens = torch.randn_like(dist_var_tokens)
@@ -398,9 +402,9 @@ class MiniPatchTrainingModel(nn.Module):
             w_patch=w_patch_unit,
             w_hat=w_hat_rand_dist_unit,
         )
-        recon_mix_rand_dist = beta_value * structural_rand_dist + (1.0 - beta_value) * behavioral_rand_dist
+        recon_mix_rand_dist = structural_coef_value * structural_rand_dist + behavioral_coef_value * behavioral_rand_dist
         kl_rand_dist = self.mini_vae.kl_loss(mu=mu_rand_dist, logvar=logvar_rand_dist)
-        total_rand_dist = recon_mix_rand_dist + kl_beta_value * kl_rand_dist
+        total_rand_dist = recon_mix_rand_dist + kl_coef_value * kl_rand_dist
 
         return {
             "decoder_random_latent_structural": structural_rand_latent,
