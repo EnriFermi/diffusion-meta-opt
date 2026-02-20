@@ -304,7 +304,10 @@ class MiniPatchTrainingModel(nn.Module):
         contrastive_sign_flip_inputs: bool,
         W_full: torch.Tensor | None = None,
         out_idx: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_latent_tensors: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]
+    ]:
         # X_full: [B_p, n, d_in]
         # X_patch: [B_p, n, p]
         # w_patch: [B_p, p]
@@ -314,11 +317,16 @@ class MiniPatchTrainingModel(nn.Module):
         )
         w_patch_unit = self.project_patch_weights_to_unit_sphere(w_patch_norm)
         dist_var_tokens, dist_patch_embed = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
-        w_hat_raw, mu, logvar, _ = self.mini_vae(
+        w_hat_raw, mu, logvar, z = self.mini_vae(
             w_patch=w_patch_unit,
             dist_var_tokens=dist_var_tokens,
             dist_patch_embed=dist_patch_embed,
         )
+        if return_latent_tensors:
+            if mu.requires_grad:
+                mu.retain_grad()
+            if z.requires_grad:
+                z.retain_grad()
         w_hat_unit = self.project_patch_weights_to_unit_sphere(w_hat_raw)
 
         structural_loss = F.mse_loss(w_hat_unit, w_patch_unit)
@@ -338,6 +346,11 @@ class MiniPatchTrainingModel(nn.Module):
 
         kl_loss = self.mini_vae.kl_loss(mu=mu, logvar=logvar)
         total_loss = recon_mix_loss + float(contrastive_coef) * contrastive_loss + float(kl_coef) * kl_loss
+        if return_latent_tensors:
+            return total_loss, structural_loss, behavioral_loss, contrastive_loss, recon_mix_loss, kl_loss, {
+                "mu": mu,
+                "z": z,
+            }
         return total_loss, structural_loss, behavioral_loss, contrastive_loss, recon_mix_loss, kl_loss
 
     def ablation_losses(

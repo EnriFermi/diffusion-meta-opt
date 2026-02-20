@@ -1496,6 +1496,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
             contrastive_window = 0.0
             recon_mix_window = 0.0
             kl_window = 0.0
+            latent_z_grad_norm_window = 0.0
+            latent_mu_grad_norm_window = 0.0
             window_steps = 0
             t0 = time.time()
             last_status_log_time = time.time()
@@ -1525,6 +1527,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                 contrastive_acc = 0.0
                 recon_mix_acc = 0.0
                 kl_acc = 0.0
+                latent_z_grad_norm_acc = 0.0
+                latent_mu_grad_norm_acc = 0.0
                 step_is_finite = True
                 fetch_ms_step = 0.0
                 patch_ms_step = 0.0
@@ -1586,7 +1590,15 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     with no_sync_ctx:
                         t_forward = time.perf_counter()
                         with autocast_context(enabled=amp_enabled, dtype=amp_dtype):
-                            total_loss, structural_loss, behavioral_loss, contrastive_loss, recon_mix_loss, kl_loss = model(
+                            (
+                                total_loss,
+                                structural_loss,
+                                behavioral_loss,
+                                contrastive_loss,
+                                recon_mix_loss,
+                                kl_loss,
+                                latent_tensors,
+                            ) = model(
                                 X_full=X_full,
                                 X_patch=X_patch,
                                 w_patch=w_patch,
@@ -1600,6 +1612,7 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                                 contrastive_sign_flip_inputs=contrastive_sign_flip_inputs,
                                 W_full=W,
                                 out_idx=out_idx,
+                                return_latent_tensors=True,
                             )
                             loss_for_backward = total_loss / grad_accum_steps
                         forward_ms_step += (time.perf_counter() - t_forward) * 1000.0
@@ -1621,6 +1634,20 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                             else:
                                 loss_for_backward.backward()
                             backward_ms_step += (time.perf_counter() - t_backward) * 1000.0
+
+                            scale_inv = 1.0
+                            if scaler.is_enabled():
+                                scale_value = float(scaler.get_scale())
+                                if scale_value > 0.0:
+                                    scale_inv = 1.0 / scale_value
+
+                            z_ref = latent_tensors.get("z")
+                            if torch.is_tensor(z_ref) and z_ref.grad is not None:
+                                latent_z_grad_norm_acc += float(z_ref.grad.detach().norm().item()) * scale_inv
+
+                            mu_ref = latent_tensors.get("mu")
+                            if torch.is_tensor(mu_ref) and mu_ref.grad is not None:
+                                latent_mu_grad_norm_acc += float(mu_ref.grad.detach().norm().item()) * scale_inv
 
                     loss_acc += float(total_loss.detach().item())
                     structural_acc += float(structural_loss.detach().item())
@@ -1669,6 +1696,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                 step_contrastive = contrastive_acc / grad_accum_steps
                 step_recon_mix = recon_mix_acc / grad_accum_steps
                 step_kl = kl_acc / grad_accum_steps
+                step_latent_z_grad_norm = latent_z_grad_norm_acc / grad_accum_steps
+                step_latent_mu_grad_norm = latent_mu_grad_norm_acc / grad_accum_steps
 
                 stats = torch.tensor(
                     [
@@ -1678,6 +1707,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                         step_contrastive,
                         step_recon_mix,
                         step_kl,
+                        step_latent_z_grad_norm,
+                        step_latent_mu_grad_norm,
                     ],
                     dtype=torch.float32,
                     device=device,
@@ -1692,6 +1723,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                 contrastive_window += float(stats[3].item())
                 recon_mix_window += float(stats[4].item())
                 kl_window += float(stats[5].item())
+                latent_z_grad_norm_window += float(stats[6].item())
+                latent_mu_grad_norm_window += float(stats[7].item())
                 window_steps += 1
                 step_fetch_ms_window += fetch_ms_step
                 step_patch_ms_window += patch_ms_step
@@ -1707,6 +1740,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     avg_contrastive = contrastive_window / max(1, window_steps)
                     avg_recon_mix = recon_mix_window / max(1, window_steps)
                     avg_kl = kl_window / max(1, window_steps)
+                    avg_latent_z_grad_norm = latent_z_grad_norm_window / max(1, window_steps)
+                    avg_latent_mu_grad_norm = latent_mu_grad_norm_window / max(1, window_steps)
                     lr = float(optimizer.param_groups[0]["lr"])
                     speed = window_steps / dt
 
@@ -1745,7 +1780,7 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                         "step=%s/%s loss=%.6f str=%.6f beh=%.6f con=%.6f recon_mix=%.6f kl=%.6f "
                         "coef_str=%.3f coef_beh=%.3f coef_con=%.3f coef_kl=%.4f lr=%.6e steps/s=%.2f patches=%s cache=%s "
                         "t_fetch=%.2fms t_patch=%.2fms t_fwd=%.2fms t_bwd=%.2fms t_opt=%.2fms "
-                        "grad_norm=%.4f grad_rms=%.6f clip=%.3f",
+                        "grad_norm=%.4f grad_rms=%.6f clip=%.3f dL_dz=%.6f dL_dmu=%.6f",
                         global_step,
                         max_steps,
                         avg_loss,
@@ -1770,6 +1805,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                         float(grad_stats.get("grad/global_norm", 0.0)),
                         float(grad_stats.get("grad/rms", 0.0)),
                         float(grad_stats.get("grad/clip_coef", 1.0)),
+                        float(avg_latent_z_grad_norm),
+                        float(avg_latent_mu_grad_norm),
                     )
                     logger.info(
                         "sample_mix window=%s models=%s datasets=%s layers=%s",
@@ -1842,6 +1879,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                         "train/recon_mix": float(avg_recon_mix),
                         "train/recon": float(avg_structural),
                         "train/kl": float(avg_kl),
+                        "train/latent_z_grad_norm": float(avg_latent_z_grad_norm),
+                        "train/latent_mu_grad_norm": float(avg_latent_mu_grad_norm),
                         "train/loss_structural_coef": float(structural_coef),
                         "train/loss_behavioral_coef": float(behavioral_coef),
                         "train/loss_contrastive_coef": float(contrastive_coef),
@@ -1913,6 +1952,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     contrastive_window = 0.0
                     recon_mix_window = 0.0
                     kl_window = 0.0
+                    latent_z_grad_norm_window = 0.0
+                    latent_mu_grad_norm_window = 0.0
                     window_steps = 0
                     step_fetch_ms_window = 0.0
                     step_patch_ms_window = 0.0
