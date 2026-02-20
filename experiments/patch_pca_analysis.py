@@ -602,17 +602,22 @@ def main() -> None:
             writer.writerow(row)
 
     all_points = _stack_or_empty(all_patch_chunks, int(args.patch_size))
+    arch_plot_path = output_dir / "all_points_pca_by_architecture.png"
+    layer_plot_path = output_dir / "all_points_pca_by_layer_type.png"
     plot_path = output_dir / "all_points_pca.png"
     points_csv_path = output_dir / "all_points_pca2d.csv"
     coords = torch.empty((0, 2), dtype=torch.float32)
     explained = [0.0, 0.0]
     global_plot_meta: dict[str, Any] = {
         "num_points": int(all_points.shape[0]),
-        "plot_path": str(plot_path),
+        "plot_path": str(plot_path),  # backward-compatible alias to architecture plot
+        "architecture_plot_path": str(arch_plot_path),
+        "layer_type_plot_path": str(layer_plot_path),
         "points_csv_path": str(points_csv_path),
         "pc1_explained_variance_ratio": 0.0,
         "pc2_explained_variance_ratio": 0.0,
-        "plot_saved": False,
+        "architecture_plot_saved": False,
+        "layer_type_plot_saved": False,
     }
     if int(all_points.shape[0]) > 0:
         coords, explained = compute_projection_2d(all_points)
@@ -644,36 +649,59 @@ def main() -> None:
             LOGGER.warning("Could not import matplotlib; skipping global PCA plot: %s", exc)
         else:
             coords_cpu = coords.cpu()
-            fig, ax = plt.subplots(figsize=(12, 9))
 
-            unique_arch = sorted(set(all_patch_arch_labels))
-            cmap = plt.get_cmap("tab20", max(1, len(unique_arch)))
-            for color_idx, arch in enumerate(unique_arch):
-                indices = [i for i, value in enumerate(all_patch_arch_labels) if value == arch]
-                if not indices:
-                    continue
-                idx_tensor = torch.tensor(indices, dtype=torch.long)
-                points = coords_cpu.index_select(0, idx_tensor)
-                ax.scatter(
-                    points[:, 0].numpy(),
-                    points[:, 1].numpy(),
-                    s=8,
-                    alpha=0.35,
-                    color=cmap(color_idx),
-                    label=arch,
-                    linewidths=0.0,
-                )
+            def _scatter_by_labels(labels: list[str], title: str, out_path: Path) -> bool:
+                unique_labels = sorted(set(labels))
+                if not unique_labels:
+                    return False
 
-            ax.set_title("PCA of Weight Patches (All Points, Single Plot)")
-            ax.set_xlabel(f"PC1 ({explained[0] * 100.0:.2f}% variance)")
-            ax.set_ylabel(f"PC2 ({explained[1] * 100.0:.2f}% variance)")
-            ax.grid(alpha=0.2)
-            if len(unique_arch) <= 20:
-                ax.legend(loc="best", fontsize=8, framealpha=0.9)
-            fig.tight_layout()
-            fig.savefig(plot_path, dpi=200)
-            plt.close(fig)
-            global_plot_meta["plot_saved"] = True
+                fig, ax = plt.subplots(figsize=(12, 9))
+                cmap = plt.get_cmap("tab20", max(1, len(unique_labels)))
+                for color_idx, label in enumerate(unique_labels):
+                    indices = [i for i, value in enumerate(labels) if value == label]
+                    if not indices:
+                        continue
+                    idx_tensor = torch.tensor(indices, dtype=torch.long)
+                    points = coords_cpu.index_select(0, idx_tensor)
+                    ax.scatter(
+                        points[:, 0].numpy(),
+                        points[:, 1].numpy(),
+                        s=8,
+                        alpha=0.35,
+                        color=cmap(color_idx),
+                        label=label,
+                        linewidths=0.0,
+                    )
+
+                ax.set_title(title)
+                ax.set_xlabel(f"PC1 ({explained[0] * 100.0:.2f}% variance)")
+                ax.set_ylabel(f"PC2 ({explained[1] * 100.0:.2f}% variance)")
+                ax.grid(alpha=0.2)
+                if len(unique_labels) <= 20:
+                    ax.legend(loc="best", fontsize=8, framealpha=0.9)
+                fig.tight_layout()
+                fig.savefig(out_path, dpi=200)
+                plt.close(fig)
+                return True
+
+            arch_saved = _scatter_by_labels(
+                labels=all_patch_arch_labels,
+                title="PCA of Weight Patches (Colored by Architecture)",
+                out_path=arch_plot_path,
+            )
+            layer_saved = _scatter_by_labels(
+                labels=all_patch_layer_labels,
+                title="PCA of Weight Patches (Colored by Layer Type)",
+                out_path=layer_plot_path,
+            )
+            global_plot_meta["architecture_plot_saved"] = arch_saved
+            global_plot_meta["layer_type_plot_saved"] = layer_saved
+            if arch_saved:
+                # Keep old path for compatibility with previous output consumers.
+                try:
+                    plot_path.write_bytes(arch_plot_path.read_bytes())
+                except Exception:
+                    pass
 
     summary["global_all_points_plot"] = global_plot_meta
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -682,10 +710,14 @@ def main() -> None:
     LOGGER.info("Saved PCA tensors to %s", tensors_path)
     LOGGER.info("Saved explained variance table to %s", csv_path)
     LOGGER.info("Saved PCA point coordinates to %s", points_csv_path)
-    if global_plot_meta["plot_saved"]:
-        LOGGER.info("Saved all-points PCA plot to %s", plot_path)
+    if global_plot_meta["architecture_plot_saved"]:
+        LOGGER.info("Saved all-points PCA architecture plot to %s", arch_plot_path)
     else:
-        LOGGER.info("All-points PCA plot was not saved (matplotlib unavailable or no points)")
+        LOGGER.info("All-points PCA architecture plot was not saved (matplotlib unavailable or no points)")
+    if global_plot_meta["layer_type_plot_saved"]:
+        LOGGER.info("Saved all-points PCA layer-type plot to %s", layer_plot_path)
+    else:
+        LOGGER.info("All-points PCA layer-type plot was not saved (matplotlib unavailable or no points)")
 
 
 if __name__ == "__main__":
