@@ -194,6 +194,7 @@ class InputDistributionEncodingModule(nn.Module):
             dim_feedforward=max(4 * cfg.d_var, cfg.d_var),
             dropout=cfg.dropout,
             batch_first=True,
+            norm_first=True,
             activation="gelu",
         )
         self.var_encoder = nn.TransformerEncoder(enc_layer, num_layers=max(1, cfg.num_var_attn_layers))
@@ -329,6 +330,7 @@ class MiniPatchEncoder(nn.Module):
             dim_feedforward=max(4 * cfg.d_e, cfg.d_e),
             dropout=cfg.dropout,
             batch_first=True,
+            norm_first=True,
             activation="gelu",
         )
         self.set_encoder = nn.TransformerEncoder(enc_layer, num_layers=max(1, cfg.num_attn_layers_encoder))
