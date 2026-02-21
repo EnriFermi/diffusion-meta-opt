@@ -556,8 +556,52 @@ class MiniPatchVAE(nn.Module):
         return w_hat, mu, logvar, z
 
 
+class PerceiverResamplerBlock(nn.Module):
+    """Perceiver-style resampler block over latent queries and input patch tokens."""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.norm_cross_q = nn.LayerNorm(d_model)
+        self.norm_cross_kv = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_self = nn.LayerNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_ffn = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, latents: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        q = self.norm_cross_q(latents)
+        kv = self.norm_cross_kv(tokens)
+        cross_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+        latents = latents + self.dropout(cross_out)
+
+        lat_norm = self.norm_self(latents)
+        self_out, _ = self.self_attn(lat_norm, lat_norm, lat_norm, need_weights=False)
+        latents = latents + self.dropout(self_out)
+
+        latents = latents + self.dropout(self.ffn(self.norm_ffn(latents)))
+        return latents
+
+
 class TransformerNoCompressionPatchEncoder(nn.Module):
-    """Debug encoder: mini-transformer with mean-pooled patch latent bottleneck."""
+    """Debug encoder: Perceiver Resampler over patch tokens (no distribution conditioning)."""
 
     def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
         super().__init__()
@@ -576,16 +620,14 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
             nn.Dropout(cfg.dropout),
         )
 
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_e,
-            nhead=cfg.n_heads,
-            dim_feedforward=max(4 * cfg.d_e, cfg.d_e),
-            dropout=cfg.dropout,
-            batch_first=True,
-            norm_first=True,
-            activation="gelu",
+        self.num_latents = max(1, int(cfg.decoder_L_latents))
+        self.resampler_latents = nn.Parameter(torch.randn(self.num_latents, cfg.d_e) * 0.02)
+        self.resampler = nn.ModuleList(
+            [
+                PerceiverResamplerBlock(d_model=cfg.d_e, n_heads=cfg.n_heads, dropout=cfg.dropout)
+                for _ in range(max(1, cfg.num_attn_layers_encoder))
+            ]
         )
-        self.set_encoder = nn.TransformerEncoder(enc_layer, num_layers=max(1, cfg.num_attn_layers_encoder))
         self.latent_norm = nn.LayerNorm(cfg.d_e)
         self.to_mu = nn.Linear(cfg.d_e, cfg.z_dim)
         self.to_logvar = nn.Linear(cfg.d_e, cfg.z_dim)
@@ -613,8 +655,11 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
         token_in = torch.cat([w_patch.unsqueeze(-1), pos_expand], dim=-1)
         e = self.elem_embed(token_in)
 
-        e_ctx = self.set_encoder(e)
-        h = self.latent_norm(e_ctx.mean(dim=1))
+        token_ctx = e
+        latents = self.resampler_latents.unsqueeze(0).expand(B, -1, -1)
+        for block in self.resampler:
+            latents = block(latents=latents, tokens=token_ctx)
+        h = self.latent_norm(latents.mean(dim=1))
         mu = self.to_mu(h)
         logvar = self.to_logvar(h)
         return mu, logvar
@@ -677,7 +722,7 @@ class MLPNoCompressionPatchDecoder(nn.Module):
 class MiniPatchVAEStub(nn.Module):
     """
     Debug Mini-VAE replacement:
-    - encoder: mini-transformer without distribution conditioning + single CLS latent
+    - encoder: Perceiver Resampler over patch tokens (without distribution conditioning)
     - decoder: MLP from latent to full patch
     """
 
