@@ -557,7 +557,7 @@ class MiniPatchVAE(nn.Module):
 
 
 class TransformerNoCompressionPatchEncoder(nn.Module):
-    """Debug encoder: mini-transformer with single CLS latent bottleneck."""
+    """Debug encoder: mini-transformer with mean-pooled patch latent bottleneck."""
 
     def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
         super().__init__()
@@ -586,7 +586,6 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
             activation="gelu",
         )
         self.set_encoder = nn.TransformerEncoder(enc_layer, num_layers=max(1, cfg.num_attn_layers_encoder))
-        self.cls_token = nn.Parameter(torch.zeros(cfg.d_e))
         self.latent_norm = nn.LayerNorm(cfg.d_e)
         self.to_mu = nn.Linear(cfg.d_e, cfg.z_dim)
         self.to_logvar = nn.Linear(cfg.d_e, cfg.z_dim)
@@ -614,11 +613,8 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
         token_in = torch.cat([w_patch.unsqueeze(-1), pos_expand], dim=-1)
         e = self.elem_embed(token_in)
 
-        cls = self.cls_token.to(dtype=e.dtype).view(1, 1, -1).expand(B, 1, -1)
-        enc_in = torch.cat([cls, e], dim=1)
-        e_ctx = self.set_encoder(enc_in)
-
-        h = self.latent_norm(e_ctx[:, 0, :])
+        e_ctx = self.set_encoder(e)
+        h = self.latent_norm(e_ctx.mean(dim=1))
         mu = self.to_mu(h)
         logvar = self.to_logvar(h)
         return mu, logvar
