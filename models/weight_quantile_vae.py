@@ -327,17 +327,14 @@ class MiniPatchEncoder(nn.Module):
             nn.Dropout(cfg.dropout),
         )
 
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_e,
-            nhead=cfg.n_heads,
-            dim_feedforward=max(4 * cfg.d_e, cfg.d_e),
-            dropout=cfg.dropout,
-            batch_first=True,
-            norm_first=True,
-            activation="gelu",
+        self.num_latents = max(1, int(cfg.decoder_L_latents))
+        self.resampler_latents = nn.Parameter(torch.randn(self.num_latents, cfg.d_e) * 0.02)
+        self.resampler = nn.ModuleList(
+            [
+                PerceiverResamplerBlock(d_model=cfg.d_e, n_heads=cfg.n_heads, dropout=cfg.dropout)
+                for _ in range(max(1, cfg.num_attn_layers_encoder))
+            ]
         )
-        self.set_encoder = nn.TransformerEncoder(enc_layer, num_layers=max(1, cfg.num_attn_layers_encoder))
-        self.cls_token = nn.Parameter(torch.zeros(cfg.d_e))
         self.head_norm = nn.LayerNorm(cfg.d_e)
 
         self.to_mu = nn.Linear(cfg.d_e, cfg.z_dim)
@@ -373,17 +370,11 @@ class MiniPatchEncoder(nn.Module):
         # E: [B, p, d_e]
         e = self.elem_embed(t)
 
-        # Prepend learnable CLS token and use its output as sequence summary.
-        # cls: [B, 1, d_e], enc_in: [B, 1 + p, d_e]
-        cls = self.cls_token.to(dtype=e.dtype).view(1, 1, -1).expand(B, 1, -1)
-        enc_in = torch.cat([cls, e], dim=1)
-
-        # E_ctx: [B, 1 + p, d_e]
-        e_ctx = self.set_encoder(enc_in)
-
-        # h: [B, d_e] from CLS readout.
-        h = e_ctx[:, 0, :]
-        h = self.head_norm(h)
+        # Perceiver resampling: latent queries cross-attend to patch tokens.
+        latents = self.resampler_latents.unsqueeze(0).expand(B, -1, -1)
+        for block in self.resampler:
+            latents = block(latents=latents, tokens=e)
+        h = self.head_norm(latents.mean(dim=1))
 
         # mu/logvar: [B, z_dim]
         mu = self.to_mu(h)
