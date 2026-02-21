@@ -557,7 +557,7 @@ class MiniPatchVAE(nn.Module):
 
 
 class TransformerNoCompressionPatchEncoder(nn.Module):
-    """Debug encoder: mini-transformer without distribution conditioning, latent size equals patch size."""
+    """Debug encoder: mini-transformer with single CLS latent bottleneck."""
 
     def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
         super().__init__()
@@ -587,9 +587,13 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
         )
         self.set_encoder = nn.TransformerEncoder(enc_layer, num_layers=max(1, cfg.num_attn_layers_encoder))
         self.cls_token = nn.Parameter(torch.zeros(cfg.d_e))
-        self.token_norm = nn.LayerNorm(cfg.d_e)
-        self.to_mu_token = nn.Linear(cfg.d_e, 1)
-        self.to_logvar_token = nn.Linear(cfg.d_e, 1)
+        self.latent_norm = nn.LayerNorm(cfg.d_e)
+        self.to_mu = nn.Linear(cfg.d_e, cfg.z_dim)
+        self.to_logvar = nn.Linear(cfg.d_e, cfg.z_dim)
+        if cfg.d_patch == cfg.z_dim:
+            self.patch_proj = nn.Identity()
+        else:
+            self.patch_proj = nn.Linear(cfg.z_dim, cfg.d_patch)
 
     def encode(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if w_patch.ndim != 2:
@@ -614,38 +618,33 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
         enc_in = torch.cat([cls, e], dim=1)
         e_ctx = self.set_encoder(enc_in)
 
-        token_h = self.token_norm(e_ctx[:, 1:, :])
-        mu = self.to_mu_token(token_h).squeeze(-1)
-        logvar = self.to_logvar_token(token_h).squeeze(-1)
+        h = self.latent_norm(e_ctx[:, 0, :])
+        mu = self.to_mu(h)
+        logvar = self.to_logvar(h)
         return mu, logvar
 
     def encode_patch(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
         mu, _ = self.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
-        target_dim = int(self.cfg.d_patch)
-        current_dim = int(mu.shape[1])
-        if current_dim == target_dim:
-            return mu
-        if current_dim > target_dim:
-            return mu[:, :target_dim]
-        pad = mu.new_zeros((mu.shape[0], target_dim - current_dim))
-        return torch.cat([mu, pad], dim=1)
+        return self.patch_proj(mu)
 
 
 class MLPNoCompressionPatchDecoder(nn.Module):
-    """Debug decoder: 2-layer token MLP over z (plus optional dist scalar)."""
+    """Debug decoder: MLP from one latent vector to full patch."""
 
     def __init__(self, d_dist: int, cfg: MiniVAEConfig) -> None:
         super().__init__()
         self.cfg = cfg
         self.use_dist_conditioning = bool(cfg.decoder_use_dist_conditioning)
+        self.latent_dim = int(cfg.z_dim)
+        self.out_dim = max(1, int(cfg.d_patch))
         hidden = max(4, int(cfg.mlp_stub_hidden_dim))
-        in_dim = 2 if self.use_dist_conditioning else 1
+        in_dim = self.latent_dim + (1 if self.use_dist_conditioning else 0)
         self.dist_scalar = nn.Linear(int(d_dist), 1) if self.use_dist_conditioning else None
-        self.token_mlp = nn.Sequential(
+        self.patch_mlp = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden, self.out_dim),
         )
 
     def forward(self, z: torch.Tensor, patch_size: int, dist_patch_embed: torch.Tensor | None = None) -> torch.Tensor:
@@ -656,29 +655,34 @@ class MLPNoCompressionPatchDecoder(nn.Module):
 
         B, z_dim = z.shape
         p = int(patch_size)
-        if z_dim >= p:
-            z_aligned = z[:, :p]
+        if z_dim >= self.latent_dim:
+            z_aligned = z[:, : self.latent_dim]
         else:
-            pad = z.new_zeros((B, p - z_dim))
+            pad = z.new_zeros((B, self.latent_dim - z_dim))
             z_aligned = torch.cat([z, pad], dim=1)
 
-        token_in = z_aligned.unsqueeze(-1)
+        dec_in = z_aligned
         if self.use_dist_conditioning:
             if self.dist_scalar is None or dist_patch_embed is None:
-                dist_token = token_in.new_zeros((B, p, 1))
+                dist_scalar = dec_in.new_zeros((B, 1))
             else:
-                dist_token = self.dist_scalar(dist_patch_embed).unsqueeze(1).expand(-1, p, -1)
-            token_in = torch.cat([token_in, dist_token], dim=-1)
+                dist_scalar = self.dist_scalar(dist_patch_embed)
+            dec_in = torch.cat([dec_in, dist_scalar], dim=-1)
 
-        w_hat = self.token_mlp(token_in).squeeze(-1)
-        return w_hat
+        w_hat = self.patch_mlp(dec_in)
+        if self.out_dim == p:
+            return w_hat
+        if self.out_dim > p:
+            return w_hat[:, :p]
+        pad = w_hat.new_zeros((B, p - self.out_dim))
+        return torch.cat([w_hat, pad], dim=1)
 
 
 class MiniPatchVAEStub(nn.Module):
     """
     Debug Mini-VAE replacement:
-    - encoder: mini-transformer without distribution conditioning, latent has patch dimensionality (no compression)
-    - decoder: 2-layer token MLP
+    - encoder: mini-transformer without distribution conditioning + single CLS latent
+    - decoder: MLP from latent to full patch
     """
 
     def __init__(self, d_var: int, cfg: MiniVAEConfig, d_dist: int | None = None) -> None:
