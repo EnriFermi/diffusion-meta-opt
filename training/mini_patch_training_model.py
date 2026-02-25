@@ -49,6 +49,7 @@ def build_mini_vae_config(cfg: DictConfig, section: str = "mini_model") -> MiniV
         use_latent_sampling=bool(mini_cfg.get("use_latent_sampling", True)),
         implementation=str(mini_cfg.get("implementation", "real")),
         mlp_stub_hidden_dim=int(mini_cfg.get("mlp_stub_hidden_dim", 256)),
+        stub_resampler_d_model=int(mini_cfg.get("stub_resampler_d_model", 0)),
         n_heads=int(mini_cfg.get("n_heads", 4)),
         d_patch=int(mini_cfg.get("d_patch", 64)),
         dropout=float(mini_cfg.get("dropout", 0.0)),

@@ -13,6 +13,7 @@ mini_vae:
   decoder_bilinear_rank: 16
   d_e: 256
   mlp_stub_hidden_dim: 256
+  stub_resampler_d_model: 0  # 0 => use d_e
   use_latent_sampling: false
   num_attn_layers_encoder: 3
   num_layers_decoder: 3

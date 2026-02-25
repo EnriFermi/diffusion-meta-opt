@@ -300,6 +300,9 @@ class MiniVAEConfig:
     use_latent_sampling: bool = True
     implementation: str = "real"  # {"real", "mlp_stub"}
     mlp_stub_hidden_dim: int = 256
+    # Stub-only: if > 0, Perceiver resampler width in TransformerNoCompressionPatchEncoder.
+    # If 0, defaults to d_e.
+    stub_resampler_d_model: int = 0
     n_heads: int = 4
     d_patch: int = 64
     dropout: float = 0.0
@@ -602,6 +605,16 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
             raise ValueError(f"mini d_e ({cfg.d_e}) must be divisible by n_heads ({cfg.n_heads})")
         if cfg.pos_dim <= 0:
             raise ValueError(f"mini pos_dim must be positive, got {cfg.pos_dim}")
+        if int(cfg.stub_resampler_d_model) < 0:
+            raise ValueError(
+                f"mini stub_resampler_d_model must be >= 0, got {int(cfg.stub_resampler_d_model)}"
+            )
+
+        self.resampler_d_model = int(cfg.stub_resampler_d_model) if int(cfg.stub_resampler_d_model) > 0 else int(cfg.d_e)
+        if self.resampler_d_model % cfg.n_heads != 0:
+            raise ValueError(
+                f"mini stub resampler d_model ({self.resampler_d_model}) must be divisible by n_heads ({cfg.n_heads})"
+            )
 
         self.elem_embed = nn.Sequential(
             nn.Linear(1 + cfg.pos_dim, cfg.d_e),
@@ -610,18 +623,26 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
             nn.Linear(cfg.d_e, cfg.d_e),
             nn.Dropout(cfg.dropout),
         )
+        if self.resampler_d_model == int(cfg.d_e):
+            self.token_to_resampler = nn.Identity()
+        else:
+            self.token_to_resampler = nn.Linear(cfg.d_e, self.resampler_d_model)
 
         self.num_latents = max(1, int(cfg.decoder_L_latents))
-        self.resampler_latents = nn.Parameter(torch.randn(self.num_latents, cfg.d_e) * 0.02)
+        self.resampler_latents = nn.Parameter(torch.randn(self.num_latents, self.resampler_d_model) * 0.02)
         self.resampler = nn.ModuleList(
             [
-                PerceiverResamplerBlock(d_model=cfg.d_e, n_heads=cfg.n_heads, dropout=cfg.dropout)
+                PerceiverResamplerBlock(
+                    d_model=self.resampler_d_model,
+                    n_heads=cfg.n_heads,
+                    dropout=cfg.dropout,
+                )
                 for _ in range(max(1, cfg.num_attn_layers_encoder))
             ]
         )
-        self.latent_norm = nn.LayerNorm(cfg.d_e)
-        self.to_mu = nn.Linear(cfg.d_e, cfg.z_dim)
-        self.to_logvar = nn.Linear(cfg.d_e, cfg.z_dim)
+        self.latent_norm = nn.LayerNorm(self.resampler_d_model)
+        self.to_mu = nn.Linear(self.resampler_d_model, cfg.z_dim)
+        self.to_logvar = nn.Linear(self.resampler_d_model, cfg.z_dim)
         if cfg.d_patch == cfg.z_dim:
             self.patch_proj = nn.Identity()
         else:
@@ -646,7 +667,7 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
         token_in = torch.cat([w_patch.unsqueeze(-1), pos_expand], dim=-1)
         e = self.elem_embed(token_in)
 
-        token_ctx = e
+        token_ctx = self.token_to_resampler(e)
         latents = self.resampler_latents.unsqueeze(0).expand(B, -1, -1)
         for block in self.resampler:
             latents = block(latents=latents, tokens=token_ctx)
