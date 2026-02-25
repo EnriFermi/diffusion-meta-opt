@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import faulthandler
+import inspect
 import json
 import logging
 import math
@@ -29,7 +30,7 @@ from dataset.shared.shared_dataset import SharedModelDataset
 from dataset.shared.streaming.backends.local_disk import LocalDiskChunkStore
 from dataset.shared.streaming.factory import build_chunk_store, resolve_streaming_cfg
 from dataset.shared.types import SharedSample
-from training.optim import build_adamw_optimizer, build_cosine_scheduler
+from training.optim import build_cosine_scheduler
 from training.mini_patch_training_model import MiniPatchTrainingModel, build_distribution_config, build_mini_vae_config
 from training.runtime import (
     autocast_context as runtime_autocast_context,
@@ -93,6 +94,29 @@ def promote_run_profile_to_root(cfg: DictConfig) -> None:
                 continue
             if section in run_profiles_cfg:
                 cfg[section] = run_profiles_cfg[section]
+
+
+def _strip_ddp_prefix(name: str) -> str:
+    if name.startswith("module."):
+        return name[len("module.") :]
+    return name
+
+
+def _resolve_group_lr(train_cfg: DictConfig, key: str, fallback_lr: float) -> float:
+    value = train_cfg.get(key, None)
+    if value is None:
+        return float(fallback_lr)
+    lr = float(value)
+    if lr <= 0.0:
+        raise ValueError(f"mini_train.{key} must be > 0 when set, got {lr}")
+    return lr
+
+
+def _get_optimizer_group_lr(optimizer: torch.optim.Optimizer, group_name: str, fallback_lr: float) -> float:
+    for group in optimizer.param_groups:
+        if str(group.get("group_name", "")) == group_name:
+            return float(group["lr"])
+    return float(fallback_lr)
 
 
 class CometTracker:
@@ -160,6 +184,16 @@ class CometTracker:
                 {
                     "mini_train.max_steps": int(cfg.mini_train.get("max_steps", 0)),
                     "mini_train.lr": float(cfg.mini_train.get("lr", 0.0)),
+                    "mini_train.lr_encoder": (
+                        float(cfg.mini_train.get("lr_encoder"))
+                        if cfg.mini_train.get("lr_encoder", None) is not None
+                        else float(cfg.mini_train.get("lr", 0.0))
+                    ),
+                    "mini_train.lr_decoder": (
+                        float(cfg.mini_train.get("lr_decoder"))
+                        if cfg.mini_train.get("lr_decoder", None) is not None
+                        else float(cfg.mini_train.get("lr", 0.0))
+                    ),
                     "mini_train.grad_accum_steps": int(cfg.mini_train.get("grad_accum_steps", 1)),
                     "mini_train.patches_per_sample": int(cfg.mini_train.get("patches_per_sample", 16)),
                     "mini_model.patch_size": int(cfg.mini_model.get("patch_size", 64)),
@@ -1161,14 +1195,57 @@ def build_optimizer(
     cfg: DictConfig,
     device: torch.device,
 ) -> torch.optim.Optimizer:
-    return build_adamw_optimizer(
-        model=model,
-        cfg=cfg,
-        device=device,
-        section="mini_train",
-        default_lr=2e-4,
-        default_weight_decay=0.01,
-    )
+    train_cfg = cfg["mini_train"]
+    lr = float(train_cfg.get("lr", 2e-4))
+    if lr <= 0.0:
+        raise ValueError(f"mini_train.lr must be > 0, got {lr}")
+    lr_encoder = _resolve_group_lr(train_cfg, "lr_encoder", lr)
+    lr_decoder = _resolve_group_lr(train_cfg, "lr_decoder", lr)
+    weight_decay = float(train_cfg.get("weight_decay", 0.01))
+    betas_cfg = train_cfg.get("betas", [0.9, 0.95])
+    beta1 = float(betas_cfg[0])
+    beta2 = float(betas_cfg[1])
+    eps = float(train_cfg.get("eps", 1e-8))
+
+    named_params = list(model.named_parameters())
+    default_params: list[torch.nn.Parameter] = []
+    mini_encoder_params: list[torch.nn.Parameter] = []
+    mini_decoder_params: list[torch.nn.Parameter] = []
+    for raw_name, param in named_params:
+        if not param.requires_grad:
+            continue
+        name = _strip_ddp_prefix(raw_name)
+        if name.startswith("mini_vae.encoder."):
+            mini_encoder_params.append(param)
+        elif name.startswith("mini_vae.decoder."):
+            mini_decoder_params.append(param)
+        else:
+            default_params.append(param)
+
+    param_groups: list[dict[str, Any]] = []
+    if default_params:
+        param_groups.append({"params": default_params, "lr": lr, "group_name": "default"})
+    if mini_encoder_params:
+        param_groups.append({"params": mini_encoder_params, "lr": lr_encoder, "group_name": "mini_encoder"})
+    if mini_decoder_params:
+        param_groups.append({"params": mini_decoder_params, "lr": lr_decoder, "group_name": "mini_decoder"})
+    if not param_groups:
+        raise ValueError("No trainable parameters were found for optimizer construction")
+
+    kwargs: dict[str, Any] = {
+        "weight_decay": weight_decay,
+        "betas": (beta1, beta2),
+        "eps": eps,
+    }
+    adamw_signature = inspect.signature(torch.optim.AdamW).parameters
+    use_fused = "fused" in adamw_signature and device.type == "cuda"
+    use_foreach = "foreach" in adamw_signature and not use_fused
+    if "fused" in adamw_signature:
+        kwargs["fused"] = use_fused
+    if "foreach" in adamw_signature:
+        kwargs["foreach"] = use_foreach
+
+    return torch.optim.AdamW(param_groups, **kwargs)
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, cfg: DictConfig) -> torch.optim.lr_scheduler.LambdaLR:
@@ -1742,7 +1819,10 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     avg_kl = kl_window / max(1, window_steps)
                     avg_latent_z_grad_norm = latent_z_grad_norm_window / max(1, window_steps)
                     avg_latent_mu_grad_norm = latent_mu_grad_norm_window / max(1, window_steps)
-                    lr = float(optimizer.param_groups[0]["lr"])
+                    lr_default = _get_optimizer_group_lr(optimizer, "default", float(optimizer.param_groups[0]["lr"]))
+                    lr_encoder = _get_optimizer_group_lr(optimizer, "mini_encoder", lr_default)
+                    lr_decoder = _get_optimizer_group_lr(optimizer, "mini_decoder", lr_default)
+                    lr = lr_default
                     speed = window_steps / dt
 
                     cache_metric = dataset.cache_size() if dataset is not None else 0
@@ -1778,7 +1858,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
 
                     logger.info(
                         "step=%s/%s loss=%.6f str=%.6f beh=%.6f con=%.6f recon_mix=%.6f kl=%.6f "
-                        "coef_str=%.3f coef_beh=%.3f coef_con=%.3f coef_kl=%.4f lr=%.6e steps/s=%.2f patches=%s cache=%s "
+                        "coef_str=%.3f coef_beh=%.3f coef_con=%.3f coef_kl=%.4f "
+                        "lr=%.6e lr_enc=%.6e lr_dec=%.6e steps/s=%.2f patches=%s cache=%s "
                         "t_fetch=%.2fms t_patch=%.2fms t_fwd=%.2fms t_bwd=%.2fms t_opt=%.2fms "
                         "grad_norm=%.4f grad_rms=%.6f clip=%.3f dL_dz=%.6f dL_dmu=%.6f",
                         global_step,
@@ -1794,6 +1875,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                         contrastive_coef,
                         kl_coef,
                         lr,
+                        lr_encoder,
+                        lr_decoder,
                         speed,
                         patches_per_sample,
                         cache_metric,
@@ -1886,6 +1969,9 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                         "train/loss_contrastive_coef": float(contrastive_coef),
                         "train/loss_kl_coef": float(kl_coef),
                         "train/lr": float(lr),
+                        "train/lr_default": float(lr_default),
+                        "train/lr_encoder": float(lr_encoder),
+                        "train/lr_decoder": float(lr_decoder),
                         "train/steps_per_sec": float(speed),
                         "timing/fetch_ms": float(avg_fetch_ms),
                         "timing/patch_ms": float(avg_patch_ms),
