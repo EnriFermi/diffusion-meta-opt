@@ -8,14 +8,12 @@ distribution:
   dropout: 0.05
 
 mini_vae:
-  decoder_L_latents: 4
-  z_dim: 512
+  decoder_L_latents: 1
+  z_dim: 32
   decoder_bilinear_rank: 16
-  d_e: 256
-  num_attn_layers_encoder: 10
-  num_layers_decoder: 4
-  implementation: mlp_stub
-  mlp_stub_hidden_dim: 256
+  d_e: 128
+  num_attn_layers_encoder: 4
+  num_layers_decoder: 2
   use_latent_sampling: false
-  n_heads: 8
+  n_heads: 4
   dropout: 0.05
