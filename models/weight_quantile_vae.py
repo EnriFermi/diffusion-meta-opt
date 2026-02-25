@@ -61,6 +61,35 @@ def sinusoidal_embedding(indices: torch.Tensor, dim: int, max_period: float = 10
     return emb
 
 
+def _init_vae_module_weights(module: nn.Module) -> None:
+    """Explicit initialization for mini-VAE modules (real and stub variants)."""
+    if isinstance(module, nn.Linear):
+        nn.init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+        nn.init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.MultiheadAttention):
+        if module.in_proj_weight is not None:
+            nn.init.xavier_uniform_(module.in_proj_weight)
+        if module.in_proj_bias is not None:
+            nn.init.zeros_(module.in_proj_bias)
+    elif isinstance(module, nn.LayerNorm):
+        if module.elementwise_affine:
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+
+
+def _init_vae_latent_parameters(module: nn.Module) -> None:
+    """Initialize standalone latent parameters that are not covered by module.apply()."""
+    with torch.no_grad():
+        for name, param in module.named_parameters():
+            if name.endswith("resampler_latents"):
+                nn.init.normal_(param, mean=0.0, std=0.02)
+
+
 class MLP(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.0) -> None:
         super().__init__()
@@ -512,6 +541,8 @@ class MiniPatchVAE(nn.Module):
         self.cfg = cfg
         self.encoder = MiniPatchEncoder(d_var=d_var, cfg=cfg)
         self.decoder = CrossAttnPatchDecoder(d_dist=int(d_dist) if d_dist is not None else int(d_var), cfg=cfg)
+        self.apply(_init_vae_module_weights)
+        _init_vae_latent_parameters(self)
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -744,6 +775,8 @@ class MiniPatchVAEStub(nn.Module):
         decoder_d_dist = int(d_dist) if d_dist is not None else int(d_var)
         self.encoder = TransformerNoCompressionPatchEncoder(d_var=d_var, cfg=cfg)
         self.decoder = MLPNoCompressionPatchDecoder(d_dist=decoder_d_dist, cfg=cfg)
+        self.apply(_init_vae_module_weights)
+        _init_vae_latent_parameters(self)
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
