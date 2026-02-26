@@ -441,6 +441,7 @@ def compute_grad_stats(model: nn.Module) -> dict[str, float]:
     }
     group_sums = {name: 0.0 for name in groups}
     group_numel = {name: 0 for name in groups}
+    group_param_count = {name: 0 for name in groups}
 
     sum_sq = 0.0
     sum_abs = 0.0
@@ -449,7 +450,8 @@ def compute_grad_stats(model: nn.Module) -> dict[str, float]:
     param_sum_sq = 0.0
     param_numel = 0
 
-    for name, param in model.named_parameters():
+    for raw_name, param in model.named_parameters():
+        name = _strip_ddp_prefix(raw_name)
         if not param.requires_grad:
             continue
 
@@ -474,11 +476,13 @@ def compute_grad_stats(model: nn.Module) -> dict[str, float]:
                 if name.startswith("mini_vae.") and not name.startswith("mini_vae.encoder.") and not name.startswith(
                     "mini_vae.decoder."
                 ):
+                    group_param_count[group_name] += 1
                     group_sums[group_name] += float((g * g).sum().item())
                     group_numel[group_name] += numel
                 continue
 
             if any(name.startswith(prefix) for prefix in prefixes):
+                group_param_count[group_name] += 1
                 group_sums[group_name] += float((g * g).sum().item())
                 group_numel[group_name] += numel
                 break
@@ -499,6 +503,8 @@ def compute_grad_stats(model: nn.Module) -> dict[str, float]:
         payload[f"grad/{group_name}_rms"] = (
             math.sqrt(group_sums[group_name] / max(1, group_numel[group_name])) if group_numel[group_name] > 0 else 0.0
         )
+        payload[f"grad/{group_name}_numel"] = float(group_numel[group_name])
+        payload[f"grad/{group_name}_params_with_grad"] = float(group_param_count[group_name])
 
     return payload
 
@@ -1861,7 +1867,9 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                         "coef_str=%.3f coef_beh=%.3f coef_con=%.3f coef_kl=%.4f "
                         "lr=%.6e lr_enc=%.6e lr_dec=%.6e steps/s=%.2f patches=%s cache=%s "
                         "t_fetch=%.2fms t_patch=%.2fms t_fwd=%.2fms t_bwd=%.2fms t_opt=%.2fms "
-                        "grad_norm=%.4f grad_rms=%.6f clip=%.3f dL_dz=%.6f dL_dmu=%.6f",
+                        "grad_norm=%.4f grad_rms=%.6f clip=%.3f "
+                        "grad_enc=%.6f grad_dec=%.6f enc_params_with_grad=%.0f dec_params_with_grad=%.0f "
+                        "dL_dz=%.6f dL_dmu=%.6f",
                         global_step,
                         max_steps,
                         avg_loss,
@@ -1888,6 +1896,10 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                         float(grad_stats.get("grad/global_norm", 0.0)),
                         float(grad_stats.get("grad/rms", 0.0)),
                         float(grad_stats.get("grad/clip_coef", 1.0)),
+                        float(grad_stats.get("grad/mini_encoder_rms", 0.0)),
+                        float(grad_stats.get("grad/mini_decoder_rms", 0.0)),
+                        float(grad_stats.get("grad/mini_encoder_params_with_grad", 0.0)),
+                        float(grad_stats.get("grad/mini_decoder_params_with_grad", 0.0)),
                         float(avg_latent_z_grad_norm),
                         float(avg_latent_mu_grad_norm),
                     )
@@ -1993,6 +2005,22 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                         "grad/mini_encoder_rms": float(grad_stats.get("grad/mini_encoder_rms", 0.0)),
                         "grad/mini_decoder_rms": float(grad_stats.get("grad/mini_decoder_rms", 0.0)),
                         "grad/mini_vae_other_rms": float(grad_stats.get("grad/mini_vae_other_rms", 0.0)),
+                        "grad/distribution_encoder_numel": float(grad_stats.get("grad/distribution_encoder_numel", 0.0)),
+                        "grad/mini_encoder_numel": float(grad_stats.get("grad/mini_encoder_numel", 0.0)),
+                        "grad/mini_decoder_numel": float(grad_stats.get("grad/mini_decoder_numel", 0.0)),
+                        "grad/mini_vae_other_numel": float(grad_stats.get("grad/mini_vae_other_numel", 0.0)),
+                        "grad/distribution_encoder_params_with_grad": float(
+                            grad_stats.get("grad/distribution_encoder_params_with_grad", 0.0)
+                        ),
+                        "grad/mini_encoder_params_with_grad": float(
+                            grad_stats.get("grad/mini_encoder_params_with_grad", 0.0)
+                        ),
+                        "grad/mini_decoder_params_with_grad": float(
+                            grad_stats.get("grad/mini_decoder_params_with_grad", 0.0)
+                        ),
+                        "grad/mini_vae_other_params_with_grad": float(
+                            grad_stats.get("grad/mini_vae_other_params_with_grad", 0.0)
+                        ),
                         "param/rms": float(grad_stats.get("param/rms", 0.0)),
                         "grad_to_param_rms_ratio": float(grad_stats.get("grad_to_param_rms_ratio", 0.0)),
                     }
