@@ -126,28 +126,18 @@ class MiniPatchTrainingModel(nn.Module):
         return F.mse_loss(y_hat, y)
 
     @staticmethod
-    def patch_relative_frobenius_loss(
-        w_patch: torch.Tensor,
+    def normalize_prediction_with_stopgrad_norm(
         w_hat: torch.Tensor,
         eps: float = 1e-8,
     ) -> torch.Tensor:
         """
-        Relative Frobenius reconstruction loss:
-        ||W - W_hat||_F^2 / (||W||_F^2 + eps), with unnormalized W/W_hat.
+        Normalize predicted patch weights with stop-grad through denominator:
+        w_hat_norm = w_hat / stop_grad(||w_hat||_2 + eps)
         """
-        if w_patch.ndim != 2 or w_hat.ndim != 2:
-            raise ValueError(
-                f"Expected rank-2 patch tensors, got w_patch={tuple(w_patch.shape)} w_hat={tuple(w_hat.shape)}"
-            )
-        if w_patch.shape != w_hat.shape:
-            raise ValueError(f"Shape mismatch: w_patch={tuple(w_patch.shape)} w_hat={tuple(w_hat.shape)}")
-
-        # Compute in fp32 to avoid overflow/underflow under AMP.
-        w_patch_fp32 = w_patch.to(dtype=torch.float32)
-        w_hat_fp32 = w_hat.to(dtype=torch.float32)
-        numerator = torch.sum((w_patch_fp32 - w_hat_fp32).pow(2))
-        denominator = torch.sum(w_patch_fp32.pow(2)).clamp_min(float(eps))
-        return numerator / denominator
+        if w_hat.ndim != 2:
+            raise ValueError(f"w_hat must be [B, p], got {tuple(w_hat.shape)}")
+        denom = (w_hat.norm(dim=1, keepdim=True) + float(eps)).detach()
+        return w_hat / denom
 
     @staticmethod
     def nt_xent_loss(z_view1: torch.Tensor, z_view2: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -355,9 +345,13 @@ class MiniPatchTrainingModel(nn.Module):
         # X_patch: [B_p, n, p]
         # w_patch: [B_p, p]
         # patch_idx: [B_p, p]
+        w_patch_norm, _ = self.normalize_patch_weights(
+            w_patch,
+        )
+        w_patch_unit = self.project_patch_weights_to_unit_sphere(w_patch_norm)
         dist_var_tokens, dist_patch_embed = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
         w_hat_raw, mu, logvar, z = self.mini_vae(
-            w_patch=w_patch,
+            w_patch=w_patch_unit,
             dist_var_tokens=dist_var_tokens,
             dist_patch_embed=dist_patch_embed,
         )
@@ -366,8 +360,9 @@ class MiniPatchTrainingModel(nn.Module):
                 mu.retain_grad()
             if z.requires_grad:
                 z.retain_grad()
-        structural_loss = self.patch_relative_frobenius_loss(w_patch=w_patch, w_hat=w_hat_raw)
-        behavioral_loss = self.patch_behavioral_mse(X_patch=X_patch, w_patch=w_patch, w_hat=w_hat_raw)
+        w_hat_unit = self.normalize_prediction_with_stopgrad_norm(w_hat=w_hat_raw)
+        structural_loss = F.mse_loss(w_hat_unit, w_patch_unit)
+        behavioral_loss = self.patch_behavioral_mse(X_patch=X_patch, w_patch=w_patch_unit, w_hat=w_hat_unit)
         recon_mix_loss = float(structural_coef) * structural_loss + float(behavioral_coef) * behavioral_loss
 
         contrastive_loss = self.contrastive_loss(
@@ -407,8 +402,12 @@ class MiniPatchTrainingModel(nn.Module):
         2) random_dist_*: full mini-VAE path with random distribution conditioning
            (both dist_var_tokens and dist_patch_embed) instead of encoder outputs.
         """
+        w_patch_norm, _ = self.normalize_patch_weights(
+            w_patch,
+        )
+        w_patch_unit = self.project_patch_weights_to_unit_sphere(w_patch_norm)
         dist_var_tokens, dist_patch_embed = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
-        mu_ref, _ = self.mini_vae.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+        mu_ref, _ = self.mini_vae.encode(w_patch=w_patch_unit, dist_var_tokens=dist_var_tokens)
 
         patch_size = int(w_patch.shape[1])
         structural_coef_value = float(structural_coef)
@@ -422,11 +421,12 @@ class MiniPatchTrainingModel(nn.Module):
             patch_size=patch_size,
             dist_patch_embed=dist_patch_embed,
         )
-        structural_rand_latent = self.patch_relative_frobenius_loss(w_patch=w_patch, w_hat=w_hat_rand_latent)
+        w_hat_rand_latent_unit = self.normalize_prediction_with_stopgrad_norm(w_hat=w_hat_rand_latent)
+        structural_rand_latent = F.mse_loss(w_hat_rand_latent_unit, w_patch_unit)
         behavioral_rand_latent = self.patch_behavioral_mse(
             X_patch=X_patch,
-            w_patch=w_patch,
-            w_hat=w_hat_rand_latent,
+            w_patch=w_patch_unit,
+            w_hat=w_hat_rand_latent_unit,
         )
         recon_mix_rand_latent = (
             structural_coef_value * structural_rand_latent + behavioral_coef_value * behavioral_rand_latent
@@ -436,15 +436,16 @@ class MiniPatchTrainingModel(nn.Module):
         rand_dist_var_tokens = torch.randn_like(dist_var_tokens)
         rand_dist_patch_embed = torch.randn_like(dist_patch_embed)
         w_hat_rand_dist_raw, mu_rand_dist, logvar_rand_dist, _ = self.mini_vae(
-            w_patch=w_patch,
+            w_patch=w_patch_unit,
             dist_var_tokens=rand_dist_var_tokens,
             dist_patch_embed=rand_dist_patch_embed,
         )
-        structural_rand_dist = self.patch_relative_frobenius_loss(w_patch=w_patch, w_hat=w_hat_rand_dist_raw)
+        w_hat_rand_dist_unit = self.normalize_prediction_with_stopgrad_norm(w_hat=w_hat_rand_dist_raw)
+        structural_rand_dist = F.mse_loss(w_hat_rand_dist_unit, w_patch_unit)
         behavioral_rand_dist = self.patch_behavioral_mse(
             X_patch=X_patch,
-            w_patch=w_patch,
-            w_hat=w_hat_rand_dist_raw,
+            w_patch=w_patch_unit,
+            w_hat=w_hat_rand_dist_unit,
         )
         recon_mix_rand_dist = structural_coef_value * structural_rand_dist + behavioral_coef_value * behavioral_rand_dist
         kl_rand_dist = self.mini_vae.kl_loss(mu=mu_rand_dist, logvar=logvar_rand_dist)
