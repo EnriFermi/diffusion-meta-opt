@@ -90,7 +90,12 @@ def _init_vae_latent_parameters(module: nn.Module) -> None:
                 nn.init.normal_(param, mean=0.0, std=0.02)
 
 
-def _decode_direction_and_logscale(u_hat: torch.Tensor, s_hat: torch.Tensor, eps: float) -> torch.Tensor:
+def _decode_direction_and_logscale(
+    u_hat: torch.Tensor,
+    s_hat: torch.Tensor,
+    eps: float,
+    s_min: float,
+) -> torch.Tensor:
     """
     Convert decoder outputs into weights:
     U = u_hat / (||u_hat||_2 + eps), s = exp(s_hat), W_hat = s * U.
@@ -108,6 +113,7 @@ def _decode_direction_and_logscale(u_hat: torch.Tensor, s_hat: torch.Tensor, eps
 
     u_norm = u_hat.norm(dim=1, keepdim=True).clamp_min(float(eps))
     u = u_hat / u_norm
+    s = s.clamp_min(float(s_min))
     return u * torch.exp(s)
 
 
@@ -503,6 +509,7 @@ class CrossAttnPatchDecoder(nn.Module):
             [CrossAttnBlock(d_model=self.d_model, n_heads=self.n_heads, dropout=float(cfg.dropout)) for _ in range(self.num_layers)]
         )
         self.output_eps = 1e-6
+        self.output_s_min = -3.0
 
         self.direction_head = nn.Sequential(
             nn.LayerNorm(self.d_model),
@@ -545,7 +552,7 @@ class CrossAttnPatchDecoder(nn.Module):
 
         u_hat = self.direction_head(q).squeeze(-1)  # [B, p]
         s_hat = self.scale_head(q.mean(dim=1)).squeeze(-1)  # [B]
-        return _decode_direction_and_logscale(u_hat=u_hat, s_hat=s_hat, eps=self.output_eps)
+        return _decode_direction_and_logscale(u_hat=u_hat, s_hat=s_hat, eps=self.output_eps, s_min=self.output_s_min)
 
 
 class MiniPatchDecoder(CrossAttnPatchDecoder):
@@ -751,6 +758,7 @@ class MLPNoCompressionPatchDecoder(nn.Module):
         self.latent_dim = int(cfg.z_dim)
         self.out_dim = max(1, int(cfg.d_patch))
         self.output_eps = 1e-6
+        self.output_s_min = -3.0
         hidden = max(4, int(cfg.mlp_stub_hidden_dim))
         in_dim = self.latent_dim + (1 if self.use_dist_conditioning else 0)
         self.dist_scalar = nn.Linear(int(d_dist), 1) if self.use_dist_conditioning else None
@@ -795,7 +803,7 @@ class MLPNoCompressionPatchDecoder(nn.Module):
         else:
             pad = u_hat.new_zeros((B, p - self.out_dim))
             u_hat_p = torch.cat([u_hat, pad], dim=1)
-        return _decode_direction_and_logscale(u_hat=u_hat_p, s_hat=s_hat, eps=self.output_eps)
+        return _decode_direction_and_logscale(u_hat=u_hat_p, s_hat=s_hat, eps=self.output_eps, s_min=self.output_s_min)
 
 
 class MiniPatchVAEStub(nn.Module):
