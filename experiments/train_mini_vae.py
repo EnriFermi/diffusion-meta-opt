@@ -1699,6 +1699,7 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                             dtype=torch.int32,
                             device=device,
                         )
+                        print(finite_flag, "FINITE FLAG")
                         if is_distributed:
                             dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
 
@@ -1747,6 +1748,7 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
 
                 grad_clip_coef = 1.0
                 if grad_clip_norm > 0.0:
+                    print('We are here')
                     clip_return = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                     grad_global_before_clip = float(clip_return)
                     grad_clip_coef = min(1.0, float(grad_clip_norm) / max(1e-12, grad_global_before_clip))
