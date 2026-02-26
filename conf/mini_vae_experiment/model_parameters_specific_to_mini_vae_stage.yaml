@@ -9,13 +9,14 @@ distribution:
 
 mini_vae:
   decoder_L_latents: 1
-  z_dim: 32
+  z_dim: 128
   decoder_bilinear_rank: 16
-  d_e: 128
+  d_e: 64
   num_attn_layers_encoder: 4
-  mlp_stub_hidden_dim: 256
+  mlp_stub_hidden_dim: 128
   num_layers_decoder: 2
-  stub_resampler_d_model: 0
+  stub_resampler_d_model: 128
   use_latent_sampling: false
-  n_heads: 4
-  dropout: 0.05
+  implementation: mlp_stub
+  n_heads: 2
+  dropout: 0.0

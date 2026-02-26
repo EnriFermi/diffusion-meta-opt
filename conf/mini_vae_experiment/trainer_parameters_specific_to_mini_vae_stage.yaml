@@ -8,15 +8,15 @@ compile_dynamic: false
 
 max_steps: 50000
 grad_accum_steps: 2
-patches_per_sample: 8
+patches_per_sample: 4
 
-warmup_steps: 100
+warmup_steps: 1
 min_lr_ratio: 0.05
 
 # Optional per-group LR overrides.
 # If null/missing, falls back to mini_train.lr from shared trainer config.
-lr_encoder: null
-lr_decoder: null
+lr_encoder: 3e-4
+lr_decoder: 3e-4
 
 checkpoint_every: 500
 checkpoint_dir: ${training_artifacts.mini_vae_checkpoint_dir}
@@ -25,7 +25,7 @@ loss:
   # Composite objective:
   # L_total = structural_coef * L_str + behavioral_coef * L_beh
   #         + contrastive_coef * L_con + kl_coef * L_kl
-  structural_coef: 100.0
+  structural_coef: 1.0
   behavioral_coef: 0.0
   contrastive_coef: 0.0
   kl_coef: 0.000
