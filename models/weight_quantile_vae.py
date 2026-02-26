@@ -90,6 +90,27 @@ def _init_vae_latent_parameters(module: nn.Module) -> None:
                 nn.init.normal_(param, mean=0.0, std=0.02)
 
 
+def _decode_direction_and_logscale(u_hat: torch.Tensor, s_hat: torch.Tensor, eps: float) -> torch.Tensor:
+    """
+    Convert decoder outputs into weights:
+    U = u_hat / (||u_hat||_2 + eps), s = exp(s_hat), W_hat = s * U.
+    """
+    if u_hat.ndim != 2:
+        raise ValueError(f"u_hat must be [B, p], got {tuple(u_hat.shape)}")
+    if s_hat.ndim == 1:
+        s = s_hat.unsqueeze(-1)
+    elif s_hat.ndim == 2 and s_hat.shape[1] == 1:
+        s = s_hat
+    else:
+        raise ValueError(f"s_hat must be [B] or [B,1], got {tuple(s_hat.shape)}")
+    if tuple(s.shape[:1]) != tuple(u_hat.shape[:1]):
+        raise ValueError(f"Batch mismatch: u_hat={tuple(u_hat.shape)}, s_hat={tuple(s_hat.shape)}")
+
+    u_norm = u_hat.norm(dim=1, keepdim=True).clamp_min(float(eps))
+    u = u_hat / u_norm
+    return u * torch.exp(s)
+
+
 class MLP(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.0) -> None:
         super().__init__()
@@ -481,8 +502,15 @@ class CrossAttnPatchDecoder(nn.Module):
         self.blocks = nn.ModuleList(
             [CrossAttnBlock(d_model=self.d_model, n_heads=self.n_heads, dropout=float(cfg.dropout)) for _ in range(self.num_layers)]
         )
+        self.output_eps = 1e-6
 
-        self.out_head = nn.Sequential(
+        self.direction_head = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Linear(self.d_model, 1),
+        )
+        self.scale_head = nn.Sequential(
             nn.LayerNorm(self.d_model),
             nn.Linear(self.d_model, self.d_model),
             nn.GELU(),
@@ -515,8 +543,9 @@ class CrossAttnPatchDecoder(nn.Module):
         for block in self.blocks:
             q = block(q, lat)
 
-        w_hat = self.out_head(q).squeeze(-1)
-        return w_hat
+        u_hat = self.direction_head(q).squeeze(-1)  # [B, p]
+        s_hat = self.scale_head(q.mean(dim=1)).squeeze(-1)  # [B]
+        return _decode_direction_and_logscale(u_hat=u_hat, s_hat=s_hat, eps=self.output_eps)
 
 
 class MiniPatchDecoder(CrossAttnPatchDecoder):
@@ -721,15 +750,17 @@ class MLPNoCompressionPatchDecoder(nn.Module):
         self.use_dist_conditioning = bool(cfg.decoder_use_dist_conditioning)
         self.latent_dim = int(cfg.z_dim)
         self.out_dim = max(1, int(cfg.d_patch))
+        self.output_eps = 1e-6
         hidden = max(4, int(cfg.mlp_stub_hidden_dim))
         in_dim = self.latent_dim + (1 if self.use_dist_conditioning else 0)
         self.dist_scalar = nn.Linear(int(d_dist), 1) if self.use_dist_conditioning else None
-        self.patch_mlp = nn.Sequential(
+        self.patch_trunk = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
-            nn.Linear(hidden, self.out_dim),
         )
+        self.direction_head = nn.Linear(hidden, self.out_dim)
+        self.scale_head = nn.Linear(hidden, 1)
 
     def forward(self, z: torch.Tensor, patch_size: int, dist_patch_embed: torch.Tensor | None = None) -> torch.Tensor:
         if z.ndim != 2:
@@ -753,13 +784,18 @@ class MLPNoCompressionPatchDecoder(nn.Module):
                 dist_scalar = self.dist_scalar(dist_patch_embed)
             dec_in = torch.cat([dec_in, dist_scalar], dim=-1)
 
-        w_hat = self.patch_mlp(dec_in)
+        h = self.patch_trunk(dec_in)
+        u_hat = self.direction_head(h)
+        s_hat = self.scale_head(h).squeeze(-1)
+
         if self.out_dim == p:
-            return w_hat
-        if self.out_dim > p:
-            return w_hat[:, :p]
-        pad = w_hat.new_zeros((B, p - self.out_dim))
-        return torch.cat([w_hat, pad], dim=1)
+            u_hat_p = u_hat
+        elif self.out_dim > p:
+            u_hat_p = u_hat[:, :p]
+        else:
+            pad = u_hat.new_zeros((B, p - self.out_dim))
+            u_hat_p = torch.cat([u_hat, pad], dim=1)
+        return _decode_direction_and_logscale(u_hat=u_hat_p, s_hat=s_hat, eps=self.output_eps)
 
 
 class MiniPatchVAEStub(nn.Module):
