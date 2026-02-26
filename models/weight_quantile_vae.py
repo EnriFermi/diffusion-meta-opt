@@ -761,8 +761,90 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
         return self.patch_proj(mu)
 
 
+def _build_stub_mlp(
+    in_dim: int,
+    hidden_dim: int,
+    out_dim: int,
+    *,
+    num_linear_layers: int = 6,
+    dropout: float = 0.0,
+) -> nn.Sequential:
+    """Build an MLP with an explicit number of Linear layers."""
+    if num_linear_layers < 2:
+        raise ValueError(f"num_linear_layers must be >= 2, got {num_linear_layers}")
+    layers: list[nn.Module] = []
+    cur_dim = int(in_dim)
+    for idx in range(int(num_linear_layers)):
+        is_last = idx == int(num_linear_layers) - 1
+        next_dim = int(out_dim) if is_last else int(hidden_dim)
+        layers.append(nn.Linear(cur_dim, next_dim))
+        if not is_last:
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(float(dropout)))
+        cur_dim = next_dim
+    return nn.Sequential(*layers)
+
+
+def _align_feature_dim(x: torch.Tensor, target_dim: int) -> torch.Tensor:
+    """Pad or trim feature dimension to target_dim."""
+    if x.ndim != 2:
+        raise ValueError(f"Expected rank-2 tensor [B, d], got {tuple(x.shape)}")
+    if target_dim <= 0:
+        raise ValueError(f"target_dim must be positive, got {target_dim}")
+    current_dim = int(x.shape[1])
+    if current_dim == target_dim:
+        return x
+    if current_dim > target_dim:
+        return x[:, :target_dim]
+    pad = x.new_zeros((x.shape[0], target_dim - current_dim))
+    return torch.cat([x, pad], dim=1)
+
+
+class MLPNoCompressionPatchEncoder(nn.Module):
+    """Stub encoder: 6-layer MLP from patch weights to latent stats."""
+
+    def __init__(self, d_var: int, cfg: MiniVAEConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.d_var = int(d_var)
+        self.in_dim = max(1, int(cfg.d_patch))
+        hidden = max(8, int(cfg.mlp_stub_hidden_dim))
+        self.latent_dim = int(cfg.z_dim)
+        self.mlp = _build_stub_mlp(
+            in_dim=self.in_dim,
+            hidden_dim=hidden,
+            out_dim=2 * self.latent_dim,
+            num_linear_layers=6,
+            dropout=float(cfg.dropout),
+        )
+        if cfg.d_patch == cfg.z_dim:
+            self.patch_proj = nn.Identity()
+        else:
+            self.patch_proj = nn.Linear(cfg.z_dim, cfg.d_patch)
+
+    def encode(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if w_patch.ndim != 2:
+            raise ValueError(f"w_patch must be [B, p], got {tuple(w_patch.shape)}")
+        if dist_var_tokens.ndim != 3:
+            raise ValueError(f"dist_var_tokens must be [B, p, d_var], got {tuple(dist_var_tokens.shape)}")
+        B, p = w_patch.shape
+        if tuple(dist_var_tokens.shape[:2]) != (B, p):
+            raise ValueError(f"Shape mismatch: w_patch={tuple(w_patch.shape)} dist_var_tokens={tuple(dist_var_tokens.shape)}")
+        if int(dist_var_tokens.shape[2]) != self.d_var:
+            raise ValueError(f"dist_var_tokens last dim must be {self.d_var}, got {int(dist_var_tokens.shape[2])}")
+
+        w_in = _align_feature_dim(w_patch, target_dim=self.in_dim)
+        stats = self.mlp(w_in)
+        mu, logvar = stats.chunk(2, dim=-1)
+        return mu, logvar
+
+    def encode_patch(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
+        mu, _ = self.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
+        return self.patch_proj(mu)
+
+
 class MLPNoCompressionPatchDecoder(nn.Module):
-    """Debug decoder: MLP from one latent vector to full patch."""
+    """Stub decoder: 6-layer MLP from latent vector to full patch."""
 
     def __init__(self, d_dist: int, cfg: MiniVAEConfig) -> None:
         super().__init__()
@@ -776,13 +858,13 @@ class MLPNoCompressionPatchDecoder(nn.Module):
         hidden = max(4, int(cfg.mlp_stub_hidden_dim))
         in_dim = self.latent_dim + (1 if self.use_dist_conditioning else 0)
         self.dist_scalar = nn.Linear(int(d_dist), 1) if self.use_dist_conditioning else None
-        self.patch_trunk = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.GELU(),
-            nn.Dropout(cfg.dropout),
+        self.mlp = _build_stub_mlp(
+            in_dim=in_dim,
+            hidden_dim=hidden,
+            out_dim=self.out_dim + 1,
+            num_linear_layers=6,
+            dropout=float(cfg.dropout),
         )
-        self.direction_head = nn.Linear(hidden, self.out_dim)
-        self.scale_head = nn.Linear(hidden, 1)
 
     def forward(self, z: torch.Tensor, patch_size: int, dist_patch_embed: torch.Tensor | None = None) -> torch.Tensor:
         if z.ndim != 2:
@@ -806,9 +888,9 @@ class MLPNoCompressionPatchDecoder(nn.Module):
                 dist_scalar = self.dist_scalar(dist_patch_embed)
             dec_in = torch.cat([dec_in, dist_scalar], dim=-1)
 
-        h = self.patch_trunk(dec_in)
-        u_hat = self.direction_head(h)
-        s_hat = self.scale_head(h).squeeze(-1)
+        out = self.mlp(dec_in)
+        u_hat = out[:, : self.out_dim]
+        s_hat = out[:, self.out_dim]
 
         if self.out_dim == p:
             u_hat_p = u_hat
@@ -829,15 +911,17 @@ class MLPNoCompressionPatchDecoder(nn.Module):
 class MiniPatchVAEStub(nn.Module):
     """
     Debug Mini-VAE replacement:
-    - encoder: Perceiver Resampler over patch tokens (without distribution conditioning)
-    - decoder: MLP from latent to full patch
+    - encoder: 6-layer MLP over patch weights
+    - decoder: 6-layer MLP from latent to full patch
     """
 
     def __init__(self, d_var: int, cfg: MiniVAEConfig, d_dist: int | None = None) -> None:
         super().__init__()
         self.cfg = cfg
         decoder_d_dist = int(d_dist) if d_dist is not None else int(d_var)
-        self.encoder = TransformerNoCompressionPatchEncoder(d_var=d_var, cfg=cfg)
+        # Previous stub path (TransformerNoCompressionPatchEncoder) is kept for fast rollback.
+        # self.encoder = TransformerNoCompressionPatchEncoder(d_var=d_var, cfg=cfg)
+        self.encoder = MLPNoCompressionPatchEncoder(d_var=d_var, cfg=cfg)
         self.decoder = MLPNoCompressionPatchDecoder(d_dist=decoder_d_dist, cfg=cfg)
         self.apply(_init_vae_module_weights)
         _init_vae_latent_parameters(self)
