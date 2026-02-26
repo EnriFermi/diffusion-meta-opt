@@ -141,8 +141,12 @@ class MiniPatchTrainingModel(nn.Module):
             )
         if w_patch.shape != w_hat.shape:
             raise ValueError(f"Shape mismatch: w_patch={tuple(w_patch.shape)} w_hat={tuple(w_hat.shape)}")
-        numerator = torch.sum((w_patch - w_hat).pow(2))
-        denominator = torch.sum(w_patch.pow(2)) + float(eps)
+
+        # Compute in fp32 to avoid overflow/underflow under AMP.
+        w_patch_fp32 = w_patch.to(dtype=torch.float32)
+        w_hat_fp32 = w_hat.to(dtype=torch.float32)
+        numerator = torch.sum((w_patch_fp32 - w_hat_fp32).pow(2))
+        denominator = torch.sum(w_patch_fp32.pow(2)).clamp_min(float(eps))
         return numerator / denominator
 
     @staticmethod
