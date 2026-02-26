@@ -346,10 +346,9 @@ class MiniPatchTrainingModel(nn.Module):
                 mu.retain_grad()
             if z.requires_grad:
                 z.retain_grad()
-        w_hat_unit = self.project_patch_weights_to_unit_sphere(w_hat_raw)
-
-        structural_loss = F.mse_loss(w_hat_unit, w_patch_unit)
-        behavioral_loss = self.patch_behavioral_mse(X_patch=X_patch, w_patch=w_patch_unit, w_hat=w_hat_unit)
+        # Keep normalized target weights, but use raw decoder output for losses.
+        structural_loss = F.mse_loss(w_hat_raw, w_patch_unit)
+        behavioral_loss = self.patch_behavioral_mse(X_patch=X_patch, w_patch=w_patch_unit, w_hat=w_hat_raw)
         recon_mix_loss = float(structural_coef) * structural_loss + float(behavioral_coef) * behavioral_loss
 
         contrastive_loss = self.contrastive_loss(
@@ -408,12 +407,11 @@ class MiniPatchTrainingModel(nn.Module):
             patch_size=patch_size,
             dist_patch_embed=dist_patch_embed,
         )
-        w_hat_rand_latent_unit = self.project_patch_weights_to_unit_sphere(w_hat_rand_latent)
-        structural_rand_latent = F.mse_loss(w_hat_rand_latent_unit, w_patch_unit)
+        structural_rand_latent = F.mse_loss(w_hat_rand_latent, w_patch_unit)
         behavioral_rand_latent = self.patch_behavioral_mse(
             X_patch=X_patch,
             w_patch=w_patch_unit,
-            w_hat=w_hat_rand_latent_unit,
+            w_hat=w_hat_rand_latent,
         )
         recon_mix_rand_latent = (
             structural_coef_value * structural_rand_latent + behavioral_coef_value * behavioral_rand_latent
@@ -427,12 +425,11 @@ class MiniPatchTrainingModel(nn.Module):
             dist_var_tokens=rand_dist_var_tokens,
             dist_patch_embed=rand_dist_patch_embed,
         )
-        w_hat_rand_dist_unit = self.project_patch_weights_to_unit_sphere(w_hat_rand_dist_raw)
-        structural_rand_dist = F.mse_loss(w_hat_rand_dist_unit, w_patch_unit)
+        structural_rand_dist = F.mse_loss(w_hat_rand_dist_raw, w_patch_unit)
         behavioral_rand_dist = self.patch_behavioral_mse(
             X_patch=X_patch,
             w_patch=w_patch_unit,
-            w_hat=w_hat_rand_dist_unit,
+            w_hat=w_hat_rand_dist_raw,
         )
         recon_mix_rand_dist = structural_coef_value * structural_rand_dist + behavioral_coef_value * behavioral_rand_dist
         kl_rand_dist = self.mini_vae.kl_loss(mu=mu_rand_dist, logvar=logvar_rand_dist)
