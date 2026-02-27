@@ -17,6 +17,8 @@ min_lr_ratio: 0.05
 # If null/missing, falls back to mini_train.lr from shared trainer config.
 lr_encoder: 3e-4
 lr_decoder: 3e-4
+# Disable decoder updates for the first N optimizer steps.
+freeze_decoder_steps: 0
 
 checkpoint_every: 500
 checkpoint_dir: ${training_artifacts.mini_vae_checkpoint_dir}
@@ -86,6 +88,24 @@ telemetry:
     recent_job_preview_count: 10
     save_jsonl: true
     jsonl_path: ${training_artifacts.mini_vae_checkpoint_dir}/runtime_status.jsonl
+  grad_layer_monitor:
+    enabled: true
+    every_steps: 10
+    include_prefixes:
+      - mini_vae.encoder.
+      - mini_vae.decoder.
+    weights_only: true
+    topk_layers: 24
+    save_csv: true
+    reset_csv_on_start: true
+    csv_path: ${training_artifacts.mini_vae_checkpoint_dir}/grad_layer_rms.csv
+    save_plot: true
+    plot_every_steps: 100
+    plot_path: ${training_artifacts.mini_vae_checkpoint_dir}/grad_layer_rms.png
+    save_heatmap: true
+    heatmap_max_layers: 96
+    heatmap_path: ${training_artifacts.mini_vae_checkpoint_dir}/grad_layer_rms_heatmap.png
+    log_scale: true
   comet:
     enabled: true
     api_key: ${oc.env:COMET_API_KEY,""}
