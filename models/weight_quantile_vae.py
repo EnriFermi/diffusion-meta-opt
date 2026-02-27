@@ -67,6 +67,10 @@ def _init_vae_module_weights(module: nn.Module) -> None:
         nn.init.xavier_uniform_(module.weight)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
+    elif isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+        if module.affine:
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
     elif isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
         nn.init.xavier_uniform_(module.weight)
         if module.bias is not None:
@@ -366,6 +370,7 @@ class MiniVAEConfig:
     use_latent_sampling: bool = True
     implementation: str = "real"  # {"real", "mlp_stub"}
     mlp_stub_hidden_dim: int = 256
+    stub_mlp_use_batchnorm: bool = False
     # Stub-only: if > 0, Perceiver resampler width in TransformerNoCompressionPatchEncoder.
     # If 0, defaults to d_e.
     stub_resampler_d_model: int = 0
@@ -766,6 +771,7 @@ def _build_stub_mlp(
     *,
     num_linear_layers: int = 6,
     dropout: float = 0.0,
+    use_batchnorm: bool = False,
 ) -> nn.Sequential:
     """Build an MLP with an explicit number of Linear layers."""
     if num_linear_layers < 2:
@@ -777,6 +783,8 @@ def _build_stub_mlp(
         next_dim = int(out_dim) if is_last else int(hidden_dim)
         layers.append(nn.Linear(cur_dim, next_dim))
         if not is_last:
+            if use_batchnorm:
+                layers.append(nn.BatchNorm1d(next_dim))
             layers.append(nn.GELU())
             layers.append(nn.Dropout(float(dropout)))
         cur_dim = next_dim
@@ -814,6 +822,7 @@ class MLPNoCompressionPatchEncoder(nn.Module):
             out_dim=2 * self.latent_dim,
             num_linear_layers=6,
             dropout=float(cfg.dropout),
+            use_batchnorm=bool(cfg.stub_mlp_use_batchnorm),
         )
         if cfg.d_patch == cfg.z_dim:
             self.patch_proj = nn.Identity()
@@ -864,6 +873,7 @@ class MLPNoCompressionPatchDecoder(nn.Module):
             out_dim=self.out_dim + 1,
             num_linear_layers=6,
             dropout=float(cfg.dropout),
+            use_batchnorm=bool(cfg.stub_mlp_use_batchnorm),
         )
 
     def forward(self, z: torch.Tensor, patch_size: int, dist_patch_embed: torch.Tensor | None = None) -> torch.Tensor:
