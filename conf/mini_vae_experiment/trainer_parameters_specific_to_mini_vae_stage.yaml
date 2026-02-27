@@ -8,7 +8,7 @@ compile_dynamic: false
 
 max_steps: 50000
 grad_accum_steps: 2
-patches_per_sample: 4
+patches_per_sample: 512
 
 warmup_steps: 1
 min_lr_ratio: 0.05
@@ -16,7 +16,7 @@ min_lr_ratio: 0.05
 # Optional per-group LR overrides.
 # If null/missing, falls back to mini_train.lr from shared trainer config.
 lr_encoder: 3e-4
-lr_decoder: 3e-4
+lr_decoder: 1e-5
 
 checkpoint_every: 500
 checkpoint_dir: ${training_artifacts.mini_vae_checkpoint_dir}

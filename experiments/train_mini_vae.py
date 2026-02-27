@@ -1237,7 +1237,9 @@ def build_optimizer(
         param_groups.append({"params": mini_decoder_params, "lr": lr_decoder, "group_name": "mini_decoder"})
     if not param_groups:
         raise ValueError("No trainable parameters were found for optimizer construction")
-
+    # print('EWWW')
+    # print(len(mini_encoder_params), lr_encoder, len(mini_decoder_params), lr_decoder)
+    # 1/0
     kwargs: dict[str, Any] = {
         "weight_decay": weight_decay,
         "betas": (beta1, beta2),
@@ -1497,7 +1499,7 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     f"mini_train.loss.contrastive_temperature must be > 0, got {contrastive_temperature}"
                 )
 
-            grad_clip_norm = float(cfg.mini_train.get("grad_clip_norm", 1.0))
+            grad_clip_norm = float(cfg.mini_train.get("grad_clip_norm", 10.0))
             max_x_rows = int(cfg.mini_train.get("max_x_rows", 0))
             patches_per_sample = int(cfg.mini_train.get("patches_per_sample", 16))
             patch_size = int(cfg.mini_model.get("patch_size", 64))
@@ -1764,6 +1766,13 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     grad_global_before_clip = float(grad_stats.get("grad/global_norm", 0.0))
                 grad_stats["grad/global_norm_before_clip"] = grad_global_before_clip
                 grad_stats["grad/clip_coef"] = grad_clip_coef
+
+                print("SCK MDK")
+                for name, param in dict(model.named_parameters()).items():
+                    if param.grad is not None:
+                        print(name, torch.norm(param.grad))
+                    else:
+                        print(name, None)
 
                 t_opt = time.perf_counter()
                 if scaler.is_enabled():

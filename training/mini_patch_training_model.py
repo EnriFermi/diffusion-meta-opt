@@ -73,6 +73,8 @@ class MiniPatchTrainingModel(nn.Module):
                 "Use one of: real, mlp_stub"
             )
 
+        print(self.mini_vae)
+
     @staticmethod
     def normalize_patch_weights(
         w_patch: torch.Tensor,
@@ -88,7 +90,7 @@ class MiniPatchTrainingModel(nn.Module):
         """
         if w_patch.ndim != 2:
             raise ValueError(f"w_patch must be [B, p], got {tuple(w_patch.shape)}")
-        scale = w_patch.pow(2).mean(dim=1, keepdim=True).sqrt().clamp_min(float(eps))
+        scale = w_patch.pow(2).sum(dim=1, keepdim=True).sqrt().clamp_min(float(eps))
         w_norm = w_patch / scale
         return w_norm, scale
 
@@ -345,13 +347,16 @@ class MiniPatchTrainingModel(nn.Module):
         # X_patch: [B_p, n, p]
         # w_patch: [B_p, p]
         # patch_idx: [B_p, p]
+        
         w_patch_norm, _ = self.normalize_patch_weights(
-            w_patch,
+            w_patch - w_patch.mean(),
         )
-        w_patch_unit = self.project_patch_weights_to_unit_sphere(w_patch_norm)
+        w_patch_norm = w_patch_norm * 8
+        print(w_patch, w_patch_norm)
+        # w_patch_unit = self.project_patch_weights_to_unit_sphere(w_patch_norm)
         dist_var_tokens, dist_patch_embed = self.distribution_encoder(X=X_full, patch_idx=patch_idx)
-        w_hat_raw, mu, logvar, z = self.mini_vae(
-            w_patch=w_patch_unit,
+        w_hat_raw, mu, logvar, z, w_norm = self.mini_vae(
+            w_patch=w_patch_norm,
             dist_var_tokens=dist_var_tokens,
             dist_patch_embed=dist_patch_embed,
         )
@@ -360,24 +365,32 @@ class MiniPatchTrainingModel(nn.Module):
                 mu.retain_grad()
             if z.requires_grad:
                 z.retain_grad()
-        w_hat_unit = self.normalize_prediction_with_stopgrad_norm(w_hat=w_hat_raw)
-        structural_loss = F.mse_loss(w_hat_unit, w_patch_unit)
-        behavioral_loss = self.patch_behavioral_mse(X_patch=X_patch, w_patch=w_patch_unit, w_hat=w_hat_unit)
-        recon_mix_loss = float(structural_coef) * structural_loss + float(behavioral_coef) * behavioral_loss
+        # w_hat_unit = self.normalize_prediction_with_stopgrad_norm(w_hat=w_hat_raw)
+        den = w_patch_norm.pow(2).sum(dim=1).clamp_min(1e-8)
+        print(type(w_hat_raw), type(w_patch_norm))
+        structural_loss = ((abs(w_hat_raw - w_patch_norm)).sum(dim=1)).mean(dim=0)
+        print("FUCAFD", den)
+        # behavioral_loss = self.patch_behavioral_mse(X_patch=X_patch, w_patch=w_patch_unit, w_hat=w_hat_unit)
+        recon_mix_loss =  float(structural_coef) * structural_loss
+        # + float(behavioral_coef) * behavioral_loss
 
-        contrastive_loss = self.contrastive_loss(
-            X_full=X_full,
-            patch_idx=patch_idx,
-            out_idx=out_idx,
-            W_full=W_full,
-            contrastive_coef=contrastive_coef,
-            temperature=contrastive_temperature,
-            permute_inputs=contrastive_permute_inputs,
-            sign_flip_inputs=contrastive_sign_flip_inputs,
-        )
+        # contrastive_loss = self.contrastive_loss(
+        #     X_full=X_full,
+        #     patch_idx=patch_idx,
+        #     out_idx=out_idx,
+        #     W_full=W_full,
+        #     contrastive_coef=contrastive_coef,
+        #     temperature=contrastive_temperature,
+        #     permute_inputs=contrastive_permute_inputs,
+        #     sign_flip_inputs=contrastive_sign_flip_inputs,
+        # )
 
-        kl_loss = self.mini_vae.kl_loss(mu=mu, logvar=logvar)
-        total_loss = recon_mix_loss + float(contrastive_coef) * contrastive_loss + float(kl_coef) * kl_loss
+        # kl_loss = self.mini_vae.kl_loss(mu=mu, logvar=logvar)
+        # total_loss = recon_mix_loss + float(contrastive_coef) * contrastive_loss + float(kl_coef) * kl_loss
+        total_loss = recon_mix_loss
+        behavioral_loss = torch.tensor([0], device='cuda:0')
+        contrastive_loss =  torch.tensor([0], device='cuda:0')
+        kl_loss =  torch.tensor([0], device='cuda:0')
         if return_latent_tensors:
             return total_loss, structural_loss, behavioral_loss, contrastive_loss, recon_mix_loss, kl_loss, {
                 "mu": mu,

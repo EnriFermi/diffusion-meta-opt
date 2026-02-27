@@ -101,7 +101,8 @@ def _decode_direction_and_logscale(
     Convert decoder outputs into weights:
     U = u_hat / (||u_hat||_2 + eps), s = exp(s_hat), W_hat = s * U.
     """
-    s_min=-6
+    s_min=0
+    s_max=0
     if u_hat.ndim != 2:
         raise ValueError(f"u_hat must be [B, p], got {tuple(u_hat.shape)}")
     if s_hat.ndim == 1:
@@ -123,7 +124,7 @@ def _decode_direction_and_logscale(
         s = float(s_max) - F.softplus(float(s_max) - s)
 
     print('DEBUG INFO', u_norm, s, u_hat.mean(dim=1))
-    return u * torch.exp(s)
+    return 8*u, u_norm
 
 
 class MLP(nn.Module):
@@ -522,15 +523,9 @@ class CrossAttnPatchDecoder(nn.Module):
         self.output_s_max = 6.0
 
         self.direction_head = nn.Sequential(
-            nn.LayerNorm(self.d_model),
-            nn.Linear(self.d_model, self.d_model),
-            nn.GELU(),
             nn.Linear(self.d_model, 1),
         )
         self.scale_head = nn.Sequential(
-            nn.LayerNorm(self.d_model),
-            nn.Linear(self.d_model, self.d_model),
-            nn.GELU(),
             nn.Linear(self.d_model, 1),
         )
 
@@ -629,8 +624,8 @@ class MiniPatchVAE(nn.Module):
             z = self.reparameterize(mu=mu, logvar=logvar)
         else:
             z = mu
-        w_hat = self.decode(z=z, patch_size=w_patch.shape[1], dist_patch_embed=dist_patch_embed)
-        return w_hat, mu, logvar, z
+        w_hat, w_norm = self.decode(z=z, patch_size=w_patch.shape[1], dist_patch_embed=dist_patch_embed)
+        return w_hat, mu, logvar, z, w_norm
 
 
 class PerceiverResamplerBlock(nn.Module):
@@ -962,8 +957,8 @@ class MiniPatchVAEStub(nn.Module):
         else:
             print('DO NOTHING')
             z = mu
-        w_hat = self.decode(z=z, patch_size=w_patch.shape[1], dist_patch_embed=dist_patch_embed)
-        return w_hat, mu, logvar, z
+        w_hat, w_norm = self.decode(z=z, patch_size=w_patch.shape[1], dist_patch_embed=dist_patch_embed)
+        return w_hat, mu, logvar, z, w_norm
 
 
 @dataclass(slots=True)
