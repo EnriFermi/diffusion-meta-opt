@@ -101,6 +101,7 @@ def _decode_direction_and_logscale(
     Convert decoder outputs into weights:
     U = u_hat / (||u_hat||_2 + eps), s = exp(s_hat), W_hat = s * U.
     """
+    s_min=-6
     if u_hat.ndim != 2:
         raise ValueError(f"u_hat must be [B, p], got {tuple(u_hat.shape)}")
     if s_hat.ndim == 1:
@@ -120,6 +121,8 @@ def _decode_direction_and_logscale(
     # Optional smooth upper barrier to avoid exp overflow and skipped non-finite steps.
     if s_max is not None:
         s = float(s_max) - F.softplus(float(s_max) - s)
+
+    print('DEBUG INFO', u_norm, s, u_hat.mean(dim=1))
     return u * torch.exp(s)
 
 
@@ -563,7 +566,7 @@ class CrossAttnPatchDecoder(nn.Module):
             u_hat=u_hat,
             s_hat=s_hat,
             eps=self.output_eps,
-            s_min=self.output_s_min,
+            s_min=-6,
             s_max=self.output_s_max,
         )
 
@@ -850,6 +853,8 @@ class MLPNoCompressionPatchDecoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.use_dist_conditioning = bool(cfg.decoder_use_dist_conditioning)
+        self.use_dist_conditioning = False
+
         self.latent_dim = int(cfg.z_dim)
         self.out_dim = max(1, int(cfg.d_patch))
         self.output_eps = 1e-6
@@ -874,13 +879,16 @@ class MLPNoCompressionPatchDecoder(nn.Module):
 
         B, z_dim = z.shape
         p = int(patch_size)
+        print("ZZZ", z_dim, self.latent_dim)
         if z_dim >= self.latent_dim:
             z_aligned = z[:, : self.latent_dim]
         else:
             pad = z.new_zeros((B, self.latent_dim - z_dim))
             z_aligned = torch.cat([z, pad], dim=1)
+            print(z_aligned.shape, z.shape)
 
         dec_in = z_aligned
+        
         if self.use_dist_conditioning:
             if self.dist_scalar is None or dist_patch_embed is None:
                 dist_scalar = dec_in.new_zeros((B, 1))
@@ -954,6 +962,7 @@ class MiniPatchVAEStub(nn.Module):
         if bool(self.cfg.use_latent_sampling):
             z = self.reparameterize(mu=mu, logvar=logvar)
         else:
+            print('DO NOTHING')
             z = mu
         w_hat = self.decode(z=z, patch_size=w_patch.shape[1], dist_patch_embed=dist_patch_embed)
         return w_hat, mu, logvar, z
