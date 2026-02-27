@@ -911,7 +911,7 @@ class MLPNoCompressionPatchDecoder(nn.Module):
 class MiniPatchVAEStub(nn.Module):
     """
     Debug Mini-VAE replacement:
-    - encoder: 6-layer MLP over patch weights
+    - encoder: Perceiver Resampler over patch tokens (without distribution conditioning)
     - decoder: 6-layer MLP from latent to full patch
     """
 
@@ -919,9 +919,7 @@ class MiniPatchVAEStub(nn.Module):
         super().__init__()
         self.cfg = cfg
         decoder_d_dist = int(d_dist) if d_dist is not None else int(d_var)
-        # Previous stub path (TransformerNoCompressionPatchEncoder) is kept for fast rollback.
-        # self.encoder = TransformerNoCompressionPatchEncoder(d_var=d_var, cfg=cfg)
-        self.encoder = MLPNoCompressionPatchEncoder(d_var=d_var, cfg=cfg)
+        self.encoder = TransformerNoCompressionPatchEncoder(d_var=d_var, cfg=cfg)
         self.decoder = MLPNoCompressionPatchDecoder(d_dist=decoder_d_dist, cfg=cfg)
         self.apply(_init_vae_module_weights)
         _init_vae_latent_parameters(self)
