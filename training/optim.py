@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 import math
-from typing import Any
+from typing import Any, Callable, Mapping
 
 import torch
 from omegaconf import DictConfig
@@ -60,6 +60,8 @@ def build_cosine_scheduler(
     default_max_steps: int = 1000,
     default_warmup_steps: int = 100,
     default_min_lr_ratio: float = 0.1,
+    step_delay_by_group_name: Mapping[str, int] | None = None,
+    group_name_key: str = "group_name",
 ) -> torch.optim.lr_scheduler.LambdaLR:
     section_cfg = cfg[section]
     max_steps = max(1, int(section_cfg.get(max_steps_key, default_max_steps)))
@@ -75,4 +77,20 @@ def build_cosine_scheduler(
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    if not step_delay_by_group_name:
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    group_lambdas: list[Callable[[int], float]] = []
+    for param_group in optimizer.param_groups:
+        group_name = str(param_group.get(group_name_key, ""))
+        delay_steps = max(0, int(step_delay_by_group_name.get(group_name, 0)))
+        if delay_steps <= 0:
+            group_lambdas.append(lr_lambda)
+            continue
+
+        def delayed_lr_lambda(step_idx: int, *, _delay_steps: int = delay_steps) -> float:
+            return lr_lambda(max(0, int(step_idx) - _delay_steps))
+
+        group_lambdas.append(delayed_lr_lambda)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=group_lambdas)

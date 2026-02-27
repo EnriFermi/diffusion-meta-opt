@@ -1521,6 +1521,9 @@ def build_optimizer(
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, cfg: DictConfig) -> torch.optim.lr_scheduler.LambdaLR:
+    freeze_decoder_steps = max(0, int(cfg.mini_train.get("freeze_decoder_steps", 0)))
+    # Keep decoder LR schedule at its initial warmup point while decoder grads are frozen.
+    step_delay_by_group_name = {"mini_decoder": freeze_decoder_steps} if freeze_decoder_steps > 0 else None
     return build_cosine_scheduler(
         optimizer=optimizer,
         cfg=cfg,
@@ -1528,6 +1531,7 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: DictConfig) -> torch.
         default_max_steps=1000,
         default_warmup_steps=100,
         default_min_lr_ratio=0.1,
+        step_delay_by_group_name=step_delay_by_group_name,
     )
 
 
@@ -1825,14 +1829,19 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     logger.warning("Could not reset grad-layer CSV at %s: %s", grad_layer_monitor_csv_path, exc)
 
             if grad_layer_monitor_enabled:
+                csv_abs = str(grad_layer_monitor_csv_path.resolve())
+                plot_abs = str(grad_layer_monitor_plot_path.resolve())
+                heatmap_abs = str(grad_layer_monitor_heatmap_path.resolve())
                 logger.info(
-                    "Grad-layer monitor enabled: every_steps=%s topk=%s csv=%s plot=%s heatmap=%s prefixes=%s",
+                    "Grad-layer monitor enabled: every_steps=%s topk=%s csv=%s plot=%s heatmap=%s prefixes=%s cwd=%s rank=%s",
                     grad_layer_monitor_every_steps,
                     grad_layer_monitor_topk_layers,
-                    grad_layer_monitor_csv_path if grad_layer_monitor_save_csv else "<off>",
-                    grad_layer_monitor_plot_path if grad_layer_monitor_save_plot else "<off>",
-                    grad_layer_monitor_heatmap_path if (grad_layer_monitor_save_plot and grad_layer_monitor_save_heatmap) else "<off>",
+                    csv_abs if grad_layer_monitor_save_csv else "<off>",
+                    plot_abs if grad_layer_monitor_save_plot else "<off>",
+                    heatmap_abs if (grad_layer_monitor_save_plot and grad_layer_monitor_save_heatmap) else "<off>",
                     list(grad_layer_monitor_include_prefixes),
+                    str(Path.cwd()),
+                    int(rank),
                 )
             if freeze_decoder_steps > 0 and rank == 0:
                 logger.info("Decoder freeze enabled: freeze_decoder_steps=%s", freeze_decoder_steps)
@@ -2229,7 +2238,15 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                             layer_grad_to_param_ratio_post_clip=layer_grad_to_param_ratio_post_clip,
                             clip_coef=float(grad_clip_coef),
                         )
+                        logger.info(
+                            "grad_layer_monitor_write step=%s csv=%s rows=%s",
+                            global_step,
+                            str(grad_layer_monitor_csv_path.resolve()),
+                            len(layer_keys),
+                        )
 
+                    plot_saved = False
+                    heatmap_saved = False
                     if grad_layer_monitor_save_plot and (
                         global_step == 1
                         or (
@@ -2252,6 +2269,22 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                                 max_layers=grad_layer_monitor_heatmap_max_layers,
                                 log_scale=grad_layer_monitor_log_scale,
                             )
+                            heatmap_saved = True
+                    if grad_layer_monitor_save_plot and (
+                        global_step == 1
+                        or (
+                            grad_layer_monitor_plot_every_steps > 0
+                            and global_step % grad_layer_monitor_plot_every_steps == 0
+                        )
+                    ):
+                        logger.info(
+                            "grad_layer_monitor_plot step=%s plot_saved=%s plot=%s heatmap_saved=%s heatmap=%s",
+                            global_step,
+                            plot_saved,
+                            str(grad_layer_monitor_plot_path.resolve()),
+                            heatmap_saved if grad_layer_monitor_save_heatmap else False,
+                            str(grad_layer_monitor_heatmap_path.resolve()) if grad_layer_monitor_save_heatmap else "<off>",
+                        )
 
                 t_opt = time.perf_counter()
                 if scaler.is_enabled():
