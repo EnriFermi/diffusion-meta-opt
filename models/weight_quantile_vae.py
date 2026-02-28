@@ -61,6 +61,45 @@ def sinusoidal_embedding(indices: torch.Tensor, dim: int, max_period: float = 10
     return emb
 
 
+def _apply_rope(x: torch.Tensor, positions: torch.Tensor, max_period: float = 10000.0) -> torch.Tensor:
+    """
+    Apply RoPE to attention projections.
+
+    x: [B, H, T, D_h]
+    positions: [T]
+    """
+    if x.ndim != 4:
+        raise ValueError(f"x must be [B,H,T,D_h], got {tuple(x.shape)}")
+    if positions.ndim != 1:
+        raise ValueError(f"positions must be rank-1 [T], got {tuple(positions.shape)}")
+    if int(positions.shape[0]) != int(x.shape[2]):
+        raise ValueError(f"positions length ({int(positions.shape[0])}) must match sequence length ({int(x.shape[2])})")
+
+    _, _, _, d_h = x.shape
+    rope_dim = int(d_h) if int(d_h) % 2 == 0 else int(d_h) - 1
+    if rope_dim <= 0:
+        return x
+
+    pos = positions.to(device=x.device, dtype=torch.float32)
+    inv_freq = torch.exp(
+        -math.log(max_period) * torch.arange(0, rope_dim, 2, device=x.device, dtype=torch.float32) / float(rope_dim)
+    )
+    angles = pos[:, None] * inv_freq[None, :]  # [T, rope_dim/2]
+    sin = torch.sin(angles).to(dtype=x.dtype).view(1, 1, x.shape[2], rope_dim // 2)
+    cos = torch.cos(angles).to(dtype=x.dtype).view(1, 1, x.shape[2], rope_dim // 2)
+
+    x_rot = x[..., :rope_dim]
+    x_pass = x[..., rope_dim:]
+    x_even = x_rot[..., 0::2]
+    x_odd = x_rot[..., 1::2]
+    rot_even = x_even * cos - x_odd * sin
+    rot_odd = x_even * sin + x_odd * cos
+    x_rotated = torch.stack((rot_even, rot_odd), dim=-1).flatten(-2)
+    if x_pass.numel() == 0:
+        return x_rotated
+    return torch.cat([x_rotated, x_pass], dim=-1)
+
+
 def _init_vae_module_weights(module: nn.Module) -> None:
     """Explicit initialization for mini-VAE modules (real and stub variants)."""
     if isinstance(module, nn.Linear):
@@ -496,15 +535,19 @@ class MiniPatchEncoder(nn.Module):
 class CrossAttnBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
         super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+        self.d_model = int(d_model)
+        self.n_heads = int(n_heads)
+        self.head_dim = int(d_model // n_heads)
         self.q_norm = nn.LayerNorm(d_model)
         self.kv_norm = nn.LayerNorm(d_model)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.attn_dropout = nn.Dropout(dropout)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_prob_dropout_p = float(dropout)
+        self.attn_out_dropout = nn.Dropout(dropout)
         self.ffn_norm = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
@@ -514,11 +557,35 @@ class CrossAttnBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        q_pos: torch.Tensor,
+        kv_pos: torch.Tensor,
+    ) -> torch.Tensor:
         q_attn = self.q_norm(q)
         kv_attn = self.kv_norm(kv)
-        attn_out, _ = self.cross_attn(q_attn, kv_attn, kv_attn, need_weights=False)
-        q = q + self.attn_dropout(attn_out)
+
+        B, Tq, _ = q_attn.shape
+        Tk = kv_attn.shape[1]
+
+        q_proj = self.q_proj(q_attn).view(B, Tq, self.n_heads, self.head_dim).transpose(1, 2)
+        k_proj = self.k_proj(kv_attn).view(B, Tk, self.n_heads, self.head_dim).transpose(1, 2)
+        v_proj = self.v_proj(kv_attn).view(B, Tk, self.n_heads, self.head_dim).transpose(1, 2)
+
+        q_proj = _apply_rope(q_proj, q_pos)
+        k_proj = _apply_rope(k_proj, kv_pos)
+
+        attn_scores = torch.matmul(q_proj, k_proj.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        if self.attn_prob_dropout_p > 0.0:
+            attn_probs = F.dropout(attn_probs, p=self.attn_prob_dropout_p, training=self.training)
+        attn_out = torch.matmul(attn_probs, v_proj)  # [B, H, Tq, D_h]
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, self.d_model)
+        attn_out = self.out_proj(attn_out)
+
+        q = q + self.attn_out_dropout(attn_out)
         q = q + self.ffn(self.ffn_norm(q))
         return q
 
@@ -554,6 +621,7 @@ class CrossAttnPatchDecoder(nn.Module):
         self.blocks = nn.ModuleList(
             [CrossAttnBlock(d_model=self.d_model, n_heads=self.n_heads, dropout=float(cfg.dropout)) for _ in range(self.num_layers)]
         )
+        self.query_seed = nn.Parameter(torch.randn(self.d_model) * 0.02)
         self.output_eps = 1e-6
         self.output_s_min = -3.0
         self.output_s_max = 6.0
@@ -591,11 +659,12 @@ class CrossAttnPatchDecoder(nn.Module):
             else:
                 lat = torch.cat([lat, dist_lat], dim=1)
 
-        q_pos = sinusoidal_embedding(torch.arange(p, device=z.device), dim=self.d_model).to(dtype=z.dtype)
-        q = q_pos.unsqueeze(0).expand(B, -1, -1)
+        q = self.query_seed.to(dtype=z.dtype).view(1, 1, self.d_model).expand(B, p, self.d_model)
+        q_pos = torch.arange(p, device=z.device, dtype=torch.float32)
+        kv_pos = torch.arange(lat.shape[1], device=z.device, dtype=torch.float32)
 
         for block in self.blocks:
-            q = block(q, lat)
+            q = block(q, lat, q_pos=q_pos, kv_pos=kv_pos)
 
         u_hat = self.direction_head(q).squeeze(-1)  # [B, p]
         s_hat = self.scale_head(q.mean(dim=1)).squeeze(-1)  # [B]
