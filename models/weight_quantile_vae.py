@@ -78,6 +78,13 @@ def _init_vae_module_weights(module: nn.Module) -> None:
     elif isinstance(module, nn.MultiheadAttention):
         if module.in_proj_weight is not None:
             nn.init.xavier_uniform_(module.in_proj_weight)
+        else:
+            if getattr(module, "q_proj_weight", None) is not None:
+                nn.init.xavier_uniform_(module.q_proj_weight)
+            if getattr(module, "k_proj_weight", None) is not None:
+                nn.init.xavier_uniform_(module.k_proj_weight)
+            if getattr(module, "v_proj_weight", None) is not None:
+                nn.init.xavier_uniform_(module.v_proj_weight)
         if module.in_proj_bias is not None:
             nn.init.zeros_(module.in_proj_bias)
     elif isinstance(module, nn.LayerNorm):
@@ -359,6 +366,9 @@ class InputDistributionEncodingModule(nn.Module):
 class MiniVAEConfig:
     z_dim: int = 64
     d_e: int = 128
+    # Real-only: Perceiver latent width in MiniPatchEncoder.
+    # If 0, defaults to d_e.
+    encoder_latent_dim: int = 0
     pos_dim: int = 32
     num_attn_layers_encoder: int = 2
     num_layers_decoder: int = 2
@@ -391,6 +401,8 @@ class MiniPatchEncoder(nn.Module):
             raise ValueError(f"mini d_e ({cfg.d_e}) must be divisible by n_heads ({cfg.n_heads})")
         if cfg.pos_dim <= 0:
             raise ValueError(f"mini pos_dim must be positive, got {cfg.pos_dim}")
+        if int(cfg.encoder_latent_dim) < 0:
+            raise ValueError(f"mini encoder_latent_dim must be >= 0, got {int(cfg.encoder_latent_dim)}")
 
         # Per-element embed: (1 + d_var + pos_dim) -> d_e.
         self.elem_embed = nn.Sequential(
@@ -400,19 +412,35 @@ class MiniPatchEncoder(nn.Module):
             nn.Linear(cfg.d_e, cfg.d_e),
             nn.Dropout(cfg.dropout),
         )
+        self.latent_d_model = int(cfg.encoder_latent_dim) if int(cfg.encoder_latent_dim) > 0 else int(cfg.d_e)
+        if self.latent_d_model % cfg.n_heads != 0:
+            raise ValueError(
+                f"mini encoder latent d_model ({self.latent_d_model}) must be divisible by n_heads ({cfg.n_heads})"
+            )
 
         self.num_latents = max(1, int(cfg.decoder_L_latents))
-        self.resampler_latents = nn.Parameter(torch.randn(self.num_latents, cfg.d_e) * 0.02)
+        self.resampler_latents = nn.Parameter(torch.randn(self.num_latents, self.latent_d_model) * 0.02)
         self.resampler = nn.ModuleList(
             [
-                PerceiverResamplerBlock(d_model=cfg.d_e, n_heads=cfg.n_heads, dropout=cfg.dropout)
+                PerceiverResamplerBlock(
+                    d_latent=self.latent_d_model,
+                    d_token=int(cfg.d_e),
+                    n_heads=cfg.n_heads,
+                    dropout=cfg.dropout,
+                )
                 for _ in range(max(1, cfg.num_attn_layers_encoder))
             ]
         )
-        self.head_norm = nn.LayerNorm(cfg.d_e)
+        self.flat_latent_dim = self.num_latents * self.latent_d_model
+        if int(cfg.z_dim) != self.flat_latent_dim:
+            raise ValueError(
+                "mini z_dim must equal flattened encoder latent size: "
+                f"z_dim={int(cfg.z_dim)} vs encoder_latent_dim*decoder_L_latents={self.latent_d_model}*{self.num_latents}={self.flat_latent_dim}"
+            )
+        self.head_norm = nn.LayerNorm(self.flat_latent_dim)
 
-        self.to_mu = nn.Linear(cfg.d_e, cfg.z_dim)
-        self.to_logvar = nn.Linear(cfg.d_e, cfg.z_dim)
+        self.to_mu = nn.Linear(self.flat_latent_dim, cfg.z_dim)
+        self.to_logvar = nn.Linear(self.flat_latent_dim, cfg.z_dim)
 
         if cfg.d_patch == cfg.z_dim:
             self.patch_proj = nn.Identity()
@@ -448,7 +476,7 @@ class MiniPatchEncoder(nn.Module):
         latents = self.resampler_latents.unsqueeze(0).expand(B, -1, -1)
         for block in self.resampler:
             latents = block(latents=latents, tokens=e)
-        h = self.head_norm(latents.mean(dim=1))
+        h = self.head_norm(latents.reshape(B, self.flat_latent_dim))
 
         # mu/logvar: [B, z_dim]
         mu = self.to_mu(h)
@@ -636,29 +664,31 @@ class MiniPatchVAE(nn.Module):
 class PerceiverResamplerBlock(nn.Module):
     """Perceiver-style resampler block over latent queries and input patch tokens."""
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+    def __init__(self, d_latent: int, d_token: int, n_heads: int, dropout: float) -> None:
         super().__init__()
-        self.norm_cross_q = nn.LayerNorm(d_model)
-        self.norm_cross_kv = nn.LayerNorm(d_model)
+        self.norm_cross_q = nn.LayerNorm(d_latent)
+        self.norm_cross_kv = nn.LayerNorm(d_token)
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
+            embed_dim=d_latent,
             num_heads=n_heads,
             dropout=dropout,
             batch_first=True,
+            kdim=d_token,
+            vdim=d_token,
         )
-        self.norm_self = nn.LayerNorm(d_model)
+        self.norm_self = nn.LayerNorm(d_latent)
         self.self_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
+            embed_dim=d_latent,
             num_heads=n_heads,
             dropout=dropout,
             batch_first=True,
         )
-        self.norm_ffn = nn.LayerNorm(d_model)
+        self.norm_ffn = nn.LayerNorm(d_latent)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
+            nn.Linear(d_latent, 4 * d_latent),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(4 * d_model, d_model),
+            nn.Linear(4 * d_latent, d_latent),
             nn.Dropout(dropout),
         )
         self.dropout = nn.Dropout(dropout)
@@ -706,26 +736,30 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
             nn.Linear(cfg.d_e, cfg.d_e),
             nn.Dropout(cfg.dropout),
         )
-        if self.resampler_d_model == int(cfg.d_e):
-            self.token_to_resampler = nn.Identity()
-        else:
-            self.token_to_resampler = nn.Linear(cfg.d_e, self.resampler_d_model)
-
         self.num_latents = max(1, int(cfg.decoder_L_latents))
         self.resampler_latents = nn.Parameter(torch.randn(self.num_latents, self.resampler_d_model) * 0.02)
         self.resampler = nn.ModuleList(
             [
                 PerceiverResamplerBlock(
-                    d_model=self.resampler_d_model,
+                    d_latent=self.resampler_d_model,
+                    d_token=int(cfg.d_e),
                     n_heads=cfg.n_heads,
                     dropout=cfg.dropout,
                 )
                 for _ in range(max(1, cfg.num_attn_layers_encoder))
             ]
         )
-        self.latent_norm = nn.LayerNorm(self.resampler_d_model)
-        self.to_mu = nn.Linear(self.resampler_d_model, cfg.z_dim)
-        self.to_logvar = nn.Linear(self.resampler_d_model, cfg.z_dim)
+        self.flat_latent_dim = self.num_latents * self.resampler_d_model
+        if int(cfg.z_dim) != self.flat_latent_dim:
+            raise ValueError(
+                "mini z_dim must equal flattened stub latent size: "
+                "z_dim="
+                f"{int(cfg.z_dim)} vs stub_resampler_d_model*decoder_L_latents="
+                f"{self.resampler_d_model}*{self.num_latents}={self.flat_latent_dim}"
+            )
+        self.latent_norm = nn.LayerNorm(self.flat_latent_dim)
+        self.to_mu = nn.Linear(self.flat_latent_dim, cfg.z_dim)
+        self.to_logvar = nn.Linear(self.flat_latent_dim, cfg.z_dim)
         if cfg.d_patch == cfg.z_dim:
             self.patch_proj = nn.Identity()
         else:
@@ -750,11 +784,10 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
         token_in = torch.cat([w_patch.unsqueeze(-1), pos_expand], dim=-1)
         e = self.elem_embed(token_in)
 
-        token_ctx = self.token_to_resampler(e)
         latents = self.resampler_latents.unsqueeze(0).expand(B, -1, -1)
         for block in self.resampler:
-            latents = block(latents=latents, tokens=token_ctx)
-        h = self.latent_norm(latents.mean(dim=1))
+            latents = block(latents=latents, tokens=e)
+        h = self.latent_norm(latents.reshape(B, self.flat_latent_dim))
         mu = self.to_mu(h)
         logvar = self.to_logvar(h)
         return mu, logvar
@@ -1506,7 +1539,15 @@ def smoke_test_big_weight_vae() -> None:
     cfg = ModelConfig(
         patch_size=16,
         distribution=DistributionConfig(k_s=16, Kq=32, d_var=128, d_dist=128),
-        mini_vae=MiniVAEConfig(z_dim=64, d_e=128, num_attn_layers_encoder=2, num_layers_decoder=2, n_heads=4, d_patch=64),
+        mini_vae=MiniVAEConfig(
+            z_dim=64,
+            d_e=128,
+            encoder_latent_dim=8,
+            num_attn_layers_encoder=2,
+            num_layers_decoder=2,
+            n_heads=4,
+            d_patch=64,
+        ),
         big_vae=BigVAEConfig(
             d_model=256,
             d_lat=256,

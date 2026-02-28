@@ -39,6 +39,7 @@ def build_mini_vae_config(cfg: DictConfig, section: str = "mini_model") -> MiniV
     return MiniVAEConfig(
         z_dim=int(mini_cfg.get("z_dim", 64)),
         d_e=int(mini_cfg.get("d_e", 128)),
+        encoder_latent_dim=int(mini_cfg.get("encoder_latent_dim", 0)),
         pos_dim=int(mini_cfg.get("pos_dim", 32)),
         num_attn_layers_encoder=int(mini_cfg.get("num_attn_layers_encoder", 2)),
         num_layers_decoder=int(mini_cfg.get("num_layers_decoder", 2)),
