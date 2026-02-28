@@ -100,6 +100,32 @@ def _apply_rope(x: torch.Tensor, positions: torch.Tensor, max_period: float = 10
     return torch.cat([x_rotated, x_pass], dim=-1)
 
 
+def _rope_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_pos: torch.Tensor,
+    k_pos: torch.Tensor,
+    dropout_p: float,
+    training: bool,
+) -> torch.Tensor:
+    """
+    RoPE + scaled dot-product attention.
+
+    q/k/v: [B, H, T, D_h] and [B, H, S, D_h]
+    q_pos: [T]
+    k_pos: [S]
+    returns: [B, H, T, D_h]
+    """
+    q_rot = _apply_rope(q, q_pos)
+    k_rot = _apply_rope(k, k_pos)
+    attn_scores = torch.matmul(q_rot, k_rot.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
+    attn_probs = torch.softmax(attn_scores, dim=-1)
+    if dropout_p > 0.0:
+        attn_probs = F.dropout(attn_probs, p=dropout_p, training=training)
+    return torch.matmul(attn_probs, v)
+
+
 def _init_vae_module_weights(module: nn.Module) -> None:
     """Explicit initialization for mini-VAE modules (real and stub variants)."""
     if isinstance(module, nn.Linear):
@@ -471,7 +497,7 @@ class MiniPatchEncoder(nn.Module):
             [
                 PerceiverResamplerBlock(
                     d_latent=self.latent_d_model,
-                    d_token=int(cfg.d_e),
+                    d_token=int(cfg.d_e) + 1,
                     n_heads=cfg.n_heads,
                     dropout=cfg.dropout,
                 )
@@ -519,8 +545,15 @@ class MiniPatchEncoder(nn.Module):
         slot_pos = sinusoidal_embedding(self.slot_tau.to(device=w_patch.device), dim=self.pos_lat_dim).to(dtype=e.dtype)
         latents0 = self.slot_pos_to_latent(slot_pos)
         latents = latents0.unsqueeze(0).expand(B, -1, -1)
+        tokens_with_w = torch.cat([e, w_patch.unsqueeze(-1).to(dtype=e.dtype)], dim=-1)
+        latent_pos = self.slot_tau.to(device=w_patch.device)
         for block in self.resampler:
-            latents = block(latents=latents, tokens=e)
+            latents = block(
+                latents=latents,
+                tokens=tokens_with_w,
+                latent_pos=latent_pos,
+                token_pos=token_tau,
+            )
         latents = self.latent_norm(latents)
         h = latents.reshape(B, self.flat_latent_dim)
 
@@ -552,6 +585,12 @@ class CrossAttnBlock(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         self.attn_prob_dropout_p = float(dropout)
         self.attn_out_dropout = nn.Dropout(dropout)
+        self.self_attn_norm = nn.LayerNorm(d_model)
+        self.self_q_proj = nn.Linear(d_model, d_model)
+        self.self_k_proj = nn.Linear(d_model, d_model)
+        self.self_v_proj = nn.Linear(d_model, d_model)
+        self.self_out_proj = nn.Linear(d_model, d_model)
+        self.self_attn_out_dropout = nn.Dropout(dropout)
         self.ffn_norm = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
@@ -578,18 +617,35 @@ class CrossAttnBlock(nn.Module):
         k_proj = self.k_proj(kv_attn).view(B, Tk, self.n_heads, self.head_dim).transpose(1, 2)
         v_proj = self.v_proj(kv_attn).view(B, Tk, self.n_heads, self.head_dim).transpose(1, 2)
 
-        q_proj = _apply_rope(q_proj, q_pos)
-        k_proj = _apply_rope(k_proj, kv_pos)
-
-        attn_scores = torch.matmul(q_proj, k_proj.transpose(-2, -1)) * (self.head_dim ** -0.5)
-        attn_probs = torch.softmax(attn_scores, dim=-1)
-        if self.attn_prob_dropout_p > 0.0:
-            attn_probs = F.dropout(attn_probs, p=self.attn_prob_dropout_p, training=self.training)
-        attn_out = torch.matmul(attn_probs, v_proj)  # [B, H, Tq, D_h]
+        attn_out = _rope_attention(
+            q=q_proj,
+            k=k_proj,
+            v=v_proj,
+            q_pos=q_pos,
+            k_pos=kv_pos,
+            dropout_p=self.attn_prob_dropout_p,
+            training=self.training,
+        )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, self.d_model)
         attn_out = self.out_proj(attn_out)
 
         q = q + self.attn_out_dropout(attn_out)
+        q_self = self.self_attn_norm(q)
+        self_q = self.self_q_proj(q_self).view(B, Tq, self.n_heads, self.head_dim).transpose(1, 2)
+        self_k = self.self_k_proj(q_self).view(B, Tq, self.n_heads, self.head_dim).transpose(1, 2)
+        self_v = self.self_v_proj(q_self).view(B, Tq, self.n_heads, self.head_dim).transpose(1, 2)
+        self_out = _rope_attention(
+            q=self_q,
+            k=self_k,
+            v=self_v,
+            q_pos=q_pos,
+            k_pos=q_pos,
+            dropout_p=self.attn_prob_dropout_p,
+            training=self.training,
+        )
+        self_out = self_out.transpose(1, 2).contiguous().view(B, Tq, self.d_model)
+        self_out = self.self_out_proj(self_out)
+        q = q + self.self_attn_out_dropout(self_out)
         q = q + self.ffn(self.ffn_norm(q))
         return q
 
@@ -742,23 +798,22 @@ class PerceiverResamplerBlock(nn.Module):
 
     def __init__(self, d_latent: int, d_token: int, n_heads: int, dropout: float) -> None:
         super().__init__()
+        if d_latent % n_heads != 0:
+            raise ValueError(f"d_latent ({d_latent}) must be divisible by n_heads ({n_heads})")
+        self.d_latent = int(d_latent)
+        self.n_heads = int(n_heads)
+        self.head_dim = int(d_latent // n_heads)
         self.norm_cross_q = nn.LayerNorm(d_latent)
         self.norm_cross_kv = nn.LayerNorm(d_token)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_latent,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
-            kdim=d_token,
-            vdim=d_token,
-        )
+        self.cross_q_proj = nn.Linear(d_latent, d_latent)
+        self.cross_k_proj = nn.Linear(d_token, d_latent)
+        self.cross_v_proj = nn.Linear(d_token, d_latent)
+        self.cross_out_proj = nn.Linear(d_latent, d_latent)
         self.norm_self = nn.LayerNorm(d_latent)
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=d_latent,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
+        self.self_q_proj = nn.Linear(d_latent, d_latent)
+        self.self_k_proj = nn.Linear(d_latent, d_latent)
+        self.self_v_proj = nn.Linear(d_latent, d_latent)
+        self.self_out_proj = nn.Linear(d_latent, d_latent)
         self.norm_ffn = nn.LayerNorm(d_latent)
         self.ffn = nn.Sequential(
             nn.Linear(d_latent, 4 * d_latent),
@@ -767,16 +822,51 @@ class PerceiverResamplerBlock(nn.Module):
             nn.Linear(4 * d_latent, d_latent),
             nn.Dropout(dropout),
         )
+        self.attn_prob_dropout_p = float(dropout)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, latents: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        latents: torch.Tensor,
+        tokens: torch.Tensor,
+        latent_pos: torch.Tensor,
+        token_pos: torch.Tensor,
+    ) -> torch.Tensor:
         q = self.norm_cross_q(latents)
         kv = self.norm_cross_kv(tokens)
-        cross_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+        B, L_lat, _ = q.shape
+        L_tok = kv.shape[1]
+        q_cross = self.cross_q_proj(q).view(B, L_lat, self.n_heads, self.head_dim).transpose(1, 2)
+        k_cross = self.cross_k_proj(kv).view(B, L_tok, self.n_heads, self.head_dim).transpose(1, 2)
+        v_cross = self.cross_v_proj(kv).view(B, L_tok, self.n_heads, self.head_dim).transpose(1, 2)
+        cross_out = _rope_attention(
+            q=q_cross,
+            k=k_cross,
+            v=v_cross,
+            q_pos=latent_pos,
+            k_pos=token_pos,
+            dropout_p=self.attn_prob_dropout_p,
+            training=self.training,
+        )
+        cross_out = cross_out.transpose(1, 2).contiguous().view(B, L_lat, self.d_latent)
+        cross_out = self.cross_out_proj(cross_out)
         latents = latents + self.dropout(cross_out)
 
         lat_norm = self.norm_self(latents)
-        self_out, _ = self.self_attn(lat_norm, lat_norm, lat_norm, need_weights=False)
+        q_self = self.self_q_proj(lat_norm).view(B, L_lat, self.n_heads, self.head_dim).transpose(1, 2)
+        k_self = self.self_k_proj(lat_norm).view(B, L_lat, self.n_heads, self.head_dim).transpose(1, 2)
+        v_self = self.self_v_proj(lat_norm).view(B, L_lat, self.n_heads, self.head_dim).transpose(1, 2)
+        self_out = _rope_attention(
+            q=q_self,
+            k=k_self,
+            v=v_self,
+            q_pos=latent_pos,
+            k_pos=latent_pos,
+            dropout_p=self.attn_prob_dropout_p,
+            training=self.training,
+        )
+        self_out = self_out.transpose(1, 2).contiguous().view(B, L_lat, self.d_latent)
+        self_out = self.self_out_proj(self_out)
         latents = latents + self.dropout(self_out)
 
         latents = latents + self.dropout(self.ffn(self.norm_ffn(latents)))
@@ -814,11 +904,13 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
         )
         self.num_latents = max(1, int(cfg.decoder_L_latents))
         self.resampler_latents = nn.Parameter(torch.randn(self.num_latents, self.resampler_d_model) * 0.02)
+        latent_tau = (torch.arange(self.num_latents, dtype=torch.float32) + 0.5) / float(self.num_latents)
+        self.register_buffer("latent_tau", latent_tau, persistent=False)
         self.resampler = nn.ModuleList(
             [
                 PerceiverResamplerBlock(
                     d_latent=self.resampler_d_model,
-                    d_token=int(cfg.d_e),
+                    d_token=int(cfg.d_e) + 1,
                     n_heads=cfg.n_heads,
                     dropout=cfg.dropout,
                 )
@@ -854,6 +946,7 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
             raise ValueError(f"dist_var_tokens last dim must be {self.d_var}, got {int(dist_var_tokens.shape[2])}")
 
         # Debug path: intentionally ignore distribution tokens to isolate model-only behavior.
+        token_tau = (torch.arange(p, device=w_patch.device, dtype=torch.float32) + 0.5) / float(p)
         pos = sinusoidal_embedding(torch.arange(p, device=w_patch.device), dim=self.cfg.pos_dim).to(dtype=w_patch.dtype)
         pos_expand = pos.unsqueeze(0).expand(B, -1, -1)
 
@@ -861,8 +954,15 @@ class TransformerNoCompressionPatchEncoder(nn.Module):
         e = self.elem_embed(token_in)
 
         latents = self.resampler_latents.unsqueeze(0).expand(B, -1, -1)
+        tokens_with_w = torch.cat([e, w_patch.unsqueeze(-1).to(dtype=e.dtype)], dim=-1)
+        latent_pos = self.latent_tau.to(device=w_patch.device)
         for block in self.resampler:
-            latents = block(latents=latents, tokens=e)
+            latents = block(
+                latents=latents,
+                tokens=tokens_with_w,
+                latent_pos=latent_pos,
+                token_pos=token_tau,
+            )
         h = self.latent_norm(latents.reshape(B, self.flat_latent_dim))
         mu = self.to_mu(h)
         logvar = self.to_logvar(h)
