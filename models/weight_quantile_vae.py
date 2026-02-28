@@ -682,6 +682,8 @@ class CrossAttnPatchDecoder(nn.Module):
             [CrossAttnBlock(d_model=self.d_model, n_heads=self.n_heads, dropout=float(cfg.dropout)) for _ in range(self.num_layers)]
         )
         self.query_seed = nn.Parameter(torch.randn(self.d_model) * 0.02)
+        self.weight_hint_proj = nn.Linear(1, self.d_model)
+        self.weight_hint_scales = nn.Parameter(torch.ones(self.num_layers))
         self.output_eps = 1e-6
         self.output_s_min = -3.0
         self.output_s_max = 6.0
@@ -693,7 +695,13 @@ class CrossAttnPatchDecoder(nn.Module):
             nn.Linear(self.d_model, 1),
         )
 
-    def forward(self, z: torch.Tensor, patch_size: int, dist_patch_embed: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        z: torch.Tensor,
+        patch_size: int,
+        dist_patch_embed: torch.Tensor | None = None,
+        weight_hint: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # z: [B, z_dim]
         # dist_patch_embed: [B, d_dist] (optional)
         # patch_size: p
@@ -704,6 +712,10 @@ class CrossAttnPatchDecoder(nn.Module):
 
         B = z.shape[0]
         p = int(patch_size)
+        if weight_hint is not None and tuple(weight_hint.shape) != (B, p):
+            raise ValueError(
+                f"weight_hint must match [B,p]=[{B},{p}], got {tuple(weight_hint.shape)}"
+            )
 
         lat = self.z_to_latents(z).view(B, self.L_latents, self.d_model)
         if self.use_dist_conditioning and dist_patch_embed is not None and self.dist_to_latents is not None:
@@ -716,9 +728,17 @@ class CrossAttnPatchDecoder(nn.Module):
         q = self.query_seed.to(dtype=z.dtype).view(1, 1, self.d_model).expand(B, p, self.d_model)
         q_pos = torch.arange(p, device=z.device, dtype=torch.float32)
         kv_pos = torch.arange(lat.shape[1], device=z.device, dtype=torch.float32)
+        hint_tokens: torch.Tensor | None = None
+        if weight_hint is not None:
+            hint_tokens = self.weight_hint_proj(weight_hint.unsqueeze(-1).to(dtype=z.dtype))
 
-        for block in self.blocks:
-            q = block(q, lat, q_pos=q_pos, kv_pos=kv_pos)
+        for layer_idx, block in enumerate(self.blocks):
+            if hint_tokens is None:
+                q_in = q
+            else:
+                layer_scale = self.weight_hint_scales[layer_idx].to(dtype=q.dtype)
+                q_in = q + hint_tokens * layer_scale
+            q = block(q_in, lat, q_pos=q_pos, kv_pos=kv_pos)
 
         u_hat = self.direction_head(q).squeeze(-1)  # [B, p]
         s_hat = self.scale_head(q.mean(dim=1)).squeeze(-1)  # [B]
@@ -771,8 +791,14 @@ class MiniPatchVAE(nn.Module):
     def encode(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.encoder.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
 
-    def decode(self, z: torch.Tensor, patch_size: int, dist_patch_embed: torch.Tensor | None = None) -> torch.Tensor:
-        return self.decoder(z=z, patch_size=patch_size, dist_patch_embed=dist_patch_embed)
+    def decode(
+        self,
+        z: torch.Tensor,
+        patch_size: int,
+        dist_patch_embed: torch.Tensor | None = None,
+        weight_hint: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.decoder(z=z, patch_size=patch_size, dist_patch_embed=dist_patch_embed, weight_hint=weight_hint)
 
     def encode_patch(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
         return self.encoder.encode_patch(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
@@ -789,7 +815,12 @@ class MiniPatchVAE(nn.Module):
             z = self.reparameterize(mu=mu, logvar=logvar)
         else:
             z = mu
-        w_hat, w_norm = self.decode(z=z, patch_size=w_patch.shape[1], dist_patch_embed=dist_patch_embed)
+        w_hat, w_norm = self.decode(
+            z=z,
+            patch_size=w_patch.shape[1],
+            dist_patch_embed=dist_patch_embed,
+            weight_hint=w_patch,
+        )
         return w_hat, mu, logvar, z, w_norm
 
 
@@ -1085,7 +1116,13 @@ class MLPNoCompressionPatchDecoder(nn.Module):
             use_batchnorm=bool(cfg.stub_mlp_use_batchnorm),
         )
 
-    def forward(self, z: torch.Tensor, patch_size: int, dist_patch_embed: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        z: torch.Tensor,
+        patch_size: int,
+        dist_patch_embed: torch.Tensor | None = None,
+        weight_hint: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if z.ndim != 2:
             raise ValueError(f"z must be [B, z_dim_like], got {tuple(z.shape)}")
         if patch_size <= 0:
@@ -1158,8 +1195,14 @@ class MiniPatchVAEStub(nn.Module):
     def encode(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.encoder.encode(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
 
-    def decode(self, z: torch.Tensor, patch_size: int, dist_patch_embed: torch.Tensor | None = None) -> torch.Tensor:
-        return self.decoder(z=z, patch_size=patch_size, dist_patch_embed=dist_patch_embed)
+    def decode(
+        self,
+        z: torch.Tensor,
+        patch_size: int,
+        dist_patch_embed: torch.Tensor | None = None,
+        weight_hint: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.decoder(z=z, patch_size=patch_size, dist_patch_embed=dist_patch_embed, weight_hint=weight_hint)
 
     def encode_patch(self, w_patch: torch.Tensor, dist_var_tokens: torch.Tensor) -> torch.Tensor:
         return self.encoder.encode_patch(w_patch=w_patch, dist_var_tokens=dist_var_tokens)
@@ -1176,7 +1219,12 @@ class MiniPatchVAEStub(nn.Module):
         else:
             print('DO NOTHING')
             z = mu
-        w_hat, w_norm = self.decode(z=z, patch_size=w_patch.shape[1], dist_patch_embed=dist_patch_embed)
+        w_hat, w_norm = self.decode(
+            z=z,
+            patch_size=w_patch.shape[1],
+            dist_patch_embed=dist_patch_embed,
+            weight_hint=w_patch,
+        )
         return w_hat, mu, logvar, z, w_norm
 
 
