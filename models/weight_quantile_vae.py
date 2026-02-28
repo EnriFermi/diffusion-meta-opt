@@ -365,6 +365,9 @@ class MiniVAEConfig:
     # Real-only: Perceiver latent width in MiniPatchEncoder.
     # If 0, defaults to d_e.
     encoder_latent_dim: int = 0
+    # Real-only: Fourier positional width for latent slot anchoring.
+    # If 0, defaults to encoder latent width.
+    pos_lat_dim: int = 0
     pos_dim: int = 32
     num_attn_layers_encoder: int = 2
     num_layers_decoder: int = 2
@@ -399,6 +402,8 @@ class MiniPatchEncoder(nn.Module):
             raise ValueError(f"mini pos_dim must be positive, got {cfg.pos_dim}")
         if int(cfg.encoder_latent_dim) < 0:
             raise ValueError(f"mini encoder_latent_dim must be >= 0, got {int(cfg.encoder_latent_dim)}")
+        if int(cfg.pos_lat_dim) < 0:
+            raise ValueError(f"mini pos_lat_dim must be >= 0, got {int(cfg.pos_lat_dim)}")
 
         # Per-element embed: (1 + d_var + pos_dim) -> d_e.
         self.elem_embed = nn.Sequential(
@@ -413,9 +418,12 @@ class MiniPatchEncoder(nn.Module):
             raise ValueError(
                 f"mini encoder latent d_model ({self.latent_d_model}) must be divisible by n_heads ({cfg.n_heads})"
             )
+        self.pos_lat_dim = int(cfg.pos_lat_dim) if int(cfg.pos_lat_dim) > 0 else self.latent_d_model
 
         self.num_latents = max(1, int(cfg.decoder_L_latents))
-        self.resampler_latents = nn.Parameter(torch.randn(self.num_latents, self.latent_d_model) * 0.02)
+        self.slot_pos_to_latent = nn.Linear(self.pos_lat_dim, self.latent_d_model)
+        slot_tau = (torch.arange(self.num_latents, dtype=torch.float32) + 0.5) / float(self.num_latents)
+        self.register_buffer("slot_tau", slot_tau, persistent=False)
         self.resampler = nn.ModuleList(
             [
                 PerceiverResamplerBlock(
@@ -428,12 +436,7 @@ class MiniPatchEncoder(nn.Module):
             ]
         )
         self.flat_latent_dim = self.num_latents * self.latent_d_model
-        if int(cfg.z_dim) != self.flat_latent_dim:
-            raise ValueError(
-                "mini z_dim must equal flattened encoder latent size: "
-                f"z_dim={int(cfg.z_dim)} vs encoder_latent_dim*decoder_L_latents={self.latent_d_model}*{self.num_latents}={self.flat_latent_dim}"
-            )
-        self.head_norm = nn.LayerNorm(self.flat_latent_dim)
+        self.latent_norm = nn.LayerNorm(self.latent_d_model)
 
         self.to_mu = nn.Linear(self.flat_latent_dim, cfg.z_dim)
         self.to_logvar = nn.Linear(self.flat_latent_dim, cfg.z_dim)
@@ -458,8 +461,9 @@ class MiniPatchEncoder(nn.Module):
         if d_var != self.d_var:
             raise ValueError(f"dist_var_tokens last dim must be {self.d_var}, got {d_var}")
 
-        # Deterministic per-position embedding: [p, pos_dim] -> [B, p, pos_dim]
-        pos = sinusoidal_embedding(torch.arange(p, device=w_patch.device), dim=self.cfg.pos_dim).to(dtype=w_patch.dtype)
+        # Deterministic per-position embedding on normalized token coordinates t_i=(i+0.5)/p.
+        token_tau = (torch.arange(p, device=w_patch.device, dtype=torch.float32) + 0.5) / float(p)
+        pos = sinusoidal_embedding(token_tau, dim=self.cfg.pos_dim).to(dtype=w_patch.dtype)
         pos_expand = pos.unsqueeze(0).expand(B, -1, -1)
 
         # T: [B, p, 1 + d_var + pos_dim]
@@ -469,10 +473,13 @@ class MiniPatchEncoder(nn.Module):
         e = self.elem_embed(t)
 
         # Perceiver resampling: latent queries cross-attend to patch tokens.
-        latents = self.resampler_latents.unsqueeze(0).expand(B, -1, -1)
+        slot_pos = sinusoidal_embedding(self.slot_tau.to(device=w_patch.device), dim=self.pos_lat_dim).to(dtype=e.dtype)
+        latents0 = self.slot_pos_to_latent(slot_pos)
+        latents = latents0.unsqueeze(0).expand(B, -1, -1)
         for block in self.resampler:
             latents = block(latents=latents, tokens=e)
-        h = self.head_norm(latents.reshape(B, self.flat_latent_dim))
+        latents = self.latent_norm(latents)
+        h = latents.reshape(B, self.flat_latent_dim)
 
         # mu/logvar: [B, z_dim]
         mu = self.to_mu(h)
