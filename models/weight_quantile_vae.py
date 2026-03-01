@@ -61,44 +61,6 @@ def sinusoidal_embedding(indices: torch.Tensor, dim: int, max_period: float = 10
     return emb
 
 
-class SequenceChannelNorm(nn.Module):
-    """
-    Per-channel normalization over sequence dimension for tensors [B, T, C].
-    For T<=1 the input is returned unchanged to avoid degenerate normalization.
-    """
-
-    def __init__(self, d_model: int, eps: float = 1e-6, affine: bool = True) -> None:
-        super().__init__()
-        if d_model <= 0:
-            raise ValueError(f"d_model must be positive, got {d_model}")
-        if eps <= 0.0:
-            raise ValueError(f"eps must be positive, got {eps}")
-        self.d_model = int(d_model)
-        self.eps = float(eps)
-        self.affine = bool(affine)
-        if self.affine:
-            self.weight = nn.Parameter(torch.ones(self.d_model))
-            self.bias = nn.Parameter(torch.zeros(self.d_model))
-        else:
-            self.register_parameter("weight", None)
-            self.register_parameter("bias", None)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(f"Expected [B,T,C], got {tuple(x.shape)}")
-        if int(x.shape[-1]) != self.d_model:
-            raise ValueError(f"Expected channel dim={self.d_model}, got {int(x.shape[-1])}")
-        if int(x.shape[1]) <= 1:
-            return x
-
-        mean = x.mean(dim=1, keepdim=True)
-        var = (x - mean).pow(2).mean(dim=1, keepdim=True)
-        y = (x - mean) * torch.rsqrt(var + self.eps)
-        if self.affine and self.weight is not None and self.bias is not None:
-            y = y * self.weight.view(1, 1, -1) + self.bias.view(1, 1, -1)
-        return y
-
-
 def _apply_rope(x: torch.Tensor, positions: torch.Tensor, max_period: float = 10000.0) -> torch.Tensor:
     """
     Apply RoPE to attention projections.
@@ -194,12 +156,6 @@ def _init_vae_module_weights(module: nn.Module) -> None:
         if module.elementwise_affine:
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
-    elif isinstance(module, SequenceChannelNorm):
-        if module.affine and module.weight is not None and module.bias is not None:
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-
-
 def _init_vae_latent_parameters(module: nn.Module) -> None:
     """Initialize standalone latent parameters that are not covered by module.apply()."""
     with torch.no_grad():
@@ -621,9 +577,6 @@ class CrossAttnBlock(nn.Module):
         self.head_dim = int(d_model // n_heads)
         self.q_norm = nn.LayerNorm(d_model)
         self.kv_norm = nn.LayerNorm(d_model)
-        self.seq_norm_cross_q_pre = SequenceChannelNorm(d_model)
-        self.seq_norm_cross_kv_pre = SequenceChannelNorm(d_model)
-        self.seq_norm_cross_out = SequenceChannelNorm(d_model)
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
@@ -631,8 +584,6 @@ class CrossAttnBlock(nn.Module):
         self.attn_prob_dropout_p = float(dropout)
         self.attn_out_dropout = nn.Dropout(dropout)
         self.self_attn_norm = nn.LayerNorm(d_model)
-        self.seq_norm_self_pre = SequenceChannelNorm(d_model)
-        self.seq_norm_self_out = SequenceChannelNorm(d_model)
         self.self_q_proj = nn.Linear(d_model, d_model)
         self.self_k_proj = nn.Linear(d_model, d_model)
         self.self_v_proj = nn.Linear(d_model, d_model)
@@ -654,8 +605,8 @@ class CrossAttnBlock(nn.Module):
         q_pos: torch.Tensor,
         kv_pos: torch.Tensor,
     ) -> torch.Tensor:
-        q_attn = self.seq_norm_cross_q_pre(self.q_norm(q))
-        kv_attn = self.seq_norm_cross_kv_pre(self.kv_norm(kv))
+        q_attn = self.q_norm(q)
+        kv_attn = self.kv_norm(kv)
 
         B, Tq, _ = q_attn.shape
         Tk = kv_attn.shape[1]
@@ -675,10 +626,9 @@ class CrossAttnBlock(nn.Module):
         )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, self.d_model)
         attn_out = self.out_proj(attn_out)
-        attn_out = self.seq_norm_cross_out(attn_out)
 
         q = q + self.attn_out_dropout(attn_out)
-        q_self = self.seq_norm_self_pre(self.self_attn_norm(q))
+        q_self = self.self_attn_norm(q)
         self_q = self.self_q_proj(q_self).view(B, Tq, self.n_heads, self.head_dim).transpose(1, 2)
         self_k = self.self_k_proj(q_self).view(B, Tq, self.n_heads, self.head_dim).transpose(1, 2)
         self_v = self.self_v_proj(q_self).view(B, Tq, self.n_heads, self.head_dim).transpose(1, 2)
@@ -693,7 +643,6 @@ class CrossAttnBlock(nn.Module):
         )
         self_out = self_out.transpose(1, 2).contiguous().view(B, Tq, self.d_model)
         self_out = self.self_out_proj(self_out)
-        self_out = self.seq_norm_self_out(self_out)
         q = q + self.self_attn_out_dropout(self_out)
         q = q + self.ffn(self.ffn_norm(q))
         return q
@@ -1426,9 +1375,6 @@ class DecoderCrossBlock(nn.Module):
 
         self.norm_q = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_lat)
-        self.seq_norm_cross_q_pre = SequenceChannelNorm(d_model)
-        self.seq_norm_cross_kv_pre = SequenceChannelNorm(d_lat)
-        self.seq_norm_cross_out = SequenceChannelNorm(d_model)
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=n_heads,
@@ -1446,10 +1392,9 @@ class DecoderCrossBlock(nn.Module):
     def forward(self, q_tokens: torch.Tensor, z_latents: torch.Tensor) -> torch.Tensor:
         # q_tokens: [B, Q, d_model]
         # z_latents: [B, L, d_lat]
-        q = self.seq_norm_cross_q_pre(self.norm_q(q_tokens))
-        kv = self.seq_norm_cross_kv_pre(self.norm_kv(z_latents))
+        q = self.norm_q(q_tokens)
+        kv = self.norm_kv(z_latents)
         cross_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
-        cross_out = self.seq_norm_cross_out(cross_out)
         q_tokens = q_tokens + self.dropout(cross_out)
         q_tokens = q_tokens + self.dropout(self.ffn(self.norm_ffn(q_tokens)))
         return q_tokens
