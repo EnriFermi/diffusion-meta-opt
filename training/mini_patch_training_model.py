@@ -53,6 +53,7 @@ def build_mini_vae_config(cfg: DictConfig, section: str = "mini_model") -> MiniV
         mlp_stub_hidden_dim=int(mini_cfg.get("mlp_stub_hidden_dim", 256)),
         stub_mlp_use_batchnorm=bool(mini_cfg.get("stub_mlp_use_batchnorm", False)),
         stub_resampler_d_model=int(mini_cfg.get("stub_resampler_d_model", 0)),
+        init_style=str(mini_cfg.get("init_style", "llm")),
         n_heads=int(mini_cfg.get("n_heads", 4)),
         d_patch=int(mini_cfg.get("d_patch", 64)),
         dropout=float(mini_cfg.get("dropout", 0.0)),
