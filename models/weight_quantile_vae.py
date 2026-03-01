@@ -554,7 +554,7 @@ class MiniPatchEncoder(nn.Module):
                 latent_pos=latent_pos,
                 token_pos=token_tau,
             )
-        latents = self.latent_norm(latents)
+        # latents = self.latent_norm(latents)
         h = latents.reshape(B, self.flat_latent_dim)
 
         # mu/logvar: [B, z_dim]
