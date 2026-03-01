@@ -126,10 +126,23 @@ def _rope_attention(
     return torch.matmul(attn_probs, v)
 
 
-def _init_vae_module_weights(module: nn.Module) -> None:
+def _init_vae_module_weights(
+    module: nn.Module,
+    base_std: float = 0.02,
+    init_style: str = "llm",
+) -> None:
     """Explicit initialization for mini-VAE modules (real and stub variants)."""
+    style = str(init_style).strip().lower()
+    if style not in {"xavier", "llm"}:
+        raise ValueError(f"init_style must be 'xavier' or 'llm', got {init_style!r}")
+    if float(base_std) <= 0.0:
+        raise ValueError(f"base_std must be positive, got {base_std}")
+
     if isinstance(module, nn.Linear):
-        nn.init.xavier_uniform_(module.weight)
+        if style == "xavier":
+            nn.init.xavier_uniform_(module.weight)
+        else:
+            nn.init.normal_(module.weight, mean=0.0, std=float(base_std))
         if module.bias is not None:
             nn.init.zeros_(module.bias)
     elif isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
@@ -142,20 +155,91 @@ def _init_vae_module_weights(module: nn.Module) -> None:
             nn.init.zeros_(module.bias)
     elif isinstance(module, nn.MultiheadAttention):
         if module.in_proj_weight is not None:
-            nn.init.xavier_uniform_(module.in_proj_weight)
+            if style == "xavier":
+                nn.init.xavier_uniform_(module.in_proj_weight)
+            else:
+                nn.init.normal_(module.in_proj_weight, mean=0.0, std=float(base_std))
         else:
             if getattr(module, "q_proj_weight", None) is not None:
-                nn.init.xavier_uniform_(module.q_proj_weight)
+                if style == "xavier":
+                    nn.init.xavier_uniform_(module.q_proj_weight)
+                else:
+                    nn.init.normal_(module.q_proj_weight, mean=0.0, std=float(base_std))
             if getattr(module, "k_proj_weight", None) is not None:
-                nn.init.xavier_uniform_(module.k_proj_weight)
+                if style == "xavier":
+                    nn.init.xavier_uniform_(module.k_proj_weight)
+                else:
+                    nn.init.normal_(module.k_proj_weight, mean=0.0, std=float(base_std))
             if getattr(module, "v_proj_weight", None) is not None:
-                nn.init.xavier_uniform_(module.v_proj_weight)
+                if style == "xavier":
+                    nn.init.xavier_uniform_(module.v_proj_weight)
+                else:
+                    nn.init.normal_(module.v_proj_weight, mean=0.0, std=float(base_std))
         if module.in_proj_bias is not None:
             nn.init.zeros_(module.in_proj_bias)
     elif isinstance(module, nn.LayerNorm):
         if module.elementwise_affine:
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
+
+
+def _find_ffn_down_projection(module: nn.Module) -> nn.Linear | None:
+    # Preferred explicit naming.
+    ffn_down = getattr(module, "ffn_down", None)
+    if isinstance(ffn_down, nn.Linear):
+        return ffn_down
+
+    # MLP helper used in BigVAE blocks.
+    ffn = getattr(module, "ffn", None)
+    if isinstance(ffn, MLP):
+        return ffn.fc2
+
+    # Sequential FFN: use last Linear as down-proj.
+    if isinstance(ffn, nn.Sequential):
+        for child in reversed(ffn):
+            if isinstance(child, nn.Linear):
+                return child
+    return None
+
+
+def _apply_residual_scaled_init(root_module: nn.Module, L_stack: int, base_std: float = 0.02) -> None:
+    """
+    Downscale residual-branch output projections:
+    std_out = base_std / sqrt(2 * L_stack)
+    """
+    if int(L_stack) <= 0:
+        raise ValueError(f"L_stack must be positive, got {L_stack}")
+    if float(base_std) <= 0.0:
+        raise ValueError(f"base_std must be positive, got {base_std}")
+    std_out = float(base_std) / math.sqrt(2.0 * float(L_stack))
+
+    with torch.no_grad():
+        for module in root_module.modules():
+            # MHA residual projection.
+            is_mha = isinstance(module, nn.MultiheadAttention)
+            if isinstance(module, nn.MultiheadAttention):
+                out_proj = getattr(module, "out_proj", None)
+                if isinstance(out_proj, nn.Linear):
+                    nn.init.normal_(out_proj.weight, mean=0.0, std=std_out)
+                    if out_proj.bias is not None:
+                        nn.init.zeros_(out_proj.bias)
+
+            # Manual attention residual projections.
+            for attr in ("out_proj", "cross_out_proj", "self_out_proj"):
+                if is_mha and attr == "out_proj":
+                    continue
+                proj = getattr(module, attr, None)
+                if isinstance(proj, nn.Linear):
+                    nn.init.normal_(proj.weight, mean=0.0, std=std_out)
+                    if proj.bias is not None:
+                        nn.init.zeros_(proj.bias)
+
+            # FFN down-projection.
+            down_proj = _find_ffn_down_projection(module)
+            if isinstance(down_proj, nn.Linear):
+                nn.init.normal_(down_proj.weight, mean=0.0, std=std_out)
+                if down_proj.bias is not None:
+                    nn.init.zeros_(down_proj.bias)
 def _init_vae_latent_parameters(module: nn.Module) -> None:
     """Initialize standalone latent parameters that are not covered by module.apply()."""
     with torch.no_grad():
@@ -450,6 +534,7 @@ class MiniVAEConfig:
     # Stub-only: if > 0, Perceiver resampler width in TransformerNoCompressionPatchEncoder.
     # If 0, defaults to d_e.
     stub_resampler_d_model: int = 0
+    init_style: str = "llm"  # {"xavier", "llm"}
     n_heads: int = 4
     d_patch: int = 64
     dropout: float = 0.0
@@ -756,8 +841,22 @@ class MiniPatchVAE(nn.Module):
         self.cfg = cfg
         self.encoder = MiniPatchEncoder(d_var=d_var, cfg=cfg)
         self.decoder = CrossAttnPatchDecoder(d_dist=int(d_dist) if d_dist is not None else int(d_var), cfg=cfg)
-        self.apply(_init_vae_module_weights)
+        init_style = str(cfg.init_style).strip().lower()
+        if init_style not in {"xavier", "llm"}:
+            raise ValueError(f"mini init_style must be 'xavier' or 'llm', got {cfg.init_style!r}")
+        self.apply(lambda module: _init_vae_module_weights(module, base_std=0.02, init_style=init_style))
         _init_vae_latent_parameters(self)
+        if init_style == "llm":
+            _apply_residual_scaled_init(
+                self.encoder,
+                L_stack=max(1, int(cfg.num_attn_layers_encoder)),
+                base_std=0.02,
+            )
+            _apply_residual_scaled_init(
+                self.decoder,
+                L_stack=max(1, int(cfg.num_layers_decoder)),
+                base_std=0.02,
+            )
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -1160,8 +1259,22 @@ class MiniPatchVAEStub(nn.Module):
         decoder_d_dist = int(d_dist) if d_dist is not None else int(d_var)
         self.encoder = TransformerNoCompressionPatchEncoder(d_var=d_var, cfg=cfg)
         self.decoder = MLPNoCompressionPatchDecoder(d_dist=decoder_d_dist, cfg=cfg)
-        self.apply(_init_vae_module_weights)
+        init_style = str(cfg.init_style).strip().lower()
+        if init_style not in {"xavier", "llm"}:
+            raise ValueError(f"mini init_style must be 'xavier' or 'llm', got {cfg.init_style!r}")
+        self.apply(lambda module: _init_vae_module_weights(module, base_std=0.02, init_style=init_style))
         _init_vae_latent_parameters(self)
+        if init_style == "llm":
+            _apply_residual_scaled_init(
+                self.encoder,
+                L_stack=max(1, int(cfg.num_attn_layers_encoder)),
+                base_std=0.02,
+            )
+            _apply_residual_scaled_init(
+                self.decoder,
+                L_stack=max(1, int(cfg.num_layers_decoder)),
+                base_std=0.02,
+            )
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
