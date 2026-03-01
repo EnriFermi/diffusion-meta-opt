@@ -354,6 +354,9 @@ class MiniPatchTrainingModel(nn.Module):
         w_patch_norm, _ = self.normalize_patch_weights(
             w_patch - w_patch.mean(),
         )
+        w_patch_norm = torch.normal(0, 1, size=(512, 4))
+        w_patch_norm = w_patch_norm / torch.norm(w_patch_norm, dim=1, keepdim=True)
+        w_patch_norm = w_patch_norm.to('cuda:0')
         w_patch_norm = w_patch_norm * 8
         print(w_patch, w_patch_norm)
         # w_patch_unit = self.project_patch_weights_to_unit_sphere(w_patch_norm)
@@ -363,6 +366,11 @@ class MiniPatchTrainingModel(nn.Module):
             dist_var_tokens=dist_var_tokens,
             dist_patch_embed=dist_patch_embed,
         )
+
+        print("||target||2", w_patch_norm.norm(dim=1).mean().item(),
+        "||pred||2",   w_hat_raw.norm(dim=1).mean().item(),
+        "L1(target)",  w_patch_norm.abs().sum(dim=1).mean().item(),
+        "L1(pred-target)", (w_hat_raw - w_patch_norm).abs().sum(dim=1).mean().item())
         if return_latent_tensors:
             if mu.requires_grad:
                 mu.retain_grad()
