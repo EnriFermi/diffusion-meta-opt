@@ -379,7 +379,8 @@ class MiniPatchTrainingModel(nn.Module):
         # w_hat_unit = self.normalize_prediction_with_stopgrad_norm(w_hat=w_hat_raw)
         den = w_patch_norm.pow(2).sum(dim=1).clamp_min(1e-8)
         print(type(w_hat_raw), type(w_patch_norm))
-        structural_loss = ((abs(w_hat_raw - w_patch_norm)).sum(dim=1)).mean(dim=0)
+        # structural_loss = ((abs(w_hat_raw - w_patch_norm)).sum(dim=1))
+        structural_loss = -1 * torch.nn.functional.cosine_similarity(w_hat_raw, w_patch_norm).mean(dim=0)
         print("FUCAFD", den)
         # behavioral_loss = self.patch_behavioral_mse(X_patch=X_patch, w_patch=w_patch_unit, w_hat=w_hat_unit)
         recon_mix_loss =  float(structural_coef) * structural_loss
