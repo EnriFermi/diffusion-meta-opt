@@ -768,6 +768,7 @@ class CrossAttnPatchDecoder(nn.Module):
         self.output_eps = 1e-6
         self.output_s_min = -3.0
         self.output_s_max = 6.0
+        self.direction_seq_norm_eps = 1e-6
 
         self.direction_head = nn.Sequential(
             nn.Linear(self.d_model, 1),
@@ -775,6 +776,17 @@ class CrossAttnPatchDecoder(nn.Module):
         self.scale_head = nn.Sequential(
             nn.Linear(self.d_model, 1),
         )
+
+    @staticmethod
+    def _channel_norm_over_sequence(x: torch.Tensor, eps: float) -> torch.Tensor:
+        # x: [B, T, C] -> normalize each channel over sequence length T.
+        if x.ndim != 3:
+            raise ValueError(f"expected [B,T,C], got {tuple(x.shape)}")
+        if int(x.shape[1]) <= 1:
+            return x
+        mean = x.mean(dim=1, keepdim=True)
+        var = (x - mean).pow(2).mean(dim=1, keepdim=True)
+        return (x - mean) * torch.rsqrt(var + float(eps))
 
     def forward(
         self,
@@ -808,7 +820,8 @@ class CrossAttnPatchDecoder(nn.Module):
         for block in self.blocks:
             q = block(q, lat, q_pos=q_pos, kv_pos=kv_pos)
 
-        u_hat = self.direction_head(q).squeeze(-1)  # [B, p]
+        q_dir = self._channel_norm_over_sequence(q, eps=self.direction_seq_norm_eps)
+        u_hat = self.direction_head(q_dir).squeeze(-1)  # [B, p]
         s_hat = self.scale_head(q.mean(dim=1)).squeeze(-1)  # [B]
         return _decode_direction_and_logscale(
             u_hat=u_hat,
