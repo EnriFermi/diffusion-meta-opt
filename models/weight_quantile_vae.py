@@ -765,6 +765,7 @@ class CrossAttnPatchDecoder(nn.Module):
             [CrossAttnBlock(d_model=self.d_model, n_heads=self.n_heads, dropout=float(cfg.dropout)) for _ in range(self.num_layers)]
         )
         self.query_seed = nn.Parameter(torch.randn(self.d_model) * 0.02)
+        self.query_pos_proj = nn.Linear(self.d_model, self.d_model)
         self.output_eps = 1e-6
         self.output_s_min = -3.0
         self.output_s_max = 6.0
@@ -815,7 +816,13 @@ class CrossAttnPatchDecoder(nn.Module):
             else:
                 lat = torch.cat([lat, dist_lat], dim=1)
 
-        q = self.query_seed.to(dtype=z.dtype).view(1, 1, self.d_model).expand(B, p, self.d_model)
+        q_seed = self.query_seed.to(dtype=z.dtype).view(1, 1, self.d_model).expand(B, p, self.d_model)
+        q_pos_emb = sinusoidal_embedding(
+            torch.arange(p, device=z.device, dtype=torch.float32),
+            dim=self.d_model,
+        ).to(dtype=self.query_pos_proj.weight.dtype)
+        q_pos_emb = self.query_pos_proj(q_pos_emb).to(dtype=z.dtype)
+        q = q_seed + q_pos_emb.unsqueeze(0)
         q_pos = torch.arange(p, device=z.device, dtype=torch.float32)
         kv_pos = torch.arange(lat.shape[1], device=z.device, dtype=torch.float32)
 
