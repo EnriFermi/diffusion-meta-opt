@@ -11,6 +11,16 @@ grad_accum_steps: 1
 patches_per_sample: 512
 
 warmup_steps: 0
+# Optional synthetic data mode for quick smoke/debug runs.
+# When enabled, train loop samples x and W from Normal and does not start collectors.
+synthetic_patch_source:
+  enabled: false
+  n_rows: 256
+  d_in: 1024
+  d_out: 1024
+  x_std: 1.0
+  w_std: 1.0
+
 min_lr_ratio: 0.05
 
 # Optional per-group LR overrides.

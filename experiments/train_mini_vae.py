@@ -1364,6 +1364,28 @@ def fetch_batch(
     )
 
 
+def sample_synthetic_layer(
+    *,
+    device: torch.device,
+    n_rows: int,
+    d_in: int,
+    d_out: int,
+    x_std: float,
+    w_std: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    x = torch.randn((int(n_rows), int(d_in)), device=device, dtype=torch.float32) * float(x_std)
+    W = torch.randn((int(d_in), int(d_out)), device=device, dtype=torch.float32) * float(w_std)
+    sample_info = {
+        "model_name": "synthetic_random_normal",
+        "layer_name": "synthetic_patch_source",
+        "datasets": ["synthetic_random_normal"],
+        "x_rows": int(n_rows),
+        "d_in": int(d_in),
+        "d_out": int(d_out),
+    }
+    return x, W, sample_info
+
+
 def sample_patch_batch(
     x: torch.Tensor,
     W: torch.Tensor,
@@ -1623,6 +1645,24 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
     streaming_mode = str(cfg.streaming.get("mode", "none")).lower()
     dataset_sharding = bool(cfg.mini_train.get("use_dataset_sharding", True)) and is_distributed and streaming_mode != "none"
     use_broadcast = is_distributed and not dataset_sharding
+    synthetic_patch_cfg = cfg.mini_train.get("synthetic_patch_source", {})
+    if synthetic_patch_cfg is None:
+        synthetic_patch_cfg = {}
+    if not isinstance(synthetic_patch_cfg, (dict, DictConfig)):
+        raise TypeError("mini_train.synthetic_patch_source must be a mapping")
+    synthetic_patch_enabled = bool(synthetic_patch_cfg.get("enabled", False))
+    synthetic_n_rows = max(1, int(synthetic_patch_cfg.get("n_rows", 256)))
+    synthetic_d_in = max(1, int(synthetic_patch_cfg.get("d_in", 1024)))
+    synthetic_d_out = max(1, int(synthetic_patch_cfg.get("d_out", 1024)))
+    synthetic_x_std = float(synthetic_patch_cfg.get("x_std", 1.0))
+    synthetic_w_std = float(synthetic_patch_cfg.get("w_std", 1.0))
+    if synthetic_x_std <= 0.0:
+        raise ValueError(f"mini_train.synthetic_patch_source.x_std must be > 0, got {synthetic_x_std}")
+    if synthetic_w_std <= 0.0:
+        raise ValueError(f"mini_train.synthetic_patch_source.w_std must be > 0, got {synthetic_w_std}")
+    if synthetic_patch_enabled:
+        dataset_sharding = False
+        use_broadcast = False
 
     if dataset_sharding:
         cfg.streaming.distributed.enabled = True
@@ -1645,6 +1685,15 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
         streaming_mode,
         dataset_sharding,
     )
+    if synthetic_patch_enabled:
+        logger.info(
+            "Synthetic patch source enabled: collectors disabled, x~N(0,%.4f), W~N(0,%.4f), n_rows=%s d_in=%s d_out=%s",
+            synthetic_x_std,
+            synthetic_w_std,
+            synthetic_n_rows,
+            synthetic_d_in,
+            synthetic_d_out,
+        )
 
     model = None
     optimizer = None
@@ -1660,21 +1709,22 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
         test_eval_predownload = False
 
         with contextlib.ExitStack() as stack:
-            if rank == 0:
-                dataset, collector = stack.enter_context(data_pipeline(cfg, logger=logger))
-                dataset_iter = iter(dataset)
-            elif dataset_sharding:
-                dataset, collector = stack.enter_context(
-                    data_pipeline(
-                        cfg,
-                        start_collector=False,
-                        predownload_models=False,
-                        logger=logger,
+            if not synthetic_patch_enabled:
+                if rank == 0:
+                    dataset, collector = stack.enter_context(data_pipeline(cfg, logger=logger))
+                    dataset_iter = iter(dataset)
+                elif dataset_sharding:
+                    dataset, collector = stack.enter_context(
+                        data_pipeline(
+                            cfg,
+                            start_collector=False,
+                            predownload_models=False,
+                            logger=logger,
+                        )
                     )
-                )
-                dataset_iter = iter(dataset)
+                    dataset_iter = iter(dataset)
 
-            if rank == 0:
+            if rank == 0 and not synthetic_patch_enabled:
                 test_eval_runtime_cfg = build_test_eval_runtime_cfg(cfg=cfg, logger=logger)
                 if test_eval_runtime_cfg is not None:
                     test_eval_cfg_local = cfg.mini_train.get("test_eval", {})
@@ -1852,6 +1902,12 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
             if not isinstance(test_eval_cfg, (dict, DictConfig)):
                 raise TypeError("mini_train.test_eval must be a mapping")
             test_eval_requested = bool(test_eval_cfg.get("enabled", False))
+            if synthetic_patch_enabled and test_eval_requested:
+                if rank == 0:
+                    logger.warning(
+                        "mini_train.test_eval.enabled=true ignored because mini_train.synthetic_patch_source.enabled=true"
+                    )
+                test_eval_requested = False
             test_eval_every_steps = max(1, int(test_eval_cfg.get("every_steps", 1000)))
             test_eval_num_batches = max(1, int(test_eval_cfg.get("num_batches", 8)))
             test_eval_timeout_seconds = max(1.0, float(test_eval_cfg.get("timeout_seconds", 300.0)))
@@ -1883,6 +1939,12 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
             if not isinstance(train_ablation_cfg, (dict, DictConfig)):
                 raise TypeError("mini_train.train_ablation_eval must be a mapping")
             train_ablation_requested = bool(train_ablation_cfg.get("enabled", True))
+            if synthetic_patch_enabled and train_ablation_requested:
+                if rank == 0:
+                    logger.warning(
+                        "mini_train.train_ablation_eval.enabled=true ignored because mini_train.synthetic_patch_source.enabled=true"
+                    )
+                train_ablation_requested = False
             train_ablation_every_steps = max(1, int(train_ablation_cfg.get("every_steps", 100)))
             train_ablation_num_batches = max(1, int(train_ablation_cfg.get("num_batches", 4)))
             train_ablation_timeout_seconds = max(1.0, float(train_ablation_cfg.get("timeout_seconds", 120.0)))
@@ -1990,14 +2052,24 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     sync_grad = micro_idx == grad_accum_steps - 1
 
                     t_fetch = time.perf_counter()
-                    x, W, sample_info = fetch_batch(
-                        rank=rank,
-                        device=device,
-                        dataset_iter=dataset_iter,
-                        use_broadcast=use_broadcast,
-                        max_x_rows=max_x_rows,
-                        logger=logger,
-                    )
+                    if synthetic_patch_enabled:
+                        x, W, sample_info = sample_synthetic_layer(
+                            device=device,
+                            n_rows=synthetic_n_rows,
+                            d_in=synthetic_d_in,
+                            d_out=synthetic_d_out,
+                            x_std=synthetic_x_std,
+                            w_std=synthetic_w_std,
+                        )
+                    else:
+                        x, W, sample_info = fetch_batch(
+                            rank=rank,
+                            device=device,
+                            dataset_iter=dataset_iter,
+                            use_broadcast=use_broadcast,
+                            max_x_rows=max_x_rows,
+                            logger=logger,
+                        )
                     fetch_ms_step += (time.perf_counter() - t_fetch) * 1000.0
                     if rank == 0 and sample_info is not None:
                         sample_info_latest = sample_info

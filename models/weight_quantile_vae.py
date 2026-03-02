@@ -780,6 +780,14 @@ class CrossAttnPatchDecoder(nn.Module):
             nn.Linear(self.d_model, 1),
         )
 
+        # Direct z-to-output shortcut: bypasses attention for immediate z dependence.
+        # Position-conditioned MLP: (z, pos_embed) -> scalar per position.
+        self.z_shortcut = nn.Sequential(
+            nn.Linear(int(cfg.z_dim) + self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Linear(self.d_model, 1),
+        )
+
     @staticmethod
     def _channel_norm_over_sequence(x: torch.Tensor, eps: float) -> torch.Tensor:
         # x: [B, T, C] -> normalize each channel over sequence length T.
@@ -831,7 +839,16 @@ class CrossAttnPatchDecoder(nn.Module):
 
         q_dir = q
         # q_dir = self._channel_norm_over_sequence(q, eps=self.direction_seq_norm_eps)
-        u_hat = self.direction_head(q_dir).squeeze(-1)  # [B, p]
+        u_hat_attn = self.direction_head(q_dir).squeeze(-1)  # [B, p]
+
+        # Direct shortcut: z + positional embedding -> per-position scalar.
+        z_exp = z.unsqueeze(1).expand(B, p, -1)  # [B, p, z_dim]
+        pos_exp = q_pos_emb.unsqueeze(0).expand(B, -1, -1)  # [B, p, d_model]
+        shortcut_in = torch.cat([z_exp, pos_exp], dim=-1)  # [B, p, z_dim + d_model]
+        u_hat_shortcut = self.z_shortcut(shortcut_in).squeeze(-1)  # [B, p]
+
+        u_hat = u_hat_attn + u_hat_shortcut
+        
         s_hat = self.scale_head(q.mean(dim=1)).squeeze(-1)  # [B]
         return _decode_direction_and_logscale(
             u_hat=u_hat,
