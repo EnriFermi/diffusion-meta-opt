@@ -259,8 +259,6 @@ def _decode_direction_and_logscale(
     Convert decoder outputs into weights:
     U = u_hat / (||u_hat||_2 + eps), s = exp(s_hat), W_hat = s * U.
     """
-    s_min=0
-    s_max=0
     if u_hat.ndim != 2:
         raise ValueError(f"u_hat must be [B, p], got {tuple(u_hat.shape)}")
     if s_hat.ndim == 1:
@@ -275,14 +273,17 @@ def _decode_direction_and_logscale(
     u_norm = u_hat.norm(dim=1, keepdim=True).clamp_min(float(eps))
     u = u_hat / u_norm
 
+    # Convert log-scale to scale.
+    s = torch.exp(s)
+
     # Smooth lower barrier: keeps s >= s_min while preserving gradients below the threshold.
-    s = float(s_min) + F.softplus(s - float(s_min))
+    if s_min != 0:
+        s = float(s_min) + F.softplus(s - float(s_min))
     # Optional smooth upper barrier to avoid exp overflow and skipped non-finite steps.
-    if s_max is not None:
+    if s_max is not None and s_max != 0:
         s = float(s_max) - F.softplus(float(s_max) - s)
 
-    print('DEBUG INFO', u_norm, s, u_hat.mean(dim=1))
-    return 8*u, u_norm
+    return s * u
 
 
 class MLP(nn.Module):
@@ -372,6 +373,8 @@ class DistributionConfig:
     dcn_deep_hidden: int = 0
     dcn_deep_layers: int = 0
     dropout: float = 0.0
+    use_covariance: bool = True
+    patch_size_for_cov: int = 16
 
 
 class InputDistributionEncodingModule(nn.Module):
@@ -432,6 +435,19 @@ class InputDistributionEncodingModule(nn.Module):
             dropout=cfg.dropout,
         )
 
+        # Covariance conditioning: encode upper triangle of patch-local X_I^T @ X_I.
+        self.use_covariance = bool(cfg.use_covariance)
+        if self.use_covariance:
+            cov_p = max(1, int(cfg.patch_size_for_cov))
+            upper_tri_size = cov_p * (cov_p + 1) // 2
+            self.cov_encoder = nn.Sequential(
+                nn.Linear(upper_tri_size, cfg.d_var),
+                nn.GELU(),
+                nn.Linear(cfg.d_var, cfg.d_var),
+            )
+        else:
+            self.cov_encoder = None
+
         probs = torch.linspace(0.0, 1.0, cfg.k_s, dtype=torch.float32)
         self.register_buffer("quantile_probs", probs, persistent=False)
 
@@ -464,8 +480,9 @@ class InputDistributionEncodingModule(nn.Module):
         # q_first/q_last: [B, 1, p]
         q_first = q[:, 0:1, :]
         q_last = q[:, -1:, :]
-        q_span = (q_last - q_first).clamp_min(1e-6)
+        q_span = (q_last - q_first).clamp_min(1e-2)  # Raised floor to prevent extreme amplification.
         q = 2.0 * (q - q_first) / q_span - 1.0  # [B, k_s, p]
+        q = q.clamp(-5.0, 5.0)  # Safety clamp on normalized quantiles.
         q_idx = torch.arange(q.shape[1], device=q.device, dtype=torch.long).view(1, -1, 1)
         q = torch.where(q_idx == 0, q.new_full((), -1.0), q)
         q = torch.where(q_idx == q.shape[1] - 1, q.new_full((), 1.0), q)
@@ -502,6 +519,22 @@ class InputDistributionEncodingModule(nn.Module):
 
         # Mean pool over variables: [B, d_var]
         v_pool = dist_var_tokens.mean(dim=1)
+
+        # Covariance conditioning: patch-local X_I^T @ X_I.
+        if self.use_covariance and self.cov_encoder is not None:
+            X_I_centered = X_I - X_I.mean(dim=1, keepdim=True)
+            # cov: [B, p, p]
+            cov = torch.bmm(
+                X_I_centered.transpose(1, 2).to(torch.float32),
+                X_I_centered.to(torch.float32),
+            ) / max(1, n - 1)
+            # Extract upper triangle (including diagonal): [B, p*(p+1)//2]
+            tri_idx = torch.triu_indices(p, p, device=cov.device)
+            cov_upper = cov[:, tri_idx[0], tri_idx[1]]
+            # Log-scale for numerical stability.
+            cov_upper = torch.sign(cov_upper) * torch.log1p(cov_upper.abs())
+            cov_embed = self.cov_encoder(cov_upper)  # [B, d_var]
+            v_pool = v_pool + cov_embed
 
         # DCNv2 patch embedding: [B, d_dist]
         dist_patch_embed = self.dcn(v_pool)
@@ -932,12 +965,12 @@ class MiniPatchVAE(nn.Module):
             z = self.reparameterize(mu=mu, logvar=logvar)
         else:
             z = mu
-        w_hat, w_norm = self.decode(
+        w_hat = self.decode(
             z=z,
             patch_size=w_patch.shape[1],
             dist_patch_embed=dist_patch_embed,
         )
-        return w_hat, mu, logvar, z, w_norm
+        return w_hat, mu, logvar, z
 
 
 class PerceiverResamplerBlock(nn.Module):
@@ -1162,6 +1195,81 @@ def _align_feature_dim(x: torch.Tensor, target_dim: int) -> torch.Tensor:
     return torch.cat([x, pad], dim=1)
 
 
+class ResidualPatchTokenizer(nn.Module):
+    """
+    Simple FC tokenizer with strong residual from raw weights.
+
+    At initialization, approximately passes through w_patch as-is,
+    giving the big-VAE transformer a reasonable starting point.
+
+    Input:  w_patch [B, p], dist_patch_embed [B, d_dist]
+    Output: patch_token [B, d_patch]
+    """
+
+    def __init__(
+        self,
+        p: int,
+        d_dist: int,
+        d_patch: int,
+        hidden_dim: int = 256,
+        num_layers: int = 3,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.p = int(p)
+        self.d_patch = int(d_patch)
+
+        # Transform branch: processes concatenated w_patch + dist_patch_embed.
+        residual_in_dim = self.p + int(d_dist)
+        layers: list[nn.Module] = []
+        in_dim = residual_in_dim
+        for i in range(max(1, int(num_layers)) - 1):
+            layers.extend([
+                nn.Linear(in_dim, int(hidden_dim)),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+            ])
+            in_dim = int(hidden_dim)
+        layers.append(nn.Linear(in_dim, self.d_patch))
+        self.transform = nn.Sequential(*layers)
+
+        # Linear projection of raw weights for residual path.
+        self.weight_residual_proj = nn.Linear(self.p, self.d_patch, bias=False)
+
+        self._init_near_identity()
+
+    def _init_near_identity(self) -> None:
+        """Initialize so output ≈ linear projection of w_patch (transform starts near zero)."""
+        with torch.no_grad():
+            # Zero out the last layer of transform so residual dominates at init.
+            last_linear: nn.Linear | None = None
+            for module in reversed(list(self.transform.modules())):
+                if isinstance(module, nn.Linear):
+                    last_linear = module
+                    break
+            if last_linear is not None:
+                nn.init.zeros_(last_linear.weight)
+                if last_linear.bias is not None:
+                    nn.init.zeros_(last_linear.bias)
+
+            # weight_residual_proj: identity-like (truncated/padded if p != d_patch).
+            min_dim = min(self.p, self.d_patch)
+            nn.init.zeros_(self.weight_residual_proj.weight)
+            self.weight_residual_proj.weight[:min_dim, :min_dim] = torch.eye(min_dim)
+
+    def forward(self, w_patch: torch.Tensor, dist_patch_embed: torch.Tensor) -> torch.Tensor:
+        # w_patch: [B, p], dist_patch_embed: [B, d_dist]
+        if w_patch.ndim != 2:
+            raise ValueError(f"w_patch must be [B, p], got {tuple(w_patch.shape)}")
+        if dist_patch_embed.ndim != 2:
+            raise ValueError(f"dist_patch_embed must be [B, d_dist], got {tuple(dist_patch_embed.shape)}")
+
+        residual = self.weight_residual_proj(w_patch)  # [B, d_patch]
+        x = torch.cat([w_patch, dist_patch_embed], dim=-1)  # [B, p + d_dist]
+        delta = self.transform(x)  # [B, d_patch]
+        return residual + delta
+
+
 class MLPNoCompressionPatchEncoder(nn.Module):
     """Stub encoder: 6-layer MLP from patch weights to latent stats."""
 
@@ -1213,7 +1321,6 @@ class MLPNoCompressionPatchDecoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.use_dist_conditioning = bool(cfg.decoder_use_dist_conditioning)
-        self.use_dist_conditioning = False
 
         self.latent_dim = int(cfg.z_dim)
         self.out_dim = max(1, int(cfg.d_patch))
@@ -1245,13 +1352,11 @@ class MLPNoCompressionPatchDecoder(nn.Module):
 
         B, z_dim = z.shape
         p = int(patch_size)
-        print("ZZZ", z_dim, self.latent_dim)
         if z_dim >= self.latent_dim:
             z_aligned = z[:, : self.latent_dim]
         else:
             pad = z.new_zeros((B, self.latent_dim - z_dim))
             z_aligned = torch.cat([z, pad], dim=1)
-            print(z_aligned.shape, z.shape)
 
         dec_in = z_aligned
         
@@ -1345,14 +1450,13 @@ class MiniPatchVAEStub(nn.Module):
         if bool(self.cfg.use_latent_sampling):
             z = self.reparameterize(mu=mu, logvar=logvar)
         else:
-            print('DO NOTHING')
             z = mu
-        w_hat, w_norm = self.decode(
+        w_hat = self.decode(
             z=z,
             patch_size=w_patch.shape[1],
             dist_patch_embed=dist_patch_embed,
         )
-        return w_hat, mu, logvar, z, w_norm
+        return w_hat, mu, logvar, z
 
 
 @dataclass(slots=True)
@@ -1388,7 +1492,6 @@ class ModelConfig:
     mini_vae: MiniVAEConfig = field(default_factory=MiniVAEConfig)
     big_vae: BigVAEConfig = field(default_factory=BigVAEConfig)
     beta: float = 1e-3
-    mini_encoder_ckpt_path: str = ""
 
 
 class LocalOutputSelfAttentionBlock(nn.Module):
@@ -1572,9 +1675,18 @@ class BigWeightVAE(nn.Module):
         d_dist = cfg.distribution.d_dist
 
         self.distribution_encoder = InputDistributionEncodingModule(cfg.distribution)
-        self.mini_patch_encoder = MiniPatchEncoder(d_var=d_var, cfg=cfg.mini_vae)
 
+        # Simple residual tokenizer replaces the complex Perceiver-based MiniPatchEncoder.
         d_patch = cfg.mini_vae.d_patch
+        self.patch_tokenizer = ResidualPatchTokenizer(
+            p=p,
+            d_dist=d_dist,
+            d_patch=d_patch,
+            hidden_dim=max(64, int(cfg.mini_vae.mlp_stub_hidden_dim)),
+            num_layers=3,
+            dropout=cfg.big_vae.dropout,
+        )
+
         d_model = cfg.big_vae.d_model
         d_lat = cfg.big_vae.d_lat
 
@@ -1583,8 +1695,8 @@ class BigWeightVAE(nn.Module):
         if d_lat % cfg.big_vae.n_heads != 0:
             raise ValueError(f"big_vae.d_lat ({d_lat}) must be divisible by big_vae.n_heads ({cfg.big_vae.n_heads})")
 
-        # Patch token projection after concat([mini_patch_token, dist_patch_embed]).
-        self.patch_token_proj = nn.Linear(d_patch + d_dist, d_model)
+        # Patch token projection (dist already baked into tokenizer output).
+        self.patch_token_proj = nn.Linear(d_patch, d_model)
 
         # One learned CLS token expanded per output column.
         self.cls_token = nn.Parameter(torch.zeros(d_model))
@@ -1633,32 +1745,7 @@ class BigWeightVAE(nn.Module):
             nn.Linear(d_model, p),
         )
 
-        if cfg.mini_encoder_ckpt_path:
-            self.load_pretrained_mini_encoder(cfg.mini_encoder_ckpt_path)
-
-    def load_pretrained_mini_encoder(self, checkpoint_path: str) -> None:
-        path = Path(checkpoint_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Mini-VAE checkpoint not found: {checkpoint_path}")
-
-        state = torch.load(path, map_location="cpu")
-        if isinstance(state, dict) and "model_state" in state:
-            state = state["model_state"]
-
-        if not isinstance(state, dict):
-            raise ValueError("Unsupported checkpoint format: expected state dict or {'model_state': state_dict}")
-
-        # Accept either plain encoder state_dict or full MiniPatchVAE with 'encoder.' prefix.
-        if any(k.startswith("encoder.") for k in state.keys()):
-            enc_state = {k[len("encoder.") :]: v for k, v in state.items() if k.startswith("encoder.")}
-        else:
-            enc_state = state
-
-        missing, unexpected = self.mini_patch_encoder.load_state_dict(enc_state, strict=False)
-        if missing:
-            print(f"[BigWeightVAE] mini encoder missing keys: {missing}")
-        if unexpected:
-            print(f"[BigWeightVAE] mini encoder unexpected keys: {unexpected}")
+        # No pretrained mini encoder loading — all components train end-to-end.
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -1674,6 +1761,16 @@ class BigWeightVAE(nn.Module):
             return kl.mean()
         kl = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1.0 - logvar, dim=-1)  # [B, L]
         return kl.mean()
+
+    @staticmethod
+    def structural_recon_loss(W: torch.Tensor, W_hat: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """Scale-normalized structural MSE: handles varying weight magnitudes."""
+        if W.ndim == 2:
+            W = W.unsqueeze(0)
+            W_hat = W_hat.unsqueeze(0)
+        w_scale = W.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(float(eps))
+        diff = (W_hat - W) / w_scale
+        return diff.pow(2).mean()
 
     @staticmethod
     def operator_recon_loss(X: torch.Tensor, W: torch.Tensor, W_hat: torch.Tensor) -> torch.Tensor:
@@ -1758,32 +1855,28 @@ class BigWeightVAE(nn.Module):
         w_patches = W_pad.transpose(1, 2).contiguous().view(B, d_out, T, p)
 
         # ---------------------------------------------------------------------
-        # 3) Patch embedding using pretrained mini encoder + dist patch embed.
+        # 3) Patch embedding using residual tokenizer + distribution conditioning.
         # ---------------------------------------------------------------------
-        # dist_var_expanded: [B, d_out, T, p, d_var]
-        dist_var_expanded = dist_var_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1, -1)
+        # dist_patch_expanded: [B, d_out, T, d_dist]
+        dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
 
-        # Flatten per-(o,t) for shared mini encoder pass.
+        # Flatten per-(o,t) for shared tokenizer pass.
         # w_flat: [B*d_out*T, p]
-        # dist_var_token_flat: [B*d_out*T, p, d_var]
+        # dist_patch_flat_expanded: [B*d_out*T, d_dist]
         w_flat = w_patches.reshape(B * d_out * T, p)
-        dist_var_token_flat = dist_var_expanded.reshape(B * d_out * T, p, d_var)
+        dist_patch_flat_expanded = dist_patch_expanded.reshape(B * d_out * T, d_dist)
 
         # patch_token_raw_flat: [B*d_out*T, d_patch]
-        patch_token_raw_flat = self.mini_patch_encoder.encode_patch(w_patch=w_flat, dist_var_tokens=dist_var_token_flat)
         d_patch = self.cfg.mini_vae.d_patch
+        patch_token_raw_flat = self.patch_tokenizer(
+            w_patch=w_flat, dist_patch_embed=dist_patch_flat_expanded,
+        )
 
         # patch_token_raw: [B, d_out, T, d_patch]
         patch_token_raw = patch_token_raw_flat.view(B, d_out, T, d_patch)
 
-        # dist_patch_expanded: [B, d_out, T, d_dist]
-        dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
-
-        # patch_token_cat: [B, d_out, T, d_patch + d_dist]
-        patch_token_cat = torch.cat([patch_token_raw, dist_patch_expanded], dim=-1)
-
         # patch_tokens: [B, d_out, T, d_model]
-        patch_tokens = self.patch_token_proj(patch_token_cat)
+        patch_tokens = self.patch_token_proj(patch_token_raw)
 
         # CLS per output column.
         # cls_tokens: [B, d_out, 1, d_model]
@@ -1889,7 +1982,10 @@ def smoke_test_big_weight_vae() -> None:
 
     cfg = ModelConfig(
         patch_size=16,
-        distribution=DistributionConfig(k_s=16, Kq=32, d_var=128, d_dist=128),
+        distribution=DistributionConfig(
+            k_s=16, Kq=32, d_var=128, d_dist=128,
+            use_covariance=True, patch_size_for_cov=16,
+        ),
         mini_vae=MiniVAEConfig(
             z_dim=64,
             d_e=128,
@@ -1898,6 +1994,7 @@ def smoke_test_big_weight_vae() -> None:
             num_layers_decoder=2,
             n_heads=4,
             d_patch=64,
+            mlp_stub_hidden_dim=256,
         ),
         big_vae=BigVAEConfig(
             d_model=256,
@@ -1918,11 +2015,24 @@ def smoke_test_big_weight_vae() -> None:
 
     W_hat, mu, logvar = model(W, X)
 
-    print("W shape:", tuple(W.shape))
-    print("X shape:", tuple(X.shape))
-    print("W_hat shape:", tuple(W_hat.shape))
-    print("mu shape:", tuple(mu.shape))
-    print("logvar shape:", tuple(logvar.shape))
+    assert tuple(W_hat.shape) == (B, d_in, d_out), f"W_hat shape mismatch: {tuple(W_hat.shape)}"
+    assert tuple(mu.shape) == (B, 16, 256), f"mu shape mismatch: {tuple(mu.shape)}"
+
+    # Test backward pass and gradient flow.
+    behavioral_loss = BigWeightVAE.operator_recon_loss(X, W, W_hat)
+    structural_loss = BigWeightVAE.structural_recon_loss(W, W_hat)
+    kl_loss = BigWeightVAE.kl_loss(mu, logvar)
+    total_loss = behavioral_loss + 0.5 * structural_loss + 0.001 * kl_loss
+    total_loss.backward()
+
+    # Check no NaN grads.
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            assert torch.isfinite(param.grad).all(), f"Non-finite grad in {name}"
+
+    print("smoke_test_big_weight_vae PASSED")
+    print(f"  W_hat: {tuple(W_hat.shape)}, behavioral={behavioral_loss.item():.4f}, "
+          f"structural={structural_loss.item():.4f}, kl={kl_loss.item():.4f}")
 
 
 if __name__ == "__main__":

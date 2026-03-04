@@ -1,6 +1,5 @@
 patch_size: 16
 beta: 0.001
-mini_encoder_ckpt_path: ${training_artifacts.mini_encoder_latest_checkpoint}
 
 big_vae:
   d_model: 256
@@ -10,7 +9,7 @@ big_vae:
   num_decoder_layers: 4
   n_heads: 8
   ffn_mult: 4.0
-  dropout: 0.0
+  dropout: 0.1
   pos_fourier_dim: 64
   encoder:
     self_attn_mode: full

@@ -104,7 +104,6 @@ def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
     return ModelConfig(
         patch_size=int(model_cfg.get("patch_size", 16)),
         beta=float(model_cfg.get("beta", 1e-3)),
-        mini_encoder_ckpt_path=str(model_cfg.get("mini_encoder_ckpt_path", "")),
         distribution=DistributionConfig(
             k_s=int(dist_cfg.get("k_s", 16)),
             Kq=int(dist_cfg.get("Kq", 32)),
@@ -116,6 +115,8 @@ def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
             dcn_deep_hidden=int(dist_cfg.get("dcn_deep_hidden", 0)),
             dcn_deep_layers=int(dist_cfg.get("dcn_deep_layers", 0)),
             dropout=float(dist_cfg.get("dropout", 0.0)),
+            use_covariance=bool(dist_cfg.get("use_covariance", True)),
+            patch_size_for_cov=int(dist_cfg.get("patch_size_for_cov", int(model_cfg.get("patch_size", 16)))),
         ),
         mini_vae=MiniVAEConfig(
             z_dim=int(mini_cfg.get("z_dim", 64)),
@@ -437,6 +438,8 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
             max_steps = max(1, int(cfg.train.get("max_steps", 1000)))
             grad_accum_steps = max(1, int(cfg.train.get("grad_accum_steps", 1)))
             kl_beta = float(cfg.train.get("kl_beta", 1e-3))
+            behavioral_coef = float(cfg.train.get("behavioral_coef", 1.0))
+            structural_coef = float(cfg.train.get("structural_coef", 0.5))
             grad_clip_norm = float(cfg.train.get("grad_clip_norm", 1.0))
             max_x_rows = int(cfg.train.get("max_x_rows", 0))
 
@@ -444,7 +447,8 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
             checkpoint_every = max(1, int(cfg.train.get("checkpoint_every", 200)))
 
             loss_window = 0.0
-            recon_window = 0.0
+            behavioral_window = 0.0
+            structural_window = 0.0
             kl_window = 0.0
             window_steps = 0
             t0 = time.time()
@@ -458,7 +462,8 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
                     dataset.maybe_collect(step_idx)
 
                 loss_acc = 0.0
-                recon_acc = 0.0
+                behavioral_acc = 0.0
+                structural_acc = 0.0
                 kl_acc = 0.0
                 step_is_finite = True
 
@@ -481,9 +486,14 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
                     with no_sync_ctx:
                         with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
                             W_hat, mu, logvar = model(W, x)
-                            recon_loss = WeightQuantileVAE.operator_recon_loss(x, W, W_hat)
+                            behavioral_loss = WeightQuantileVAE.operator_recon_loss(x, W, W_hat)
+                            structural_loss = WeightQuantileVAE.structural_recon_loss(W, W_hat)
                             kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
-                            total_loss = recon_loss + kl_beta * kl_loss
+                            total_loss = (
+                                behavioral_coef * behavioral_loss
+                                + structural_coef * structural_loss
+                                + kl_beta * kl_loss
+                            )
                             loss_for_backward = total_loss / grad_accum_steps
 
                         finite_flag = torch.tensor(
@@ -503,7 +513,8 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
                                 loss_for_backward.backward()
 
                     loss_acc += float(total_loss.detach().item())
-                    recon_acc += float(recon_loss.detach().item())
+                    behavioral_acc += float(behavioral_loss.detach().item())
+                    structural_acc += float(structural_loss.detach().item())
                     kl_acc += float(kl_loss.detach().item())
 
                     if not step_is_finite:
@@ -530,34 +541,41 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
                 scheduler.step()
 
                 step_loss = loss_acc / grad_accum_steps
-                step_recon = recon_acc / grad_accum_steps
+                step_behavioral = behavioral_acc / grad_accum_steps
+                step_structural = structural_acc / grad_accum_steps
                 step_kl = kl_acc / grad_accum_steps
 
-                stats = torch.tensor([step_loss, step_recon, step_kl], dtype=torch.float32, device=device)
+                stats = torch.tensor(
+                    [step_loss, step_behavioral, step_structural, step_kl],
+                    dtype=torch.float32, device=device,
+                )
                 if is_distributed:
                     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
                     stats /= float(world_size)
 
                 loss_window += float(stats[0].item())
-                recon_window += float(stats[1].item())
-                kl_window += float(stats[2].item())
+                behavioral_window += float(stats[1].item())
+                structural_window += float(stats[2].item())
+                kl_window += float(stats[3].item())
                 window_steps += 1
 
                 if rank == 0 and global_step % log_every == 0:
                     dt = max(1e-6, time.time() - t0)
                     avg_loss = loss_window / max(1, window_steps)
-                    avg_recon = recon_window / max(1, window_steps)
+                    avg_behavioral = behavioral_window / max(1, window_steps)
+                    avg_structural = structural_window / max(1, window_steps)
                     avg_kl = kl_window / max(1, window_steps)
                     lr = float(optimizer.param_groups[0]["lr"])
                     speed = window_steps / dt
 
                     cache_metric = dataset.cache_size() if dataset is not None else 0
                     logger.info(
-                        "step=%s/%s loss=%.6f recon=%.6f kl=%.6f lr=%.6e steps/s=%.2f cache=%s",
+                        "step=%s/%s loss=%.6f behav=%.6f struct=%.6f kl=%.6f lr=%.6e steps/s=%.2f cache=%s",
                         global_step,
                         max_steps,
                         avg_loss,
-                        avg_recon,
+                        avg_behavioral,
+                        avg_structural,
                         avg_kl,
                         lr,
                         speed,
@@ -565,7 +583,8 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
                     )
 
                     loss_window = 0.0
-                    recon_window = 0.0
+                    behavioral_window = 0.0
+                    structural_window = 0.0
                     kl_window = 0.0
                     window_steps = 0
                     t0 = time.time()

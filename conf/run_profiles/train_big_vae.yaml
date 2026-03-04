@@ -2,7 +2,7 @@
 defaults:
   - /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
   - /data_collection_runtime/data_profiles@data: data_profile_for_big_vae_training
-  - /data_collection_runtime/collector_profiles@collector: collector_profile_interleaved
+  - /data_collection_runtime/collector_profiles@collector: collector_profile_async_gpu1
   - /data_collection_runtime/streaming_profiles@streaming: streaming_profile_none
 
   - /shared_training_parameters@train: trainer_execution_common
