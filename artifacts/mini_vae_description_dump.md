@@ -116,22 +116,38 @@ run_worker (experiments/train_mini_vae.py)
 - `dist_var_tokens`: `[B, p, d_var]`
 
 Шаги:
-1. Позиционные эмбеддинги:
-   - `pos = sinusoidal_embedding(arange(p), pos_dim)` -> `[p, pos_dim]`
+1. Позиционные эмбеддинги токенов патча:
+   - `token_tau = (arange(p) + 0.5) / p` -> `[p]`
+   - `pos = sinusoidal_embedding(token_tau, pos_dim)` -> `[p, pos_dim]`
    - expand -> `[B, p, pos_dim]`
 2. Сбор per-element токена:
    - `t = concat(w_patch[...,None], dist_var_tokens, pos)`
    - `t: [B, p, 1 + d_var + pos_dim]`
 3. Проекция в model-space:
    - `e = elem_embed(t)` -> `[B, p, d_e]`
-4. Perceiver resampling:
-   - learnable queries `resampler_latents`: `[L_lat, d_e]`
-   - expand -> `[B, L_lat, d_e]`
-   - проход по `PerceiverResamplerBlock` (cross-attn latents<-tokens + self-attn + FFN)
-5. Pool + heads:
-   - `h = LayerNorm(mean(latents, dim=1))` -> `[B, d_e]`
+4. Выбор размерности латентов энкодера:
+   - `latent_dim = encoder_latent_dim`, если `encoder_latent_dim > 0`, иначе `latent_dim = d_e`
+5. Slot-anchoring латентов:
+   - фиксированные позиции слотов: `slot_tau = (arange(L_lat) + 0.5) / L_lat` -> `[L_lat]`
+   - `slot_pos = sinusoidal_embedding(slot_tau, pos_lat_dim)` -> `[L_lat, pos_lat_dim]`
+   - `latents0 = slot_pos_to_latent(slot_pos)` -> `[L_lat, latent_dim]`
+   - expand -> `latents: [B, L_lat, latent_dim]`
+6. Токены для cross-attn в Perceiver:
+   - `tokens_with_w = concat(e, w_patch[...,None])` -> `[B, p, d_e + 1]`
+7. Perceiver resampling (с RoPE в attention):
+   - для каждого `PerceiverResamplerBlock(d_latent=latent_dim, d_token=d_e+1)`:
+     - cross-attn: `latents <- tokens_with_w`, RoPE с позициями
+       - `latent_pos = slot_tau`
+       - `token_pos = token_tau`
+     - self-attn по латентам: RoPE с `latent_pos`
+     - FFN по латентам
+8. Нормализация и heads:
+   - `latents = LayerNorm(latents)` (по последней оси `latent_dim`)
+   - `h = reshape(latents, [B, L_lat * latent_dim])`
    - `mu = to_mu(h)` -> `[B, z_dim]`
    - `logvar = to_logvar(h)` -> `[B, z_dim]`
+9. Важный момент про размерности:
+   - в `real` сейчас `z_dim` может быть произвольным, heads делают проекцию `Linear(L_lat*latent_dim -> z_dim)`.
 
 ### 4.2 Reparameterization
 Если `use_latent_sampling=True`:
@@ -147,6 +163,9 @@ run_worker (experiments/train_mini_vae.py)
 - `patch_size = p`
 - `dist_patch_embed`: `[B, d_dist]` (optional)
 
+Примечание по размерностям:
+- `decoder` работает в `d_model = d_e` (он не использует `encoder_latent_dim` напрямую).
+
 Шаги:
 1. Латентные токены из `z`:
    - `lat = z_to_latents(z).view(B, L_lat, d_model)`
@@ -154,14 +173,20 @@ run_worker (experiments/train_mini_vae.py)
    - `dist_lat = dist_to_latents(dist_patch_embed).view(B, L_lat, d_model)`
    - если `decoder_dist_mode="add"`: `lat = lat + dist_lat`
    - если `decoder_dist_mode="concat"`: `lat = concat(lat, dist_lat, dim=1)`
-3. Query-токены как sinusoidal-позиции размера `p`:
-   - `q_pos: [p, d_model]`, expand -> `q: [B, p, d_model]`
-4. Кросс-аттеншн блоки:
-   - для каждого `CrossAttnBlock`: `q = block(q, lat)`
-5. Heads:
+3. Query-токены:
+   - learnable `query_seed: [d_model]`
+   - `q = query_seed[None,None,:].expand(B, p, d_model)`
+4. Позиции для RoPE:
+   - `q_pos = arange(p)` для query-токенов
+   - `kv_pos = arange(lat_len)` для latent key/value токенов (`lat_len = L_lat` или `2*L_lat` при `concat`)
+5. Decoder blocks (`CrossAttnBlock`) на каждом слое:
+   - cross-attn `q <- lat` с RoPE (`q_pos`, `kv_pos`)
+   - self-attn по `q` с RoPE (`q_pos`)
+   - FFN
+6. Heads:
    - `u_hat = direction_head(q).squeeze(-1)` -> `[B, p]`
    - `s_hat = scale_head(mean(q,dim=1)).squeeze(-1)` -> `[B]`
-6. Direction + scale decode (`_decode_direction_and_logscale`):
+7. Direction + scale decode (`_decode_direction_and_logscale`):
    - `u = u_hat / (||u_hat|| + eps)`
    - log-scale barrier:
      - нижняя: `s = s_min + softplus(s - s_min)`
@@ -257,11 +282,17 @@ run_worker (experiments/train_mini_vae.py)
 ## 8) Конфигурационные переключатели (ключевые)
 
 `MiniVAEConfig`:
-- `z_dim, d_e, pos_dim, n_heads`
+- `z_dim, d_e, encoder_latent_dim, pos_dim, n_heads`
+- `pos_lat_dim`
 - `num_attn_layers_encoder, num_layers_decoder, decoder_L_latents`
 - `decoder_use_dist_conditioning, decoder_dist_mode`
 - `use_latent_sampling`
 - `implementation` (`real` / `mlp_stub`)
+- `stub_resampler_d_model` (для `mlp_stub`)
+
+Размерные инварианты:
+- `real`: `z_dim` свободный (через `Linear(L_lat*latent_dim -> z_dim)`), где `latent_dim = encoder_latent_dim` (если `>0`), иначе `d_e`
+- `mlp_stub`: `z_dim = decoder_L_latents * resampler_d_model`, где `resampler_d_model = stub_resampler_d_model` (если `>0`), иначе `d_e`
 
 Trainer/loss:
 - `structural_coef, behavioral_coef, contrastive_coef, kl_coef`
@@ -274,6 +305,17 @@ Trainer/loss:
 Если выбран stub:
 - encoder: `TransformerNoCompressionPatchEncoder`
   - игнорирует `dist_var_tokens`
+  - вход в `elem_embed`: `concat(w_i, sinusoidal(arange(p)))`
+  - токены после `elem_embed`: `[B, p, d_e]`
+  - латенты: размер `resampler_d_model`, где
+    - `resampler_d_model = stub_resampler_d_model`, если `> 0`
+    - иначе `resampler_d_model = d_e`
+  - токены для cross-attn: `tokens_with_w = concat(e, w_i)` -> `[B, p, d_e+1]`
+  - в `PerceiverResamplerBlock`:
+    - cross-attn `latents <- tokens_with_w` (RoPE, `latent_pos=latent_tau`, `token_pos=token_tau`, где `token_tau=(i+0.5)/p`)
+    - self-attn по латентам (RoPE, `latent_pos`)
+  - дальше `latents` flatten: `[B, L_lat * resampler_d_model]`, затем `LayerNorm(flat)` -> `mu, logvar`
+  - жесткая проверка: `z_dim = L_lat * resampler_d_model`
 - decoder: `MLPNoCompressionPatchDecoder`
 - `MiniPatchVAEStub.kl_loss` возвращает ноль
 
@@ -294,4 +336,3 @@ Trainer/loss:
 - `dist_patch_embed`: `[B_p, d_dist]`
 - `mu, logvar, z`: `[B_p, z_dim]`
 - `w_hat_raw, w_hat_unit`: `[B_p, p]`
-
