@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import logging
+import os
 import random
 import socket
+import uuid
+from pathlib import Path
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 
 def get_rank_logger(name: str, rank: int) -> logging.Logger:
@@ -191,3 +195,79 @@ def autocast_context(enabled: bool, dtype: torch.dtype | None) -> contextlib.Abs
     if not enabled or dtype is None:
         return contextlib.nullcontext()
     return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def _safe_run_label(text: str) -> str:
+    raw = str(text).strip().replace(" ", "_").replace("/", "__")
+    cleaned = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in raw)
+    return cleaned or "run"
+
+
+def configure_per_run_artifacts(
+    cfg: DictConfig,
+    *,
+    run_label: str,
+) -> dict[str, str]:
+    """
+    Configure per-run artifact directories under training_artifacts.
+
+    By default this creates:
+      <base_root_dir>/runs/<run_id>/{logs,reports,crashes,checkpoints/...}
+    """
+
+    with open_dict(cfg):
+        if not isinstance(cfg.get("training_artifacts"), (dict, DictConfig)):
+            cfg["training_artifacts"] = {}
+        ta = cfg["training_artifacts"]
+
+        base_root = Path(str(ta.get("base_root_dir", ta.get("root_dir", "./artifacts/training"))))
+        separate_run_dirs = bool(ta.get("separate_run_dirs", True))
+        runs_dir = Path(str(ta.get("runs_dir", base_root / "runs")))
+
+        run_id = str(ta.get("run_id", "")).strip()
+        if not run_id:
+            run_id = str(os.environ.get("TRAINING_RUN_ID", "")).strip()
+        if not run_id:
+            timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_id = f"{_safe_run_label(run_label)}_{timestamp}_pid{os.getpid()}_{uuid.uuid4().hex[:6]}"
+
+        root_dir = (runs_dir / run_id) if separate_run_dirs else base_root
+        logs_dir = root_dir / "logs"
+        reports_dir = root_dir / "reports"
+        crashes_dir = root_dir / "crashes"
+        mini_ckpt_dir = root_dir / "checkpoints" / "mini_patch_vae"
+        big_ckpt_dir = root_dir / "checkpoints" / "weight_quantile_vae"
+
+        ta["base_root_dir"] = str(base_root)
+        ta["separate_run_dirs"] = bool(separate_run_dirs)
+        ta["runs_dir"] = str(runs_dir)
+        ta["run_id"] = run_id
+        ta["root_dir"] = str(root_dir)
+        ta["logs_dir"] = str(logs_dir)
+        ta["reports_dir"] = str(reports_dir)
+        ta["crashes_dir"] = str(crashes_dir)
+        ta["mini_vae_checkpoint_dir"] = str(mini_ckpt_dir)
+        ta["big_vae_checkpoint_dir"] = str(big_ckpt_dir)
+        ta["mini_encoder_latest_checkpoint"] = str(mini_ckpt_dir / "mini_encoder_latest.pt")
+
+        if isinstance(cfg.get("logging"), (dict, DictConfig)):
+            cfg["logging"]["dir"] = str(logs_dir)
+
+        if isinstance(cfg.get("train"), (dict, DictConfig)) and str(cfg["train"].get("checkpoint_dir", "")).strip():
+            cfg["train"]["checkpoint_dir"] = str(big_ckpt_dir)
+
+        if isinstance(cfg.get("mini_train"), (dict, DictConfig)) and str(cfg["mini_train"].get("checkpoint_dir", "")).strip():
+            cfg["mini_train"]["checkpoint_dir"] = str(mini_ckpt_dir)
+
+    for path in (root_dir, logs_dir, reports_dir, crashes_dir, mini_ckpt_dir, big_ckpt_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "run_id": run_id,
+        "root_dir": str(root_dir),
+        "logs_dir": str(logs_dir),
+        "reports_dir": str(reports_dir),
+        "crashes_dir": str(crashes_dir),
+        "mini_vae_checkpoint_dir": str(mini_ckpt_dir),
+        "big_vae_checkpoint_dir": str(big_ckpt_dir),
+    }

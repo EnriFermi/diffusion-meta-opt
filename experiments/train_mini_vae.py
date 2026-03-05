@@ -34,6 +34,7 @@ from training.optim import build_cosine_scheduler
 from training.mini_patch_training_model import MiniPatchTrainingModel, build_distribution_config, build_mini_vae_config
 from training.runtime import (
     autocast_context as runtime_autocast_context,
+    configure_per_run_artifacts as runtime_configure_per_run_artifacts,
     find_free_port as runtime_find_free_port,
     get_rank_logger,
     maybe_compile_model as runtime_maybe_compile_model,
@@ -3081,6 +3082,11 @@ def spawn_entry(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
 @hydra.main(version_base=None, config_path="../conf", config_name="mini_vae_train")
 def main(cfg: DictConfig) -> None:
     promote_run_profile_to_root(cfg)
+    run_artifacts = runtime_configure_per_run_artifacts(cfg, run_label="train_mini_vae")
+    print(
+        f"[train_mini_vae] run_id={run_artifacts.get('run_id')} artifacts_root={run_artifacts.get('root_dir')}",
+        flush=True,
+    )
     world_size = resolve_world_size(cfg)
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     assert isinstance(cfg_dict, dict)
