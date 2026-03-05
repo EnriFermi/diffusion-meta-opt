@@ -603,6 +603,13 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
             if rank == 0:
                 logger.info("Training completed successfully: steps=%s", max_steps)
 
+    except BaseException:
+        logger.exception(
+            "Training worker exiting due to unhandled exception (rank=%s, world_size=%s)",
+            rank,
+            world_size,
+        )
+        raise
     finally:
         if is_distributed:
             try:

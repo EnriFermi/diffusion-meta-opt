@@ -846,12 +846,40 @@ class CollectorService:
 
     def shutdown(self) -> None:
         if self._process is not None:
+            forced_terminate = False
             if self._stop_event is not None:
                 self._stop_event.set()
             self._process.join(timeout=10)
             if self._process.is_alive():
+                forced_terminate = True
                 self._process.terminate()
                 self._process.join(timeout=3)
+
+            self._drain_status_queue()
+            exit_code = self._process.exitcode
+            if self.is_async_mode and exit_code not in (None, 0):
+                exit_reason = _format_process_exit(exit_code)
+                cgroup_snapshot = _read_cgroup_memory_snapshot() if self.include_cgroup_on_failure else {}
+                crash_report_payload = self._build_crash_report_payload(
+                    exit_code=exit_code,
+                    exit_reason=exit_reason,
+                    cgroup_snapshot=cgroup_snapshot,
+                )
+                crash_report_written = self._maybe_write_crash_report(crash_report_payload)
+                if crash_report_written is not None:
+                    self.logger.warning(
+                        "Async collector exited with non-zero code during shutdown (%s, forced_terminate=%s). "
+                        "crash_report_path=%s",
+                        exit_reason,
+                        forced_terminate,
+                        crash_report_written,
+                    )
+                else:
+                    self.logger.warning(
+                        "Async collector exited with non-zero code during shutdown (%s, forced_terminate=%s).",
+                        exit_reason,
+                        forced_terminate,
+                    )
             self._process = None
 
         if self._status_queue is not None:
