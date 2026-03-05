@@ -161,7 +161,15 @@ def maybe_compile_model(
 
 
 def resolve_amp(cfg: DictConfig, device: torch.device, *, section: str, amp_key: str = "amp") -> tuple[bool, torch.dtype | None]:
-    mode = str(cfg[section].get(amp_key, "auto")).lower()
+    mode_raw = cfg[section].get(amp_key, "auto")
+    if isinstance(mode_raw, bool):
+        mode = "auto" if mode_raw else "off"
+    else:
+        mode = str(mode_raw).lower()
+
+    if mode in {"on", "true", "1", "yes"}:
+        mode = "auto"
+
     if device.type != "cuda" or mode in {"off", "false", "0", "none"}:
         return False, None
 
