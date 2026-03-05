@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -28,6 +29,15 @@ from models.weight_quantile_vae import (
     WeightQuantileVAE,
 )
 from training.optim import build_adamw_optimizer, build_cosine_scheduler
+from training.forensics import (
+    apply_nccl_forensics_env,
+    emit_fatal_report,
+    maybe_enable_core_dumps,
+    maybe_redirect_stdio,
+    monitor_send_event,
+    start_process_monitor,
+    stop_process_monitor,
+)
 from training.runtime import (
     autocast_context as runtime_autocast_context,
     find_free_port as runtime_find_free_port,
@@ -197,34 +207,96 @@ def _build_collector_status_snapshot(collector: Any) -> dict[str, Any]:
         "items_emitted": int(stats.get("items_emitted", 0)),
         "async_process_alive": stats.get("async_process_alive"),
         "async_events_dropped": stats.get("async_events_dropped"),
+        "worker_status_dir": stats.get("worker_status_dir"),
     }
 
     async_last_status = stats.get("async_last_status")
     if not isinstance(async_last_status, dict):
         return payload
 
-    workers_payload: dict[str, dict[str, Any]] = {}
+    worker_total = 0
+    worker_alive = 0
+    worker_disabled = 0
+    degraded_workers: list[dict[str, Any]] = []
     raw_workers = async_last_status.get("raw_pool_workers")
     if isinstance(raw_workers, dict):
         for dataset_name, info in raw_workers.items():
             if not isinstance(info, dict):
                 continue
-            worker_entry = {
-                "worker_pid": info.get("worker_pid"),
-                "worker_alive": bool(info.get("worker_alive", False)),
-                "worker_exitcode": info.get("worker_exitcode"),
-                "worker_restarts": int(info.get("worker_restarts", 0) or 0),
-                "worker_permanently_stopped": bool(info.get("worker_permanently_stopped", False)),
-                "worker_last_error": info.get("worker_last_error"),
-            }
-            if "resource_rss_mb" in info:
-                worker_entry["worker_rss_mb"] = info.get("resource_rss_mb")
-            workers_payload[str(dataset_name)] = worker_entry
+            worker_total += 1
+            is_alive = bool(info.get("worker_alive", False))
+            is_disabled = bool(info.get("disabled", False) or info.get("worker_permanently_stopped", False))
+            if is_alive:
+                worker_alive += 1
+            if is_disabled:
+                worker_disabled += 1
+            if (not is_alive) or is_disabled or bool(info.get("worker_last_error")):
+                degraded_workers.append(
+                    {
+                        "dataset": str(dataset_name),
+                        "worker_pid": info.get("worker_pid"),
+                        "worker_alive": is_alive,
+                        "disabled": is_disabled,
+                        "worker_restarts": int(info.get("worker_restarts", 0) or 0),
+                        "worker_last_error": info.get("worker_last_error"),
+                    }
+                )
 
-    if workers_payload:
-        payload["dataset_workers"] = workers_payload
+    if worker_total > 0:
+        payload["dataset_workers_total"] = int(worker_total)
+        payload["dataset_workers_alive"] = int(worker_alive)
+        payload["dataset_workers_disabled_or_stopped"] = int(worker_disabled)
+    if degraded_workers:
+        payload["dataset_workers_degraded"] = degraded_workers[:8]
 
     return payload
+
+
+def _collector_tracked_children(collector: Any) -> list[dict[str, Any]]:
+    tracked: list[dict[str, Any]] = []
+    try:
+        stats = collector.stats()
+    except Exception:
+        return tracked
+
+    async_last_status = stats.get("async_last_status")
+    if not isinstance(async_last_status, dict):
+        return tracked
+
+    collector_pid = async_last_status.get("collector_pid")
+    if isinstance(collector_pid, int) and collector_pid > 0:
+        tracked.append(
+            {
+                "pid": int(collector_pid),
+                "role": "collector_process",
+                "metadata": {
+                    "mode": stats.get("mode"),
+                    "streaming_mode": stats.get("streaming_mode"),
+                },
+            }
+        )
+
+    raw_workers = async_last_status.get("raw_pool_workers")
+    if isinstance(raw_workers, dict):
+        for dataset_name, info in raw_workers.items():
+            if not isinstance(info, dict):
+                continue
+            worker_pid = info.get("worker_pid")
+            if not isinstance(worker_pid, int) or worker_pid <= 0:
+                continue
+            tracked.append(
+                {
+                    "pid": int(worker_pid),
+                    "role": "dataset_worker",
+                    "metadata": {
+                        "dataset": str(dataset_name),
+                        "worker_alive": bool(info.get("worker_alive", False)),
+                        "worker_restarts": int(info.get("worker_restarts", 0) or 0),
+                        "worker_last_error": info.get("worker_last_error"),
+                    },
+                }
+            )
+    return tracked
 
 
 def _save_checkpoint(
@@ -362,11 +434,32 @@ def _fetch_batch(
     )
 
 
-def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr: str, master_port: int) -> None:
+def _run_worker(
+    rank: int,
+    world_size: int,
+    cfg_dict: dict[str, Any],
+    master_addr: str,
+    master_port: int,
+    monitor_queue: Any | None = None,
+) -> None:
+    maybe_redirect_stdio(cfg_dict, role="train_worker", section="train", rank=rank)
     cfg = OmegaConf.create(cfg_dict)
     _promote_run_profile_to_root(cfg)
     setup_logging(cfg, rank=rank)
     logger = _logger("train", rank=rank)
+    maybe_enable_core_dumps(cfg_dict, section="train", logger=logger)
+    monitor_send_event(
+        monitor_queue,
+        {
+            "type": "register",
+            "pid": int(os.getpid()),
+            "role": f"train_rank_{rank}",
+            "metadata": {
+                "rank": int(rank),
+                "world_size": int(world_size),
+            },
+        },
+    )
     if rank == 0:
         logger.info("Starting training entrypoint")
         logger.debug("Resolved config:\n%s", OmegaConf.to_yaml(cfg, resolve=True))
@@ -489,6 +582,11 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
             log_worker_status_every = max(
                 1,
                 int(cfg.train.get("log_worker_status_every", log_every)),
+            )
+            forensics_cfg = cfg.train.get("forensics", {})
+            forensics_heartbeat_steps = max(
+                1,
+                int(forensics_cfg.get("heartbeat_steps", log_every)),
             )
             checkpoint_every = max(1, int(cfg.train.get("checkpoint_every", 200)))
 
@@ -645,6 +743,24 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
                     window_steps = 0
                     t0 = time.time()
 
+                if global_step % forensics_heartbeat_steps == 0:
+                    heartbeat_payload: dict[str, Any] = {
+                        "type": "heartbeat",
+                        "pid": int(os.getpid()),
+                        "role": f"train_rank_{rank}",
+                        "metadata": {
+                            "rank": int(rank),
+                            "world_size": int(world_size),
+                            "global_step": int(global_step),
+                            "max_steps": int(max_steps),
+                            "loss": float(step_loss),
+                            "lr": float(optimizer.param_groups[0]["lr"]),
+                        },
+                    }
+                    if rank == 0 and collector is not None:
+                        heartbeat_payload["tracked_children"] = _collector_tracked_children(collector)
+                    monitor_send_event(monitor_queue, heartbeat_payload)
+
                 if rank == 0 and (global_step % checkpoint_every == 0 or global_step == max_steps):
                     _save_checkpoint(
                         model=model,
@@ -659,8 +775,35 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
             if rank == 0:
                 logger.info("Training completed successfully: steps=%s", max_steps)
 
-    except BaseException:
+    except BaseException as exc:
         failed = True
+        traceback_text = traceback.format_exc()
+        report_path = emit_fatal_report(
+            cfg_dict,
+            role=f"train_rank_{rank}",
+            error=str(exc),
+            traceback_text=traceback_text,
+            extra={
+                "rank": int(rank),
+                "world_size": int(world_size),
+            },
+            section="train",
+        )
+        monitor_send_event(
+            monitor_queue,
+            {
+                "type": "fatal",
+                "pid": int(os.getpid()),
+                "role": f"train_rank_{rank}",
+                "error": str(exc),
+                "traceback": traceback_text,
+                "metadata": {
+                    "rank": int(rank),
+                    "world_size": int(world_size),
+                    "fatal_report_path": report_path,
+                },
+            },
+        )
         logger.exception(
             "Training worker exiting due to unhandled exception (rank=%s, world_size=%s)",
             rank,
@@ -668,6 +811,19 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
         )
         raise
     finally:
+        monitor_send_event(
+            monitor_queue,
+            {
+                "type": "exit",
+                "pid": int(os.getpid()),
+                "role": f"train_rank_{rank}",
+                "metadata": {
+                    "rank": int(rank),
+                    "world_size": int(world_size),
+                    "failed": bool(failed),
+                },
+            },
+        )
         if is_distributed and dist.is_initialized():
             if not failed:
                 try:
@@ -679,13 +835,29 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
             dist.destroy_process_group()
 
 
-def _spawn_entry(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr: str, master_port: int) -> None:
-    _run_worker(rank=rank, world_size=world_size, cfg_dict=cfg_dict, master_addr=master_addr, master_port=master_port)
+def _spawn_entry(
+    rank: int,
+    world_size: int,
+    cfg_dict: dict[str, Any],
+    master_addr: str,
+    master_port: int,
+    monitor_queue: Any | None = None,
+) -> None:
+    _run_worker(
+        rank=rank,
+        world_size=world_size,
+        cfg_dict=cfg_dict,
+        master_addr=master_addr,
+        master_port=master_port,
+        monitor_queue=monitor_queue,
+    )
 
 
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
     _promote_run_profile_to_root(cfg)
+    maybe_redirect_stdio(cfg, role="train_launcher", section="train")
+    maybe_enable_core_dumps(cfg, section="train", logger=None)
     # Freeze one shared log path before spawning worker processes.
     if not os.environ.get(LOG_PATH_ENV):
         os.environ[LOG_PATH_ENV] = str(resolve_log_path(cfg))
@@ -693,21 +865,84 @@ def main(cfg: DictConfig) -> None:
     world_size = _resolve_world_size(cfg)
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     assert isinstance(cfg_dict, dict)
-
-    if world_size <= 1:
-        _run_worker(rank=0, world_size=1, cfg_dict=cfg_dict, master_addr="127.0.0.1", master_port=0)
-        return
-
-    master_addr = str(cfg.train.get("master_addr", "127.0.0.1"))
-    requested_port = int(cfg.train.get("master_port", 0))
-    master_port = requested_port if requested_port > 0 else _find_free_port()
-
-    mp.spawn(
-        _spawn_entry,
-        args=(world_size, cfg_dict, master_addr, master_port),
-        nprocs=world_size,
-        join=True,
+    apply_nccl_forensics_env(cfg_dict, section="train")
+    monitor_process, monitor_queue, monitor_stop_event = start_process_monitor(
+        cfg_dict,
+        section="train",
+        label="train_big_vae",
     )
+    monitor_send_event(
+        monitor_queue,
+        {
+            "type": "register",
+            "pid": int(os.getpid()),
+            "role": "train_launcher",
+            "metadata": {
+                "world_size": int(world_size),
+            },
+        },
+    )
+
+    try:
+        if world_size <= 1:
+            _run_worker(
+                rank=0,
+                world_size=1,
+                cfg_dict=cfg_dict,
+                master_addr="127.0.0.1",
+                master_port=0,
+                monitor_queue=monitor_queue,
+            )
+            return
+
+        master_addr = str(cfg.train.get("master_addr", "127.0.0.1"))
+        requested_port = int(cfg.train.get("master_port", 0))
+        master_port = requested_port if requested_port > 0 else _find_free_port()
+
+        mp.spawn(
+            _spawn_entry,
+            args=(world_size, cfg_dict, master_addr, master_port, monitor_queue),
+            nprocs=world_size,
+            join=True,
+        )
+    except BaseException as exc:
+        traceback_text = traceback.format_exc()
+        report_path = emit_fatal_report(
+            cfg_dict,
+            role="train_launcher",
+            error=str(exc),
+            traceback_text=traceback_text,
+            extra={"world_size": int(world_size)},
+            section="train",
+        )
+        monitor_send_event(
+            monitor_queue,
+            {
+                "type": "fatal",
+                "pid": int(os.getpid()),
+                "role": "train_launcher",
+                "error": str(exc),
+                "traceback": traceback_text,
+                "metadata": {
+                    "world_size": int(world_size),
+                    "fatal_report_path": report_path,
+                },
+            },
+        )
+        raise
+    finally:
+        monitor_send_event(
+            monitor_queue,
+            {
+                "type": "exit",
+                "pid": int(os.getpid()),
+                "role": "train_launcher",
+                "metadata": {
+                    "world_size": int(world_size),
+                },
+            },
+        )
+        stop_process_monitor(monitor_process, monitor_queue, monitor_stop_event)
 
 
 if __name__ == "__main__":

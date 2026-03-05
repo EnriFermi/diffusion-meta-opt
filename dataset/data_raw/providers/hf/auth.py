@@ -39,17 +39,23 @@ def get_hf_token(cfg: Any) -> str | None:
     return token
 
 
-def validate_gated_datasets_token(cfg: Any, active_dataset_cfgs: dict[str, Any]) -> None:
+def gated_datasets_missing_token(cfg: Any, active_dataset_cfgs: dict[str, Any]) -> list[str]:
     token = get_hf_token(cfg)
-    missing_for: list[str] = []
+    if token:
+        return []
 
+    missing_for: list[str] = []
     for dataset_name, dataset_cfg in active_dataset_cfgs.items():
         plain = to_plain_dict(dataset_cfg)
         enabled = bool(plain.get("enabled", True))
         gated = bool(plain.get("gated", False))
-        if enabled and gated and not token:
-            missing_for.append(dataset_name)
+        if enabled and gated:
+            missing_for.append(str(dataset_name))
+    return sorted(missing_for)
 
+
+def validate_gated_datasets_token(cfg: Any, active_dataset_cfgs: dict[str, Any]) -> None:
+    missing_for = gated_datasets_missing_token(cfg, active_dataset_cfgs)
     if missing_for:
         names = ", ".join(sorted(missing_for))
         raise ValueError(

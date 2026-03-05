@@ -182,15 +182,34 @@ def _resolve_paths(cfg_dict: dict[str, Any]) -> tuple[Path, Path]:
     logging_cfg = cfg_dict.get("logging", {}) if isinstance(cfg_dict, dict) else {}
     if not isinstance(logging_cfg, dict):
         logging_cfg = {}
+    collector_cfg = cfg_dict.get("collector", {}) if isinstance(cfg_dict, dict) else {}
+    if not isinstance(collector_cfg, dict):
+        collector_cfg = {}
+    diagnostics_cfg = collector_cfg.get("diagnostics", {})
+    if not isinstance(diagnostics_cfg, dict):
+        diagnostics_cfg = {}
+    training_artifacts_cfg = cfg_dict.get("training_artifacts", {}) if isinstance(cfg_dict, dict) else {}
+    if not isinstance(training_artifacts_cfg, dict):
+        training_artifacts_cfg = {}
 
     file_path = logging_cfg.get("file_path")
     if file_path:
         base_log_path = Path(str(file_path))
-        directory = base_log_path.parent
+        default_directory = base_log_path.parent
         stem = base_log_path.stem
     else:
-        directory = Path(str(logging_cfg.get("dir", "logs")))
+        default_directory = Path(str(logging_cfg.get("dir", "logs")))
         stem = str(logging_cfg.get("project_name", "run"))
+
+    reports_dir = diagnostics_cfg.get("load_reports_dir")
+    if reports_dir:
+        directory = Path(str(reports_dir))
+    else:
+        artifacts_reports_dir = training_artifacts_cfg.get("reports_dir")
+        if artifacts_reports_dir:
+            directory = Path(str(artifacts_reports_dir))
+        else:
+            directory = default_directory
 
     events_path = directory / f"{stem}_load_report.jsonl"
     summary_path = directory / f"{stem}_load_summary.json"

@@ -22,3 +22,18 @@ tf32: true
 cudnn_benchmark: true
 
 log_every: 10
+
+forensics:
+  enabled: true
+  stdio_redirect: true
+  enable_core_dumps: true
+  heartbeat_steps: 10
+  monitor_enabled: true
+  monitor_poll_s: 1.0
+  monitor_max_children: 16
+  monitor_queue_max_items: 8192
+  nccl:
+    enabled: true
+    trace_buffer_size: 1048576
+    dump_on_timeout: true
+    async_error_handling: true
