@@ -15,7 +15,7 @@ betas: [0.9, 0.999]
 eps: 0.00000001
 grad_clip_norm: 1.0
 
-amp: false
+amp: true
 compile: true
 compile_mode: max-autotune
 tf32: true
