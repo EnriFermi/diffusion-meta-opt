@@ -373,7 +373,7 @@ def apply_nccl_forensics_env(
     env_updates = {
         "TORCH_NCCL_TRACE_BUFFER_SIZE": str(int(nccl_cfg.get("trace_buffer_size", 1048576))),
         "TORCH_NCCL_DUMP_ON_TIMEOUT": "1" if bool(nccl_cfg.get("dump_on_timeout", True)) else "0",
-        "NCCL_ASYNC_ERROR_HANDLING": "1" if bool(nccl_cfg.get("async_error_handling", True)) else "0",
+        "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1" if bool(nccl_cfg.get("async_error_handling", True)) else "0",
         "PYTHONFAULTHANDLER": "1",
     }
     for key, value in env_updates.items():
@@ -386,7 +386,7 @@ def apply_nccl_forensics_env(
             "Forensics NCCL env: trace_buffer=%s dump_on_timeout=%s async_error_handling=%s",
             os.environ.get("TORCH_NCCL_TRACE_BUFFER_SIZE"),
             os.environ.get("TORCH_NCCL_DUMP_ON_TIMEOUT"),
-            os.environ.get("NCCL_ASYNC_ERROR_HANDLING"),
+            os.environ.get("TORCH_NCCL_ASYNC_ERROR_HANDLING"),
         )
 
 

@@ -574,6 +574,12 @@ def _run_worker(
 
             amp_enabled, amp_dtype = _resolve_amp(cfg=cfg, device=device)
             scaler = GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
+            cudagraph_step_begin = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
+            use_cudagraph_step_begin = (
+                bool(cfg.train.get("compile", False))
+                and device.type == "cuda"
+                and callable(cudagraph_step_begin)
+            )
 
             max_steps = max(1, int(cfg.train.get("max_steps", 1000)))
             grad_accum_steps = max(1, int(cfg.train.get("grad_accum_steps", 1)))
@@ -633,6 +639,8 @@ def _run_worker(
                         no_sync_ctx = model.no_sync()  # type: ignore[union-attr]
 
                     with no_sync_ctx:
+                        if use_cudagraph_step_begin:
+                            cudagraph_step_begin()
                         with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
                             W_hat, mu, logvar = model(W, x)
                             behavioral_loss = WeightQuantileVAE.operator_recon_loss(x, W, W_hat)
