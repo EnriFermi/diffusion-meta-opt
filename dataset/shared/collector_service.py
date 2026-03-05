@@ -38,6 +38,7 @@ from dataset.shared.streaming.factory import (
     resolve_streaming_cfg,
 )
 from dataset.shared.types import CollectorJobStats, SharedSample
+from training.forensics import emit_fatal_report, maybe_enable_core_dumps, maybe_redirect_stdio
 
 _FAULT_HANDLER_FILES: list[Any] = []
 
@@ -214,6 +215,15 @@ def _write_json_report(path: Path, payload: dict[str, Any], logger: logging.Logg
         tmp_path.replace(path)
     except Exception as exc:
         logger.warning("Failed to write collector crash report '%s': %s", path, exc)
+
+
+def _append_jsonl_record(path: Path, payload: dict[str, Any], logger: logging.Logger) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:
+        logger.warning("Failed to append JSONL record '%s': %s", path, exc)
 
 
 def _safe_int(value: Any) -> int | None:
@@ -620,6 +630,10 @@ class CollectorService:
         self.crash_report_path = Path(
             str(diagnostics_cfg.get("crash_report_path", "./data/reports/collector_crash_report.json"))
         )
+        self.worker_status_enabled = bool(diagnostics_cfg.get("worker_status_enabled", True))
+        self.worker_status_dir = Path(
+            str(diagnostics_cfg.get("worker_status_dir", "./data/reports/dataset_workers"))
+        )
 
         self.interleaved_cfg = collector_cfg.get("interleaved_schedule", {})
         collect_every_n_steps_cfg = self.interleaved_cfg.get(
@@ -723,6 +737,8 @@ class CollectorService:
         crash_report_written = self._maybe_write_crash_report(crash_report_payload)
         if crash_report_written is not None:
             hint_parts.append(f"crash_report_path={crash_report_written}")
+        if self.worker_status_enabled:
+            hint_parts.append(f"worker_status_dir={self.worker_status_dir}")
 
         if isinstance(self._async_last_status, dict):
             try:
@@ -746,6 +762,17 @@ class CollectorService:
                 )
             except Exception:
                 pass
+            fatal_error = self._async_last_status.get("fatal_error")
+            if fatal_error:
+                hint_parts.append(f"fatal_error={fatal_error}")
+            fatal_traceback = self._async_last_status.get("fatal_traceback")
+            if isinstance(fatal_traceback, str) and fatal_traceback:
+                first_line = fatal_traceback.strip().splitlines()[-1]
+                if first_line:
+                    hint_parts.append(f"fatal_traceback_last_line={first_line}")
+            fatal_report_path = self._async_last_status.get("fatal_report_path")
+            if fatal_report_path:
+                hint_parts.append(f"fatal_report_path={fatal_report_path}")
 
         message = f"Async collector process exited unexpectedly ({exit_reason})"
         if hint_parts:
@@ -776,6 +803,8 @@ class CollectorService:
             "async_events_dropped": int(self._async_events_dropped),
             "async_recent_jobs": list(self._async_recent_jobs),
             "async_last_status": self._async_last_status,
+            "worker_status_enabled": bool(self.worker_status_enabled),
+            "worker_status_dir": str(self.worker_status_dir),
             "host_snapshot": _collect_process_resource_snapshot(
                 pid=os.getpid(),
                 max_children=self.resource_snapshot_max_children,
@@ -1114,6 +1143,8 @@ class CollectorService:
             "sink": self._sink.stats() if self._sink else None,
             "status_emit_interval_s": self.status_emit_interval_s,
             "status_queue_max_items": self.status_queue_max_items,
+            "worker_status_enabled": bool(self.worker_status_enabled),
+            "worker_status_dir": str(self.worker_status_dir),
         }
 
         if self.is_async_mode:
@@ -1164,6 +1195,8 @@ class CollectorService:
             self._load_report.summary_path,
             self._load_report.events_path,
         )
+        if self.worker_status_enabled:
+            self.logger.info("Dataset worker status dir: %s", self.worker_status_dir)
 
         try:
             self._raw_pool = RawDatasetPool(cfg=self.cfg, index=self.compat_index, load_report=self._load_report)
@@ -1295,9 +1328,6 @@ class CollectorService:
         self._emit_status_event(event_type=event_type, job_stats=None)
 
     def _emit_status_event(self, event_type: str, job_stats: CollectorJobStats | None) -> None:
-        if self._status_queue is None:
-            return
-
         payload: dict[str, Any] = {
             "type": str(event_type),
             "timestamp": float(time.time()),
@@ -1329,6 +1359,12 @@ class CollectorService:
         if job_stats is not None:
             payload["job_stats"] = asdict(job_stats)
 
+        self._write_dataset_worker_status_files(payload)
+
+        if self._status_queue is None:
+            self._last_status_emit_ts = payload["timestamp"]
+            return
+
         try:
             self._status_queue.put_nowait(payload)
             self._last_status_emit_ts = payload["timestamp"]
@@ -1336,6 +1372,39 @@ class CollectorService:
             self._async_events_dropped += 1
         except Exception:
             pass
+
+    def _write_dataset_worker_status_files(self, payload: dict[str, Any]) -> None:
+        if not self.worker_status_enabled:
+            return
+        workers = payload.get("raw_pool_workers")
+        if not isinstance(workers, dict):
+            return
+
+        timestamp = float(payload.get("timestamp", time.time()))
+        collector_pid = _safe_int(payload.get("collector_pid"))
+        event_type = str(payload.get("type", "status"))
+        cache_size = _safe_int(payload.get("cache_size"))
+        jobs_total = _safe_int(payload.get("jobs_total"))
+        items_emitted = _safe_int(payload.get("items_emitted"))
+
+        all_rows_path = self.worker_status_dir / "_all_workers.jsonl"
+        for dataset_name, info in workers.items():
+            if not isinstance(info, dict):
+                continue
+            row = {
+                "timestamp": timestamp,
+                "event_type": event_type,
+                "dataset": str(dataset_name),
+                "collector_pid": collector_pid,
+                "cache_size": cache_size,
+                "jobs_total": jobs_total,
+                "items_emitted": items_emitted,
+                **info,
+            }
+            safe_dataset_name = str(dataset_name).replace("/", "__")
+            dataset_path = self.worker_status_dir / f"{safe_dataset_name}.jsonl"
+            _append_jsonl_record(dataset_path, row, logger=self.logger)
+            _append_jsonl_record(all_rows_path, row, logger=self.logger)
 
     def _drain_status_queue(self) -> None:
         if self._status_queue is None:
@@ -1428,25 +1497,61 @@ def collector_process_main(
     stop_event: Any,
     status_queue: Any | None = None,
 ) -> None:
-    try:
-        faulthandler.enable(all_threads=True)
-    except Exception:
-        pass
+    forensics_cfg_dict = dict(cfg_dict)
+    if "train" not in forensics_cfg_dict and isinstance(forensics_cfg_dict.get("mini_train"), dict):
+        forensics_cfg_dict["train"] = dict(forensics_cfg_dict["mini_train"])
 
-    log_path = configure_root_logging(cfg=cfg_dict, rank=0, force=True)
-    logger = logging.getLogger("collector_process")
-    logger.info("Run log file: %s", log_path)
-    fault_path = _enable_fault_handler_log(log_path, label="collector_process", logger=logger)
-    if fault_path is not None:
-        logger.info("Collector fault log file: %s", fault_path)
-
-    service = CollectorService(cfg=cfg_dict, cache=cache, status_queue=status_queue)
     try:
-        service.run_forever(stop_event=stop_event)
-    except KeyboardInterrupt:
-        logger.info("Collector process interrupted")
-    finally:
-        service.shutdown()
+        try:
+            faulthandler.enable(all_threads=True)
+        except Exception:
+            pass
+
+        maybe_redirect_stdio(forensics_cfg_dict, role="collector_process", section="train")
+        log_path = configure_root_logging(cfg=cfg_dict, rank=0, force=True)
+        logger = logging.getLogger("collector_process")
+        maybe_enable_core_dumps(forensics_cfg_dict, section="train", logger=logger)
+        logger.info("Run log file: %s", log_path)
+        fault_path = _enable_fault_handler_log(log_path, label="collector_process", logger=logger)
+        if fault_path is not None:
+            logger.info("Collector fault log file: %s", fault_path)
+
+        service = CollectorService(cfg=cfg_dict, cache=cache, status_queue=status_queue)
+        try:
+            service.run_forever(stop_event=stop_event)
+        except KeyboardInterrupt:
+            logger.info("Collector process interrupted")
+        finally:
+            service.shutdown()
+    except BaseException as exc:
+        logger = logging.getLogger("collector_process")
+        traceback_text = traceback.format_exc()
+        report_path = emit_fatal_report(
+            forensics_cfg_dict,
+            role="collector_process",
+            error=str(exc),
+            traceback_text=traceback_text,
+            extra={
+                "collector_mode": str(cfg_dict.get("collector", {}).get("mode", "unknown")),
+            },
+            section="train",
+        )
+        logger.exception("Collector process failed with unhandled exception")
+        if status_queue is not None:
+            try:
+                status_queue.put_nowait(
+                    {
+                        "type": "fatal_exception",
+                        "timestamp": float(time.time()),
+                        "collector_pid": int(os.getpid()),
+                        "fatal_error": str(exc),
+                        "fatal_traceback": traceback_text,
+                        "fatal_report_path": report_path,
+                    }
+                )
+            except Exception:
+                pass
+        raise
 
 
 def stats_to_dict_list(items: list[CollectorJobStats]) -> list[dict[str, Any]]:

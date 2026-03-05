@@ -26,7 +26,7 @@ collector:
   empty_cuda_cache_on_unload: true
   diagnostics:
     crash_report_enabled: true
-    crash_report_path: ./checkpoints/mini_patch_vae/collector_crash_report.json
+    crash_report_path: ${oc.select:training_artifacts.crashes_dir,./data/reports}/collector_crash_report_train_mini_vae.json
   layer_output_splitting:
     xy_samples_random_slice: 256
 

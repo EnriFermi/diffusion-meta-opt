@@ -26,7 +26,17 @@ diagnostics:
   resource_snapshot_max_children: 8
   include_cgroup_on_failure: true
   crash_report_enabled: true
-  crash_report_path: ./data/reports/collector_crash_report.json
+  crash_report_path: ${oc.select:training_artifacts.crashes_dir,./data/reports}/collector_crash_report.json
+  worker_status_enabled: true
+  worker_status_dir: ${oc.select:training_artifacts.reports_dir,./data/reports}/dataset_workers
+
+dataset_pool:
+  continue_on_create_failure: true
+  continue_on_start_failure: true
+  # If HF token is missing, disable gated datasets and keep training alive with the rest.
+  continue_on_missing_hf_token_for_gated_datasets: true
+  disable_dataset_on_runtime_failure: true
+  max_runtime_failures_before_disable: 3
 
 in_memory_buffer:
   capacity_samples: 3000

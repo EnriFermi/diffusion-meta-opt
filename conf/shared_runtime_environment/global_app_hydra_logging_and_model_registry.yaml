@@ -12,7 +12,7 @@ hydra:
 
 logging:
   project_name: diffusion_meta_opt
-  dir: logs
+  dir: ${oc.select:training_artifacts.logs_dir,logs}
   file_name: ${logging.project_name}_${hydra:job.name}_${now:%Y-%m-%d_%H-%M-%S}.log
   file_path: ${logging.dir}/${logging.file_name}
   format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"

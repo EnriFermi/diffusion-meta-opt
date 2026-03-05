@@ -4,6 +4,10 @@ defaults:
   - _self_
 
 training_artifacts:
-  mini_vae_checkpoint_dir: ./checkpoints/mini_patch_vae
-  big_vae_checkpoint_dir: ./checkpoints/weight_quantile_vae
+  root_dir: ./artifacts/training
+  logs_dir: ${training_artifacts.root_dir}/logs
+  reports_dir: ${training_artifacts.root_dir}/reports
+  crashes_dir: ${training_artifacts.root_dir}/crashes
+  mini_vae_checkpoint_dir: ${training_artifacts.root_dir}/checkpoints/mini_patch_vae
+  big_vae_checkpoint_dir: ${training_artifacts.root_dir}/checkpoints/weight_quantile_vae
   mini_encoder_latest_checkpoint: ${training_artifacts.mini_vae_checkpoint_dir}/mini_encoder_latest.pt
