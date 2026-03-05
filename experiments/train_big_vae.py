@@ -40,6 +40,7 @@ from training.forensics import (
 )
 from training.runtime import (
     autocast_context as runtime_autocast_context,
+    configure_per_run_artifacts as runtime_configure_per_run_artifacts,
     find_free_port as runtime_find_free_port,
     get_rank_logger,
     maybe_compile_model,
@@ -195,6 +196,10 @@ def _resolve_amp(cfg: DictConfig, device: torch.device) -> tuple[bool, torch.dty
 
 def _autocast_context(enabled: bool, dtype: torch.dtype | None) -> contextlib.AbstractContextManager:
     return runtime_autocast_context(enabled, dtype)
+
+
+def _configure_run_artifacts(cfg: DictConfig) -> dict[str, str]:
+    return runtime_configure_per_run_artifacts(cfg, run_label="train_big_vae")
 
 
 def _build_collector_status_snapshot(collector: Any) -> dict[str, Any]:
@@ -856,8 +861,13 @@ def _spawn_entry(
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
     _promote_run_profile_to_root(cfg)
+    run_artifacts = _configure_run_artifacts(cfg)
     maybe_redirect_stdio(cfg, role="train_launcher", section="train")
     maybe_enable_core_dumps(cfg, section="train", logger=None)
+    print(
+        f"[train_big_vae] run_id={run_artifacts.get('run_id')} artifacts_root={run_artifacts.get('root_dir')}",
+        flush=True,
+    )
     # Freeze one shared log path before spawning worker processes.
     if not os.environ.get(LOG_PATH_ENV):
         os.environ[LOG_PATH_ENV] = str(resolve_log_path(cfg))
