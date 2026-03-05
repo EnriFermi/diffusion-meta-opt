@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import time
@@ -184,6 +185,46 @@ def _resolve_amp(cfg: DictConfig, device: torch.device) -> tuple[bool, torch.dty
 
 def _autocast_context(enabled: bool, dtype: torch.dtype | None) -> contextlib.AbstractContextManager:
     return runtime_autocast_context(enabled, dtype)
+
+
+def _build_collector_status_snapshot(collector: Any) -> dict[str, Any]:
+    stats = collector.stats()
+    payload: dict[str, Any] = {
+        "mode": stats.get("mode"),
+        "streaming_mode": stats.get("streaming_mode"),
+        "cache_size": int(stats.get("cache_size", 0)),
+        "jobs_total": int(stats.get("jobs_total", 0)),
+        "items_emitted": int(stats.get("items_emitted", 0)),
+        "async_process_alive": stats.get("async_process_alive"),
+        "async_events_dropped": stats.get("async_events_dropped"),
+    }
+
+    async_last_status = stats.get("async_last_status")
+    if not isinstance(async_last_status, dict):
+        return payload
+
+    workers_payload: dict[str, dict[str, Any]] = {}
+    raw_workers = async_last_status.get("raw_pool_workers")
+    if isinstance(raw_workers, dict):
+        for dataset_name, info in raw_workers.items():
+            if not isinstance(info, dict):
+                continue
+            worker_entry = {
+                "worker_pid": info.get("worker_pid"),
+                "worker_alive": bool(info.get("worker_alive", False)),
+                "worker_exitcode": info.get("worker_exitcode"),
+                "worker_restarts": int(info.get("worker_restarts", 0) or 0),
+                "worker_permanently_stopped": bool(info.get("worker_permanently_stopped", False)),
+                "worker_last_error": info.get("worker_last_error"),
+            }
+            if "resource_rss_mb" in info:
+                worker_entry["worker_rss_mb"] = info.get("resource_rss_mb")
+            workers_payload[str(dataset_name)] = worker_entry
+
+    if workers_payload:
+        payload["dataset_workers"] = workers_payload
+
+    return payload
 
 
 def _save_checkpoint(
@@ -377,6 +418,7 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
     scheduler = None
     scaler = None
 
+    failed = False
     try:
         collector: Any | None = None
         dataset: Any | None = None
@@ -444,6 +486,10 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
             max_x_rows = int(cfg.train.get("max_x_rows", 0))
 
             log_every = max(1, int(cfg.train.get("log_every", 10)))
+            log_worker_status_every = max(
+                1,
+                int(cfg.train.get("log_worker_status_every", log_every)),
+            )
             checkpoint_every = max(1, int(cfg.train.get("checkpoint_every", 200)))
 
             loss_window = 0.0
@@ -581,6 +627,16 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
                         speed,
                         cache_metric,
                     )
+                    if collector is not None and (global_step % log_worker_status_every == 0):
+                        try:
+                            collector_status = _build_collector_status_snapshot(collector)
+                            logger.info(
+                                "collector_status step=%s status=%s",
+                                global_step,
+                                json.dumps(collector_status, ensure_ascii=False),
+                            )
+                        except Exception:
+                            logger.exception("Failed to capture collector_status at step=%s", global_step)
 
                     loss_window = 0.0
                     behavioral_window = 0.0
@@ -603,14 +659,23 @@ def _run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_add
             if rank == 0:
                 logger.info("Training completed successfully: steps=%s", max_steps)
 
+    except BaseException:
+        failed = True
+        logger.exception(
+            "Training worker exiting due to unhandled exception (rank=%s, world_size=%s)",
+            rank,
+            world_size,
+        )
+        raise
     finally:
-        if is_distributed:
-            try:
-                dist.barrier()
-            except Exception:
-                pass
-
         if is_distributed and dist.is_initialized():
+            if not failed:
+                try:
+                    dist.barrier()
+                except Exception:
+                    pass
+            else:
+                logger.warning("Skipping dist.barrier during shutdown because this rank failed")
             dist.destroy_process_group()
 
 
