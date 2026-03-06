@@ -4,7 +4,9 @@ defaults:
 
 # Async collection profile pinned to cuda:1.
 mode: auto
-device: "cuda:1"
+device: null
+device_candidates: ["cuda:1", "cuda:0"]
+allow_async_on_train_device: true
 pin_gpu: true
 release_device_on_unload: false
 empty_cuda_cache_on_unload: false
