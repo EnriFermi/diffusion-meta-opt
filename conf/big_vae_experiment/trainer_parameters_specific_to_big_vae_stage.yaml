@@ -26,3 +26,17 @@ stage_scale_factor: 2
 steps_per_sample: 10
 slice_batch_size: 4
 resume_checkpoint: ""
+
+forensics:
+  stdio_redirect: false
+
+telemetry:
+  comet:
+    enabled: true
+    api_key: ${oc.env:COMET_API_KEY,""}
+    workspace: ${oc.env:COMET_WORKSPACE,""}
+    project_name: big_weight_vae
+    experiment_name: ""
+    tags: []
+    offline_directory: ""
+    log_code: false

@@ -152,6 +152,7 @@ def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
             ffn_mult=float(big_cfg.get("ffn_mult", 4.0)),
             dropout=float(big_cfg.get("dropout", 0.0)),
             pos_fourier_dim=int(big_cfg.get("pos_fourier_dim", 64)),
+            use_latent_sampling=bool(big_cfg.get("use_latent_sampling", True)),
             encoder=EncoderConfig(
                 self_attn_mode=str(enc_cfg.get("self_attn_mode", "full")),
                 cross_attend_only_cls=bool(enc_cfg.get("cross_attend_only_cls", True)),
@@ -200,6 +201,114 @@ def _autocast_context(enabled: bool, dtype: torch.dtype | None) -> contextlib.Ab
 
 def _configure_run_artifacts(cfg: DictConfig) -> dict[str, str]:
     return runtime_configure_per_run_artifacts(cfg, run_label="train_big_vae")
+
+
+class CometTracker:
+    def __init__(self, cfg: DictConfig, logger: logging.Logger, rank: int) -> None:
+        self.logger = logger
+        self.rank = rank
+        self.experiment: Any | None = None
+        self.enabled = False
+
+        telemetry_cfg = cfg.train.get("telemetry", {})
+        comet_cfg = telemetry_cfg.get("comet", {})
+        if not bool(comet_cfg.get("enabled", False)):
+            return
+        if rank != 0:
+            return
+
+        try:
+            from comet_ml import Experiment, OfflineExperiment  # type: ignore
+        except Exception as exc:
+            message = str(exc)
+            if "rpds.rpds" in message:
+                self.logger.warning(
+                    "Comet is enabled but comet_ml is unavailable: %s. "
+                    "Install missing dependency in active env: `python -m pip install -U rpds-py`",
+                    exc,
+                )
+            else:
+                self.logger.warning("Comet is enabled but comet_ml is unavailable: %s", exc)
+            return
+
+        api_key = str(comet_cfg.get("api_key", "")).strip()
+        workspace = str(comet_cfg.get("workspace", "")).strip()
+        project_name = str(comet_cfg.get("project_name", "big_weight_vae")).strip() or "big_weight_vae"
+        experiment_name = str(comet_cfg.get("experiment_name", "")).strip()
+        offline_dir = str(comet_cfg.get("offline_directory", "")).strip()
+        log_code = bool(comet_cfg.get("log_code", False))
+
+        try:
+            train_cfg = cfg.get("train", {})
+            model_cfg = cfg.get("model", {})
+            big_cfg = model_cfg.get("big_vae", {})
+            streaming_cfg = cfg.get("streaming", {})
+            collector_cfg = cfg.get("collector", {})
+            if api_key:
+                exp = Experiment(
+                    api_key=api_key,
+                    project_name=project_name,
+                    workspace=workspace or None,
+                    auto_output_logging="simple",
+                    log_code=log_code,
+                )
+            else:
+                exp = OfflineExperiment(
+                    project_name=project_name,
+                    workspace=workspace or None,
+                    auto_output_logging="simple",
+                    log_code=log_code,
+                    offline_directory=offline_dir or None,
+                )
+
+            if experiment_name:
+                exp.set_name(experiment_name)
+
+            tags = comet_cfg.get("tags", [])
+            if isinstance(tags, (list, tuple)):
+                for tag in tags:
+                    exp.add_tag(str(tag))
+
+            exp.log_parameters(
+                {
+                    "train.max_steps": int(train_cfg.get("max_steps", 0)),
+                    "train.lr": float(train_cfg.get("lr", 0.0)),
+                    "train.grad_accum_steps": int(train_cfg.get("grad_accum_steps", 1)),
+                    "train.kl_beta": float(train_cfg.get("kl_beta", 0.0)),
+                    "train.behavioral_coef": float(train_cfg.get("behavioral_coef", 0.0)),
+                    "train.structural_coef": float(train_cfg.get("structural_coef", 0.0)),
+                    "model.patch_size": int(model_cfg.get("patch_size", 16)),
+                    "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
+                    "streaming.mode": str(streaming_cfg.get("mode", "none")),
+                    "collector.mode": str(collector_cfg.get("mode", "auto")),
+                    "collector.device": str(collector_cfg.get("device", "")),
+                    "train.device": str(train_cfg.get("device", "")),
+                }
+            )
+
+            self.experiment = exp
+            self.enabled = True
+            self.logger.info("Comet tracking enabled: project=%s workspace=%s", project_name, workspace or "<default>")
+        except Exception as exc:
+            self.logger.warning("Failed to initialize Comet tracker: %s", exc)
+            self.experiment = None
+            self.enabled = False
+
+    def log_metrics(self, metrics: dict[str, float], step: int) -> None:
+        if self.experiment is None:
+            return
+        try:
+            self.experiment.log_metrics(metrics, step=int(step))
+        except Exception as exc:
+            self.logger.warning("Comet metrics log failed at step=%s: %s", step, exc)
+
+    def end(self) -> None:
+        if self.experiment is None:
+            return
+        try:
+            self.experiment.end()
+        except Exception:
+            pass
 
 
 def _build_collector_status_snapshot(collector: Any) -> dict[str, Any]:
@@ -583,6 +692,7 @@ def _run_worker(
     optimizer = None
     scheduler = None
     scaler = None
+    comet_tracker: CometTracker | None = None
 
     failed = False
     try:
@@ -643,6 +753,7 @@ def _run_worker(
 
             optimizer = _build_optimizer(model=model, cfg=cfg, device=device)
             scheduler = _build_scheduler(optimizer=optimizer, cfg=cfg)
+            comet_tracker = CometTracker(cfg=cfg, logger=logger, rank=rank)
 
             amp_enabled, amp_dtype = _resolve_amp(cfg=cfg, device=device)
             scaler = GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
@@ -656,6 +767,13 @@ def _run_worker(
             max_steps = max(1, int(cfg.train.get("max_steps", 1000)))
             grad_accum_steps = max(1, int(cfg.train.get("grad_accum_steps", 1)))
             kl_beta = float(cfg.train.get("kl_beta", 1e-3))
+            model_unwrapped = model.module if isinstance(model, DDP) else model
+            cfg_holder = model_unwrapped
+            if not hasattr(cfg_holder, "cfg") and hasattr(cfg_holder, "_orig_mod"):
+                cfg_holder = getattr(cfg_holder, "_orig_mod")
+            if not hasattr(cfg_holder, "cfg"):
+                raise AttributeError(f"Model does not expose cfg: type={type(model_unwrapped)}")
+            use_latent_sampling = bool(cfg_holder.cfg.big_vae.use_latent_sampling)
             behavioral_coef = float(cfg.train.get("behavioral_coef", 1.0))
             structural_coef = float(cfg.train.get("structural_coef", 0.5))
             grad_clip_norm = float(cfg.train.get("grad_clip_norm", 1.0))
@@ -686,6 +804,12 @@ def _run_worker(
             steps_per_sample = max(1, int(cfg.train.get("steps_per_sample", 1)))
             if rank == 0:
                 logger.info("Steps per sample: %s", steps_per_sample)
+                logger.info(
+                    "BigVAE latent mode: %s (use_latent_sampling=%s, kl_beta=%s)",
+                    "VAE" if use_latent_sampling else "AE",
+                    use_latent_sampling,
+                    kl_beta,
+                )
 
             loss_window = 0.0
             behavioral_window = 0.0
@@ -737,7 +861,10 @@ def _run_worker(
                             W_hat, mu, logvar = model(W_s, x_s)
                             behavioral_loss = WeightQuantileVAE.operator_recon_loss(x_s, W_s, W_hat)
                             structural_loss = WeightQuantileVAE.structural_recon_loss(W_s, W_hat)
-                            kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
+                            if use_latent_sampling:
+                                kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
+                            else:
+                                kl_loss = mu.new_zeros(())
                             total_loss = (
                                 behavioral_coef * behavioral_loss
                                 + structural_coef * structural_loss
@@ -830,6 +957,27 @@ def _run_worker(
                         speed,
                         cache_metric,
                     )
+                    if comet_tracker is not None and comet_tracker.enabled:
+                        comet_metrics: dict[str, float] = {
+                            "train/loss": float(avg_loss),
+                            "train/behavioral_loss": float(avg_behavioral),
+                            "train/structural_loss": float(avg_structural),
+                            "train/kl_loss": float(avg_kl),
+                            "train/lr": float(lr),
+                            "train/steps_per_sec": float(speed),
+                            "data/cache_size": float(cache_metric),
+                        }
+                        if device.type == "cuda":
+                            comet_metrics["gpu/memory_allocated_mb"] = float(
+                                torch.cuda.memory_allocated(device) / (1024.0 * 1024.0)
+                            )
+                            comet_metrics["gpu/memory_reserved_mb"] = float(
+                                torch.cuda.memory_reserved(device) / (1024.0 * 1024.0)
+                            )
+                            comet_metrics["gpu/max_memory_allocated_mb"] = float(
+                                torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0)
+                            )
+                        comet_tracker.log_metrics(comet_metrics, step=global_step)
                     if collector is not None and (global_step % log_worker_status_every == 0):
                         try:
                             collector_status = _build_collector_status_snapshot(collector)
@@ -917,6 +1065,8 @@ def _run_worker(
         )
         raise
     finally:
+        if comet_tracker is not None:
+            comet_tracker.end()
         monitor_send_event(
             monitor_queue,
             {

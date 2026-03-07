@@ -1616,6 +1616,7 @@ class BigVAEConfig:
     ffn_mult: float = 4.0
     dropout: float = 0.0
     pos_fourier_dim: int = 64
+    use_latent_sampling: bool = True
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
 
 
@@ -2084,7 +2085,10 @@ class BigWeightVAE(nn.Module):
         latents_flat = self.latent_norm(latents.reshape(B, self.flat_lat_dim))
         mu = self.to_mu(latents_flat)
         logvar = self.to_logvar(latents_flat)
-        z = self.reparameterize(mu=mu, logvar=logvar)
+        if bool(self.cfg.big_vae.use_latent_sampling):
+            z = self.reparameterize(mu=mu, logvar=logvar)
+        else:
+            z = mu
 
         # ---------------------------------------------------------------------
         # 5) Decoder: CrossAttnBlock + direction/scale decomposition.
