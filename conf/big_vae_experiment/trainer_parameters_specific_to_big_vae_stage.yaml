@@ -1,5 +1,5 @@
 max_steps: 1000000
-grad_accum_steps: 5
+grad_accum_steps: 16
 distributed: true
 num_gpus: 2
 compile: true
@@ -21,10 +21,10 @@ checkpoint_dir: ${training_artifacts.big_vae_checkpoint_dir}
 
 stage: 1
 stage_base_T_patches: 8
-stage_base_d_out: 32
+stage_base_d_out: 8
 stage_scale_factor: 2
 steps_per_sample: 10
-slice_batch_size: 4
+slice_batch_size: 16
 resume_checkpoint: ""
 
 forensics:
