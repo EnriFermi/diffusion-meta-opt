@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import time
 import traceback
@@ -13,7 +14,8 @@ import hydra
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from omegaconf import DictConfig, OmegaConf, open_dict
+import torch.nn as nn
+from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -265,7 +267,7 @@ class CometTracker:
                 exp.set_name(experiment_name)
 
             tags = comet_cfg.get("tags", [])
-            if isinstance(tags, (list, tuple)):
+            if isinstance(tags, (list, tuple, ListConfig)):
                 for tag in tags:
                     exp.add_tag(str(tag))
 
@@ -309,6 +311,356 @@ class CometTracker:
             self.experiment.end()
         except Exception:
             pass
+
+
+def _strip_ddp_prefix(name: str) -> str:
+    out = str(name)
+    # DDP + torch.compile wrappers can both prepend module qualifiers.
+    changed = True
+    while changed:
+        changed = False
+        if out.startswith("module."):
+            out = out[len("module.") :]
+            changed = True
+        if out.startswith("_orig_mod."):
+            out = out[len("_orig_mod.") :]
+            changed = True
+    return out
+
+
+def _layer_key_from_param_name(name: str) -> str:
+    parts = name.split(".")
+    if not parts:
+        return name
+    last = parts[-1]
+    if last in {"weight", "bias"} or last.endswith("_weight") or last.endswith("_bias"):
+        if len(parts) > 1:
+            return ".".join(parts[:-1])
+    return name
+
+
+def compute_grad_stats(model: nn.Module) -> dict[str, float]:
+    groups: dict[str, tuple[str, ...]] = {
+        "distribution_encoder": ("distribution_encoder.",),
+        "patch_tokenizer": ("patch_tokenizer.", "patch_token_proj.", "cls_token"),
+        "encoder": (
+            "encoder_layers.",
+            "enc_dist_inject_projs.",
+            "enc_dist_to_latent_heads.",
+            "latent_base",
+            "latent_norm.",
+            "to_mu.",
+            "to_logvar.",
+        ),
+        "decoder": (
+            "decoder_layers.",
+            "z_to_latents.",
+            "pos_proj.",
+            "query_pos_proj.",
+            "query_proj.",
+            "direction_head.",
+            "z_shortcut.",
+            "scale_head.",
+        ),
+        "big_vae_other": tuple(),
+    }
+    group_sums = {name: 0.0 for name in groups}
+    group_numel = {name: 0 for name in groups}
+    group_param_count = {name: 0 for name in groups}
+
+    sum_sq = 0.0
+    sum_abs = 0.0
+    max_abs = 0.0
+    grad_numel = 0
+    param_sum_sq = 0.0
+    param_numel = 0
+
+    for raw_name, param in model.named_parameters():
+        name = _strip_ddp_prefix(raw_name)
+        if not param.requires_grad:
+            continue
+
+        p = param.detach()
+        param_sum_sq += float(p.pow(2).sum().item())
+        param_numel += int(p.numel())
+
+        grad = param.grad
+        if grad is None:
+            continue
+
+        g = grad.detach()
+        abs_g = g.abs()
+        sum_sq += float((g * g).sum().item())
+        sum_abs += float(abs_g.sum().item())
+        max_abs = max(max_abs, float(abs_g.max().item()))
+        numel = int(g.numel())
+        grad_numel += numel
+
+        assigned = False
+        for group_name, prefixes in groups.items():
+            if group_name == "big_vae_other":
+                continue
+            if any(name.startswith(prefix) for prefix in prefixes):
+                group_param_count[group_name] += 1
+                group_sums[group_name] += float((g * g).sum().item())
+                group_numel[group_name] += numel
+                assigned = True
+                break
+        if not assigned:
+            group_param_count["big_vae_other"] += 1
+            group_sums["big_vae_other"] += float((g * g).sum().item())
+            group_numel["big_vae_other"] += numel
+
+    grad_rms = math.sqrt(sum_sq / max(1, grad_numel))
+    param_rms = math.sqrt(param_sum_sq / max(1, param_numel))
+    payload: dict[str, float] = {
+        "grad/global_norm": math.sqrt(sum_sq),
+        "grad/rms": grad_rms,
+        "grad/abs_mean": (sum_abs / max(1, grad_numel)),
+        "grad/max_abs": max_abs,
+        "grad/numel": float(grad_numel),
+        "param/rms": param_rms,
+        "grad_to_param_rms_ratio": grad_rms / max(1e-12, param_rms),
+    }
+
+    for group_name in groups:
+        payload[f"grad/{group_name}_rms"] = (
+            math.sqrt(group_sums[group_name] / max(1, group_numel[group_name])) if group_numel[group_name] > 0 else 0.0
+        )
+        payload[f"grad/{group_name}_numel"] = float(group_numel[group_name])
+        payload[f"grad/{group_name}_params_with_grad"] = float(group_param_count[group_name])
+
+    return payload
+
+
+def collect_grad_rms_per_layer(
+    model: nn.Module,
+    *,
+    include_prefixes: tuple[str, ...],
+    weights_only: bool,
+) -> dict[str, float]:
+    sumsq_by_layer: dict[str, float] = {}
+    count_by_layer: dict[str, int] = {}
+    global_sumsq = 0.0
+    global_count = 0
+
+    for raw_name, param in model.named_parameters():
+        name = _strip_ddp_prefix(raw_name)
+        if include_prefixes and not any(name.startswith(prefix) for prefix in include_prefixes):
+            continue
+        if weights_only and param.ndim < 2:
+            continue
+
+        grad = param.grad
+        if grad is None:
+            continue
+        g = grad.detach()
+        if g.numel() == 0:
+            continue
+
+        sumsq = float((g * g).sum().item())
+        count = int(g.numel())
+        layer = _layer_key_from_param_name(name)
+        sumsq_by_layer[layer] = sumsq_by_layer.get(layer, 0.0) + sumsq
+        count_by_layer[layer] = count_by_layer.get(layer, 0) + count
+
+        global_sumsq += sumsq
+        global_count += count
+
+    out: dict[str, float] = {}
+    for layer, sumsq in sumsq_by_layer.items():
+        out[layer] = math.sqrt(sumsq / float(max(1, count_by_layer[layer])))
+    if global_count > 0:
+        out["__global__"] = math.sqrt(global_sumsq / float(global_count))
+    return out
+
+
+def collect_param_rms_per_layer(
+    model: nn.Module,
+    *,
+    include_prefixes: tuple[str, ...],
+    weights_only: bool,
+) -> dict[str, float]:
+    sumsq_by_layer: dict[str, float] = {}
+    count_by_layer: dict[str, int] = {}
+    global_sumsq = 0.0
+    global_count = 0
+
+    for raw_name, param in model.named_parameters():
+        name = _strip_ddp_prefix(raw_name)
+        if include_prefixes and not any(name.startswith(prefix) for prefix in include_prefixes):
+            continue
+        if weights_only and param.ndim < 2:
+            continue
+
+        p = param.detach()
+        if p.numel() == 0:
+            continue
+
+        sumsq = float((p * p).sum().item())
+        count = int(p.numel())
+        layer = _layer_key_from_param_name(name)
+        sumsq_by_layer[layer] = sumsq_by_layer.get(layer, 0.0) + sumsq
+        count_by_layer[layer] = count_by_layer.get(layer, 0) + count
+        global_sumsq += sumsq
+        global_count += count
+
+    out: dict[str, float] = {}
+    for layer, sumsq in sumsq_by_layer.items():
+        out[layer] = math.sqrt(sumsq / float(max(1, count_by_layer[layer])))
+    if global_count > 0:
+        out["__global__"] = math.sqrt(global_sumsq / float(global_count))
+    return out
+
+
+def _append_grad_layer_rms_csv(
+    save_path: Path,
+    *,
+    step: int,
+    layer_rms_pre_clip: dict[str, float],
+    layer_rms_post_clip: dict[str, float],
+    layer_param_rms: dict[str, float],
+    layer_grad_to_param_ratio_pre_clip: dict[str, float],
+    layer_grad_to_param_ratio_post_clip: dict[str, float],
+    clip_coef: float,
+) -> None:
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    if not save_path.exists():
+        save_path.write_text(
+            "step,layer,grad_rms_pre_clip,grad_rms_post_clip,param_rms,grad_to_param_ratio_pre_clip,"
+            "grad_to_param_ratio_post_clip,clip_coef\n",
+            encoding="utf-8",
+        )
+
+    layers = sorted(
+        set(layer_rms_pre_clip.keys())
+        | set(layer_rms_post_clip.keys())
+        | set(layer_param_rms.keys())
+        | set(layer_grad_to_param_ratio_pre_clip.keys())
+        | set(layer_grad_to_param_ratio_post_clip.keys())
+    )
+    with save_path.open("a", encoding="utf-8") as handle:
+        for layer in layers:
+            pre_val = float(layer_rms_pre_clip.get(layer, 0.0))
+            post_val = float(layer_rms_post_clip.get(layer, 0.0))
+            param_val = float(layer_param_rms.get(layer, 0.0))
+            ratio_pre_val = float(layer_grad_to_param_ratio_pre_clip.get(layer, 0.0))
+            ratio_post_val = float(layer_grad_to_param_ratio_post_clip.get(layer, 0.0))
+            handle.write(
+                f"{int(step)},{layer},{pre_val:.12e},{post_val:.12e},{param_val:.12e},"
+                f"{ratio_pre_val:.12e},{ratio_post_val:.12e},{float(clip_coef):.12e}\n"
+            )
+
+
+def _save_grad_rms_layer_plot(
+    history: dict[str, list[tuple[int, float]]],
+    save_path: Path,
+    *,
+    topk_layers: int,
+    log_scale: bool,
+) -> bool:
+    if not history:
+        return False
+    try:
+        import matplotlib.pyplot as plt  # type: ignore[import-not-found]
+    except Exception:
+        return False
+
+    layers = [layer for layer in history.keys() if layer != "__global__"]
+    layers.sort(
+        key=lambda key: sum(val for _, val in history[key]) / max(1, len(history[key])),
+        reverse=True,
+    )
+    layers = layers[: max(1, int(topk_layers))]
+
+    plt.figure(figsize=(13, 6))
+    if "__global__" in history:
+        steps = [step for step, _ in history["__global__"]]
+        values = [value for _, value in history["__global__"]]
+        plt.plot(steps, values, label="__global__", linewidth=2.5, color="black")
+    for layer in layers:
+        steps = [step for step, _ in history[layer]]
+        values = [value for _, value in history[layer]]
+        plt.plot(steps, values, label=layer, linewidth=1.1, alpha=0.9)
+
+    plt.title("BigVAE Gradient RMS Per Layer (pre-clip)")
+    plt.xlabel("Step")
+    plt.ylabel("Gradient RMS")
+    if log_scale:
+        plt.yscale("log")
+    plt.grid(True, alpha=0.2)
+    if layers or "__global__" in history:
+        plt.legend(loc="best", fontsize=7, ncol=2)
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=140)
+    plt.close()
+    return True
+
+
+def _save_grad_rms_layer_heatmap(
+    history: dict[str, list[tuple[int, float]]],
+    save_path: Path,
+    *,
+    max_layers: int,
+    log_scale: bool,
+    min_value: float = 1e-20,
+) -> bool:
+    if not history:
+        return False
+    try:
+        import matplotlib.pyplot as plt  # type: ignore[import-not-found]
+    except Exception:
+        return False
+
+    layers = [layer for layer in history.keys() if layer != "__global__"]
+    if not layers:
+        return False
+    layers.sort(key=lambda key: sum(val for _, val in history[key]) / max(1, len(history[key])))
+    layers = layers[: max(1, int(max_layers))]
+
+    step_values = sorted({int(step) for points in history.values() for step, _ in points})
+    if not step_values:
+        return False
+    step_to_idx = {step: idx for idx, step in enumerate(step_values)}
+
+    matrix: list[list[float]] = []
+    for layer in layers:
+        row = [float("nan")] * len(step_values)
+        for step, value in history[layer]:
+            idx = step_to_idx.get(int(step))
+            if idx is None:
+                continue
+            safe_value = max(float(min_value), float(value))
+            row[idx] = math.log10(safe_value) if log_scale else safe_value
+        matrix.append(row)
+
+    fig_h = max(4.0, 0.24 * len(layers) + 2.0)
+    fig, ax = plt.subplots(figsize=(13, fig_h))
+    im = ax.imshow(matrix, aspect="auto", interpolation="nearest", cmap="viridis")
+    ax.set_title("BigVAE Gradient RMS Heatmap (pre-clip)")
+    ax.set_ylabel("Layer")
+    ax.set_xlabel("Step")
+    ax.set_yticks(list(range(len(layers))))
+    ax.set_yticklabels(layers, fontsize=7)
+
+    xtick_count = min(12, len(step_values))
+    if xtick_count >= 2:
+        xtick_idx = sorted(
+            set(int(round(i * (len(step_values) - 1) / float(xtick_count - 1))) for i in range(xtick_count))
+        )
+    else:
+        xtick_idx = [0]
+    ax.set_xticks(xtick_idx)
+    ax.set_xticklabels([str(step_values[idx]) for idx in xtick_idx], rotation=45, ha="right")
+
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("log10(grad RMS)" if log_scale else "grad RMS")
+    plt.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=140)
+    plt.close(fig)
+    return True
 
 
 def _build_collector_status_snapshot(collector: Any) -> dict[str, Any]:
@@ -800,6 +1152,57 @@ def _run_worker(
                 int(forensics_cfg.get("heartbeat_steps", log_every)),
             )
             checkpoint_every = max(1, int(cfg.train.get("checkpoint_every", 200)))
+            telemetry_cfg = cfg.train.get("telemetry", {})
+            if not isinstance(telemetry_cfg, (dict, DictConfig)):
+                raise TypeError("train.telemetry must be a mapping")
+            grad_layer_monitor_cfg = telemetry_cfg.get("grad_layer_monitor", {})
+            if not isinstance(grad_layer_monitor_cfg, (dict, DictConfig)):
+                raise TypeError("train.telemetry.grad_layer_monitor must be a mapping")
+            grad_layer_monitor_enabled = bool(grad_layer_monitor_cfg.get("enabled", True)) and rank == 0
+            grad_layer_monitor_every_steps = max(
+                1,
+                int(grad_layer_monitor_cfg.get("every_steps", log_every)),
+            )
+            grad_layer_monitor_weights_only = bool(grad_layer_monitor_cfg.get("weights_only", True))
+            grad_layer_monitor_topk_layers = max(1, int(grad_layer_monitor_cfg.get("topk_layers", 24)))
+            grad_layer_monitor_log_scale = bool(grad_layer_monitor_cfg.get("log_scale", True))
+            grad_layer_monitor_save_csv = bool(grad_layer_monitor_cfg.get("save_csv", True))
+            grad_layer_monitor_reset_csv_on_start = bool(grad_layer_monitor_cfg.get("reset_csv_on_start", True))
+            grad_layer_monitor_save_plot = bool(grad_layer_monitor_cfg.get("save_plot", True))
+            grad_layer_monitor_plot_every_steps = max(0, int(grad_layer_monitor_cfg.get("plot_every_steps", 200)))
+            grad_layer_monitor_save_heatmap = bool(grad_layer_monitor_cfg.get("save_heatmap", True))
+            grad_layer_monitor_heatmap_max_layers = max(1, int(grad_layer_monitor_cfg.get("heatmap_max_layers", 96)))
+            grad_layer_monitor_include_prefixes_raw = grad_layer_monitor_cfg.get(
+                "include_prefixes",
+                [],
+            )
+            grad_layer_monitor_include_prefixes_list: list[str] = []
+            if isinstance(grad_layer_monitor_include_prefixes_raw, (list, tuple, ListConfig)):
+                for item in grad_layer_monitor_include_prefixes_raw:
+                    text = str(item).strip()
+                    if text:
+                        grad_layer_monitor_include_prefixes_list.append(text)
+            else:
+                text = str(grad_layer_monitor_include_prefixes_raw).strip()
+                if text:
+                    grad_layer_monitor_include_prefixes_list.append(text)
+            grad_layer_monitor_include_prefixes = tuple(grad_layer_monitor_include_prefixes_list)
+            monitor_base_dir = Path(str(cfg.train.get("checkpoint_dir", "./checkpoints/weight_quantile_vae"))) / f"stage_{stage_num}"
+            grad_layer_monitor_csv_path = Path(
+                str(grad_layer_monitor_cfg.get("csv_path", str(monitor_base_dir / "grad_layer_rms.csv")))
+            )
+            grad_layer_monitor_plot_path = Path(
+                str(grad_layer_monitor_cfg.get("plot_path", str(monitor_base_dir / "grad_layer_rms.png")))
+            )
+            grad_layer_monitor_heatmap_path = Path(
+                str(grad_layer_monitor_cfg.get("heatmap_path", str(monitor_base_dir / "grad_layer_rms_heatmap.png")))
+            )
+            if grad_layer_monitor_enabled and grad_layer_monitor_save_csv and grad_layer_monitor_reset_csv_on_start:
+                try:
+                    if grad_layer_monitor_csv_path.exists():
+                        grad_layer_monitor_csv_path.unlink()
+                except Exception as exc:
+                    logger.warning("Could not reset grad-layer CSV at %s: %s", grad_layer_monitor_csv_path, exc)
 
             steps_per_sample = max(1, int(cfg.train.get("steps_per_sample", 1)))
             if rank == 0:
@@ -810,6 +1213,20 @@ def _run_worker(
                     use_latent_sampling,
                     kl_beta,
                 )
+                if grad_layer_monitor_enabled:
+                    logger.info(
+                        "Grad-layer monitor enabled: every_steps=%s topk=%s csv=%s plot=%s heatmap=%s "
+                        "weights_only=%s include_prefixes=%s",
+                        grad_layer_monitor_every_steps,
+                        grad_layer_monitor_topk_layers,
+                        str(grad_layer_monitor_csv_path.resolve()) if grad_layer_monitor_save_csv else "<off>",
+                        str(grad_layer_monitor_plot_path.resolve()) if grad_layer_monitor_save_plot else "<off>",
+                        str(grad_layer_monitor_heatmap_path.resolve())
+                        if (grad_layer_monitor_save_plot and grad_layer_monitor_save_heatmap)
+                        else "<off>",
+                        grad_layer_monitor_weights_only,
+                        list(grad_layer_monitor_include_prefixes),
+                    )
 
             loss_window = 0.0
             behavioral_window = 0.0
@@ -817,6 +1234,20 @@ def _run_worker(
             kl_window = 0.0
             window_steps = 0
             t0 = time.time()
+            grad_layer_history: dict[str, list[tuple[int, float]]] = {}
+            latest_grad_layer_snapshot: dict[str, Any] = {
+                "step": 0,
+                "num_layers": 0,
+                "clip_coef": 1.0,
+                "global_grad_rms_pre_clip": 0.0,
+                "global_grad_rms_post_clip": 0.0,
+                "global_param_rms": 0.0,
+                "global_grad_to_param_ratio_pre_clip": 0.0,
+                "global_grad_to_param_ratio_post_clip": 0.0,
+                "top_layers_pre_clip": [],
+                "low_layers_pre_clip": [],
+                "top_layers_ratio_pre_clip": [],
+            }
 
             current_x: torch.Tensor | None = None
             current_W: torch.Tensor | None = None
@@ -905,8 +1336,162 @@ def _run_worker(
                 if scaler.is_enabled():
                     scaler.unscale_(optimizer)
 
+                grad_clip_coef = 1.0
                 if grad_clip_norm > 0.0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    clip_return = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    grad_global_before_clip = float(clip_return)
+                    grad_clip_coef = min(1.0, float(grad_clip_norm) / max(1e-12, grad_global_before_clip))
+                else:
+                    grad_global_before_clip = 0.0
+
+                grad_stats: dict[str, float] = {}
+                if rank == 0:
+                    grad_stats = compute_grad_stats(model)
+                    if grad_clip_norm <= 0.0:
+                        grad_global_before_clip = float(grad_stats.get("grad/global_norm", 0.0))
+                    grad_stats["grad/global_norm_before_clip"] = float(grad_global_before_clip)
+                    grad_stats["grad/clip_coef"] = float(grad_clip_coef)
+
+                if grad_layer_monitor_enabled and (
+                    global_step == 1 or (global_step % grad_layer_monitor_every_steps == 0)
+                ):
+                    layer_rms_post_clip = collect_grad_rms_per_layer(
+                        model=model,
+                        include_prefixes=grad_layer_monitor_include_prefixes,
+                        weights_only=grad_layer_monitor_weights_only,
+                    )
+                    clip_coef_safe = max(1e-12, float(grad_clip_coef))
+                    layer_rms_pre_clip = {
+                        key: (float(value) / clip_coef_safe if float(grad_clip_coef) < 1.0 else float(value))
+                        for key, value in layer_rms_post_clip.items()
+                    }
+                    layer_param_rms = collect_param_rms_per_layer(
+                        model=model,
+                        include_prefixes=grad_layer_monitor_include_prefixes,
+                        weights_only=grad_layer_monitor_weights_only,
+                    )
+                    layer_grad_to_param_ratio_pre_clip: dict[str, float] = {}
+                    layer_grad_to_param_ratio_post_clip: dict[str, float] = {}
+                    layer_keys = sorted(set(layer_rms_pre_clip.keys()) | set(layer_rms_post_clip.keys()) | set(layer_param_rms.keys()))
+                    for layer in layer_keys:
+                        param_rms = float(layer_param_rms.get(layer, 0.0))
+                        pre_rms = float(layer_rms_pre_clip.get(layer, 0.0))
+                        post_rms = float(layer_rms_post_clip.get(layer, 0.0))
+                        denom = max(1e-12, param_rms)
+                        layer_grad_to_param_ratio_pre_clip[layer] = pre_rms / denom
+                        layer_grad_to_param_ratio_post_clip[layer] = post_rms / denom
+
+                    for layer, value in layer_rms_pre_clip.items():
+                        grad_layer_history.setdefault(layer, []).append((int(global_step), float(value)))
+
+                    ranked_layers = [
+                        (layer, value)
+                        for layer, value in layer_rms_pre_clip.items()
+                        if not layer.startswith("__")
+                    ]
+                    ranked_layers.sort(key=lambda item: float(item[1]), reverse=True)
+                    ranked_low_layers = sorted(ranked_layers, key=lambda item: float(item[1]))
+                    ranked_by_ratio = sorted(
+                        (
+                            (layer, float(layer_grad_to_param_ratio_pre_clip.get(layer, 0.0)))
+                            for layer, _ in ranked_layers
+                        ),
+                        key=lambda item: float(item[1]),
+                        reverse=True,
+                    )
+                    topk = max(1, int(grad_layer_monitor_topk_layers))
+                    top_layers_pre_clip = [
+                        [
+                            str(layer),
+                            float(value),
+                            float(layer_param_rms.get(layer, 0.0)),
+                            float(layer_grad_to_param_ratio_pre_clip.get(layer, 0.0)),
+                        ]
+                        for layer, value in ranked_layers[:topk]
+                    ]
+                    low_layers_pre_clip = [
+                        [
+                            str(layer),
+                            float(value),
+                            float(layer_param_rms.get(layer, 0.0)),
+                            float(layer_grad_to_param_ratio_pre_clip.get(layer, 0.0)),
+                        ]
+                        for layer, value in ranked_low_layers[:topk]
+                    ]
+                    top_layers_ratio_pre_clip = [
+                        [
+                            str(layer),
+                            float(value),
+                            float(layer_rms_pre_clip.get(layer, 0.0)),
+                            float(layer_param_rms.get(layer, 0.0)),
+                        ]
+                        for layer, value in ranked_by_ratio[:topk]
+                    ]
+                    global_grad_rms_pre_clip = float(layer_rms_pre_clip.get("__global__", 0.0))
+                    global_grad_rms_post_clip = float(layer_rms_post_clip.get("__global__", 0.0))
+                    global_param_rms = float(layer_param_rms.get("__global__", 0.0))
+                    global_grad_to_param_ratio_pre_clip = global_grad_rms_pre_clip / max(1e-12, global_param_rms)
+                    global_grad_to_param_ratio_post_clip = global_grad_rms_post_clip / max(1e-12, global_param_rms)
+
+                    latest_grad_layer_snapshot = {
+                        "step": int(global_step),
+                        "num_layers": int(len(ranked_layers)),
+                        "clip_coef": float(grad_clip_coef),
+                        "global_grad_rms_pre_clip": global_grad_rms_pre_clip,
+                        "global_grad_rms_post_clip": global_grad_rms_post_clip,
+                        "global_param_rms": global_param_rms,
+                        "global_grad_to_param_ratio_pre_clip": global_grad_to_param_ratio_pre_clip,
+                        "global_grad_to_param_ratio_post_clip": global_grad_to_param_ratio_post_clip,
+                        "top_layers_pre_clip": top_layers_pre_clip,
+                        "low_layers_pre_clip": low_layers_pre_clip,
+                        "top_layers_ratio_pre_clip": top_layers_ratio_pre_clip,
+                    }
+
+                    if grad_layer_monitor_save_csv:
+                        _append_grad_layer_rms_csv(
+                            save_path=grad_layer_monitor_csv_path,
+                            step=int(global_step),
+                            layer_rms_pre_clip=layer_rms_pre_clip,
+                            layer_rms_post_clip=layer_rms_post_clip,
+                            layer_param_rms=layer_param_rms,
+                            layer_grad_to_param_ratio_pre_clip=layer_grad_to_param_ratio_pre_clip,
+                            layer_grad_to_param_ratio_post_clip=layer_grad_to_param_ratio_post_clip,
+                            clip_coef=float(grad_clip_coef),
+                        )
+                    if grad_layer_monitor_save_plot and (
+                        global_step == 1
+                        or (
+                            grad_layer_monitor_plot_every_steps > 0
+                            and global_step % grad_layer_monitor_plot_every_steps == 0
+                        )
+                    ):
+                        plot_saved = _save_grad_rms_layer_plot(
+                            history=grad_layer_history,
+                            save_path=grad_layer_monitor_plot_path,
+                            topk_layers=grad_layer_monitor_topk_layers,
+                            log_scale=grad_layer_monitor_log_scale,
+                        )
+                        if not plot_saved:
+                            logger.warning("Grad-layer monitor plot skipped: matplotlib is unavailable")
+                        if grad_layer_monitor_save_heatmap:
+                            _save_grad_rms_layer_heatmap(
+                                history=grad_layer_history,
+                                save_path=grad_layer_monitor_heatmap_path,
+                                max_layers=grad_layer_monitor_heatmap_max_layers,
+                                log_scale=grad_layer_monitor_log_scale,
+                            )
+
+                    logger.info(
+                        "grad_layer_monitor step=%s layers=%s global_pre=%.3e global_post=%.3e "
+                        "global_ratio_pre=%.3e top_pre=%s low_pre=%s",
+                        global_step,
+                        int(latest_grad_layer_snapshot.get("num_layers", 0)),
+                        float(latest_grad_layer_snapshot.get("global_grad_rms_pre_clip", 0.0)),
+                        float(latest_grad_layer_snapshot.get("global_grad_rms_post_clip", 0.0)),
+                        float(latest_grad_layer_snapshot.get("global_grad_to_param_ratio_pre_clip", 0.0)),
+                        latest_grad_layer_snapshot.get("top_layers_pre_clip", [])[: min(5, grad_layer_monitor_topk_layers)],
+                        latest_grad_layer_snapshot.get("low_layers_pre_clip", [])[: min(5, grad_layer_monitor_topk_layers)],
+                    )
 
                 if scaler.is_enabled():
                     scaler.step(optimizer)
@@ -966,7 +1551,55 @@ def _run_worker(
                             "train/lr": float(lr),
                             "train/steps_per_sec": float(speed),
                             "data/cache_size": float(cache_metric),
+                            "grad/global_norm_before_clip": float(grad_stats.get("grad/global_norm_before_clip", 0.0)),
+                            "grad/global_norm": float(grad_stats.get("grad/global_norm", 0.0)),
+                            "grad/rms": float(grad_stats.get("grad/rms", 0.0)),
+                            "grad/abs_mean": float(grad_stats.get("grad/abs_mean", 0.0)),
+                            "grad/max_abs": float(grad_stats.get("grad/max_abs", 0.0)),
+                            "grad/clip_coef": float(grad_stats.get("grad/clip_coef", 1.0)),
+                            "grad/distribution_encoder_rms": float(grad_stats.get("grad/distribution_encoder_rms", 0.0)),
+                            "grad/patch_tokenizer_rms": float(grad_stats.get("grad/patch_tokenizer_rms", 0.0)),
+                            "grad/encoder_rms": float(grad_stats.get("grad/encoder_rms", 0.0)),
+                            "grad/decoder_rms": float(grad_stats.get("grad/decoder_rms", 0.0)),
+                            "grad/big_vae_other_rms": float(grad_stats.get("grad/big_vae_other_rms", 0.0)),
+                            "grad/distribution_encoder_numel": float(grad_stats.get("grad/distribution_encoder_numel", 0.0)),
+                            "grad/patch_tokenizer_numel": float(grad_stats.get("grad/patch_tokenizer_numel", 0.0)),
+                            "grad/encoder_numel": float(grad_stats.get("grad/encoder_numel", 0.0)),
+                            "grad/decoder_numel": float(grad_stats.get("grad/decoder_numel", 0.0)),
+                            "grad/big_vae_other_numel": float(grad_stats.get("grad/big_vae_other_numel", 0.0)),
+                            "grad/distribution_encoder_params_with_grad": float(
+                                grad_stats.get("grad/distribution_encoder_params_with_grad", 0.0)
+                            ),
+                            "grad/patch_tokenizer_params_with_grad": float(
+                                grad_stats.get("grad/patch_tokenizer_params_with_grad", 0.0)
+                            ),
+                            "grad/encoder_params_with_grad": float(grad_stats.get("grad/encoder_params_with_grad", 0.0)),
+                            "grad/decoder_params_with_grad": float(grad_stats.get("grad/decoder_params_with_grad", 0.0)),
+                            "grad/big_vae_other_params_with_grad": float(
+                                grad_stats.get("grad/big_vae_other_params_with_grad", 0.0)
+                            ),
+                            "param/rms": float(grad_stats.get("param/rms", 0.0)),
+                            "grad_to_param_rms_ratio": float(grad_stats.get("grad_to_param_rms_ratio", 0.0)),
                         }
+                        if grad_layer_monitor_enabled:
+                            comet_metrics["grad/layer_monitor_num_layers"] = float(
+                                latest_grad_layer_snapshot.get("num_layers", 0)
+                            )
+                            comet_metrics["grad/layer_monitor_global_rms_pre_clip"] = float(
+                                latest_grad_layer_snapshot.get("global_grad_rms_pre_clip", 0.0)
+                            )
+                            comet_metrics["grad/layer_monitor_global_rms_post_clip"] = float(
+                                latest_grad_layer_snapshot.get("global_grad_rms_post_clip", 0.0)
+                            )
+                            comet_metrics["grad/layer_monitor_global_param_rms"] = float(
+                                latest_grad_layer_snapshot.get("global_param_rms", 0.0)
+                            )
+                            comet_metrics["grad/layer_monitor_global_ratio_pre_clip"] = float(
+                                latest_grad_layer_snapshot.get("global_grad_to_param_ratio_pre_clip", 0.0)
+                            )
+                            comet_metrics["grad/layer_monitor_global_ratio_post_clip"] = float(
+                                latest_grad_layer_snapshot.get("global_grad_to_param_ratio_post_clip", 0.0)
+                            )
                         if device.type == "cuda":
                             comet_metrics["gpu/memory_allocated_mb"] = float(
                                 torch.cuda.memory_allocated(device) / (1024.0 * 1024.0)
