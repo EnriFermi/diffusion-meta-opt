@@ -152,6 +152,7 @@ def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
             ffn_mult=float(big_cfg.get("ffn_mult", 4.0)),
             dropout=float(big_cfg.get("dropout", 0.0)),
             pos_fourier_dim=int(big_cfg.get("pos_fourier_dim", 64)),
+            use_latent_sampling=bool(big_cfg.get("use_latent_sampling", True)),
             encoder=EncoderConfig(
                 self_attn_mode=str(enc_cfg.get("self_attn_mode", "full")),
                 cross_attend_only_cls=bool(enc_cfg.get("cross_attend_only_cls", True)),
@@ -656,6 +657,13 @@ def _run_worker(
             max_steps = max(1, int(cfg.train.get("max_steps", 1000)))
             grad_accum_steps = max(1, int(cfg.train.get("grad_accum_steps", 1)))
             kl_beta = float(cfg.train.get("kl_beta", 1e-3))
+            model_unwrapped = model.module if isinstance(model, DDP) else model
+            cfg_holder = model_unwrapped
+            if not hasattr(cfg_holder, "cfg") and hasattr(cfg_holder, "_orig_mod"):
+                cfg_holder = getattr(cfg_holder, "_orig_mod")
+            if not hasattr(cfg_holder, "cfg"):
+                raise AttributeError(f"Model does not expose cfg: type={type(model_unwrapped)}")
+            use_latent_sampling = bool(cfg_holder.cfg.big_vae.use_latent_sampling)
             behavioral_coef = float(cfg.train.get("behavioral_coef", 1.0))
             structural_coef = float(cfg.train.get("structural_coef", 0.5))
             grad_clip_norm = float(cfg.train.get("grad_clip_norm", 1.0))
@@ -686,6 +694,12 @@ def _run_worker(
             steps_per_sample = max(1, int(cfg.train.get("steps_per_sample", 1)))
             if rank == 0:
                 logger.info("Steps per sample: %s", steps_per_sample)
+                logger.info(
+                    "BigVAE latent mode: %s (use_latent_sampling=%s, kl_beta=%s)",
+                    "VAE" if use_latent_sampling else "AE",
+                    use_latent_sampling,
+                    kl_beta,
+                )
 
             loss_window = 0.0
             behavioral_window = 0.0
@@ -737,7 +751,10 @@ def _run_worker(
                             W_hat, mu, logvar = model(W_s, x_s)
                             behavioral_loss = WeightQuantileVAE.operator_recon_loss(x_s, W_s, W_hat)
                             structural_loss = WeightQuantileVAE.structural_recon_loss(W_s, W_hat)
-                            kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
+                            if use_latent_sampling:
+                                kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
+                            else:
+                                kl_loss = mu.new_zeros(())
                             total_loss = (
                                 behavioral_coef * behavioral_loss
                                 + structural_coef * structural_loss
