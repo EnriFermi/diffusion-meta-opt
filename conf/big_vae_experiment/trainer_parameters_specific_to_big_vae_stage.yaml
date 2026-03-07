@@ -9,11 +9,11 @@ compile_disable_cudagraphs: true
 
 warmup_steps: 10000
 min_lr_ratio: 0.01
-kl_beta: 0.05
+kl_beta: 0.0
 lr: 5e-4
 
-behavioral_coef: 0.1
-structural_coef: 2.0
+behavioral_coef: 100.0
+structural_coef: 1.0
 contrastive_coef: 0.0
 
 checkpoint_every: 500
