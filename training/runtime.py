@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import inspect
 import logging
 import os
 import random
@@ -139,6 +140,7 @@ def maybe_compile_model(
     compile_mode = str(cfg[section].get(compile_mode_key, "max-autotune"))
     dynamic = bool(cfg[section].get("compile_dynamic", True))
     backend = cfg[section].get("compile_backend")
+    disable_cudagraphs = bool(cfg[section].get("compile_disable_cudagraphs", False))
     backend_name = str(backend).strip() if backend is not None else ""
 
     logger.info(
@@ -161,6 +163,45 @@ def maybe_compile_model(
     compile_kwargs: dict[str, object] = {"mode": compile_mode, "dynamic": dynamic}
     if backend_name:
         compile_kwargs["backend"] = backend_name
+
+    compile_options_raw = cfg[section].get("compile_options")
+    compile_options: dict[str, object] = {}
+    if isinstance(compile_options_raw, (dict, DictConfig)):
+        for key, value in compile_options_raw.items():
+            compile_options[str(key)] = value
+    if disable_cudagraphs:
+        # Prevent output-buffer reuse issues from inductor cudagraphs on dynamic workloads.
+        compile_options.setdefault("triton.cudagraphs", False)
+        logger.info("Disabling inductor cudagraphs for %s", label)
+
+    compile_signature = inspect.signature(torch.compile).parameters
+    if compile_options:
+        if "options" in compile_signature:
+            compile_kwargs["options"] = compile_options
+        else:
+            logger.warning(
+                "torch.compile(options=...) unsupported in this PyTorch version; "
+                "compile_options for %s will be ignored",
+                label,
+            )
+            if disable_cudagraphs:
+                try:
+                    # Backward-compat fallback for older torch versions.
+                    import torch._inductor.config as inductor_config
+
+                    triton_cfg = getattr(inductor_config, "triton", None)
+                    if triton_cfg is not None and hasattr(triton_cfg, "cudagraphs"):
+                        setattr(triton_cfg, "cudagraphs", False)
+                    elif hasattr(inductor_config, "cudagraphs"):
+                        setattr(inductor_config, "cudagraphs", False)
+                    else:
+                        logger.warning(
+                            "Requested compile_disable_cudagraphs for %s but could not find "
+                            "a known torch._inductor.config cudagraph switch",
+                            label,
+                        )
+                except Exception as exc:
+                    logger.warning("Failed to disable inductor cudagraphs for %s: %s", label, exc)
     return torch.compile(model, **compile_kwargs)
 
 
