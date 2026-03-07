@@ -151,16 +151,7 @@ def maybe_compile_model(
         f", backend={backend_name}" if backend_name else "",
     )
 
-    if compile_mode == "max-autotune" and dynamic:
-        logger.warning(
-            "%s.%s=max-autotune with %s.compile_dynamic=true can be unstable on some CUDA stacks; "
-            "prefer mode=reduce-overhead and compile_dynamic=false for stability",
-            section,
-            compile_mode_key,
-            section,
-        )
-
-    compile_kwargs: dict[str, object] = {"mode": compile_mode, "dynamic": dynamic}
+    compile_kwargs: dict[str, object] = {"dynamic": dynamic}
     if backend_name:
         compile_kwargs["backend"] = backend_name
 
@@ -178,6 +169,11 @@ def maybe_compile_model(
     if compile_options:
         if "options" in compile_signature:
             compile_kwargs["options"] = compile_options
+            logger.info(
+                "Using torch.compile options for %s; omitting mode=%s because mode and options are mutually exclusive",
+                label,
+                compile_mode,
+            )
         else:
             logger.warning(
                 "torch.compile(options=...) unsupported in this PyTorch version; "
@@ -202,6 +198,17 @@ def maybe_compile_model(
                         )
                 except Exception as exc:
                     logger.warning("Failed to disable inductor cudagraphs for %s: %s", label, exc)
+            compile_kwargs["mode"] = compile_mode
+    else:
+        compile_kwargs["mode"] = compile_mode
+    if "mode" in compile_kwargs and compile_mode == "max-autotune" and dynamic:
+        logger.warning(
+            "%s.%s=max-autotune with %s.compile_dynamic=true can be unstable on some CUDA stacks; "
+            "prefer mode=reduce-overhead and compile_dynamic=false for stability",
+            section,
+            compile_mode_key,
+            section,
+        )
     return torch.compile(model, **compile_kwargs)
 
 
