@@ -312,13 +312,16 @@ def _save_checkpoint(
     cfg: DictConfig,
     step_idx: int,
     logger: logging.Logger,
+    stage: int = 1,
 ) -> None:
-    checkpoint_dir = Path(str(cfg.train.get("checkpoint_dir", "./checkpoints/weight_quantile_vae")))
+    base_dir = Path(str(cfg.train.get("checkpoint_dir", "./checkpoints/weight_quantile_vae")))
+    checkpoint_dir = base_dir / f"stage_{stage}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     model_to_save = model.module if isinstance(model, DDP) else model
     payload = {
         "step": step_idx,
+        "stage": stage,
         "model_state": model_to_save.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
@@ -437,6 +440,71 @@ def _fetch_batch(
         x_cpu.to(device=device, non_blocking=True),
         W_cpu.to(device=device, non_blocking=True),
     )
+
+
+def _compute_curriculum_slice_sizes(cfg: DictConfig) -> tuple[int, int]:
+    train_cfg = cfg.get("train", {})
+    stage = max(1, int(train_cfg.get("stage", 1)))
+    base_T = int(train_cfg.get("stage_base_T_patches", 4))
+    base_d_out = int(train_cfg.get("stage_base_d_out", 16))
+    scale = int(train_cfg.get("stage_scale_factor", 2))
+    max_T = base_T * (scale ** (stage - 1))
+    max_d_out = base_d_out * (scale ** (stage - 1))
+    return max_T, max_d_out
+
+
+def _slice_sample(
+    W: torch.Tensor,
+    x: torch.Tensor,
+    max_T_patches: int,
+    max_d_out: int,
+    patch_size: int,
+    batch_size: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    d_in, d_out = W.shape
+    T_total = d_in // patch_size
+    T_use = min(max_T_patches, T_total)
+    d_out_use = min(max_d_out, d_out)
+
+    need_row_slice = T_use < T_total
+    need_col_slice = d_out_use < d_out
+    dev = W.device
+
+    if not need_row_slice and not need_col_slice:
+        return W.unsqueeze(0).expand(batch_size, -1, -1), x.unsqueeze(0).expand(batch_size, -1, -1)
+
+    offsets = torch.arange(patch_size, device=dev) if need_row_slice else None
+    W_slices = []
+    x_slices = []
+    for _ in range(batch_size):
+        W_i = W
+        x_i = x
+        if need_row_slice:
+            patch_idx = torch.randperm(T_total, device=dev)[:T_use].sort().values
+            row_idx = (patch_idx.unsqueeze(1) * patch_size + offsets.unsqueeze(0)).flatten()
+            row_idx = row_idx.clamp(max=d_in - 1)
+            W_i = W_i[row_idx, :]
+            x_i = x_i[:, row_idx]
+        if need_col_slice:
+            col_idx = torch.randperm(d_out, device=dev)[:d_out_use].sort().values
+            W_i = W_i[:, col_idx]
+        W_slices.append(W_i)
+        x_slices.append(x_i)
+
+    return torch.stack(W_slices), torch.stack(x_slices)
+
+
+def _load_model_weights_from_checkpoint(
+    model: torch.nn.Module,
+    path: str,
+    logger: logging.Logger,
+) -> None:
+    logger.info("Loading model weights from checkpoint: %s", path)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    state_dict = ckpt["model_state"]
+    target = model.module if isinstance(model, DDP) else model
+    target.load_state_dict(state_dict, strict=True)
+    logger.info("Model weights loaded successfully (step=%s)", ckpt.get("step", "?"))
 
 
 def _run_worker(
@@ -569,6 +637,10 @@ def _run_worker(
                         gradient_as_bucket_view=True,
                     )
 
+            resume_checkpoint = str(cfg.train.get("resume_checkpoint", "")).strip()
+            if resume_checkpoint:
+                _load_model_weights_from_checkpoint(model, resume_checkpoint, logger)
+
             optimizer = _build_optimizer(model=model, cfg=cfg, device=device)
             scheduler = _build_scheduler(optimizer=optimizer, cfg=cfg)
 
@@ -589,6 +661,16 @@ def _run_worker(
             grad_clip_norm = float(cfg.train.get("grad_clip_norm", 1.0))
             max_x_rows = int(cfg.train.get("max_x_rows", 0))
 
+            patch_size_for_slice = int(cfg.model.get("patch_size", 16))
+            curriculum_max_T, curriculum_max_d_out = _compute_curriculum_slice_sizes(cfg)
+            stage_num = max(1, int(cfg.train.get("stage", 1)))
+            slice_batch_size = max(1, int(cfg.train.get("slice_batch_size", 1)))
+            if rank == 0:
+                logger.info(
+                    "Curriculum slicing: stage=%s max_T_patches=%s max_d_out=%s patch_size=%s slice_batch_size=%s",
+                    stage_num, curriculum_max_T, curriculum_max_d_out, patch_size_for_slice, slice_batch_size,
+                )
+
             log_every = max(1, int(cfg.train.get("log_every", 10)))
             log_worker_status_every = max(
                 1,
@@ -601,12 +683,19 @@ def _run_worker(
             )
             checkpoint_every = max(1, int(cfg.train.get("checkpoint_every", 200)))
 
+            steps_per_sample = max(1, int(cfg.train.get("steps_per_sample", 1)))
+            if rank == 0:
+                logger.info("Steps per sample: %s", steps_per_sample)
+
             loss_window = 0.0
             behavioral_window = 0.0
             structural_window = 0.0
             kl_window = 0.0
             window_steps = 0
             t0 = time.time()
+
+            current_x: torch.Tensor | None = None
+            current_W: torch.Tensor | None = None
 
             for step_idx in range(max_steps):
                 global_step = step_idx + 1
@@ -615,6 +704,16 @@ def _run_worker(
 
                 if rank == 0 and collector is not None and dataset is not None and not collector.is_async_mode:
                     dataset.maybe_collect(step_idx)
+
+                if current_x is None or step_idx % steps_per_sample == 0:
+                    current_x, current_W = _fetch_batch(
+                        rank=rank,
+                        device=device,
+                        dataset_iter=dataset_iter,
+                        use_broadcast=use_broadcast,
+                        max_x_rows=max_x_rows,
+                        logger=logger,
+                    )
 
                 loss_acc = 0.0
                 behavioral_acc = 0.0
@@ -625,14 +724,7 @@ def _run_worker(
                 for micro_idx in range(grad_accum_steps):
                     sync_grad = micro_idx == grad_accum_steps - 1
 
-                    x, W = _fetch_batch(
-                        rank=rank,
-                        device=device,
-                        dataset_iter=dataset_iter,
-                        use_broadcast=use_broadcast,
-                        max_x_rows=max_x_rows,
-                        logger=logger,
-                    )
+                    W_s, x_s = _slice_sample(current_W, current_x, curriculum_max_T, curriculum_max_d_out, patch_size_for_slice, batch_size=slice_batch_size)
 
                     no_sync_ctx = contextlib.nullcontext()
                     if is_distributed and not sync_grad:
@@ -642,9 +734,9 @@ def _run_worker(
                         if use_cudagraph_step_begin:
                             cudagraph_step_begin()
                         with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
-                            W_hat, mu, logvar = model(W, x)
-                            behavioral_loss = WeightQuantileVAE.operator_recon_loss(x, W, W_hat)
-                            structural_loss = WeightQuantileVAE.structural_recon_loss(W, W_hat)
+                            W_hat, mu, logvar = model(W_s, x_s)
+                            behavioral_loss = WeightQuantileVAE.operator_recon_loss(x_s, W_s, W_hat)
+                            structural_loss = WeightQuantileVAE.structural_recon_loss(W_s, W_hat)
                             kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
                             total_loss = (
                                 behavioral_coef * behavioral_loss
@@ -783,6 +875,7 @@ def _run_worker(
                         cfg=cfg,
                         step_idx=global_step,
                         logger=logger,
+                        stage=stage_num,
                     )
 
             if rank == 0:

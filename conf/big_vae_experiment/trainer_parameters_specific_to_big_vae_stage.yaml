@@ -11,3 +11,11 @@ contrastive_coef: 0.0
 
 checkpoint_every: 500
 checkpoint_dir: ${training_artifacts.big_vae_checkpoint_dir}
+
+stage: 1
+stage_base_T_patches: 4
+stage_base_d_out: 16
+stage_scale_factor: 2
+steps_per_sample: 10
+slice_batch_size: 4
+resume_checkpoint: ""
