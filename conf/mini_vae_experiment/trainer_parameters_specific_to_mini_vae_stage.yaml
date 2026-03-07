@@ -6,10 +6,11 @@ compile: false
 compile_mode: reduce-overhead
 compile_dynamic: false
 
-max_steps: 50000
-grad_accum_steps: 2
+max_steps: 75000
+grad_accum_steps: 1
 patches_per_sample: 512
 
+warmup_steps: 0
 # Optional synthetic data mode for quick smoke/debug runs.
 # When enabled, train loop samples x and W from Normal and does not start collectors.
 synthetic_patch_source:
@@ -20,15 +21,15 @@ synthetic_patch_source:
   x_std: 1.0
   w_std: 1.0
 
-warmup_steps: 1
 min_lr_ratio: 0.05
 
 # Optional per-group LR overrides.
 # If null/missing, falls back to mini_train.lr from shared trainer config.
-lr_encoder: 3e-4
-lr_decoder: 1e-5
+lr_encoder: 1e-4
+weight_decay: 0.01
+lr_decoder: 1e-4
 # Disable decoder updates for the first N optimizer steps.
-freeze_decoder_steps: 0
+freeze_decoder_steps : 0
 checkpoint_every: 500
 checkpoint_dir: ${training_artifacts.mini_vae_checkpoint_dir}
 

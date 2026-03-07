@@ -338,7 +338,7 @@ def _init_vae_latent_parameters(module: nn.Module) -> None:
     with torch.no_grad():
         for name, param in module.named_parameters():
             if name.endswith("resampler_latents"):
-                nn.init.normal_(param, mean=0.0, std=0.02)
+                nn.init.normal_(param, mean=0.0, std=0.005)
 
 
 def _decode_direction_and_logscale(
@@ -918,7 +918,9 @@ class CrossAttnPatchDecoder(nn.Module):
         self.direction_seq_norm_eps = 1e-6
 
         self.direction_head = nn.Sequential(
-            nn.Linear(self.d_model, 1),
+            nn.Linear(self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Linear(self.d_model, 1)
         )
         self.scale_head = nn.Sequential(
             nn.Linear(self.d_model, 1),
@@ -981,7 +983,8 @@ class CrossAttnPatchDecoder(nn.Module):
         for block in self.blocks:
             q = block(q, lat, q_pos=q_pos, kv_pos=kv_pos)
 
-        q_dir = self._channel_norm_over_sequence(q, eps=self.direction_seq_norm_eps)
+        q_dir = q
+        # q_dir = self._channel_norm_over_sequence(q, eps=self.direction_seq_norm_eps)
         u_hat_attn = self.direction_head(q_dir).squeeze(-1)  # [B, p]
 
         # Direct shortcut: z + positional embedding -> per-position scalar.
@@ -991,6 +994,7 @@ class CrossAttnPatchDecoder(nn.Module):
         u_hat_shortcut = self.z_shortcut(shortcut_in).squeeze(-1)  # [B, p]
 
         u_hat = u_hat_attn + u_hat_shortcut
+        
         s_hat = self.scale_head(q.mean(dim=1)).squeeze(-1)  # [B]
         return _decode_direction_and_logscale(
             u_hat=u_hat,

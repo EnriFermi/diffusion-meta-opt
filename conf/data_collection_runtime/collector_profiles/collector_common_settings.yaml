@@ -1,5 +1,15 @@
 enabled: true
 device: null
+# Optional prioritized list for collector GPU selection.
+# If `device` is null, runtime picks first available from this list.
+device_candidates: []
+# Prefer collector device different from train.device when possible.
+prefer_non_train_device: true
+# If no non-train device is available, allow using train.device from candidates.
+allow_train_device_fallback: true
+# Allow async collector even when collector.device == train.device.
+# Keep false by default to avoid train/collector contention on one GPU.
+allow_async_on_train_device: false
 mode: auto
 max_loaded_models: 1
 pin_gpu: false

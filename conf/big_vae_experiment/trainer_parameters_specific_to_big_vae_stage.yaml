@@ -1,9 +1,14 @@
-max_steps: 10000
-grad_accum_steps: 4
+max_steps: 1000000
+grad_accum_steps: 5
+distributed: false
+num_gpus: 1
+compile: true
+compile_dynamic: true
 
-warmup_steps: 500
+warmup_steps: 10000
 min_lr_ratio: 0.01
 kl_beta: 0.05
+lr: 5e-4
 
 behavioral_coef: 0.1
 structural_coef: 2.0

@@ -1,16 +1,16 @@
-patch_size: 16
+patch_size: 64
 beta: 0.001
 
 big_vae:
-  d_model: 256
+  d_model: 512
   d_lat: 256
   num_latents: 32
-  num_encoder_layers: 4
-  num_decoder_layers: 4
+  num_encoder_layers: 8
+  num_decoder_layers: 8
   n_heads: 8
   ffn_mult: 4.0
   dropout: 0.1
   pos_fourier_dim: 64
   encoder:
     self_attn_mode: full
-    cross_attend_only_cls: true
+    cross_attend_only_cls: false

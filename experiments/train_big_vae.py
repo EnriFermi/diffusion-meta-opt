@@ -969,11 +969,23 @@ def main(cfg: DictConfig) -> None:
         f"[train_big_vae] run_id={run_artifacts.get('run_id')} artifacts_root={run_artifacts.get('root_dir')}",
         flush=True,
     )
+    train_cfg = cfg.get("train", {})
+    print(
+        "[train_big_vae] effective train config: "
+        f"distributed={train_cfg.get('distributed')} "
+        f"num_gpus={train_cfg.get('num_gpus')} "
+        f"device={train_cfg.get('device')} "
+        f"compile={train_cfg.get('compile')} "
+        f"compile_mode={train_cfg.get('compile_mode')} "
+        f"compile_dynamic={train_cfg.get('compile_dynamic')}",
+        flush=True,
+    )
     # Freeze one shared log path before spawning worker processes.
     if not os.environ.get(LOG_PATH_ENV):
         os.environ[LOG_PATH_ENV] = str(resolve_log_path(cfg))
 
     world_size = _resolve_world_size(cfg)
+    print(f"[train_big_vae] resolved world_size={world_size}", flush=True)
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     assert isinstance(cfg_dict, dict)
     apply_nccl_forensics_env(cfg_dict, section="train")
