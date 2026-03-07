@@ -2,8 +2,8 @@ max_steps: 1000000
 grad_accum_steps: 5
 distributed: false
 num_gpus: 1
-compile: false
-compile_dynamic: false
+compile: true
+compile_dynamic: true
 
 warmup_steps: 10000
 min_lr_ratio: 0.01
