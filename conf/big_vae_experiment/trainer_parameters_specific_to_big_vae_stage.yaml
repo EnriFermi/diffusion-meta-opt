@@ -1,7 +1,7 @@
 max_steps: 1000000
 grad_accum_steps: 5
-distributed: false
-num_gpus: 1
+distributed: true
+num_gpus: 2
 compile: true
 compile_dynamic: true
 
@@ -18,8 +18,8 @@ checkpoint_every: 500
 checkpoint_dir: ${training_artifacts.big_vae_checkpoint_dir}
 
 stage: 1
-stage_base_T_patches: 4
-stage_base_d_out: 16
+stage_base_T_patches: 8
+stage_base_d_out: 32
 stage_scale_factor: 2
 steps_per_sample: 10
 slice_batch_size: 4
