@@ -24,7 +24,7 @@ from dataset.shared.atomizer import atomize
 from dataset.shared.cache import SharedSampleCache
 from dataset.shared.compatibility_index import (
     CompatibilityIndex,
-    normalize_device,
+    resolve_collector_device,
     resolve_collector_mode,
     resolve_train_device,
 )
@@ -606,14 +606,20 @@ class CollectorService:
                 low_watermark=int(in_memory_cfg.get("low_watermark_samples", 3000)),
             )
 
-        self.collector_device = normalize_device(collector_cfg.get("device"))
+        self.collector_device = resolve_collector_device(self.cfg_dict)
         self.train_device = resolve_train_device(self.cfg_dict)
+        allow_async_on_train_device = bool(collector_cfg.get("allow_async_on_train_device", False))
 
         if self.collector_mode == "async":
             if self.collector_device is None:
-                raise ValueError("collector.device must be set for async collector mode")
-            if self.train_device is not None and self.collector_device == self.train_device:
-                raise ValueError("async collector mode requires collector.device != train.device")
+                raise ValueError(
+                    "collector.device (or collector.device_candidates) must resolve to a device for async collector mode"
+                )
+            if self.train_device is not None and self.collector_device == self.train_device and not allow_async_on_train_device:
+                raise ValueError(
+                    "async collector mode requires collector.device != train.device "
+                    "(unless collector.allow_async_on_train_device=true)"
+                )
 
         self.model_selection_strategy = str(collector_cfg.get("model_selection_strategy", "round_robin_shuffled"))
         self.jobs_per_selected_model = int(collector_cfg.get("jobs_per_selected_model", 2))

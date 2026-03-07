@@ -25,7 +25,7 @@ class CompatibilityIndex:
         self.train_cfg = self.cfg_dict.get("train", {})
 
         self.collector_mode = resolve_collector_mode(self.cfg_dict)
-        self.collector_device = normalize_device(self.collector_cfg.get("device"))
+        self.collector_device = resolve_collector_device(self.cfg_dict)
 
         self.dataset_cfgs = self._load_enabled_dataset_cfgs()
         self.model_cfgs = self._load_model_cfgs()
@@ -205,14 +205,15 @@ def resolve_collector_mode(cfg: dict[str, Any]) -> str:
     if mode in {"async", "interleaved"}:
         return mode
 
-    collector_device = normalize_device(collector_cfg.get("device"))
+    collector_device = resolve_collector_device(cfg)
     train_device = resolve_train_device(cfg)
+    allow_async_on_train_device = bool(collector_cfg.get("allow_async_on_train_device", False))
 
     if collector_device is None:
         return "interleaved"
     if train_device is None:
         return "interleaved"
-    if collector_device == train_device:
+    if collector_device == train_device and not allow_async_on_train_device:
         return "interleaved"
     return "async"
 
@@ -241,6 +242,91 @@ def normalize_device(value: Any) -> str | None:
     if lowered in {"none", "null"}:
         return None
     return text
+
+
+def normalize_device_candidates(value: Any) -> list[str]:
+    if value is None:
+        return []
+
+    raw_items: list[Any]
+    if isinstance(value, str):
+        if "," in value:
+            raw_items = [part.strip() for part in value.split(",")]
+        else:
+            raw_items = [value]
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+
+    out: list[str] = []
+    for item in raw_items:
+        normalized = normalize_device(item)
+        if normalized is None:
+            continue
+        if normalized in out:
+            continue
+        out.append(normalized)
+    return out
+
+
+def _is_device_available(device: str) -> bool:
+    normalized = normalize_device(device)
+    if normalized is None:
+        return False
+
+    lowered = normalized.lower()
+    if not lowered.startswith("cuda"):
+        return True
+
+    try:
+        import torch  # local import: avoid hard dependency during config-only ops
+    except Exception:
+        return True
+
+    if not torch.cuda.is_available():
+        return False
+
+    if ":" not in lowered:
+        return True
+
+    _, raw_idx = lowered.split(":", 1)
+    try:
+        idx = int(raw_idx)
+    except Exception:
+        return False
+    return 0 <= idx < int(torch.cuda.device_count())
+
+
+def resolve_collector_device(cfg: dict[str, Any]) -> str | None:
+    collector_cfg = cfg.get("collector", {})
+
+    explicit = normalize_device(collector_cfg.get("device"))
+    if explicit is not None:
+        return explicit
+
+    candidates = normalize_device_candidates(collector_cfg.get("device_candidates"))
+    if not candidates:
+        return None
+
+    available = [device for device in candidates if _is_device_available(device)]
+    if not available:
+        available = candidates
+
+    train_device = resolve_train_device(cfg)
+    prefer_non_train = bool(collector_cfg.get("prefer_non_train_device", True))
+    allow_train_fallback = bool(collector_cfg.get("allow_train_device_fallback", True))
+
+    if not prefer_non_train or train_device is None:
+        return available[0]
+
+    non_train = [device for device in available if device != train_device]
+    if non_train:
+        return non_train[0]
+
+    if allow_train_fallback:
+        return available[0]
+    return None
 
 
 def _resolve_data_section(cfg: dict[str, Any]) -> dict[str, Any]:
