@@ -803,6 +803,7 @@ def run_pretrain_stub(cfg: PretrainConfig) -> None:
         dcn_deep_hidden=cfg.dist_dcn_deep_hidden,
         dcn_deep_layers=cfg.dist_dcn_deep_layers,
         dropout=cfg.dist_dropout,
+        patch_size_for_cov=cfg.patch_size,
     )
     dist_encoder = InputDistributionEncodingModule(dist_cfg).to(device)
 

@@ -10,7 +10,8 @@ distribution:
   dcn_deep_layers: 0
   dropout: 0.0
   use_covariance: true
-  patch_size_for_cov: 16
+  # Keep covariance encoder input width aligned with the active model patch size.
+  patch_size_for_cov: ${..patch_size}
 
 mini_vae:
   z_dim: 64

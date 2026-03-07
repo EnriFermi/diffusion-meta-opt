@@ -615,6 +615,15 @@ class InputDistributionEncodingModule(nn.Module):
 
         # Covariance conditioning: patch-local X_I^T @ X_I.
         if self.use_covariance and self.cov_encoder is not None:
+            cov_in_features = int(self.cov_encoder[0].in_features)
+            expected_cov_in_features = p * (p + 1) // 2
+            if cov_in_features != expected_cov_in_features:
+                raise ValueError(
+                    "Covariance encoder input size mismatch: "
+                    f"patch_idx width p={p} implies {expected_cov_in_features} covariance features, "
+                    f"but cov_encoder expects {cov_in_features}. "
+                    "Set distribution.patch_size_for_cov to match model.patch_size."
+                )
             X_I_centered = X_I - X_I.mean(dim=1, keepdim=True)
             # cov: [B, p, p]
             cov = torch.bmm(

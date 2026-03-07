@@ -17,6 +17,7 @@ from models.weight_quantile_vae import (
 def build_distribution_config(cfg: DictConfig, section: str = "mini_model") -> DistributionConfig:
     model_cfg = cfg.get(section, {})
     dist_cfg = model_cfg.get("distribution", {})
+    model_patch_size = int(model_cfg.get("patch_size", 16))
 
     return DistributionConfig(
         k_s=int(dist_cfg.get("k_s", 16)),
@@ -29,6 +30,8 @@ def build_distribution_config(cfg: DictConfig, section: str = "mini_model") -> D
         dcn_deep_hidden=int(dist_cfg.get("dcn_deep_hidden", 0)),
         dcn_deep_layers=int(dist_cfg.get("dcn_deep_layers", 0)),
         dropout=float(dist_cfg.get("dropout", 0.0)),
+        use_covariance=bool(dist_cfg.get("use_covariance", True)),
+        patch_size_for_cov=int(dist_cfg.get("patch_size_for_cov", model_patch_size)),
     )
 
 
