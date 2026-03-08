@@ -18,6 +18,12 @@ behavioral_coef: 100.0
 structural_coef: 1.0
 scale_match_coef: 1000.0
 contrastive_coef: 0.0
+grad_clip_norm_by_part:
+  distribution_encoder: 100.0
+  patch_tokenizer: 100.0
+  encoder: 100.0
+  decoder: 100.0
+  big_vae_other: 100.0
 
 checkpoint_every: 500
 checkpoint_dir: ${training_artifacts.big_vae_checkpoint_dir}

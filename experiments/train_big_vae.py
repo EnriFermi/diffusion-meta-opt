@@ -271,23 +271,28 @@ class CometTracker:
                 for tag in tags:
                     exp.add_tag(str(tag))
 
-            exp.log_parameters(
-                {
-                    "train.max_steps": int(train_cfg.get("max_steps", 0)),
-                    "train.lr": float(train_cfg.get("lr", 0.0)),
-                    "train.grad_accum_steps": int(train_cfg.get("grad_accum_steps", 1)),
-                    "train.kl_beta": float(train_cfg.get("kl_beta", 0.0)),
-                    "train.behavioral_coef": float(train_cfg.get("behavioral_coef", 0.0)),
-                    "train.structural_coef": float(train_cfg.get("structural_coef", 0.0)),
-                    "train.scale_match_coef": float(train_cfg.get("scale_match_coef", 0.0)),
-                    "model.patch_size": int(model_cfg.get("patch_size", 16)),
-                    "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
-                    "streaming.mode": str(streaming_cfg.get("mode", "none")),
-                    "collector.mode": str(collector_cfg.get("mode", "auto")),
-                    "collector.device": str(collector_cfg.get("device", "")),
-                    "train.device": str(train_cfg.get("device", "")),
-                }
-            )
+            comet_params: dict[str, Any] = {
+                "train.max_steps": int(train_cfg.get("max_steps", 0)),
+                "train.lr": float(train_cfg.get("lr", 0.0)),
+                "train.grad_accum_steps": int(train_cfg.get("grad_accum_steps", 1)),
+                "train.kl_beta": float(train_cfg.get("kl_beta", 0.0)),
+                "train.behavioral_coef": float(train_cfg.get("behavioral_coef", 0.0)),
+                "train.structural_coef": float(train_cfg.get("structural_coef", 0.0)),
+                "train.scale_match_coef": float(train_cfg.get("scale_match_coef", 0.0)),
+                "model.patch_size": int(model_cfg.get("patch_size", 16)),
+                "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
+                "streaming.mode": str(streaming_cfg.get("mode", "none")),
+                "collector.mode": str(collector_cfg.get("mode", "auto")),
+                "collector.device": str(collector_cfg.get("device", "")),
+                "train.device": str(train_cfg.get("device", "")),
+            }
+            clip_by_part_cfg = train_cfg.get("grad_clip_norm_by_part", {})
+            if isinstance(clip_by_part_cfg, (dict, DictConfig)):
+                for group_name in _grad_stat_group_prefixes():
+                    if group_name not in clip_by_part_cfg:
+                        continue
+                    comet_params[f"train.grad_clip_norm_by_part.{group_name}"] = float(clip_by_part_cfg[group_name])
+            exp.log_parameters(comet_params)
 
             self.experiment = exp
             self.enabled = True
@@ -340,8 +345,8 @@ def _layer_key_from_param_name(name: str) -> str:
     return name
 
 
-def compute_grad_stats(model: nn.Module) -> dict[str, float]:
-    groups: dict[str, tuple[str, ...]] = {
+def _grad_stat_group_prefixes() -> dict[str, tuple[str, ...]]:
+    return {
         "distribution_encoder": ("distribution_encoder.",),
         "patch_tokenizer": ("patch_tokenizer.", "patch_token_proj.", "cls_token"),
         "encoder": (
@@ -350,6 +355,8 @@ def compute_grad_stats(model: nn.Module) -> dict[str, float]:
             "enc_dist_to_latent_heads.",
             "latent_base",
             "latent_norm.",
+            "to_mu.",
+            "to_logvar.",
         ),
         "decoder": (
             "decoder_layers.",
@@ -364,6 +371,41 @@ def compute_grad_stats(model: nn.Module) -> dict[str, float]:
         ),
         "big_vae_other": tuple(),
     }
+
+
+def _grad_group_name_for_param(name: str, groups: dict[str, tuple[str, ...]]) -> str:
+    for group_name, prefixes in groups.items():
+        if group_name == "big_vae_other":
+            continue
+        if any(name.startswith(prefix) for prefix in prefixes):
+            return group_name
+    return "big_vae_other"
+
+
+def _collect_params_by_grad_group(model: nn.Module, groups: dict[str, tuple[str, ...]]) -> dict[str, list[nn.Parameter]]:
+    out: dict[str, list[nn.Parameter]] = {group_name: [] for group_name in groups}
+    for raw_name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        name = _strip_ddp_prefix(raw_name)
+        group_name = _grad_group_name_for_param(name, groups)
+        out[group_name].append(param)
+    return out
+
+
+def _grad_l2_norm_for_params(params: list[nn.Parameter]) -> float:
+    sum_sq = 0.0
+    for param in params:
+        grad = param.grad
+        if grad is None:
+            continue
+        g = grad.detach()
+        sum_sq += float((g * g).sum().item())
+    return math.sqrt(sum_sq)
+
+
+def compute_grad_stats(model: nn.Module) -> dict[str, float]:
+    groups = _grad_stat_group_prefixes()
     group_sums = {name: 0.0 for name in groups}
     group_numel = {name: 0 for name in groups}
     group_param_count = {name: 0 for name in groups}
@@ -396,20 +438,10 @@ def compute_grad_stats(model: nn.Module) -> dict[str, float]:
         numel = int(g.numel())
         grad_numel += numel
 
-        assigned = False
-        for group_name, prefixes in groups.items():
-            if group_name == "big_vae_other":
-                continue
-            if any(name.startswith(prefix) for prefix in prefixes):
-                group_param_count[group_name] += 1
-                group_sums[group_name] += float((g * g).sum().item())
-                group_numel[group_name] += numel
-                assigned = True
-                break
-        if not assigned:
-            group_param_count["big_vae_other"] += 1
-            group_sums["big_vae_other"] += float((g * g).sum().item())
-            group_numel["big_vae_other"] += numel
+        group_name = _grad_group_name_for_param(name, groups)
+        group_param_count[group_name] += 1
+        group_sums[group_name] += float((g * g).sum().item())
+        group_numel[group_name] += numel
 
     grad_rms = math.sqrt(sum_sq / max(1, grad_numel))
     param_rms = math.sqrt(param_sum_sq / max(1, param_numel))
@@ -1157,6 +1189,26 @@ def _run_worker(
             structural_coef = float(cfg.train.get("structural_coef", 0.5))
             scale_match_coef = float(cfg.train.get("scale_match_coef", 1000.0))
             grad_clip_norm = float(cfg.train.get("grad_clip_norm", 1.0))
+            grad_clip_norm_by_part_raw = cfg.train.get("grad_clip_norm_by_part", {})
+            if grad_clip_norm_by_part_raw is None:
+                grad_clip_norm_by_part_raw = {}
+            if not isinstance(grad_clip_norm_by_part_raw, (dict, DictConfig)):
+                raise TypeError("train.grad_clip_norm_by_part must be a mapping when provided")
+            grad_group_prefixes = _grad_stat_group_prefixes()
+            grad_clip_norm_by_part: dict[str, float] = {
+                group_name: float(grad_clip_norm) for group_name in grad_group_prefixes
+            }
+            partwise_grad_clip_enabled = False
+            unknown_clip_groups: list[str] = []
+            for key, value in grad_clip_norm_by_part_raw.items():
+                group_name = str(key).strip()
+                if not group_name:
+                    continue
+                if group_name not in grad_clip_norm_by_part:
+                    unknown_clip_groups.append(group_name)
+                    continue
+                grad_clip_norm_by_part[group_name] = float(value)
+                partwise_grad_clip_enabled = True
             max_x_rows = int(cfg.train.get("max_x_rows", 0))
 
             patch_size_for_slice = int(cfg.model.get("patch_size", 16))
@@ -1225,6 +1277,9 @@ def _run_worker(
             grad_layer_monitor_heatmap_path = Path(
                 str(grad_layer_monitor_cfg.get("heatmap_path", str(monitor_base_dir / "grad_layer_rms_heatmap.png")))
             )
+            params_by_grad_group: dict[str, list[nn.Parameter]] = {}
+            if partwise_grad_clip_enabled:
+                params_by_grad_group = _collect_params_by_grad_group(model=model, groups=grad_group_prefixes)
             if grad_layer_monitor_enabled and grad_layer_monitor_save_csv and grad_layer_monitor_reset_csv_on_start:
                 try:
                     if grad_layer_monitor_csv_path.exists():
@@ -1242,6 +1297,21 @@ def _run_worker(
                     kl_beta,
                     scale_match_coef,
                 )
+                if unknown_clip_groups:
+                    logger.warning(
+                        "Ignoring unknown train.grad_clip_norm_by_part groups: %s",
+                        sorted(set(unknown_clip_groups)),
+                    )
+                if partwise_grad_clip_enabled:
+                    params_with_grad_per_group = {
+                        group_name: int(len(params_by_grad_group.get(group_name, [])))
+                        for group_name in grad_group_prefixes
+                    }
+                    logger.info(
+                        "Per-part grad clipping enabled: clip_norms=%s params_per_group=%s",
+                        grad_clip_norm_by_part,
+                        params_with_grad_per_group,
+                    )
                 if grad_layer_monitor_enabled:
                     logger.info(
                         "Grad-layer monitor enabled: every_steps=%s topk=%s csv=%s plot=%s heatmap=%s "
@@ -1384,35 +1454,102 @@ def _run_worker(
                 if scaler.is_enabled():
                     scaler.unscale_(optimizer)
 
+                monitor_layer_snapshot_this_step = grad_layer_monitor_enabled and (
+                    global_step == 1 or (global_step % grad_layer_monitor_every_steps == 0)
+                )
+                layer_rms_pre_clip_snapshot: dict[str, float] | None = None
+                if monitor_layer_snapshot_this_step:
+                    layer_rms_pre_clip_snapshot = collect_grad_rms_per_layer(
+                        model=model,
+                        include_prefixes=grad_layer_monitor_include_prefixes,
+                        weights_only=grad_layer_monitor_weights_only,
+                    )
+
                 grad_clip_coef = 1.0
-                if grad_clip_norm > 0.0:
+                grad_global_before_clip = 0.0
+                grad_global_after_clip = 0.0
+                grad_clip_group_before: dict[str, float] = {}
+                grad_clip_group_after: dict[str, float] = {}
+                grad_clip_group_coef: dict[str, float] = {}
+                if partwise_grad_clip_enabled:
+                    for group_name in grad_group_prefixes:
+                        params = params_by_grad_group.get(group_name, [])
+                        clip_limit = float(grad_clip_norm_by_part.get(group_name, grad_clip_norm))
+                        if not params:
+                            before_norm = 0.0
+                            after_norm = 0.0
+                            clip_coef = 1.0
+                        elif clip_limit > 0.0:
+                            clip_return = torch.nn.utils.clip_grad_norm_(params, clip_limit)
+                            before_norm = float(clip_return)
+                            clip_coef = min(1.0, clip_limit / max(1e-12, before_norm))
+                            after_norm = before_norm * clip_coef
+                        else:
+                            before_norm = _grad_l2_norm_for_params(params)
+                            after_norm = before_norm
+                            clip_coef = 1.0
+                        grad_clip_group_before[group_name] = float(before_norm)
+                        grad_clip_group_after[group_name] = float(after_norm)
+                        grad_clip_group_coef[group_name] = float(clip_coef)
+
+                    grad_global_before_clip = math.sqrt(
+                        sum(float(value) * float(value) for value in grad_clip_group_before.values())
+                    )
+                    grad_global_after_clip = math.sqrt(
+                        sum(float(value) * float(value) for value in grad_clip_group_after.values())
+                    )
+                    grad_clip_coef = (
+                        grad_global_after_clip / max(1e-12, grad_global_before_clip)
+                        if grad_global_before_clip > 0.0
+                        else 1.0
+                    )
+                elif grad_clip_norm > 0.0:
                     clip_return = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                     grad_global_before_clip = float(clip_return)
                     grad_clip_coef = min(1.0, float(grad_clip_norm) / max(1e-12, grad_global_before_clip))
+                    grad_global_after_clip = grad_global_before_clip * grad_clip_coef
                 else:
                     grad_global_before_clip = 0.0
+                    grad_global_after_clip = 0.0
 
                 grad_stats: dict[str, float] = {}
                 if rank == 0:
                     grad_stats = compute_grad_stats(model)
-                    if grad_clip_norm <= 0.0:
+                    if (not partwise_grad_clip_enabled) and grad_clip_norm <= 0.0:
                         grad_global_before_clip = float(grad_stats.get("grad/global_norm", 0.0))
+                        grad_global_after_clip = grad_global_before_clip
                     grad_stats["grad/global_norm_before_clip"] = float(grad_global_before_clip)
+                    grad_stats["grad/global_norm_after_clip_est"] = float(grad_global_after_clip)
                     grad_stats["grad/clip_coef"] = float(grad_clip_coef)
+                    if partwise_grad_clip_enabled:
+                        for group_name in grad_group_prefixes:
+                            grad_stats[f"grad/{group_name}_global_norm_before_clip"] = float(
+                                grad_clip_group_before.get(group_name, 0.0)
+                            )
+                            grad_stats[f"grad/{group_name}_global_norm_after_clip"] = float(
+                                grad_clip_group_after.get(group_name, 0.0)
+                            )
+                            grad_stats[f"grad/{group_name}_clip_coef"] = float(
+                                grad_clip_group_coef.get(group_name, 1.0)
+                            )
+                            grad_stats[f"grad/{group_name}_clip_norm_limit"] = float(
+                                grad_clip_norm_by_part.get(group_name, grad_clip_norm)
+                            )
 
-                if grad_layer_monitor_enabled and (
-                    global_step == 1 or (global_step % grad_layer_monitor_every_steps == 0)
-                ):
+                if monitor_layer_snapshot_this_step:
                     layer_rms_post_clip = collect_grad_rms_per_layer(
                         model=model,
                         include_prefixes=grad_layer_monitor_include_prefixes,
                         weights_only=grad_layer_monitor_weights_only,
                     )
-                    clip_coef_safe = max(1e-12, float(grad_clip_coef))
-                    layer_rms_pre_clip = {
-                        key: (float(value) / clip_coef_safe if float(grad_clip_coef) < 1.0 else float(value))
-                        for key, value in layer_rms_post_clip.items()
-                    }
+                    if layer_rms_pre_clip_snapshot:
+                        layer_rms_pre_clip = {str(key): float(value) for key, value in layer_rms_pre_clip_snapshot.items()}
+                    else:
+                        clip_coef_safe = max(1e-12, float(grad_clip_coef))
+                        layer_rms_pre_clip = {
+                            key: (float(value) / clip_coef_safe if float(grad_clip_coef) < 1.0 else float(value))
+                            for key, value in layer_rms_post_clip.items()
+                        }
                     layer_param_rms = collect_param_rms_per_layer(
                         model=model,
                         include_prefixes=grad_layer_monitor_include_prefixes,
@@ -1631,6 +1768,7 @@ def _run_worker(
                             "train/steps_per_sec": float(speed),
                             "data/cache_size": float(cache_metric),
                             "grad/global_norm_before_clip": float(grad_stats.get("grad/global_norm_before_clip", 0.0)),
+                            "grad/global_norm_after_clip_est": float(grad_stats.get("grad/global_norm_after_clip_est", 0.0)),
                             "grad/global_norm": float(grad_stats.get("grad/global_norm", 0.0)),
                             "grad/rms": float(grad_stats.get("grad/rms", 0.0)),
                             "grad/abs_mean": float(grad_stats.get("grad/abs_mean", 0.0)),
@@ -1660,6 +1798,20 @@ def _run_worker(
                             "param/rms": float(grad_stats.get("param/rms", 0.0)),
                             "grad_to_param_rms_ratio": float(grad_stats.get("grad_to_param_rms_ratio", 0.0)),
                         }
+                        if partwise_grad_clip_enabled:
+                            for group_name in grad_group_prefixes:
+                                comet_metrics[f"grad/{group_name}_global_norm_before_clip"] = float(
+                                    grad_stats.get(f"grad/{group_name}_global_norm_before_clip", 0.0)
+                                )
+                                comet_metrics[f"grad/{group_name}_global_norm_after_clip"] = float(
+                                    grad_stats.get(f"grad/{group_name}_global_norm_after_clip", 0.0)
+                                )
+                                comet_metrics[f"grad/{group_name}_clip_coef"] = float(
+                                    grad_stats.get(f"grad/{group_name}_clip_coef", 1.0)
+                                )
+                                comet_metrics[f"grad/{group_name}_clip_norm_limit"] = float(
+                                    grad_stats.get(f"grad/{group_name}_clip_norm_limit", 0.0)
+                                )
                         if grad_layer_monitor_enabled:
                             comet_metrics["grad/layer_monitor_num_layers"] = float(
                                 latest_grad_layer_snapshot.get("num_layers", 0)
