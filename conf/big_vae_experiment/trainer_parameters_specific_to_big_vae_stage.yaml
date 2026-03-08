@@ -6,6 +6,8 @@ compile: true
 compile_dynamic: true
 # Keep torch.compile while avoiding inductor CUDAGraph output-buffer reuse issues.
 compile_disable_cudagraphs: true
+# Pull model artifacts up front to reduce collector cold-start stalls.
+predownload_models: true
 
 warmup_steps: 10000
 min_lr_ratio: 0.01

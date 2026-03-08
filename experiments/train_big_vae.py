@@ -955,6 +955,56 @@ def _slice_sample(
     return torch.stack(W_slices), torch.stack(x_slices)
 
 
+def _compute_patch_scale_means(
+    W: torch.Tensor,
+    W_hat: torch.Tensor,
+    *,
+    patch_size: int,
+    eps: float = 1e-12,
+) -> tuple[float, float, float]:
+    """
+    Estimate average per-patch scale (L2 norm) for target and prediction.
+
+    Decoder reconstructs each patch as `w_hat = scale * unit_direction`, so
+    the patch L2 norm is the decoded scale.
+    """
+    if patch_size <= 0:
+        raise ValueError(f"patch_size must be > 0, got {patch_size}")
+
+    if W.ndim == 2:
+        W = W.unsqueeze(0)
+    if W_hat.ndim == 2:
+        W_hat = W_hat.unsqueeze(0)
+    if W.ndim != 3 or W_hat.ndim != 3:
+        raise ValueError(f"Expected rank-3 tensors [B,d_in,d_out], got W={tuple(W.shape)}, W_hat={tuple(W_hat.shape)}")
+    if tuple(W.shape) != tuple(W_hat.shape):
+        raise ValueError(f"Shape mismatch: W={tuple(W.shape)} W_hat={tuple(W_hat.shape)}")
+
+    Wf = W.detach().to(dtype=torch.float32)
+    W_hat_f = W_hat.detach().to(dtype=torch.float32)
+    bsz, d_in, d_out = Wf.shape
+
+    full_patches = int(d_in) // int(patch_size)
+    if full_patches <= 0:
+        target_norm = Wf.transpose(1, 2).norm(dim=-1)
+        pred_norm = W_hat_f.transpose(1, 2).norm(dim=-1)
+    else:
+        used_rows = full_patches * int(patch_size)
+        target_patches = Wf[:, :used_rows, :].transpose(1, 2).contiguous().view(
+            bsz, d_out, full_patches, int(patch_size)
+        )
+        pred_patches = W_hat_f[:, :used_rows, :].transpose(1, 2).contiguous().view(
+            bsz, d_out, full_patches, int(patch_size)
+        )
+        target_norm = target_patches.norm(dim=-1)
+        pred_norm = pred_patches.norm(dim=-1)
+
+    target_scale_mean = float(target_norm.mean().item()) if target_norm.numel() > 0 else 0.0
+    pred_scale_mean = float(pred_norm.mean().item()) if pred_norm.numel() > 0 else 0.0
+    pred_to_target_ratio = pred_scale_mean / max(float(eps), target_scale_mean)
+    return pred_scale_mean, target_scale_mean, pred_to_target_ratio
+
+
 def _load_model_weights_from_checkpoint(
     model: torch.nn.Module,
     path: str,
@@ -1232,6 +1282,9 @@ def _run_worker(
             behavioral_window = 0.0
             structural_window = 0.0
             kl_window = 0.0
+            pred_scale_window = 0.0
+            target_scale_window = 0.0
+            scale_ratio_window = 0.0
             window_steps = 0
             t0 = time.time()
             grad_layer_history: dict[str, list[tuple[int, float]]] = {}
@@ -1274,6 +1327,9 @@ def _run_worker(
                 behavioral_acc = 0.0
                 structural_acc = 0.0
                 kl_acc = 0.0
+                pred_scale_acc = 0.0
+                target_scale_acc = 0.0
+                scale_ratio_acc = 0.0
                 step_is_finite = True
 
                 for micro_idx in range(grad_accum_steps):
@@ -1323,6 +1379,14 @@ def _run_worker(
                     behavioral_acc += float(behavioral_loss.detach().item())
                     structural_acc += float(structural_loss.detach().item())
                     kl_acc += float(kl_loss.detach().item())
+                    pred_scale_mean, target_scale_mean, pred_to_target_scale_ratio = _compute_patch_scale_means(
+                        W=W_s,
+                        W_hat=W_hat,
+                        patch_size=patch_size_for_slice,
+                    )
+                    pred_scale_acc += float(pred_scale_mean)
+                    target_scale_acc += float(target_scale_mean)
+                    scale_ratio_acc += float(pred_to_target_scale_ratio)
 
                     if not step_is_finite:
                         break
@@ -1505,9 +1569,20 @@ def _run_worker(
                 step_behavioral = behavioral_acc / grad_accum_steps
                 step_structural = structural_acc / grad_accum_steps
                 step_kl = kl_acc / grad_accum_steps
+                step_pred_scale = pred_scale_acc / grad_accum_steps
+                step_target_scale = target_scale_acc / grad_accum_steps
+                step_scale_ratio = scale_ratio_acc / grad_accum_steps
 
                 stats = torch.tensor(
-                    [step_loss, step_behavioral, step_structural, step_kl],
+                    [
+                        step_loss,
+                        step_behavioral,
+                        step_structural,
+                        step_kl,
+                        step_pred_scale,
+                        step_target_scale,
+                        step_scale_ratio,
+                    ],
                     dtype=torch.float32, device=device,
                 )
                 if is_distributed:
@@ -1518,6 +1593,9 @@ def _run_worker(
                 behavioral_window += float(stats[1].item())
                 structural_window += float(stats[2].item())
                 kl_window += float(stats[3].item())
+                pred_scale_window += float(stats[4].item())
+                target_scale_window += float(stats[5].item())
+                scale_ratio_window += float(stats[6].item())
                 window_steps += 1
 
                 if rank == 0 and global_step % log_every == 0:
@@ -1526,18 +1604,26 @@ def _run_worker(
                     avg_behavioral = behavioral_window / max(1, window_steps)
                     avg_structural = structural_window / max(1, window_steps)
                     avg_kl = kl_window / max(1, window_steps)
+                    avg_pred_scale = pred_scale_window / max(1, window_steps)
+                    avg_target_scale = target_scale_window / max(1, window_steps)
+                    avg_scale_ratio = scale_ratio_window / max(1, window_steps)
                     lr = float(optimizer.param_groups[0]["lr"])
                     speed = window_steps / dt
 
                     cache_metric = dataset.cache_size() if dataset is not None else 0
                     logger.info(
-                        "step=%s/%s loss=%.6f behav=%.6f struct=%.6f kl=%.6f lr=%.6e steps/s=%.2f cache=%s",
+                        "step=%s/%s loss=%.6f behav=%.6f struct=%.6f kl=%.6f "
+                        "pred_scale=%.6f target_scale=%.6f scale_ratio=%.6f "
+                        "lr=%.6e steps/s=%.2f cache=%s",
                         global_step,
                         max_steps,
                         avg_loss,
                         avg_behavioral,
                         avg_structural,
                         avg_kl,
+                        avg_pred_scale,
+                        avg_target_scale,
+                        avg_scale_ratio,
                         lr,
                         speed,
                         cache_metric,
@@ -1548,6 +1634,9 @@ def _run_worker(
                             "train/behavioral_loss": float(avg_behavioral),
                             "train/structural_loss": float(avg_structural),
                             "train/kl_loss": float(avg_kl),
+                            "train/pred_scale_mean": float(avg_pred_scale),
+                            "train/target_scale_mean": float(avg_target_scale),
+                            "train/pred_to_target_scale_ratio": float(avg_scale_ratio),
                             "train/lr": float(lr),
                             "train/steps_per_sec": float(speed),
                             "data/cache_size": float(cache_metric),
@@ -1626,6 +1715,9 @@ def _run_worker(
                     behavioral_window = 0.0
                     structural_window = 0.0
                     kl_window = 0.0
+                    pred_scale_window = 0.0
+                    target_scale_window = 0.0
+                    scale_ratio_window = 0.0
                     window_steps = 0
                     t0 = time.time()
 
