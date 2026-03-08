@@ -16,6 +16,7 @@ lr: 5e-4
 
 behavioral_coef: 100.0
 structural_coef: 1.0
+scale_match_coef: 1000.0
 contrastive_coef: 0.0
 
 checkpoint_every: 500
