@@ -16,6 +16,8 @@ lr: 5e-4
 
 behavioral_coef: 0.1
 structural_coef: 2.0
+# Aggressive amplitude alignment: force predicted patch scales toward target scales.
+scale_match_coef: 1000.0
 contrastive_coef: 0.0
 
 checkpoint_every: 500
