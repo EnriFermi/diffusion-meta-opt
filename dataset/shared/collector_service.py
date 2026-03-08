@@ -659,8 +659,8 @@ class CollectorService:
         self._validate_layer_output_splitting(self.atom_cfg)
 
         max_loaded = int(collector_cfg.get("max_loaded_models", 1))
-        if max_loaded != 1:
-            raise ValueError("collector.max_loaded_models must be 1 (single collector model on collector GPU)")
+        if max_loaded < 1:
+            raise ValueError("collector.max_loaded_models must be >= 1")
 
         self._runtime_ready = False
         self._raw_pool: RawDatasetPool | None = None
