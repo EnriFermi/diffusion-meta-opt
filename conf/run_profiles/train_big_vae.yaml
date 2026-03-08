@@ -13,6 +13,12 @@ defaults:
 
   - _self_
 
+# BigVAE speed tuning: fewer model switches + lighter per-layer x/y payload.
+collector:
+  jobs_per_selected_model: 8
+  layer_output_splitting:
+    xy_samples_random_slice: 256
+
 hydra:
   job:
     name: train_big_vae
