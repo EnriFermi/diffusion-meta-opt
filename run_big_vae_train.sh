@@ -1,35 +1,26 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+set -a
+. "./mom.env"
+set +a
+export COMET_API_KEY="${COMET_API_KEY:-$COMET_API_KEY_DEFAULT}"
+export COMET_WORKSPACE="${COMET_WORKSPACE:-$COMET_WORKSPACE_DEFAULT}"
 
-# ── Conda environment ───────────────────────────────────────────────
-CONDA_ENV="onerec"
-PYTHON="/opt/homebrew/Caskroom/miniconda/base/envs/${CONDA_ENV}/bin/python"
 
-if [[ ! -x "$PYTHON" ]]; then
-    echo "ERROR: Python not found at $PYTHON"
-    echo "       Make sure conda env '${CONDA_ENV}' exists."
-    exit 1
+if [ -n "${CONDA_PREFIX:-}" ]; then
+  export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
-# ── Install missing deps if needed ──────────────────────────────────
-"$PYTHON" -c "import hydra" 2>/dev/null || {
-    echo "Installing hydra-core..."
-    "${PYTHON%/python}/pip" install hydra-core
-}
+if [ -n "${PIPENV_ACTIVE:-}" ]; then
+  exec python -m experiments.train_big_vae "$@"
+fi
 
-# ── Launch training ─────────────────────────────────────────────────
-echo "=== Big VAE Training ==="
-echo "Python:  $PYTHON"
-echo "Workdir: $SCRIPT_DIR"
-echo ""
+if [ -n "${CONDA_PREFIX:-}" ]; then
+  exec python -m experiments.train_big_vae "$@"
+fi
 
-DEFAULT_OVERRIDES=(
-  "train.distributed=false"
-  "train.num_gpus=1"
-  "train.compile=false"
-)
+if command -v pipenv >/dev/null 2>&1; then
+  exec pipenv run python -m experiments.train_big_vae "$@"
+fi
 
-exec "$PYTHON" experiments/train_big_vae.py "${DEFAULT_OVERRIDES[@]}" "$@"
+exec python -m experiments.train_big_vae "$@"
