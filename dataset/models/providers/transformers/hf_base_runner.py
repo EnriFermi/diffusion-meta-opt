@@ -188,13 +188,17 @@ class HFBaseRunner(BaseVirtualModel):
             output_chunks = state["outputs"]
 
             if input_chunks:
-                inputs = torch.cat(input_chunks, dim=0)
+                inputs = torch.cat(input_chunks, dim=0).to(
+                    device="cpu", dtype=torch.float32
+                )
             else:
                 in_features = int(getattr(module, "in_features", 0))
                 inputs = torch.empty((0, in_features), dtype=torch.float32)
 
             if output_chunks:
-                outputs = torch.cat(output_chunks, dim=0)
+                outputs = torch.cat(output_chunks, dim=0).to(
+                    device="cpu", dtype=torch.float32
+                )
             else:
                 out_features = int(getattr(module, "out_features", 0))
                 outputs = torch.empty((0, out_features), dtype=torch.float32)

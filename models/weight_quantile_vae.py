@@ -486,21 +486,13 @@ class InputDistributionEncodingModule(nn.Module):
     def __init__(self, cfg: DistributionConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        if cfg.k_s < 3:
-            raise ValueError(
-                f"k_s must be >= 3 for kernel_size=3 quantile conv (output length k_s-2), got {cfg.k_s}"
-            )
 
         if cfg.d_var % cfg.var_attn_heads != 0:
             raise ValueError(f"d_var ({cfg.d_var}) must be divisible by var_attn_heads ({cfg.var_attn_heads})")
 
-        # Single-channel conv along quantile axis (no padding).
-        # [B*p, 1, k_s] -> [B*p, 1, k_s - 2]
-        self.quantile_conv = nn.Conv1d(in_channels=1, out_channels=1, kernel_size=3, padding=0)
-
-        # Shared per-variable MLP: ((k_s - 2) + 2) -> d_var.
+        # Shared per-variable MLP: (k_s quantiles + mu_log + sigma_log) -> d_var.
         self.var_mlp = nn.Sequential(
-            nn.Linear(cfg.k_s, cfg.d_var),
+            nn.Linear(cfg.k_s + 2, cfg.d_var),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
             nn.Linear(cfg.d_var, cfg.d_var),
@@ -591,18 +583,12 @@ class InputDistributionEncodingModule(nn.Module):
         mu_log = torch.sign(mu) * torch.log1p(mu.abs())
         sigma_log = torch.log(sigma + eps)
 
-        # Convolution along quantile axis only.
+        # Per-variable features: raw quantiles + moments.
         # q_var_major: [B, p, k_s]
-        # q_conv_in: [B*p, 1, k_s]
         q_var_major = q.permute(0, 2, 1).contiguous()
-        q_conv_in = q_var_major.view(B * p, 1, self.cfg.k_s)
 
-        # q_conv_seq: [B*p, 1, k_s - 2] -> q_conv: [B, p, k_s - 2]
-        q_conv_seq = self.quantile_conv(q_conv_in)
-        q_conv = q_conv_seq.squeeze(1).reshape(B, p, self.cfg.k_s - 2)
-
-        # Per-variable features: [B, p, (k_s - 2) + 2] = [B, p, k_s]
-        f = torch.cat([q_conv, mu_log.unsqueeze(-1), sigma_log.unsqueeze(-1)], dim=-1)
+        # [B, p, k_s + 2]
+        f = torch.cat([q_var_major, mu_log.unsqueeze(-1), sigma_log.unsqueeze(-1)], dim=-1)
 
         # Shared var MLP: [B, p, d_var]
         v = self.var_mlp(f.to(dtype=X.dtype if X.dtype.is_floating_point else torch.float32))
@@ -1410,6 +1396,104 @@ class ResidualPatchTokenizer(nn.Module):
         return residual + delta
 
 
+class MixerPatchTokenizer(nn.Module):
+    """
+    MLP-Mixer style patch tokenizer.
+
+    Alternates weight-wise MLPs (per position, shared across positions) and
+    patch-wise MLPs (per feature, shared across features) to mix information
+    across the patch.  Final output is mean-pooled, concatenated with
+    dist_patch_embed, and projected to d_patch.
+
+    Input:  w_patch [B, p], dist_var_tokens [B, p, d_var], dist_patch_embed [B, d_dist]
+    Output: patch_token [B, d_patch]
+    """
+
+    def __init__(
+        self,
+        p: int,
+        d_var: int,
+        d_dist: int,
+        d_patch: int,
+        d_hidden: int = 128,
+        num_mixer_layers: int = 3,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.p = int(p)
+        self.d_patch = int(d_patch)
+        self.d_hidden = int(d_hidden)
+
+        # Per-weight initial embedding: (1 scalar weight + d_var distribution embed) → d_hidden.
+        self.weight_embed = nn.Sequential(
+            nn.Linear(1 + int(d_var), d_hidden),
+            nn.GELU(),
+            nn.Linear(d_hidden, d_hidden),
+        )
+
+        # Alternating mixer layers.
+        self.weight_mlps = nn.ModuleList()
+        self.patch_mlps = nn.ModuleList()
+        for _ in range(max(1, int(num_mixer_layers))):
+            self.weight_mlps.append(nn.Sequential(
+                nn.LayerNorm(d_hidden),
+                nn.Linear(d_hidden, d_hidden),
+                nn.GELU(),
+                nn.Linear(d_hidden, d_hidden),
+                nn.Dropout(float(dropout)),
+            ))
+            self.patch_mlps.append(nn.Sequential(
+                nn.LayerNorm(self.p),
+                nn.Linear(self.p, self.p),
+                nn.GELU(),
+                nn.Linear(self.p, self.p),
+                nn.Dropout(float(dropout)),
+            ))
+
+        # Final projection: mean-pooled features + dist_patch_embed → d_patch.
+        self.final_proj = nn.Sequential(
+            nn.Linear(d_hidden + int(d_dist), d_hidden),
+            nn.GELU(),
+            nn.Linear(d_hidden, d_patch),
+        )
+
+    def forward(
+        self,
+        w_patch: torch.Tensor,
+        dist_var_tokens: torch.Tensor,
+        dist_patch_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        # w_patch: [B, p]
+        # dist_var_tokens: [B, p, d_var]
+        # dist_patch_embed: [B, d_dist]
+        if w_patch.ndim != 2:
+            raise ValueError(f"w_patch must be [B, p], got {tuple(w_patch.shape)}")
+        if dist_var_tokens.ndim != 3:
+            raise ValueError(f"dist_var_tokens must be [B, p, d_var], got {tuple(dist_var_tokens.shape)}")
+        if dist_patch_embed.ndim != 2:
+            raise ValueError(f"dist_patch_embed must be [B, d_dist], got {tuple(dist_patch_embed.shape)}")
+
+        # Per-weight embedding: [B, p, 1 + d_var] → [B, p, d_hidden]
+        x = torch.cat([w_patch.unsqueeze(-1), dist_var_tokens], dim=-1)
+        x = self.weight_embed(x)
+
+        # Alternating mixer layers with residual connections.
+        for weight_mlp, patch_mlp in zip(self.weight_mlps, self.patch_mlps):
+            # Weight-wise MLP: applied independently per position.
+            x = x + weight_mlp(x)  # [B, p, d_hidden]
+            # Patch-wise MLP: applied independently per feature.
+            x_t = x.transpose(1, 2)  # [B, d_hidden, p]
+            x_t = x_t + patch_mlp(x_t)  # [B, d_hidden, p]
+            x = x_t.transpose(1, 2)  # [B, p, d_hidden]
+
+        # Mean-pool over weight positions.
+        x_pool = x.mean(dim=1)  # [B, d_hidden]
+
+        # Concat dist_patch_embed and project to d_patch.
+        x_cat = torch.cat([x_pool, dist_patch_embed], dim=-1)  # [B, d_hidden + d_dist]
+        return self.final_proj(x_cat)  # [B, d_patch]
+
+
 class MLPNoCompressionPatchEncoder(nn.Module):
     """Stub encoder: 6-layer MLP from patch weights to latent stats."""
 
@@ -1834,14 +1918,15 @@ class BigWeightVAE(nn.Module):
 
         self.distribution_encoder = InputDistributionEncodingModule(cfg.distribution)
 
-        # Simple residual tokenizer.
+        # MLP-Mixer style patch tokenizer.
         d_patch = cfg.mini_vae.d_patch
-        self.patch_tokenizer = ResidualPatchTokenizer(
+        self.patch_tokenizer = MixerPatchTokenizer(
             p=p,
+            d_var=d_var,
             d_dist=d_dist,
             d_patch=d_patch,
-            hidden_dim=max(64, int(cfg.mini_vae.mlp_stub_hidden_dim)),
-            num_layers=3,
+            d_hidden=d_var,
+            num_mixer_layers=3,
             dropout=cfg.big_vae.dropout,
         )
 
@@ -1901,17 +1986,15 @@ class BigWeightVAE(nn.Module):
         # Global latent base: [L, d_lat]
         self.latent_base = nn.Parameter(torch.randn(num_latents, d_lat) * 0.02)
 
-        # Flatten latents → mu/logvar (like mini-VAE).
-        z_dim = cfg.mini_vae.z_dim
-        self.z_dim = z_dim
+        # z = flattened latents (no mu/logvar compression).
+        # z_dim = num_latents * d_lat.
+        self.z_dim = self.flat_lat_dim
         self.latent_norm = nn.LayerNorm(self.flat_lat_dim)
-        self.to_mu = nn.Linear(self.flat_lat_dim, z_dim)
-        self.to_logvar = nn.Linear(self.flat_lat_dim, z_dim)
 
         # --- Decoder: CrossAttnBlock (cross-attn + self-attn + FFN, all with RoPE) ---
-        # z → decoder latent tokens for KV.
-        self.dec_L_latents = max(1, int(cfg.mini_vae.decoder_L_latents))
-        self.z_to_latents = nn.Linear(z_dim, self.dec_L_latents * d_model)
+        # Decoder KV: reshape z back to [B, num_latents, d_lat], project to d_model.
+        self.dec_L_latents = num_latents
+        self.latent_to_decoder = nn.Linear(d_lat, d_model)
 
         # Decoder query construction with (o, t) positional encoding.
         self.pos_proj = nn.Linear(2 * cfg.big_vae.pos_fourier_dim, d_model)
@@ -1934,22 +2017,18 @@ class BigWeightVAE(nn.Module):
         self.output_s_max = 6.0
         self.direction_seq_norm_eps = 1e-6
 
-        # Z-shortcut: direct z + positional → p-dimensional direction, bypassing cross-attn.
+        # Z-shortcut: project z to d_model first (avoids 8192-wide expansion), then
+        # combine with positional embeddings → p-dimensional direction.
+        self.z_shortcut_proj = nn.Linear(self.flat_lat_dim, d_model)
         self.z_shortcut = nn.Sequential(
-            nn.Linear(z_dim + d_model, d_model),
+            nn.Linear(d_model + d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, p),
         )
 
     @staticmethod
-    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        eps = torch.randn_like(mu)
-        return mu + eps * torch.exp(0.5 * logvar)
-
-    @staticmethod
     def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        kl = 0.5 * torch.sum(torch.exp(logvar) + mu.pow(2) - 1.0 - logvar, dim=-1)
-        return kl.mean()
+        return mu.new_zeros(())
 
     @staticmethod
     def structural_recon_loss(W: torch.Tensor, W_hat: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -2035,15 +2114,19 @@ class BigWeightVAE(nn.Module):
         w_patches = W_pad.transpose(1, 2).contiguous().view(B, d_out, T, p)
 
         # ---------------------------------------------------------------------
-        # 3) Patch embedding using residual tokenizer.
+        # 3) Patch embedding using mixer tokenizer.
         # ---------------------------------------------------------------------
         dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
+        dist_var_expanded = dist_var_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1, -1)
         w_flat = w_patches.reshape(B * d_out * T, p)
         dist_patch_flat_expanded = dist_patch_expanded.reshape(B * d_out * T, d_dist)
+        dist_var_flat_expanded = dist_var_expanded.reshape(B * d_out * T, p, d_var)
 
         d_patch = self.cfg.mini_vae.d_patch
         patch_token_raw_flat = self.patch_tokenizer(
-            w_patch=w_flat, dist_patch_embed=dist_patch_flat_expanded,
+            w_patch=w_flat,
+            dist_var_tokens=dist_var_flat_expanded,
+            dist_patch_embed=dist_patch_flat_expanded,
         )
         patch_token_raw = patch_token_raw_flat.view(B, d_out, T, d_patch)
         patch_tokens = self.patch_token_proj(patch_token_raw)
@@ -2081,19 +2164,13 @@ class BigWeightVAE(nn.Module):
                 cross_attend_only_cls=self.cfg.big_vae.encoder.cross_attend_only_cls,
             )
 
-        # Flatten latents → mu/logvar.
-        latents_flat = self.latent_norm(latents.reshape(B, self.flat_lat_dim))
-        mu = self.to_mu(latents_flat)
-        logvar = self.to_logvar(latents_flat)
-        if bool(self.cfg.big_vae.use_latent_sampling):
-            z = self.reparameterize(mu=mu, logvar=logvar)
-        else:
-            z = mu
+        # Flatten latents → z (no mu/logvar compression).
+        z = self.latent_norm(latents.reshape(B, self.flat_lat_dim))
 
         # ---------------------------------------------------------------------
         # 5) Decoder: CrossAttnBlock + direction/scale decomposition.
         # ---------------------------------------------------------------------
-        lat = self.z_to_latents(z).view(B, self.dec_L_latents, d_model)
+        lat = self.latent_to_decoder(z.view(B, num_latents, d_lat))  # [B, num_latents, d_model]
 
         # Build (o, t) positional queries.
         o_idx = torch.arange(d_out, device=device)
@@ -2129,10 +2206,11 @@ class BigWeightVAE(nn.Module):
         q_dir = self._channel_norm_over_sequence(q_tokens, eps=self.direction_seq_norm_eps)
         u_hat_attn = self.direction_head(q_dir)  # [B, Q, p]
 
-        # Z-shortcut: z + positional → p-dim direction per patch.
-        z_exp = z.unsqueeze(1).expand(B, Q, -1)
+        # Z-shortcut: project z to d_model, then combine with positional → p-dim direction.
+        z_proj = self.z_shortcut_proj(z)  # [B, d_model]
+        z_exp = z_proj.unsqueeze(1).expand(B, Q, -1)  # [B, Q, d_model]
         pos_exp = q_pos_emb.reshape(1, Q, d_model).expand(B, -1, -1)
-        shortcut_in = torch.cat([z_exp, pos_exp], dim=-1)
+        shortcut_in = torch.cat([z_exp, pos_exp], dim=-1)  # [B, Q, 2*d_model]
         u_hat_shortcut = self.z_shortcut(shortcut_in)  # [B, Q, p]
 
         u_hat = (u_hat_attn + u_hat_shortcut).reshape(B * Q, p)  # [B*Q, p]
@@ -2152,9 +2230,9 @@ class BigWeightVAE(nn.Module):
         W_hat = W_hat_pad[:, :d_in, :]
 
         if squeeze_batch:
-            return W_hat.squeeze(0), mu.squeeze(0), logvar.squeeze(0)
+            return W_hat.squeeze(0), z.squeeze(0), z.new_zeros(self.z_dim)
 
-        return W_hat, mu, logvar
+        return W_hat, z, z.new_zeros(B, self.z_dim)
 
 
 # Backward-compat alias used in other files.
@@ -2190,11 +2268,16 @@ def _smoke_test() -> None:
 def smoke_test_big_weight_vae() -> None:
     torch.manual_seed(0)
 
+    p = 16
+    num_latents = 16
+    d_lat = 256
+    z_dim_expected = num_latents * d_lat
+
     cfg = ModelConfig(
-        patch_size=16,
+        patch_size=p,
         distribution=DistributionConfig(
             k_s=16, Kq=32, d_var=128, d_dist=128,
-            use_covariance=True, patch_size_for_cov=16,
+            use_covariance=True, patch_size_for_cov=p,
         ),
         mini_vae=MiniVAEConfig(
             z_dim=64,
@@ -2208,11 +2291,12 @@ def smoke_test_big_weight_vae() -> None:
         ),
         big_vae=BigVAEConfig(
             d_model=256,
-            d_lat=256,
-            num_latents=16,
+            d_lat=d_lat,
+            num_latents=num_latents,
             num_encoder_layers=2,
             num_decoder_layers=2,
             n_heads=8,
+            use_latent_sampling=False,
             encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
         ),
     )
@@ -2223,16 +2307,18 @@ def smoke_test_big_weight_vae() -> None:
     X = torch.randn(B, n, d_in)
     W = torch.randn(B, d_in, d_out)
 
-    W_hat, mu, logvar = model(W, X)
+    W_hat, z, logvar_dummy = model(W, X)
 
     assert tuple(W_hat.shape) == (B, d_in, d_out), f"W_hat shape mismatch: {tuple(W_hat.shape)}"
-    assert tuple(mu.shape) == (B, 64), f"mu shape mismatch: {tuple(mu.shape)}"
+    assert tuple(z.shape) == (B, z_dim_expected), f"z shape mismatch: {tuple(z.shape)}, expected {(B, z_dim_expected)}"
+    assert (logvar_dummy == 0).all(), "logvar dummy should be all zeros"
 
     # Test backward pass and gradient flow.
     behavioral_loss = BigWeightVAE.operator_recon_loss(X, W, W_hat)
     structural_loss = BigWeightVAE.structural_recon_loss(W, W_hat)
-    kl_loss = BigWeightVAE.kl_loss(mu, logvar)
-    total_loss = behavioral_loss + 0.5 * structural_loss + 0.001 * kl_loss
+    kl_loss = BigWeightVAE.kl_loss(z, logvar_dummy)
+    assert kl_loss.item() == 0.0, f"kl_loss should be 0, got {kl_loss.item()}"
+    total_loss = behavioral_loss + 0.5 * structural_loss
     total_loss.backward()
 
     # Check no NaN grads.
@@ -2241,8 +2327,8 @@ def smoke_test_big_weight_vae() -> None:
             assert torch.isfinite(param.grad).all(), f"Non-finite grad in {name}"
 
     print("smoke_test_big_weight_vae PASSED")
-    print(f"  W_hat: {tuple(W_hat.shape)}, behavioral={behavioral_loss.item():.4f}, "
-          f"structural={structural_loss.item():.4f}, kl={kl_loss.item():.4f}")
+    print(f"  W_hat: {tuple(W_hat.shape)}, z: {tuple(z.shape)}, "
+          f"behavioral={behavioral_loss.item():.4f}, structural={structural_loss.item():.4f}")
 
 
 if __name__ == "__main__":
