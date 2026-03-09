@@ -1183,6 +1183,7 @@ def _run_worker(
             if struct_loss_cfg is None:
                 struct_loss_cfg = {}
             struct_gamma = float(struct_loss_cfg.get("gamma", 0.5))
+            struct_lambda_dir = float(struct_loss_cfg.get("lambda_dir", 1.0))
             struct_lambda_scale = float(struct_loss_cfg.get("lambda_scale", 0.25))
             struct_lambda_rec = float(struct_loss_cfg.get("lambda_rec", 0.5))
             struct_lambda_rel = float(struct_loss_cfg.get("lambda_rel", 0.1))
@@ -1399,6 +1400,7 @@ def _run_worker(
                             structural_loss, struct_details = WeightQuantileVAE.patch_structure_loss(
                                 W_s, W_hat, patch_size=patch_size_for_slice,
                                 gamma=struct_gamma,
+                                lambda_dir=struct_lambda_dir,
                                 lambda_scale=struct_lambda_scale,
                                 lambda_rec=struct_lambda_rec,
                                 lambda_rel=struct_lambda_rel,

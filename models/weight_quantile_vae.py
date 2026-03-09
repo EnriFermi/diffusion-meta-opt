@@ -2047,6 +2047,7 @@ class BigWeightVAE(nn.Module):
         patch_size: int,
         eps: float = 1e-8,
         gamma: float = 0.5,
+        lambda_dir: float = 1.0,
         lambda_scale: float = 0.25,
         lambda_rec: float = 0.5,
         lambda_rel: float = 0.1,
@@ -2120,7 +2121,7 @@ class BigWeightVAE(nn.Module):
         G_hat = torch.bmm(u_hat, u_hat.transpose(1, 2))  # [N, T, T]
         L_rel = (G_hat - G).pow(2).mean()               # scalar
 
-        L = L_dir + lambda_scale * L_scale + lambda_rec * L_rec + lambda_rel * L_rel
+        L = lambda_dir * L_dir + lambda_scale * L_scale + lambda_rec * L_rec + lambda_rel * L_rel
 
         details = {
             "L_dir": L_dir.detach(),
