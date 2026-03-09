@@ -8,7 +8,7 @@ import os
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import hydra
 import torch
@@ -402,6 +402,25 @@ def _grad_l2_norm_for_params(params: list[nn.Parameter]) -> float:
         g = grad.detach()
         sum_sq += float((g * g).sum().item())
     return math.sqrt(sum_sq)
+
+
+def _clip_grad_norm_with_optional_foreach(
+    get_params: Callable[[], Any],
+    max_norm: float,
+    *,
+    use_foreach: bool,
+) -> Any:
+    """Use foreach clipping when available; gracefully fallback on older torch."""
+    try:
+        return torch.nn.utils.clip_grad_norm_(get_params(), max_norm, foreach=use_foreach)
+    except TypeError:
+        return torch.nn.utils.clip_grad_norm_(get_params(), max_norm)
+
+
+def _clip_return_to_float(clip_return: Any) -> float:
+    if torch.is_tensor(clip_return):
+        return float(clip_return.detach().item())
+    return float(clip_return)
 
 
 def compute_grad_stats(model: nn.Module) -> dict[str, float]:
@@ -1457,6 +1476,10 @@ def _run_worker(
                 monitor_layer_snapshot_this_step = grad_layer_monitor_enabled and (
                     global_step == 1 or (global_step % grad_layer_monitor_every_steps == 0)
                 )
+                collect_clip_diagnostics_this_step = rank == 0 and (
+                    monitor_layer_snapshot_this_step or (global_step % log_every == 0)
+                )
+                clip_use_foreach = device.type == "cuda"
                 layer_rms_pre_clip_snapshot: dict[str, float] | None = None
                 if monitor_layer_snapshot_this_step:
                     layer_rms_pre_clip_snapshot = collect_grad_rms_per_layer(
@@ -1475,13 +1498,24 @@ def _run_worker(
                     for group_name in grad_group_prefixes:
                         params = params_by_grad_group.get(group_name, [])
                         clip_limit = float(grad_clip_norm_by_part.get(group_name, grad_clip_norm))
+                        clip_return = None
+
+                        if params and clip_limit > 0.0:
+                            clip_return = _clip_grad_norm_with_optional_foreach(
+                                get_params=lambda params=params: params,
+                                max_norm=clip_limit,
+                                use_foreach=clip_use_foreach,
+                            )
+
+                        if not collect_clip_diagnostics_this_step:
+                            continue
+
                         if not params:
                             before_norm = 0.0
                             after_norm = 0.0
                             clip_coef = 1.0
                         elif clip_limit > 0.0:
-                            clip_return = torch.nn.utils.clip_grad_norm_(params, clip_limit)
-                            before_norm = float(clip_return)
+                            before_norm = _clip_return_to_float(clip_return) if clip_return is not None else 0.0
                             clip_coef = min(1.0, clip_limit / max(1e-12, before_norm))
                             after_norm = before_norm * clip_coef
                         else:
@@ -1492,28 +1526,35 @@ def _run_worker(
                         grad_clip_group_after[group_name] = float(after_norm)
                         grad_clip_group_coef[group_name] = float(clip_coef)
 
-                    grad_global_before_clip = math.sqrt(
-                        sum(float(value) * float(value) for value in grad_clip_group_before.values())
-                    )
-                    grad_global_after_clip = math.sqrt(
-                        sum(float(value) * float(value) for value in grad_clip_group_after.values())
-                    )
-                    grad_clip_coef = (
-                        grad_global_after_clip / max(1e-12, grad_global_before_clip)
-                        if grad_global_before_clip > 0.0
-                        else 1.0
-                    )
+                    if collect_clip_diagnostics_this_step:
+                        grad_global_before_clip = math.sqrt(
+                            sum(float(value) * float(value) for value in grad_clip_group_before.values())
+                        )
+                        grad_global_after_clip = math.sqrt(
+                            sum(float(value) * float(value) for value in grad_clip_group_after.values())
+                        )
+                        grad_clip_coef = (
+                            grad_global_after_clip / max(1e-12, grad_global_before_clip)
+                            if grad_global_before_clip > 0.0
+                            else 1.0
+                        )
                 elif grad_clip_norm > 0.0:
-                    clip_return = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                    grad_global_before_clip = float(clip_return)
-                    grad_clip_coef = min(1.0, float(grad_clip_norm) / max(1e-12, grad_global_before_clip))
-                    grad_global_after_clip = grad_global_before_clip * grad_clip_coef
+                    clip_return = _clip_grad_norm_with_optional_foreach(
+                        get_params=model.parameters,
+                        max_norm=grad_clip_norm,
+                        use_foreach=clip_use_foreach,
+                    )
+                    if collect_clip_diagnostics_this_step:
+                        grad_global_before_clip = _clip_return_to_float(clip_return)
+                        grad_clip_coef = min(1.0, float(grad_clip_norm) / max(1e-12, grad_global_before_clip))
+                        grad_global_after_clip = grad_global_before_clip * grad_clip_coef
                 else:
                     grad_global_before_clip = 0.0
                     grad_global_after_clip = 0.0
 
                 grad_stats: dict[str, float] = {}
-                if rank == 0:
+                collect_grad_stats_this_step = rank == 0 and (global_step % log_every == 0)
+                if collect_grad_stats_this_step:
                     grad_stats = compute_grad_stats(model)
                     if (not partwise_grad_clip_enabled) and grad_clip_norm <= 0.0:
                         grad_global_before_clip = float(grad_stats.get("grad/global_norm", 0.0))
