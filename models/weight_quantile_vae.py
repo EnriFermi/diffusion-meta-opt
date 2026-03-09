@@ -2041,13 +2041,94 @@ class BigWeightVAE(nn.Module):
         return mu.new_zeros(())
 
     @staticmethod
-    def structural_recon_loss(W: torch.Tensor, W_hat: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    def patch_structure_loss(
+        W: torch.Tensor,
+        W_hat: torch.Tensor,
+        patch_size: int,
+        eps: float = 1e-8,
+        gamma: float = 0.5,
+        lambda_scale: float = 0.25,
+        lambda_rec: float = 0.5,
+        lambda_rel: float = 0.1,
+        huber_delta: float = 0.1,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Patch-decomposed structural loss.
+
+        Decomposes both W and W_hat into per-patch (direction, scale), computes
+        four loss terms per output column, and averages over outputs.
+
+        Returns (total_loss, details_dict).
+        """
         if W.ndim == 2:
             W = W.unsqueeze(0)
             W_hat = W_hat.unsqueeze(0)
-        w_scale = W.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(float(eps))
-        diff = (W_hat - W) / w_scale
-        return diff.pow(2).mean()
+
+        B, d_in, d_out = W.shape
+        p = int(patch_size)
+        T = d_in // p
+        if T <= 0:
+            zero = W.new_zeros(())
+            return zero, {"L_dir": zero, "L_scale": zero, "L_rec": zero, "L_rel": zero}
+
+        used = T * p
+
+        # Patchify: [B, d_out, T, p]
+        X = W[:, :used, :].transpose(1, 2).contiguous().view(B, d_out, T, p)
+        X_hat = W_hat[:, :used, :].transpose(1, 2).contiguous().view(B, d_out, T, p)
+
+        # Per-output computation: [B*d_out, T, p]
+        N = B * d_out
+        X = X.reshape(N, T, p)
+        X_hat = X_hat.reshape(N, T, p)
+
+        # Target decomposition.
+        r = X.norm(dim=-1)                              # [N, T]
+        u = X / (r.unsqueeze(-1) + eps)                 # [N, T, p]
+        log_r = torch.log(r + eps)                      # [N, T]
+
+        # Prediction decomposition.
+        r_hat = X_hat.norm(dim=-1)                      # [N, T]
+        u_hat = X_hat / (r_hat.unsqueeze(-1) + eps)     # [N, T, p]
+        log_r_hat = torch.log(r_hat + eps)              # [N, T]
+
+        # Patch weights for direction term (larger patches matter more).
+        w = (r + eps) ** gamma                          # [N, T]
+        w = w / (w.sum(dim=1, keepdim=True) + eps)      # normalize per output
+
+        # 1) Direction loss.
+        cos = (u_hat * u).sum(dim=-1)                   # [N, T]
+        L_dir = (w * (1.0 - cos)).sum(dim=1).mean()     # scalar
+
+        # 2) Scale loss in log-space with Huber.
+        d = log_r_hat - log_r                           # [N, T]
+        abs_d = d.abs()
+        huber = torch.where(
+            abs_d <= huber_delta,
+            0.5 * d.pow(2),
+            huber_delta * (abs_d - 0.5 * huber_delta),
+        )
+        L_scale = huber.mean()                          # scalar
+
+        # 3) Relative reconstruction loss per patch.
+        rec_num = (X_hat - X).pow(2).sum(dim=-1)        # [N, T]
+        rec_den = r.pow(2) + eps                        # [N, T]
+        L_rec = (rec_num / rec_den).mean()              # scalar
+
+        # 4) Relation loss between patch directions (Gram matrices).
+        G = torch.bmm(u, u.transpose(1, 2))            # [N, T, T]
+        G_hat = torch.bmm(u_hat, u_hat.transpose(1, 2))  # [N, T, T]
+        L_rel = (G_hat - G).pow(2).mean()               # scalar
+
+        L = L_dir + lambda_scale * L_scale + lambda_rec * L_rec + lambda_rel * L_rel
+
+        details = {
+            "L_dir": L_dir.detach(),
+            "L_scale": L_scale.detach(),
+            "L_rec": L_rec.detach(),
+            "L_rel": L_rel.detach(),
+        }
+        return L, details
 
     @staticmethod
     def operator_recon_loss(X: torch.Tensor, W: torch.Tensor, W_hat: torch.Tensor) -> torch.Tensor:
@@ -2325,7 +2406,7 @@ def smoke_test_big_weight_vae() -> None:
 
     # Test backward pass and gradient flow.
     behavioral_loss = BigWeightVAE.operator_recon_loss(X, W, W_hat)
-    structural_loss = BigWeightVAE.structural_recon_loss(W, W_hat)
+    structural_loss, struct_details = BigWeightVAE.patch_structure_loss(W, W_hat, patch_size=cfg.patch_size)
     kl_loss = BigWeightVAE.kl_loss(z, logvar_dummy)
     assert kl_loss.item() == 0.0, f"kl_loss should be 0, got {kl_loss.item()}"
     total_loss = behavioral_loss + 0.5 * structural_loss
@@ -2339,6 +2420,7 @@ def smoke_test_big_weight_vae() -> None:
     print("smoke_test_big_weight_vae PASSED")
     print(f"  W_hat: {tuple(W_hat.shape)}, z: {tuple(z.shape)}, "
           f"behavioral={behavioral_loss.item():.4f}, structural={structural_loss.item():.4f}")
+    print(f"  struct details: " + ", ".join(f"{k}={v.item():.4f}" for k, v in struct_details.items()))
 
 
 if __name__ == "__main__":
