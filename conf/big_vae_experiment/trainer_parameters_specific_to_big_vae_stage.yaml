@@ -2,7 +2,7 @@ max_steps: 1000000
 grad_accum_steps: 16
 distributed: true
 num_gpus: 2
-compile: true
+compile: false
 compile_dynamic: true
 # Keep torch.compile while avoiding inductor CUDAGraph output-buffer reuse issues.
 compile_disable_cudagraphs: true
