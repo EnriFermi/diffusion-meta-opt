@@ -1,5 +1,5 @@
 max_steps: 1000000
-grad_accum_steps: 16
+grad_accum_steps: 1
 distributed: true
 num_gpus: 2
 
@@ -11,14 +11,14 @@ compile_disable_cudagraphs: true
 # Pull model artifacts up front to reduce collector cold-start stalls.
 predownload_models: true
 
-warmup_steps: 10000
+warmup_steps: 1000
 min_lr_ratio: 0.01
 kl_beta: 0.0
 lr: 5e-4
 
 behavioral_coef: 100.0
 structural_coef: 1.0
-scale_match_coef: 1000.0
+scale_match_coef: 10.0
 contrastive_coef: 0.0
 grad_clip_norm_by_part:
   distribution_encoder: 100.0
