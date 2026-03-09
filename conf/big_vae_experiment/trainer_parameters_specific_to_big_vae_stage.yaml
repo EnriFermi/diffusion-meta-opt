@@ -33,6 +33,8 @@ stage: 1
 stage_base_T_patches: 8
 stage_base_d_out: 8
 stage_scale_factor: 2
+# Cap rows in x to reduce rare heavy samples that can stall steps.
+max_x_rows: 512
 steps_per_sample: 10
 slice_batch_size: 16
 resume_checkpoint: ""
@@ -43,7 +45,7 @@ forensics:
 telemetry:
   grad_layer_monitor:
     enabled: true
-    every_steps: 10
+    every_steps: 20
     # Empty means monitor all trainable layers.
     include_prefixes: []
     weights_only: true
@@ -51,10 +53,10 @@ telemetry:
     save_csv: true
     reset_csv_on_start: true
     csv_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/grad_layer_rms.csv
-    save_plot: true
+    save_plot: false
     plot_every_steps: 100
     plot_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/grad_layer_rms.png
-    save_heatmap: true
+    save_heatmap: false
     heatmap_max_layers: 160
     heatmap_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/grad_layer_rms_heatmap.png
     log_scale: true
