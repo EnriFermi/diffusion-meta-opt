@@ -278,7 +278,6 @@ class CometTracker:
                 "train.kl_beta": float(train_cfg.get("kl_beta", 0.0)),
                 "train.behavioral_coef": float(train_cfg.get("behavioral_coef", 0.0)),
                 "train.structural_coef": float(train_cfg.get("structural_coef", 0.0)),
-                "train.scale_match_coef": float(train_cfg.get("scale_match_coef", 0.0)),
                 "model.patch_size": int(model_cfg.get("patch_size", 16)),
                 "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
                 "streaming.mode": str(streaming_cfg.get("mode", "none")),
@@ -1006,32 +1005,6 @@ def _slice_sample(
     return torch.stack(W_slices), torch.stack(x_slices)
 
 
-def _compute_patch_scales(
-    W: torch.Tensor,
-    *,
-    patch_size: int,
-    eps: float = 1e-12,
-) -> torch.Tensor:
-    """Return per-patch L2 scale tensor [B, d_out, T_used] for W in [B, d_in, d_out]."""
-    if patch_size <= 0:
-        raise ValueError(f"patch_size must be > 0, got {patch_size}")
-    if W.ndim == 2:
-        W = W.unsqueeze(0)
-    if W.ndim != 3:
-        raise ValueError(f"Expected rank-3 tensor [B,d_in,d_out], got {tuple(W.shape)}")
-
-    Wf = W.to(dtype=torch.float32)
-    bsz, d_in, d_out = Wf.shape
-    full_patches = int(d_in) // int(patch_size)
-    if full_patches <= 0:
-        return Wf.transpose(1, 2).norm(dim=-1, keepdim=True).clamp_min(float(eps))
-
-    used_rows = full_patches * int(patch_size)
-    patches = Wf[:, :used_rows, :].transpose(1, 2).contiguous().view(
-        bsz, d_out, full_patches, int(patch_size)
-    )
-    return patches.norm(dim=-1).clamp_min(float(eps))
-
 
 def _load_model_weights_from_checkpoint(
     model: torch.nn.Module,
@@ -1206,7 +1179,14 @@ def _run_worker(
             use_latent_sampling = bool(cfg_holder.cfg.big_vae.use_latent_sampling)
             behavioral_coef = float(cfg.train.get("behavioral_coef", 1.0))
             structural_coef = float(cfg.train.get("structural_coef", 0.5))
-            scale_match_coef = float(cfg.train.get("scale_match_coef", 1000.0))
+            struct_loss_cfg = cfg.train.get("struct_loss", {})
+            if struct_loss_cfg is None:
+                struct_loss_cfg = {}
+            struct_gamma = float(struct_loss_cfg.get("gamma", 0.5))
+            struct_lambda_scale = float(struct_loss_cfg.get("lambda_scale", 0.25))
+            struct_lambda_rec = float(struct_loss_cfg.get("lambda_rec", 0.5))
+            struct_lambda_rel = float(struct_loss_cfg.get("lambda_rel", 0.1))
+            struct_huber_delta = float(struct_loss_cfg.get("huber_delta", 0.1))
             grad_clip_norm = float(cfg.train.get("grad_clip_norm", 1.0))
             grad_clip_norm_by_part_raw = cfg.train.get("grad_clip_norm_by_part", {})
             if grad_clip_norm_by_part_raw is None:
@@ -1310,11 +1290,10 @@ def _run_worker(
             if rank == 0:
                 logger.info("Steps per sample: %s", steps_per_sample)
                 logger.info(
-                    "BigVAE latent mode: %s (use_latent_sampling=%s, kl_beta=%s, scale_match_coef=%s)",
+                    "BigVAE latent mode: %s (use_latent_sampling=%s, kl_beta=%s)",
                     "VAE" if use_latent_sampling else "AE",
                     use_latent_sampling,
                     kl_beta,
-                    scale_match_coef,
                 )
                 if unknown_clip_groups:
                     logger.warning(
@@ -1350,10 +1329,10 @@ def _run_worker(
             behavioral_window = 0.0
             structural_window = 0.0
             kl_window = 0.0
-            scale_match_window = 0.0
-            pred_scale_window = 0.0
-            target_scale_window = 0.0
-            scale_ratio_window = 0.0
+            struct_dir_window = 0.0
+            struct_scale_window = 0.0
+            struct_rec_window = 0.0
+            struct_rel_window = 0.0
             window_steps = 0
             t0 = time.time()
             grad_layer_history: dict[str, list[tuple[int, float]]] = {}
@@ -1396,10 +1375,10 @@ def _run_worker(
                 behavioral_acc = 0.0
                 structural_acc = 0.0
                 kl_acc = 0.0
-                scale_match_acc = 0.0
-                pred_scale_acc = 0.0
-                target_scale_acc = 0.0
-                scale_ratio_acc = 0.0
+                struct_dir_acc = 0.0
+                struct_scale_acc = 0.0
+                struct_rec_acc = 0.0
+                struct_rel_acc = 0.0
                 step_is_finite = True
 
                 for micro_idx in range(grad_accum_steps):
@@ -1417,10 +1396,14 @@ def _run_worker(
                         with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
                             W_hat, mu, logvar = model(W_s, x_s)
                             behavioral_loss = WeightQuantileVAE.operator_recon_loss(x_s, W_s, W_hat)
-                            structural_loss = WeightQuantileVAE.structural_recon_loss(W_s, W_hat)
-                            pred_patch_scales = _compute_patch_scales(W_hat, patch_size=patch_size_for_slice)
-                            target_patch_scales = _compute_patch_scales(W_s, patch_size=patch_size_for_slice)
-                            scale_match_loss = torch.nn.functional.mse_loss(pred_patch_scales, target_patch_scales)
+                            structural_loss, struct_details = WeightQuantileVAE.patch_structure_loss(
+                                W_s, W_hat, patch_size=patch_size_for_slice,
+                                gamma=struct_gamma,
+                                lambda_scale=struct_lambda_scale,
+                                lambda_rec=struct_lambda_rec,
+                                lambda_rel=struct_lambda_rel,
+                                huber_delta=struct_huber_delta,
+                            )
                             if use_latent_sampling:
                                 kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
                             else:
@@ -1428,7 +1411,6 @@ def _run_worker(
                             total_loss = (
                                 behavioral_coef * behavioral_loss
                                 + structural_coef * structural_loss
-                                + scale_match_coef * scale_match_loss
                                 + kl_beta * kl_loss
                             )
                             loss_for_backward = total_loss / grad_accum_steps
@@ -1453,13 +1435,10 @@ def _run_worker(
                     behavioral_acc += float(behavioral_loss.detach().item())
                     structural_acc += float(structural_loss.detach().item())
                     kl_acc += float(kl_loss.detach().item())
-                    scale_match_acc += float(scale_match_loss.detach().item())
-                    pred_scale_mean = float(pred_patch_scales.detach().mean().item())
-                    target_scale_mean = float(target_patch_scales.detach().mean().item())
-                    pred_to_target_scale_ratio = pred_scale_mean / max(1e-12, target_scale_mean)
-                    pred_scale_acc += float(pred_scale_mean)
-                    target_scale_acc += float(target_scale_mean)
-                    scale_ratio_acc += float(pred_to_target_scale_ratio)
+                    struct_dir_acc += float(struct_details["L_dir"].detach().item())
+                    struct_scale_acc += float(struct_details["L_scale"].detach().item())
+                    struct_rec_acc += float(struct_details["L_rec"].detach().item())
+                    struct_rel_acc += float(struct_details["L_rel"].detach().item())
 
                     if not step_is_finite:
                         break
@@ -1731,10 +1710,10 @@ def _run_worker(
                 step_behavioral = behavioral_acc / grad_accum_steps
                 step_structural = structural_acc / grad_accum_steps
                 step_kl = kl_acc / grad_accum_steps
-                step_scale_match = scale_match_acc / grad_accum_steps
-                step_pred_scale = pred_scale_acc / grad_accum_steps
-                step_target_scale = target_scale_acc / grad_accum_steps
-                step_scale_ratio = scale_ratio_acc / grad_accum_steps
+                step_struct_dir = struct_dir_acc / grad_accum_steps
+                step_struct_scale = struct_scale_acc / grad_accum_steps
+                step_struct_rec = struct_rec_acc / grad_accum_steps
+                step_struct_rel = struct_rel_acc / grad_accum_steps
 
                 stats = torch.tensor(
                     [
@@ -1742,10 +1721,10 @@ def _run_worker(
                         step_behavioral,
                         step_structural,
                         step_kl,
-                        step_scale_match,
-                        step_pred_scale,
-                        step_target_scale,
-                        step_scale_ratio,
+                        step_struct_dir,
+                        step_struct_scale,
+                        step_struct_rec,
+                        step_struct_rel,
                     ],
                     dtype=torch.float32, device=device,
                 )
@@ -1757,10 +1736,10 @@ def _run_worker(
                 behavioral_window += float(stats[1].item())
                 structural_window += float(stats[2].item())
                 kl_window += float(stats[3].item())
-                scale_match_window += float(stats[4].item())
-                pred_scale_window += float(stats[5].item())
-                target_scale_window += float(stats[6].item())
-                scale_ratio_window += float(stats[7].item())
+                struct_dir_window += float(stats[4].item())
+                struct_scale_window += float(stats[5].item())
+                struct_rec_window += float(stats[6].item())
+                struct_rel_window += float(stats[7].item())
                 window_steps += 1
 
                 if rank == 0 and global_step % log_every == 0:
@@ -1769,28 +1748,28 @@ def _run_worker(
                     avg_behavioral = behavioral_window / max(1, window_steps)
                     avg_structural = structural_window / max(1, window_steps)
                     avg_kl = kl_window / max(1, window_steps)
-                    avg_scale_match = scale_match_window / max(1, window_steps)
-                    avg_pred_scale = pred_scale_window / max(1, window_steps)
-                    avg_target_scale = target_scale_window / max(1, window_steps)
-                    avg_scale_ratio = scale_ratio_window / max(1, window_steps)
+                    avg_struct_dir = struct_dir_window / max(1, window_steps)
+                    avg_struct_scale = struct_scale_window / max(1, window_steps)
+                    avg_struct_rec = struct_rec_window / max(1, window_steps)
+                    avg_struct_rel = struct_rel_window / max(1, window_steps)
                     lr = float(optimizer.param_groups[0]["lr"])
                     speed = window_steps / dt
 
                     cache_metric = dataset.cache_size() if dataset is not None else 0
                     logger.info(
-                        "step=%s/%s loss=%.6f behav=%.6f struct=%.6f kl=%.6f scale_match=%.6f "
-                        "pred_scale=%.6f target_scale=%.6f scale_ratio=%.6f "
-                        "lr=%.6e steps/s=%.2f cache=%s",
+                        "step=%s/%s loss=%.6f behav=%.6f struct=%.6f "
+                        "s_dir=%.6f s_scl=%.6f s_rec=%.6f s_rel=%.6f "
+                        "kl=%.6f lr=%.6e steps/s=%.2f cache=%s",
                         global_step,
                         max_steps,
                         avg_loss,
                         avg_behavioral,
                         avg_structural,
+                        avg_struct_dir,
+                        avg_struct_scale,
+                        avg_struct_rec,
+                        avg_struct_rel,
                         avg_kl,
-                        avg_scale_match,
-                        avg_pred_scale,
-                        avg_target_scale,
-                        avg_scale_ratio,
                         lr,
                         speed,
                         cache_metric,
@@ -1801,10 +1780,10 @@ def _run_worker(
                             "train/behavioral_loss": float(avg_behavioral),
                             "train/structural_loss": float(avg_structural),
                             "train/kl_loss": float(avg_kl),
-                            "train/scale_match_loss": float(avg_scale_match),
-                            "train/pred_scale_mean": float(avg_pred_scale),
-                            "train/target_scale_mean": float(avg_target_scale),
-                            "train/pred_to_target_scale_ratio": float(avg_scale_ratio),
+                            "train/struct_dir": float(avg_struct_dir),
+                            "train/struct_scale": float(avg_struct_scale),
+                            "train/struct_rec": float(avg_struct_rec),
+                            "train/struct_rel": float(avg_struct_rel),
                             "train/lr": float(lr),
                             "train/steps_per_sec": float(speed),
                             "data/cache_size": float(cache_metric),
@@ -1898,10 +1877,10 @@ def _run_worker(
                     behavioral_window = 0.0
                     structural_window = 0.0
                     kl_window = 0.0
-                    scale_match_window = 0.0
-                    pred_scale_window = 0.0
-                    target_scale_window = 0.0
-                    scale_ratio_window = 0.0
+                    struct_dir_window = 0.0
+                    struct_scale_window = 0.0
+                    struct_rec_window = 0.0
+                    struct_rel_window = 0.0
                     window_steps = 0
                     t0 = time.time()
 

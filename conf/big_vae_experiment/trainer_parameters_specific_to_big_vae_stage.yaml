@@ -18,8 +18,13 @@ lr: 5e-4
 
 behavioral_coef: 100.0
 structural_coef: 1.0
-scale_match_coef: 10.0
 contrastive_coef: 0.0
+struct_loss:
+  gamma: 0.5
+  lambda_scale: 0.25
+  lambda_rec: 0.5
+  lambda_rel: 0.1
+  huber_delta: 0.1
 grad_clip_norm_by_part:
   distribution_encoder: 100.0
   patch_tokenizer: 100.0
