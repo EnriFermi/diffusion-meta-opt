@@ -119,11 +119,16 @@ def _rope_attention(
     """
     q_rot = _apply_rope(q, q_pos)
     k_rot = _apply_rope(k, k_pos)
-    attn_scores = torch.matmul(q_rot, k_rot.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
-    attn_probs = torch.softmax(attn_scores, dim=-1)
-    if dropout_p > 0.0:
-        attn_probs = F.dropout(attn_probs, p=dropout_p, training=training)
-    return torch.matmul(attn_probs, v)
+    # Let SDPA handle scaling internally to avoid SymInt pow(-1/2) in torch.compile(dynamic=True).
+    attn_dropout = float(dropout_p) if training else 0.0
+    return F.scaled_dot_product_attention(
+        q_rot,
+        k_rot,
+        v,
+        attn_mask=None,
+        dropout_p=attn_dropout,
+        is_causal=False,
+    )
 
 
 class RoPeMixed2D(nn.Module):
@@ -212,11 +217,16 @@ def _rope_attention_with_angles(
     """
     q_rot = _apply_rope_with_angles(q, q_angles)
     k_rot = _apply_rope_with_angles(k, k_angles)
-    attn_scores = torch.matmul(q_rot, k_rot.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
-    attn_probs = torch.softmax(attn_scores, dim=-1)
-    if dropout_p > 0.0:
-        attn_probs = F.dropout(attn_probs, p=dropout_p, training=training)
-    return torch.matmul(attn_probs, v)
+    # Let SDPA handle scaling internally to avoid SymInt pow(-1/2) in torch.compile(dynamic=True).
+    attn_dropout = float(dropout_p) if training else 0.0
+    return F.scaled_dot_product_attention(
+        q_rot,
+        k_rot,
+        v,
+        attn_mask=None,
+        dropout_p=attn_dropout,
+        is_causal=False,
+    )
 
 
 def _init_vae_module_weights(
