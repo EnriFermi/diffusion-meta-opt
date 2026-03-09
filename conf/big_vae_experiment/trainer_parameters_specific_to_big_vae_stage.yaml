@@ -36,7 +36,7 @@ stage_base_d_out: 8
 stage_scale_factor: 2
 # Cap rows in x to reduce rare heavy samples that can stall steps.
 max_x_rows: 512
-steps_per_sample: 10
+steps_per_sample: 100000000
 slice_batch_size: 16
 resume_checkpoint: ""
 
