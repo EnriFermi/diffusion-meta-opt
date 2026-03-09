@@ -16,13 +16,13 @@ min_lr_ratio: 0.01
 kl_beta: 0.0
 lr: 5e-4
 
-behavioral_coef: 100.0
+behavioral_coef: 0.0
 structural_coef: 1.0
 contrastive_coef: 0.0
 struct_loss:
   gamma: 0.5
-  lambda_scale: 0.25
-  lambda_rec: 0.5
+  lambda_scale: 0.0
+  lambda_rec: 1.0
   lambda_rel: 0.1
   huber_delta: 0.1
 grad_clip_norm_by_part:
@@ -31,7 +31,7 @@ grad_clip_norm_by_part:
   encoder: 100.0
   decoder: 100.0
   big_vae_other: 100.0
-
+ 
 checkpoint_every: 500
 checkpoint_dir: ${training_artifacts.big_vae_checkpoint_dir}
 
