@@ -39,6 +39,15 @@ stage: 1
 stage_base_T_patches: 8
 stage_base_d_out: 8
 stage_scale_factor: 2
+# Optional synthetic data mode for quick smoke/debug runs.
+# When enabled, train loop samples x and W from Normal and does not start collectors.
+synthetic_layer_source:
+  enabled: false
+  n_rows: 256
+  d_in: 1024
+  d_out: 1024
+  x_std: 1.0
+  w_std: 1.0
 # Cap rows in x to reduce rare heavy samples that can stall steps.
 max_x_rows: 512
 steps_per_sample: 10
