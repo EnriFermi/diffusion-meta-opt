@@ -2093,46 +2093,74 @@ class BigWeightVAE(nn.Module):
         u = X / (r.unsqueeze(-1) + eps)                 # [N, T, p]
         log_r = torch.log(r + eps)                      # [N, T]
 
-        # Prediction decomposition.
-        r_hat = X_hat.norm(dim=-1)                      # [N, T]
-        u_hat = X_hat / (r_hat.unsqueeze(-1) + eps)     # [N, T, p]
-        log_r_hat = torch.log(r_hat + eps)              # [N, T]
+        use_dir = float(lambda_dir) != 0.0
+        use_scale = float(lambda_scale) != 0.0
+        use_rec = float(lambda_rec) != 0.0
+        use_rel = float(lambda_rel) != 0.0
 
-        # Use direct direction head outputs for L_dir if provided.
-        # pred_dirs may have more patches (ceil division + padding in forward),
-        # slice to match the floor-division T used here.
-        if pred_dirs is not None:
-            u_hat_dir = pred_dirs[:, :, :T, :].reshape(N, T, p)
-        else:
-            u_hat_dir = u_hat
+        zero = X.new_zeros(())
+        L_dir = zero
+        L_scale = zero
+        L_rec = zero
+        L_rel = zero
 
-        # Patch weights for direction term (larger patches matter more).
-        w = (r + eps) ** gamma                          # [N, T]
-        w = w / (w.sum(dim=1, keepdim=True) + eps)      # normalize per output
+        r_hat: torch.Tensor | None = None
+        u_hat: torch.Tensor | None = None
+        log_r_hat: torch.Tensor | None = None
 
-        # 1) Direction loss (on raw head outputs when available).
-        cos = (u_hat_dir * u).sum(dim=-1)               # [N, T]
-        L_dir = (w * (1.0 - cos)).sum(dim=1).mean()     # scalar
+        def _ensure_r_hat() -> torch.Tensor:
+            nonlocal r_hat
+            if r_hat is None:
+                r_hat = X_hat.norm(dim=-1)
+            return r_hat
 
-        # 2) Scale loss in log-space with Huber.
-        d = log_r_hat - log_r                           # [N, T]
-        abs_d = d.abs()
-        huber = torch.where(
-            abs_d <= huber_delta,
-            0.5 * d.pow(2),
-            huber_delta * (abs_d - 0.5 * huber_delta),
-        )
-        L_scale = huber.mean()                          # scalar
+        def _ensure_u_hat() -> torch.Tensor:
+            nonlocal u_hat
+            if u_hat is None:
+                current_r_hat = _ensure_r_hat()
+                u_hat = X_hat / (current_r_hat.unsqueeze(-1) + eps)
+            return u_hat
 
-        # 3) Relative reconstruction loss per patch.
-        rec_num = (X_hat - X).pow(2).sum(dim=-1)        # [N, T]
-        rec_den = r.pow(2) + eps                        # [N, T]
-        L_rec = (rec_num / rec_den).mean()              # scalar
+        def _ensure_log_r_hat() -> torch.Tensor:
+            nonlocal log_r_hat
+            if log_r_hat is None:
+                log_r_hat = torch.log(_ensure_r_hat() + eps)
+            return log_r_hat
 
-        # 4) Relation loss between patch directions (Gram matrices).
-        G = torch.bmm(u, u.transpose(1, 2))            # [N, T, T]
-        G_hat = torch.bmm(u_hat, u_hat.transpose(1, 2))  # [N, T, T]
-        L_rel = (G_hat - G).pow(2).mean()               # scalar
+        if use_dir:
+            if pred_dirs is not None:
+                # pred_dirs may have more patches (ceil division + padding in forward),
+                # slice to match the floor-division T used here.
+                u_hat_dir = pred_dirs[:, :, :T, :].reshape(N, T, p)
+            else:
+                u_hat_dir = _ensure_u_hat()
+
+            # Patch weights for direction term (larger patches matter more).
+            w = (r + eps) ** gamma                      # [N, T]
+            w = w / (w.sum(dim=1, keepdim=True) + eps)  # normalize per output
+            cos = (u_hat_dir * u).sum(dim=-1)           # [N, T]
+            L_dir = (w * (1.0 - cos)).sum(dim=1).mean()  # scalar
+
+        if use_scale:
+            d = _ensure_log_r_hat() - log_r            # [N, T]
+            abs_d = d.abs()
+            huber = torch.where(
+                abs_d <= huber_delta,
+                0.5 * d.pow(2),
+                huber_delta * (abs_d - 0.5 * huber_delta),
+            )
+            L_scale = huber.mean()                     # scalar
+
+        if use_rec:
+            rec_num = (X_hat - X).pow(2).sum(dim=-1)   # [N, T]
+            rec_den = r.pow(2) + eps                   # [N, T]
+            L_rec = (rec_num / rec_den).mean()         # scalar
+
+        if use_rel:
+            current_u_hat = _ensure_u_hat()
+            G = torch.bmm(u, u.transpose(1, 2))        # [N, T, T]
+            G_hat = torch.bmm(current_u_hat, current_u_hat.transpose(1, 2))  # [N, T, T]
+            L_rel = (G_hat - G).pow(2).mean()          # scalar
 
         L = lambda_dir * L_dir + lambda_scale * L_scale + lambda_rec * L_rec + lambda_rel * L_rel
 
@@ -2169,7 +2197,19 @@ class BigWeightVAE(nn.Module):
         patch_idx_t = patch_idx_t.clamp(max=max(0, d_in - 1))
         return patch_idx_t, T, d_in_pad
 
-    def forward(self, W: torch.Tensor, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        W: torch.Tensor,
+        X: torch.Tensor,
+        *,
+        return_direction_pre_norms: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         if W.ndim not in {2, 3}:
             raise ValueError(f"W must be rank-2 or rank-3, got {tuple(W.shape)}")
         if X.ndim not in {2, 3}:
@@ -2319,6 +2359,7 @@ class BigWeightVAE(nn.Module):
         u_hat_shortcut = self.z_shortcut(shortcut_in)  # [B, Q, p]
 
         u_hat = (u_hat_attn + u_hat_shortcut).reshape(B * Q, p)  # [B*Q, p]
+        direction_pre_norms = u_hat.norm(dim=-1)  # [B*Q]
 
         # Scale: one scalar per patch from mean-pooled decoder output.
         s_hat = self.scale_head(q_tokens).reshape(B * Q)  # [B*Q]
@@ -2339,9 +2380,20 @@ class BigWeightVAE(nn.Module):
         W_hat = W_hat_pad[:, :d_in, :]
 
         if squeeze_batch:
-            return W_hat.squeeze(0), z.squeeze(0), z.new_zeros(self.z_dim), pred_dirs.squeeze(0)
+            outputs = (
+                W_hat.squeeze(0),
+                z.squeeze(0),
+                z.new_zeros(self.z_dim),
+                pred_dirs.squeeze(0),
+            )
+            if return_direction_pre_norms:
+                return outputs + (direction_pre_norms,)
+            return outputs
 
-        return W_hat, z, z.new_zeros(B, self.z_dim), pred_dirs
+        outputs = (W_hat, z, z.new_zeros(B, self.z_dim), pred_dirs)
+        if return_direction_pre_norms:
+            return outputs + (direction_pre_norms,)
+        return outputs
 
 
 # Backward-compat alias used in other files.

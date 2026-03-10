@@ -1023,6 +1023,43 @@ def _slice_sample(
     return torch.stack(W_slices), torch.stack(x_slices)
 
 
+def _tensor_debug_stats(tensor: torch.Tensor | None) -> dict[str, Any]:
+    if tensor is None:
+        return {"is_none": True}
+
+    detached = tensor.detach()
+    flat = detached.reshape(-1)
+    numel = int(flat.numel())
+    finite_mask = torch.isfinite(flat)
+    finite_count = int(finite_mask.sum().item())
+    nan_count = int(torch.isnan(flat).sum().item())
+    inf_count = int(torch.isinf(flat).sum().item())
+    payload: dict[str, Any] = {
+        "shape": list(detached.shape),
+        "dtype": str(detached.dtype),
+        "device": str(detached.device),
+        "numel": numel,
+        "finite_count": finite_count,
+        "nan_count": nan_count,
+        "inf_count": inf_count,
+    }
+    if finite_count > 0:
+        finite_values = flat[finite_mask]
+        payload["min"] = float(finite_values.min().item())
+        payload["max"] = float(finite_values.max().item())
+        payload["abs_max"] = float(finite_values.abs().max().item())
+        payload["mean"] = float(finite_values.mean().item())
+        payload["std"] = float(finite_values.std(unbiased=False).item())
+    return payload
+
+
+def _scalar_debug_value(tensor: torch.Tensor) -> float | str:
+    value = tensor.detach()
+    if value.numel() != 1:
+        return f"<non_scalar shape={tuple(value.shape)}>"
+    scalar = value.item()
+    return float(scalar) if isinstance(scalar, (int, float)) else str(scalar)
+
 
 def _load_model_weights_from_checkpoint(
     model: torch.nn.Module,
@@ -1411,6 +1448,7 @@ def _run_worker(
             current_W: torch.Tensor | None = None
             fixed_batch_x: torch.Tensor | None = None
             fixed_batch_W: torch.Tensor | None = None
+            direction_pre_norm_stats_latest: dict[str, Any] | None = None
 
             for step_idx in range(max_steps):
                 global_step = step_idx + 1
@@ -1518,7 +1556,15 @@ def _run_worker(
                         if use_cudagraph_step_begin:
                             cudagraph_step_begin()
                         with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
-                            W_hat, mu, logvar, pred_dirs = model(W_s, x_s)
+                            direction_pre_norms: torch.Tensor | None = None
+                            if fixed_training_batch_enabled:
+                                W_hat, mu, logvar, pred_dirs, direction_pre_norms = model(
+                                    W_s,
+                                    x_s,
+                                    return_direction_pre_norms=True,
+                                )
+                            else:
+                                W_hat, mu, logvar, pred_dirs = model(W_s, x_s)
                             behavioral_loss = WeightQuantileVAE.operator_recon_loss(x_s, W_s, W_hat)
                             structural_loss, struct_details = WeightQuantileVAE.patch_structure_loss(
                                 W_s, W_hat, patch_size=patch_size_for_slice,
@@ -1541,8 +1587,44 @@ def _run_worker(
                             )
                             loss_for_backward = total_loss / grad_accum_steps
 
+                        if rank == 0 and fixed_training_batch_enabled and direction_pre_norms is not None:
+                            direction_pre_norm_stats_latest = _tensor_debug_stats(direction_pre_norms)
+
+                        local_loss_is_finite = bool(torch.isfinite(loss_for_backward.detach()).item())
+                        if not local_loss_is_finite:
+                            non_finite_payload = {
+                                "step": int(global_step),
+                                "micro_step": int(micro_idx),
+                                "rank": int(rank),
+                                "fixed_training_batch": bool(fixed_training_batch_enabled),
+                                "synthetic_layer_source": bool(synthetic_layer_enabled),
+                                "loss": {
+                                    "total": _scalar_debug_value(total_loss),
+                                    "behavioral": _scalar_debug_value(behavioral_loss),
+                                    "structural": _scalar_debug_value(structural_loss),
+                                    "kl": _scalar_debug_value(kl_loss),
+                                    "struct_dir": _scalar_debug_value(struct_details["L_dir"]),
+                                    "struct_scale": _scalar_debug_value(struct_details["L_scale"]),
+                                    "struct_rec": _scalar_debug_value(struct_details["L_rec"]),
+                                    "struct_rel": _scalar_debug_value(struct_details["L_rel"]),
+                                },
+                                "tensors": {
+                                    "x_s": _tensor_debug_stats(x_s),
+                                    "W_s": _tensor_debug_stats(W_s),
+                                    "W_hat": _tensor_debug_stats(W_hat),
+                                    "mu": _tensor_debug_stats(mu),
+                                    "logvar": _tensor_debug_stats(logvar),
+                                    "pred_dirs": _tensor_debug_stats(pred_dirs),
+                                    "direction_pre_norms": _tensor_debug_stats(direction_pre_norms),
+                                },
+                            }
+                            logger.warning(
+                                "Non-finite local loss detected: %s",
+                                json.dumps(non_finite_payload, ensure_ascii=False),
+                            )
+
                         finite_flag = torch.tensor(
-                            1 if torch.isfinite(loss_for_backward.detach()) else 0,
+                            1 if local_loss_is_finite else 0,
                             dtype=torch.int32,
                             device=device,
                         )
@@ -1900,6 +1982,20 @@ def _run_worker(
                         speed,
                         cache_metric,
                     )
+                    if fixed_training_batch_enabled and direction_pre_norm_stats_latest is not None:
+                        logger.info(
+                            "direction_pre_norm step=%s mean=%.6f std=%.6f min=%.6f max=%.6f "
+                            "finite=%s/%s nan=%s inf=%s",
+                            global_step,
+                            float(direction_pre_norm_stats_latest.get("mean", 0.0)),
+                            float(direction_pre_norm_stats_latest.get("std", 0.0)),
+                            float(direction_pre_norm_stats_latest.get("min", 0.0)),
+                            float(direction_pre_norm_stats_latest.get("max", 0.0)),
+                            int(direction_pre_norm_stats_latest.get("finite_count", 0)),
+                            int(direction_pre_norm_stats_latest.get("numel", 0)),
+                            int(direction_pre_norm_stats_latest.get("nan_count", 0)),
+                            int(direction_pre_norm_stats_latest.get("inf_count", 0)),
+                        )
                     if comet_tracker is not None and comet_tracker.enabled:
                         comet_metrics: dict[str, float] = {
                             "train/loss": float(avg_loss),
