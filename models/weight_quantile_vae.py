@@ -2052,12 +2052,17 @@ class BigWeightVAE(nn.Module):
         lambda_rec: float = 0.5,
         lambda_rel: float = 0.1,
         huber_delta: float = 0.1,
+        pred_dirs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Patch-decomposed structural loss.
 
         Decomposes both W and W_hat into per-patch (direction, scale), computes
         four loss terms per output column, and averages over outputs.
+
+        If pred_dirs is provided ([B, d_out, T, p] normalized directions from the
+        direction head), L_dir is computed directly on them instead of re-extracting
+        from W_hat.
 
         Returns (total_loss, details_dict).
         """
@@ -2093,12 +2098,20 @@ class BigWeightVAE(nn.Module):
         u_hat = X_hat / (r_hat.unsqueeze(-1) + eps)     # [N, T, p]
         log_r_hat = torch.log(r_hat + eps)              # [N, T]
 
+        # Use direct direction head outputs for L_dir if provided.
+        # pred_dirs may have more patches (ceil division + padding in forward),
+        # slice to match the floor-division T used here.
+        if pred_dirs is not None:
+            u_hat_dir = pred_dirs[:, :, :T, :].reshape(N, T, p)
+        else:
+            u_hat_dir = u_hat
+
         # Patch weights for direction term (larger patches matter more).
         w = (r + eps) ** gamma                          # [N, T]
         w = w / (w.sum(dim=1, keepdim=True) + eps)      # normalize per output
 
-        # 1) Direction loss.
-        cos = (u_hat * u).sum(dim=-1)                   # [N, T]
+        # 1) Direction loss (on raw head outputs when available).
+        cos = (u_hat_dir * u).sum(dim=-1)               # [N, T]
         L_dir = (w * (1.0 - cos)).sum(dim=1).mean()     # scalar
 
         # 2) Scale loss in log-space with Huber.
@@ -2316,15 +2329,19 @@ class BigWeightVAE(nn.Module):
             eps=self.output_eps, s_min=self.output_s_min, s_max=self.output_s_max,
         )  # [B*Q, p]
 
+        # Normalized predicted directions: [B, d_out, T, p]
+        u_hat_norm = u_hat / (u_hat.norm(dim=-1, keepdim=True) + self.output_eps)
+        pred_dirs = u_hat_norm.view(B, d_out, T, p)
+
         # Stitch patches back to matrix.
         w_hat_patches = w_hat_flat.view(B, d_out, T, p)
         W_hat_pad = w_hat_patches.view(B, d_out, d_in_pad).transpose(1, 2)
         W_hat = W_hat_pad[:, :d_in, :]
 
         if squeeze_batch:
-            return W_hat.squeeze(0), z.squeeze(0), z.new_zeros(self.z_dim)
+            return W_hat.squeeze(0), z.squeeze(0), z.new_zeros(self.z_dim), pred_dirs.squeeze(0)
 
-        return W_hat, z, z.new_zeros(B, self.z_dim)
+        return W_hat, z, z.new_zeros(B, self.z_dim), pred_dirs
 
 
 # Backward-compat alias used in other files.
@@ -2399,7 +2416,7 @@ def smoke_test_big_weight_vae() -> None:
     X = torch.randn(B, n, d_in)
     W = torch.randn(B, d_in, d_out)
 
-    W_hat, z, logvar_dummy = model(W, X)
+    W_hat, z, logvar_dummy, pred_dirs = model(W, X)
 
     assert tuple(W_hat.shape) == (B, d_in, d_out), f"W_hat shape mismatch: {tuple(W_hat.shape)}"
     assert tuple(z.shape) == (B, z_dim_expected), f"z shape mismatch: {tuple(z.shape)}, expected {(B, z_dim_expected)}"
@@ -2407,7 +2424,7 @@ def smoke_test_big_weight_vae() -> None:
 
     # Test backward pass and gradient flow.
     behavioral_loss = BigWeightVAE.operator_recon_loss(X, W, W_hat)
-    structural_loss, struct_details = BigWeightVAE.patch_structure_loss(W, W_hat, patch_size=cfg.patch_size)
+    structural_loss, struct_details = BigWeightVAE.patch_structure_loss(W, W_hat, patch_size=cfg.patch_size, pred_dirs=pred_dirs)
     kl_loss = BigWeightVAE.kl_loss(z, logvar_dummy)
     assert kl_loss.item() == 0.0, f"kl_loss should be 0, got {kl_loss.item()}"
     total_loss = behavioral_loss + 0.5 * structural_loss

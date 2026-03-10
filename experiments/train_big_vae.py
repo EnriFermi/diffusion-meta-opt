@@ -953,6 +953,24 @@ def _fetch_batch(
     )
 
 
+def _sample_synthetic_layer(
+    *,
+    device: torch.device,
+    n_rows: int,
+    d_in: int,
+    d_out: int,
+    x_std: float,
+    w_std: float,
+    max_x_rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    effective_n_rows = int(n_rows)
+    if max_x_rows > 0:
+        effective_n_rows = min(effective_n_rows, int(max_x_rows))
+    x = torch.randn((effective_n_rows, int(d_in)), device=device, dtype=torch.float32) * float(x_std)
+    W = torch.randn((int(d_in), int(d_out)), device=device, dtype=torch.float32) * float(w_std)
+    return x, W
+
+
 def _compute_curriculum_slice_sizes(cfg: DictConfig) -> tuple[int, int]:
     train_cfg = cfg.get("train", {})
     stage = max(1, int(train_cfg.get("stage", 1)))
@@ -1068,6 +1086,24 @@ def _run_worker(
     streaming_mode = str(cfg.streaming.get("mode", "none")).lower()
     dataset_sharding = bool(cfg.train.get("use_dataset_sharding", True)) and is_distributed and streaming_mode != "none"
     use_broadcast = is_distributed and not dataset_sharding
+    synthetic_layer_cfg = cfg.train.get("synthetic_layer_source", {})
+    if synthetic_layer_cfg is None:
+        synthetic_layer_cfg = {}
+    if not isinstance(synthetic_layer_cfg, (dict, DictConfig)):
+        raise TypeError("train.synthetic_layer_source must be a mapping")
+    synthetic_layer_enabled = bool(synthetic_layer_cfg.get("enabled", False))
+    synthetic_n_rows = max(1, int(synthetic_layer_cfg.get("n_rows", 256)))
+    synthetic_d_in = max(1, int(synthetic_layer_cfg.get("d_in", 1024)))
+    synthetic_d_out = max(1, int(synthetic_layer_cfg.get("d_out", 1024)))
+    synthetic_x_std = float(synthetic_layer_cfg.get("x_std", 1.0))
+    synthetic_w_std = float(synthetic_layer_cfg.get("w_std", 1.0))
+    if synthetic_x_std <= 0.0:
+        raise ValueError(f"train.synthetic_layer_source.x_std must be > 0, got {synthetic_x_std}")
+    if synthetic_w_std <= 0.0:
+        raise ValueError(f"train.synthetic_layer_source.w_std must be > 0, got {synthetic_w_std}")
+    if synthetic_layer_enabled:
+        dataset_sharding = False
+        use_broadcast = False
 
     if dataset_sharding:
         cfg.streaming.distributed.enabled = True
@@ -1090,6 +1126,15 @@ def _run_worker(
         streaming_mode,
         dataset_sharding,
     )
+    if synthetic_layer_enabled:
+        logger.info(
+            "Synthetic layer source enabled: collectors disabled, x~N(0,%.4f), W~N(0,%.4f), n_rows=%s d_in=%s d_out=%s",
+            synthetic_x_std,
+            synthetic_w_std,
+            synthetic_n_rows,
+            synthetic_d_in,
+            synthetic_d_out,
+        )
 
     model = None
     optimizer = None
@@ -1104,29 +1149,30 @@ def _run_worker(
         dataset_iter: Iterator[Any] | None = None
 
         with contextlib.ExitStack() as stack:
-            if rank == 0:
-                dataset, collector = stack.enter_context(
-                    data_pipeline(
-                        cfg,
-                        logger=logger,
-                        emit_run_report=True,
-                        rank=rank,
+            if not synthetic_layer_enabled:
+                if rank == 0:
+                    dataset, collector = stack.enter_context(
+                        data_pipeline(
+                            cfg,
+                            logger=logger,
+                            emit_run_report=True,
+                            rank=rank,
+                        )
                     )
-                )
-                dataset_iter = iter(dataset)
-            elif dataset_sharding:
-                # Consumer-only wrapper over shared chunk stream.
-                dataset, collector = stack.enter_context(
-                    data_pipeline(
-                        cfg,
-                        start_collector=False,
-                        predownload_models=False,
-                        logger=logger,
-                        emit_run_report=False,
-                        rank=rank,
+                    dataset_iter = iter(dataset)
+                elif dataset_sharding:
+                    # Consumer-only wrapper over shared chunk stream.
+                    dataset, collector = stack.enter_context(
+                        data_pipeline(
+                            cfg,
+                            start_collector=False,
+                            predownload_models=False,
+                            logger=logger,
+                            emit_run_report=False,
+                            rank=rank,
+                        )
                     )
-                )
-                dataset_iter = iter(dataset)
+                    dataset_iter = iter(dataset)
 
             model_cfg = _build_model_cfg(cfg)
             model = WeightQuantileVAE(model_cfg).to(device)
@@ -1363,14 +1409,25 @@ def _run_worker(
                     dataset.maybe_collect(step_idx)
 
                 if current_x is None or step_idx % steps_per_sample == 0:
-                    current_x, current_W = _fetch_batch(
-                        rank=rank,
-                        device=device,
-                        dataset_iter=dataset_iter,
-                        use_broadcast=use_broadcast,
-                        max_x_rows=max_x_rows,
-                        logger=logger,
-                    )
+                    if synthetic_layer_enabled:
+                        current_x, current_W = _sample_synthetic_layer(
+                            device=device,
+                            n_rows=synthetic_n_rows,
+                            d_in=synthetic_d_in,
+                            d_out=synthetic_d_out,
+                            x_std=synthetic_x_std,
+                            w_std=synthetic_w_std,
+                            max_x_rows=max_x_rows,
+                        )
+                    else:
+                        current_x, current_W = _fetch_batch(
+                            rank=rank,
+                            device=device,
+                            dataset_iter=dataset_iter,
+                            use_broadcast=use_broadcast,
+                            max_x_rows=max_x_rows,
+                            logger=logger,
+                        )
 
                 loss_acc = 0.0
                 behavioral_acc = 0.0
@@ -1395,7 +1452,7 @@ def _run_worker(
                         if use_cudagraph_step_begin:
                             cudagraph_step_begin()
                         with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
-                            W_hat, mu, logvar = model(W_s, x_s)
+                            W_hat, mu, logvar, pred_dirs = model(W_s, x_s)
                             behavioral_loss = WeightQuantileVAE.operator_recon_loss(x_s, W_s, W_hat)
                             structural_loss, struct_details = WeightQuantileVAE.patch_structure_loss(
                                 W_s, W_hat, patch_size=patch_size_for_slice,
@@ -1405,6 +1462,7 @@ def _run_worker(
                                 lambda_rec=struct_lambda_rec,
                                 lambda_rel=struct_lambda_rel,
                                 huber_delta=struct_huber_delta,
+                                pred_dirs=pred_dirs,
                             )
                             if use_latent_sampling:
                                 kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
