@@ -1097,6 +1097,12 @@ def _run_worker(
     synthetic_d_out = max(1, int(synthetic_layer_cfg.get("d_out", 1024)))
     synthetic_x_std = float(synthetic_layer_cfg.get("x_std", 1.0))
     synthetic_w_std = float(synthetic_layer_cfg.get("w_std", 1.0))
+    fixed_batch_cfg = cfg.train.get("fixed_training_batch", {})
+    if fixed_batch_cfg is None:
+        fixed_batch_cfg = {}
+    if not isinstance(fixed_batch_cfg, (dict, DictConfig)):
+        raise TypeError("train.fixed_training_batch must be a mapping")
+    fixed_training_batch_enabled = bool(fixed_batch_cfg.get("enabled", False))
     if synthetic_x_std <= 0.0:
         raise ValueError(f"train.synthetic_layer_source.x_std must be > 0, got {synthetic_x_std}")
     if synthetic_w_std <= 0.0:
@@ -1134,6 +1140,10 @@ def _run_worker(
             synthetic_n_rows,
             synthetic_d_in,
             synthetic_d_out,
+        )
+    if fixed_training_batch_enabled:
+        logger.info(
+            "Fixed training batch enabled: one curriculum-sliced batch will be captured once and reused for the whole run"
         )
 
     model = None
@@ -1399,16 +1409,33 @@ def _run_worker(
 
             current_x: torch.Tensor | None = None
             current_W: torch.Tensor | None = None
+            fixed_batch_x: torch.Tensor | None = None
+            fixed_batch_W: torch.Tensor | None = None
 
             for step_idx in range(max_steps):
                 global_step = step_idx + 1
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
 
-                if rank == 0 and collector is not None and dataset is not None and not collector.is_async_mode:
+                if (
+                    rank == 0
+                    and collector is not None
+                    and dataset is not None
+                    and not collector.is_async_mode
+                    and (not fixed_training_batch_enabled or fixed_batch_x is None or fixed_batch_W is None)
+                ):
                     dataset.maybe_collect(step_idx)
 
-                if current_x is None or step_idx % steps_per_sample == 0:
+                should_refresh_source_sample = False
+                if fixed_training_batch_enabled:
+                    should_refresh_source_sample = (
+                        (fixed_batch_x is None or fixed_batch_W is None)
+                        and (current_x is None or current_W is None)
+                    )
+                else:
+                    should_refresh_source_sample = current_x is None or step_idx % steps_per_sample == 0
+
+                if should_refresh_source_sample:
                     if synthetic_layer_enabled:
                         current_x, current_W = _sample_synthetic_layer(
                             device=device,
@@ -1442,7 +1469,46 @@ def _run_worker(
                 for micro_idx in range(grad_accum_steps):
                     sync_grad = micro_idx == grad_accum_steps - 1
 
-                    W_s, x_s = _slice_sample(current_W, current_x, curriculum_max_T, curriculum_max_d_out, patch_size_for_slice, batch_size=slice_batch_size)
+                    if fixed_training_batch_enabled:
+                        if fixed_batch_x is None or fixed_batch_W is None:
+                            if current_x is None or current_W is None:
+                                raise RuntimeError("fixed training batch capture requires a loaded source sample")
+                            fixed_batch_W, fixed_batch_x = _slice_sample(
+                                current_W,
+                                current_x,
+                                curriculum_max_T,
+                                curriculum_max_d_out,
+                                patch_size_for_slice,
+                                batch_size=slice_batch_size,
+                            )
+                            current_x = None
+                            current_W = None
+                            if rank == 0:
+                                logger.info(
+                                    "Captured fixed training batch at step=%s: W=%s x=%s",
+                                    global_step,
+                                    tuple(fixed_batch_W.shape),
+                                    tuple(fixed_batch_x.shape),
+                                )
+                            if dataset is not None:
+                                dataset.close()
+                                dataset = None
+                            if collector is not None:
+                                collector.shutdown()
+                                collector = None
+                            dataset_iter = None
+                        W_s, x_s = fixed_batch_W, fixed_batch_x
+                    else:
+                        if current_x is None or current_W is None:
+                            raise RuntimeError("training step requires a loaded source sample")
+                        W_s, x_s = _slice_sample(
+                            current_W,
+                            current_x,
+                            curriculum_max_T,
+                            curriculum_max_d_out,
+                            patch_size_for_slice,
+                            batch_size=slice_batch_size,
+                        )
 
                     no_sync_ctx = contextlib.nullcontext()
                     if is_distributed and not sync_grad:
