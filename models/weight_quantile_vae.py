@@ -1459,12 +1459,18 @@ class MixerPatchTokenizer(nn.Module):
                 nn.Linear(self.p, self.p),
                 nn.Dropout(float(dropout)),
             ))
-
+        
         # Final projection: mean-pooled features + dist_patch_embed → d_patch.
+        d_reduction = (self.d_patch + self.p - 1) // self.p
+
+        self.reduction_proj = nn.Linear(d_hidden, d_reduction) 
+
         self.final_proj = nn.Sequential(
-            nn.Linear(d_hidden + int(d_dist), d_hidden),
+            nn.Linear(self.p * d_reduction + int(d_dist), d_hidden),
             nn.GELU(),
-            nn.Linear(d_hidden, d_patch),
+            nn.Linear(self.d_patch, d_patch),
+            nn.GELU(),
+            nn.Linear(self.d_patch, d_patch),
         )
 
     def forward(
@@ -1497,10 +1503,10 @@ class MixerPatchTokenizer(nn.Module):
             x = x_t.transpose(1, 2)  # [B, p, d_hidden]
 
         # Mean-pool over weight positions.
-        x_pool = x.mean(dim=1)  # [B, d_hidden]
+        x_pool = self.reduction_proj(x).flatten(start_dim=1)  # [B, d_reduction]
 
         # Concat dist_patch_embed and project to d_patch.
-        x_cat = torch.cat([x_pool, dist_patch_embed], dim=-1)  # [B, d_hidden + d_dist]
+        x_cat = torch.cat([x_pool, dist_patch_embed], dim=-1)  # [B, p + d_dist]
         return self.final_proj(x_cat)  # [B, d_patch]
 
 
@@ -2020,6 +2026,7 @@ class BigWeightVAE(nn.Module):
 
         # Direction/scale decomposition output (like mini-VAE).
         # Each decoder query = one patch (o,t), so heads output p-dimensional direction.
+        self.q_tokens_norm = nn.LayerNorm(d_model)
         self.direction_head = nn.Linear(d_model, p)
         self.scale_head = nn.Linear(d_model, 1)
         self.output_eps = 1e-6
@@ -2348,7 +2355,8 @@ class BigWeightVAE(nn.Module):
             )
 
         # Direction head: [B, Q, d_model] → [B, Q, p] (p-dim direction per patch).
-        q_dir = self._channel_norm_over_sequence(q_tokens, eps=self.direction_seq_norm_eps)
+        q_dir = self.q_tokens_norm(q_tokens)
+        # q_dir = self._channel_norm_over_sequence(q_tokens, eps=self.direction_seq_norm_eps)
         u_hat_attn = self.direction_head(q_dir)  # [B, Q, p]
 
         # Z-shortcut: project z to d_model, then combine with positional → p-dim direction.
