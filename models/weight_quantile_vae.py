@@ -1468,9 +1468,9 @@ class MixerPatchTokenizer(nn.Module):
         self.final_proj = nn.Sequential(
             nn.Linear(self.p * d_reduction + int(d_dist), d_hidden),
             nn.GELU(),
-            nn.Linear(self.d_patch, d_patch),
+            nn.Linear(d_hidden, d_patch),
             nn.GELU(),
-            nn.Linear(self.d_patch, d_patch),
+            nn.Linear(d_patch, d_patch),
         )
 
     def forward(
