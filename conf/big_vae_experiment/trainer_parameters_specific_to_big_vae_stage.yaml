@@ -24,7 +24,7 @@ struct_loss:
   lambda_scale: 0.0
   lambda_rec: 0.0
   lambda_dir: 1.0
-  lambda_rel: 0.1
+  lambda_rel: 0.0
   huber_delta: 0.1
 grad_clip_norm_by_part:
   distribution_encoder: 100.0
