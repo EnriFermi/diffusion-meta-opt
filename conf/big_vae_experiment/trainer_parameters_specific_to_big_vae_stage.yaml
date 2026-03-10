@@ -49,6 +49,11 @@ synthetic_layer_source:
   d_out: 1024
   x_std: 1.0
   w_std: 1.0
+# Optional one-batch overfit mode.
+# When enabled, train loop captures one already-sliced training batch once and
+# reuses it for the full run instead of reslicing on every micro-step.
+fixed_training_batch:
+  enabled: false
 # Cap rows in x to reduce rare heavy samples that can stall steps.
 max_x_rows: 512
 steps_per_sample: 100000000
