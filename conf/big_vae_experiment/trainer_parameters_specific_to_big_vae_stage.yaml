@@ -14,6 +14,7 @@ predownload_models: true
 warmup_steps: 1000
 min_lr_ratio: 0.01
 kl_beta: 0.0
+weight_decay: 0.0
 lr: 5e-4
 
 behavioral_coef: 0.0
@@ -45,15 +46,15 @@ stage_scale_factor: 2
 synthetic_layer_source:
   enabled: false
   n_rows: 256
-  d_in: 1024
-  d_out: 1024
+  d_in: 256
+  d_out: 32
   x_std: 1.0
   w_std: 1.0
 # Optional one-batch overfit mode.
 # When enabled, train loop captures one already-sliced training batch once and
 # reuses it for the full run instead of reslicing on every micro-step.
 fixed_training_batch:
-  enabled: false
+  enabled: true
 # Cap rows in x to reduce rare heavy samples that can stall steps.
 max_x_rows: 512
 steps_per_sample: 100000000
@@ -61,7 +62,7 @@ slice_batch_size: 16
 resume_checkpoint: ""
 
 forensics:
-  stdio_redirect: false
+  stdio_redirect: true
 
 telemetry:
   grad_layer_monitor:
