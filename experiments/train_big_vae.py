@@ -483,6 +483,65 @@ def compute_grad_stats(model: nn.Module) -> dict[str, float]:
     return payload
 
 
+def _collect_nonfinite_grad_report(
+    model: nn.Module,
+    *,
+    max_items: int = 12,
+) -> dict[str, Any] | None:
+    groups = _grad_stat_group_prefixes()
+    total_bad_tensors = 0
+    total_nan = 0
+    total_inf = 0
+    items: list[dict[str, Any]] = []
+
+    for raw_name, param in model.named_parameters():
+        if not param.requires_grad or param.grad is None:
+            continue
+
+        grad = param.grad.detach()
+        finite_mask = torch.isfinite(grad)
+        if bool(finite_mask.all().item()):
+            continue
+
+        total_bad_tensors += 1
+        nan_count = int(torch.isnan(grad).sum().item())
+        inf_count = int(torch.isinf(grad).sum().item())
+        total_nan += nan_count
+        total_inf += inf_count
+
+        if len(items) >= int(max_items):
+            continue
+
+        name = _strip_ddp_prefix(raw_name)
+        item: dict[str, Any] = {
+            "name": name,
+            "layer": _layer_key_from_param_name(name),
+            "group": _grad_group_name_for_param(name, groups),
+            "shape": list(grad.shape),
+            "dtype": str(grad.dtype),
+            "device": str(grad.device),
+            "nan_count": nan_count,
+            "inf_count": inf_count,
+            "finite_count": int(finite_mask.sum().item()),
+        }
+        if item["finite_count"] > 0:
+            finite_vals = grad[finite_mask]
+            item["finite_abs_max"] = float(finite_vals.abs().max().item())
+            item["finite_mean"] = float(finite_vals.mean().item())
+            item["finite_std"] = float(finite_vals.std(unbiased=False).item())
+        items.append(item)
+
+    if total_bad_tensors == 0:
+        return None
+
+    return {
+        "bad_tensors": int(total_bad_tensors),
+        "total_nan": int(total_nan),
+        "total_inf": int(total_inf),
+        "items": items,
+    }
+
+
 def collect_grad_rms_per_layer(
     model: nn.Module,
     *,
@@ -1503,6 +1562,7 @@ def _run_worker(
                 struct_rec_acc = 0.0
                 struct_rel_acc = 0.0
                 step_is_finite = True
+                step_invalid_reason: str | None = None
 
                 for micro_idx in range(grad_accum_steps):
                     sync_grad = micro_idx == grad_accum_steps - 1
@@ -1633,11 +1693,47 @@ def _run_worker(
 
                         if int(finite_flag.item()) == 0:
                             step_is_finite = False
+                            step_invalid_reason = "non-finite loss"
                         else:
                             if scaler.is_enabled():
                                 scaler.scale(loss_for_backward).backward()
                             else:
                                 loss_for_backward.backward()
+
+                            local_bad_grad_report = _collect_nonfinite_grad_report(model, max_items=12)
+                            local_grads_finite = local_bad_grad_report is None
+                            grad_finite_flag = torch.tensor(
+                                1 if local_grads_finite else 0,
+                                dtype=torch.int32,
+                                device=device,
+                            )
+                            if is_distributed:
+                                dist.all_reduce(grad_finite_flag, op=dist.ReduceOp.MIN)
+
+                            if not local_grads_finite:
+                                grad_payload = {
+                                    "step": int(global_step),
+                                    "micro_step": int(micro_idx),
+                                    "rank": int(rank),
+                                    "amp_enabled": bool(scaler.is_enabled()),
+                                    "fixed_training_batch": bool(fixed_training_batch_enabled),
+                                    "synthetic_layer_source": bool(synthetic_layer_enabled),
+                                    "report": local_bad_grad_report,
+                                }
+                                logger.warning(
+                                    "Non-finite gradients detected: %s",
+                                    json.dumps(grad_payload, ensure_ascii=False),
+                                )
+
+                            if int(grad_finite_flag.item()) == 0:
+                                step_is_finite = False
+                                step_invalid_reason = "non-finite gradients"
+                                if local_grads_finite and rank == 0:
+                                    logger.warning(
+                                        "Non-finite gradients detected on another rank: step=%s micro_step=%s",
+                                        global_step,
+                                        micro_idx,
+                                    )
 
                     loss_acc += float(total_loss.detach().item())
                     behavioral_acc += float(behavioral_loss.detach().item())
@@ -1654,7 +1750,11 @@ def _run_worker(
                 if not step_is_finite:
                     optimizer.zero_grad(set_to_none=True)
                     if rank == 0:
-                        logger.warning("Skipping step %s due to non-finite loss", global_step)
+                        logger.warning(
+                            "Skipping step %s due to %s",
+                            global_step,
+                            step_invalid_reason or "non-finite values",
+                        )
                     continue
 
                 if scaler.is_enabled():
