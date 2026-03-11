@@ -2,11 +2,19 @@
 
 Документ описывает все параметры моделей и связанных конфигов в текущей кодовой базе:
 
-- `models/weight_quantile_vae.py`
+- `models/weight_quantile_vae.py` (backward-compatible re-export shim)
+- `models/distribution_encoder.py`
+- `models/mini_patch_vae.py`
+- `models/patch_tokenizers.py`
+- `models/big_weight_vae.py`
+- `models/vae_shared.py`
 - `pretrain_mini_patch_vae.py`
 - `conf/model/weight_quantile_vae.yaml`
 - `conf/mini_model/mini_patch_vae.yaml`
 - `conf/mini_train/default.yaml`
+
+Основная реализация больше не лежит в одном файле: `models/weight_quantile_vae.py`
+сохранен для обратной совместимости и просто реэкспортирует публичные классы.
 
 ## Modules
 
