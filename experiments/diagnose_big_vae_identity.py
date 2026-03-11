@@ -976,7 +976,12 @@ def _experiment_2(
     seed = int(cfg.diagnostics.get("seed", 0)) + 202
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
-    random_logits = torch.randn(frozen.u_target.shape, generator=generator, dtype=frozen.u_target.dtype)
+    # Sample deterministically on CPU, then move to match the frozen target device.
+    random_logits = torch.randn(
+        frozen.u_target.shape,
+        generator=generator,
+        dtype=frozen.u_target.dtype,
+    ).to(device=frozen.u_target.device)
 
     rows: list[dict[str, Any]] = []
     for idx in range(steps):
