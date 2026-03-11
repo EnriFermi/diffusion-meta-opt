@@ -2204,12 +2204,238 @@ class BigWeightVAE(nn.Module):
         patch_idx_t = patch_idx_t.clamp(max=max(0, d_in - 1))
         return patch_idx_t, T, d_in_pad
 
+    def _encode_distribution_context(
+        self,
+        X: torch.Tensor,
+        *,
+        d_in: int,
+    ) -> tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if X.ndim != 3:
+            raise ValueError(f"X must be rank-3 [B, n, d_in], got {tuple(X.shape)}")
+
+        B, n, d_in_x = X.shape
+        if d_in_x != d_in:
+            raise ValueError(f"X last dim ({d_in_x}) must match d_in ({d_in})")
+
+        device = X.device
+        p = self.cfg.patch_size
+        patch_idx_t, T, d_in_pad = self._build_patch_indices(d_in=d_in, patch_size=p, device=device)
+        patch_idx_bt = patch_idx_t.unsqueeze(0).expand(B, -1, -1).contiguous()
+        X_rep = X.unsqueeze(1).expand(B, T, n, d_in).reshape(B * T, n, d_in)
+        patch_idx_flat = patch_idx_bt.reshape(B * T, p)
+
+        dist_var_flat, dist_patch_flat = self.distribution_encoder(X_rep, patch_idx_flat)
+
+        d_var = self.cfg.distribution.d_var
+        d_dist = self.cfg.distribution.d_dist
+        dist_var_by_patch = dist_var_flat.view(B, T, p, d_var)
+        dist_patch_by_patch = dist_patch_flat.view(B, T, d_dist)
+        dist_var_pooled = dist_var_by_patch.mean(dim=2)
+        return T, d_in_pad, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled
+
+    def _encode_latent_slots(
+        self,
+        W: torch.Tensor,
+        *,
+        T: int,
+        d_in_pad: int,
+        dist_var_by_patch: torch.Tensor,
+        dist_patch_by_patch: torch.Tensor,
+        dist_var_pooled: torch.Tensor,
+    ) -> torch.Tensor:
+        if W.ndim != 3:
+            raise ValueError(f"W must be rank-3 [B, d_in, d_out], got {tuple(W.shape)}")
+
+        B, d_in, d_out = W.shape
+        p = self.cfg.patch_size
+        d_var = self.cfg.distribution.d_var
+        d_dist = self.cfg.distribution.d_dist
+
+        if tuple(dist_var_by_patch.shape[:3]) != (B, T, p):
+            raise ValueError(
+                "dist_var_by_patch must be [B, T, p, d_var], got "
+                f"{tuple(dist_var_by_patch.shape)} for expected {(B, T, p, d_var)}"
+            )
+        if int(dist_var_by_patch.shape[3]) != d_var:
+            raise ValueError(f"dist_var_by_patch last dim must be {d_var}, got {int(dist_var_by_patch.shape[3])}")
+        if tuple(dist_patch_by_patch.shape[:2]) != (B, T):
+            raise ValueError(
+                "dist_patch_by_patch must be [B, T, d_dist], got "
+                f"{tuple(dist_patch_by_patch.shape)} for expected {(B, T, d_dist)}"
+            )
+        if int(dist_patch_by_patch.shape[2]) != d_dist:
+            raise ValueError(f"dist_patch_by_patch last dim must be {d_dist}, got {int(dist_patch_by_patch.shape[2])}")
+        if tuple(dist_var_pooled.shape[:2]) != (B, T):
+            raise ValueError(
+                "dist_var_pooled must be [B, T, d_var], got "
+                f"{tuple(dist_var_pooled.shape)} for expected {(B, T, d_var)}"
+            )
+
+        W_pad = torch.zeros(B, d_in_pad, d_out, device=W.device, dtype=W.dtype)
+        W_pad[:, :d_in, :] = W
+        w_patches = W_pad.transpose(1, 2).contiguous().view(B, d_out, T, p)
+
+        dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
+        dist_var_expanded = dist_var_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1, -1)
+        w_flat = w_patches.reshape(B * d_out * T, p)
+        dist_patch_flat_expanded = dist_patch_expanded.reshape(B * d_out * T, d_dist)
+        dist_var_flat_expanded = dist_var_expanded.reshape(B * d_out * T, p, d_var)
+
+        d_patch = self.cfg.mini_vae.d_patch
+        patch_token_raw_flat = self.patch_tokenizer(
+            w_patch=w_flat,
+            dist_var_tokens=dist_var_flat_expanded,
+            dist_patch_embed=dist_patch_flat_expanded,
+        )
+        patch_token_raw = patch_token_raw_flat.view(B, d_out, T, d_patch)
+        patch_tokens = self.patch_token_proj(patch_token_raw)
+
+        cls_tokens = self.cls_token.view(1, 1, 1, -1).expand(B, d_out, 1, -1)
+        tokens_by_output = torch.cat([cls_tokens, patch_tokens], dim=2)
+
+        dist_var_for_inject = dist_var_pooled.unsqueeze(1).expand(-1, d_out, -1, -1)
+        dist_var_global = dist_var_pooled.mean(dim=1)
+
+        latents = self.latent_base.unsqueeze(0).expand(B, -1, -1)
+        num_latents = self.cfg.big_vae.num_latents
+        d_lat = self.cfg.big_vae.d_lat
+
+        for layer_idx, enc_layer in enumerate(self.encoder_layers):
+            cls_part = tokens_by_output[:, :, :1, :]
+            patch_part = tokens_by_output[:, :, 1:, :]
+            patch_with_dist = torch.cat([patch_part, dist_var_for_inject], dim=-1)
+            patch_part = self.enc_dist_inject_projs[layer_idx](patch_with_dist)
+            tokens_by_output = torch.cat([cls_part, patch_part], dim=2)
+
+            dist_lat_delta = self.enc_dist_to_latent_heads[layer_idx](dist_var_global)
+            latents = latents + dist_lat_delta.view(B, num_latents, d_lat)
+
+            tokens_by_output, latents = enc_layer(
+                tokens_by_output=tokens_by_output,
+                latents=latents,
+                cross_attend_only_cls=self.cfg.big_vae.encoder.cross_attend_only_cls,
+            )
+
+        return latents
+
+    def _decode_from_latent_slots(
+        self,
+        latent_slots: torch.Tensor,
+        *,
+        dist_patch_by_patch: torch.Tensor,
+        d_in: int,
+        d_out: int,
+        d_in_pad: int,
+        T: int,
+        return_direction_pre_norms: bool = False,
+        disable_z_shortcut: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        if latent_slots.ndim != 3:
+            raise ValueError(f"latent_slots must be [B, num_latents, d_lat], got {tuple(latent_slots.shape)}")
+
+        B, num_latents, d_lat = latent_slots.shape
+        expected_num_latents = int(self.cfg.big_vae.num_latents)
+        expected_d_lat = int(self.cfg.big_vae.d_lat)
+        if num_latents != expected_num_latents or d_lat != expected_d_lat:
+            raise ValueError(
+                "latent_slots shape mismatch: "
+                f"got {(B, num_latents, d_lat)}, expected (*, {expected_num_latents}, {expected_d_lat})"
+            )
+        if tuple(dist_patch_by_patch.shape[:2]) != (B, T):
+            raise ValueError(
+                "dist_patch_by_patch must be [B, T, d_dist], got "
+                f"{tuple(dist_patch_by_patch.shape)} for expected {(B, T, self.cfg.distribution.d_dist)}"
+            )
+
+        p = self.cfg.patch_size
+        expected_d_in_pad = T * p
+        if d_in_pad != expected_d_in_pad:
+            raise ValueError(f"d_in_pad must equal T*patch_size={expected_d_in_pad}, got {d_in_pad}")
+
+        d_model = self.cfg.big_vae.d_model
+        z = self.latent_norm(latent_slots.reshape(B, self.flat_lat_dim))
+        lat = self.latent_to_decoder(z.view(B, num_latents, d_lat))
+
+        dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
+        device = latent_slots.device
+        o_idx = torch.arange(d_out, device=device)
+        t_idx = torch.arange(T, device=device)
+        o_grid, t_grid = torch.meshgrid(o_idx, t_idx, indexing="ij")
+
+        pos_dim = self.cfg.big_vae.pos_fourier_dim
+        pos_o = sinusoidal_embedding(o_grid.to(torch.float32), pos_dim)
+        pos_t = sinusoidal_embedding(t_grid.to(torch.float32), pos_dim)
+        pos_ot = torch.cat([pos_o, pos_t], dim=-1)
+
+        q_base = self.pos_proj(pos_ot)
+        q_pos_emb = self.query_pos_proj(q_base)
+        q_base_expanded = q_base.unsqueeze(0).expand(B, -1, -1, -1)
+        q_cond_cat = torch.cat([q_base_expanded, dist_patch_expanded], dim=-1)
+        q_tokens = self.query_proj(q_cond_cat).reshape(B, d_out * T, d_model)
+
+        Q = d_out * T
+        q_pos_o = o_grid.flatten().to(dtype=torch.float32)
+        q_pos_t = t_grid.flatten().to(dtype=torch.float32)
+        kv_pos = torch.arange(self.dec_L_latents, device=device, dtype=torch.float32)
+
+        for dec_layer in self.decoder_layers:
+            q_tokens = dec_layer(
+                q=q_tokens,
+                kv=lat,
+                q_pos=q_pos_o,
+                kv_pos=kv_pos,
+                q_pos2=q_pos_t,
+                kv_pos2=kv_pos,
+            )
+
+        q_dir = self.q_tokens_norm(q_tokens)
+        u_hat_attn = self.direction_head(q_dir)
+
+        if disable_z_shortcut:
+            u_hat_shortcut = torch.zeros_like(u_hat_attn)
+        else:
+            z_proj = self.z_shortcut_proj(z)
+            z_exp = z_proj.unsqueeze(1).expand(B, Q, -1)
+            pos_exp = q_pos_emb.reshape(1, Q, d_model).expand(B, -1, -1)
+            shortcut_in = torch.cat([z_exp, pos_exp], dim=-1)
+            u_hat_shortcut = self.z_shortcut(shortcut_in)
+
+        u_hat = (u_hat_attn + u_hat_shortcut).reshape(B * Q, p)
+        direction_pre_norms = u_hat.norm(dim=-1)
+        s_hat = self.scale_head(q_tokens).reshape(B * Q)
+
+        w_hat_flat = _decode_direction_and_logscale(
+            u_hat=u_hat,
+            s_hat=s_hat,
+            eps=self.output_eps,
+            s_min=self.output_s_min,
+            s_max=self.output_s_max,
+        )
+
+        u_hat_norm = u_hat / (u_hat.norm(dim=-1, keepdim=True) + self.output_eps)
+        pred_dirs = u_hat_norm.view(B, d_out, T, p)
+
+        w_hat_patches = w_hat_flat.view(B, d_out, T, p)
+        W_hat_pad = w_hat_patches.view(B, d_out, d_in_pad).transpose(1, 2)
+        W_hat = W_hat_pad[:, :d_in, :]
+
+        outputs = (W_hat, z, pred_dirs)
+        if return_direction_pre_norms:
+            return outputs + (direction_pre_norms,)
+        return outputs
+
     def forward(
         self,
         W: torch.Tensor,
         X: torch.Tensor,
         *,
         return_direction_pre_norms: bool = False,
+        disable_z_shortcut: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[
         torch.Tensor,
         torch.Tensor,
@@ -2235,157 +2461,32 @@ class BigWeightVAE(nn.Module):
         if Bx != B or d_in_x != d_in:
             raise ValueError(f"Shape mismatch: W={tuple(W.shape)}, X={tuple(X.shape)}")
 
-        device = W.device
-        dtype = W.dtype
-        p = self.cfg.patch_size
-        d_model = self.cfg.big_vae.d_model
-        patch_idx_t, T, d_in_pad = self._build_patch_indices(d_in=d_in, patch_size=p, device=device)
-
-        # ---------------------------------------------------------------------
-        # 1) Distribution encoding per input patch t.
-        # ---------------------------------------------------------------------
-        patch_idx_bt = patch_idx_t.unsqueeze(0).expand(B, -1, -1).contiguous()
-        X_rep = X.unsqueeze(1).expand(B, T, n, d_in).reshape(B * T, n, d_in)
-        patch_idx_flat = patch_idx_bt.reshape(B * T, p)
-
-        dist_var_flat, dist_patch_flat = self.distribution_encoder(X_rep, patch_idx_flat)
-
-        d_var = self.cfg.distribution.d_var
-        d_dist = self.cfg.distribution.d_dist
-        dist_var_by_patch = dist_var_flat.view(B, T, p, d_var)
-        dist_patch_by_patch = dist_patch_flat.view(B, T, d_dist)
-
-        # Mean-pool dist_var over patch variables: [B, T, d_var]
-        dist_var_pooled = dist_var_by_patch.mean(dim=2)
-
-        # ---------------------------------------------------------------------
-        # 2) Patchify W.
-        # ---------------------------------------------------------------------
-        W_pad = torch.zeros(B, d_in_pad, d_out, device=device, dtype=dtype)
-        W_pad[:, :d_in, :] = W
-        w_patches = W_pad.transpose(1, 2).contiguous().view(B, d_out, T, p)
-
-        # ---------------------------------------------------------------------
-        # 3) Patch embedding using mixer tokenizer.
-        # ---------------------------------------------------------------------
-        dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
-        dist_var_expanded = dist_var_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1, -1)
-        w_flat = w_patches.reshape(B * d_out * T, p)
-        dist_patch_flat_expanded = dist_patch_expanded.reshape(B * d_out * T, d_dist)
-        dist_var_flat_expanded = dist_var_expanded.reshape(B * d_out * T, p, d_var)
-
-        d_patch = self.cfg.mini_vae.d_patch
-        patch_token_raw_flat = self.patch_tokenizer(
-            w_patch=w_flat,
-            dist_var_tokens=dist_var_flat_expanded,
-            dist_patch_embed=dist_patch_flat_expanded,
+        T, d_in_pad, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled = self._encode_distribution_context(
+            X,
+            d_in=d_in,
         )
-        patch_token_raw = patch_token_raw_flat.view(B, d_out, T, d_patch)
-        patch_tokens = self.patch_token_proj(patch_token_raw)
-
-        cls_tokens = self.cls_token.view(1, 1, 1, -1).expand(B, d_out, 1, -1)
-        tokens_by_output = torch.cat([cls_tokens, patch_tokens], dim=2)
-
-        # ---------------------------------------------------------------------
-        # 4) Encoder with dist_var injection + dist→latent heads per layer.
-        # ---------------------------------------------------------------------
-        # dist_var for patch token injection: [B, d_out, T, d_var]
-        dist_var_for_inject = dist_var_pooled.unsqueeze(1).expand(-1, d_out, -1, -1)
-        # Global dist_var for latent head: [B, d_var]
-        dist_var_global = dist_var_pooled.mean(dim=1)
-
-        latents = self.latent_base.unsqueeze(0).expand(B, -1, -1)
-        num_latents = self.cfg.big_vae.num_latents
-        d_lat = self.cfg.big_vae.d_lat
-
-        for layer_idx, enc_layer in enumerate(self.encoder_layers):
-            # Inject dist_var into patch tokens (not CLS) before each layer.
-            cls_part = tokens_by_output[:, :, :1, :]
-            patch_part = tokens_by_output[:, :, 1:, :]
-            patch_with_dist = torch.cat([patch_part, dist_var_for_inject], dim=-1)
-            patch_part = self.enc_dist_inject_projs[layer_idx](patch_with_dist)
-            tokens_by_output = torch.cat([cls_part, patch_part], dim=2)
-
-            # Dist→latent additive head.
-            dist_lat_delta = self.enc_dist_to_latent_heads[layer_idx](dist_var_global)
-            latents = latents + dist_lat_delta.view(B, num_latents, d_lat)
-
-            tokens_by_output, latents = enc_layer(
-                tokens_by_output=tokens_by_output,
-                latents=latents,
-                cross_attend_only_cls=self.cfg.big_vae.encoder.cross_attend_only_cls,
-            )
-
-        # Flatten latents → z (no mu/logvar compression).
-        z = self.latent_norm(latents.reshape(B, self.flat_lat_dim))
-
-        # ---------------------------------------------------------------------
-        # 5) Decoder: CrossAttnBlock + direction/scale decomposition.
-        # ---------------------------------------------------------------------
-        lat = self.latent_to_decoder(z.view(B, num_latents, d_lat))  # [B, num_latents, d_model]
-
-        # Build (o, t) positional queries.
-        o_idx = torch.arange(d_out, device=device)
-        t_idx = torch.arange(T, device=device)
-        o_grid, t_grid = torch.meshgrid(o_idx, t_idx, indexing="ij")
-
-        pos_dim = self.cfg.big_vae.pos_fourier_dim
-        pos_o = sinusoidal_embedding(o_grid.to(torch.float32), pos_dim)
-        pos_t = sinusoidal_embedding(t_grid.to(torch.float32), pos_dim)
-        pos_ot = torch.cat([pos_o, pos_t], dim=-1)  # [d_out, T, 2*pos_dim]
-
-        q_base = self.pos_proj(pos_ot)  # [d_out, T, d_model]
-        q_pos_emb = self.query_pos_proj(q_base)  # [d_out, T, d_model]
-        q_base_expanded = q_base.unsqueeze(0).expand(B, -1, -1, -1)
-        q_cond_cat = torch.cat([q_base_expanded, dist_patch_expanded], dim=-1)
-        q_tokens = self.query_proj(q_cond_cat).reshape(B, d_out * T, d_model)
-
-        Q = d_out * T
-        # 2D RoPE positions for decoder queries: (o, t) per patch.
-        q_pos_o = o_grid.flatten().to(dtype=torch.float32)  # [Q]
-        q_pos_t = t_grid.flatten().to(dtype=torch.float32)  # [Q]
-        # KV (latent tokens) have abstract 1D positions — use same for both dims (degenerate 2D).
-        kv_pos = torch.arange(self.dec_L_latents, device=device, dtype=torch.float32)
-
-        for dec_layer in self.decoder_layers:
-            q_tokens = dec_layer(
-                q=q_tokens, kv=lat,
-                q_pos=q_pos_o, kv_pos=kv_pos,
-                q_pos2=q_pos_t, kv_pos2=kv_pos,
-            )
-
-        # Direction head: [B, Q, d_model] → [B, Q, p] (p-dim direction per patch).
-        q_dir = self.q_tokens_norm(q_tokens)
-        # q_dir = self._channel_norm_over_sequence(q_tokens, eps=self.direction_seq_norm_eps)
-        u_hat_attn = self.direction_head(q_dir)  # [B, Q, p]
-
-        # Z-shortcut: project z to d_model, then combine with positional → p-dim direction.
-        z_proj = self.z_shortcut_proj(z)  # [B, d_model]
-        z_exp = z_proj.unsqueeze(1).expand(B, Q, -1)  # [B, Q, d_model]
-        pos_exp = q_pos_emb.reshape(1, Q, d_model).expand(B, -1, -1)
-        shortcut_in = torch.cat([z_exp, pos_exp], dim=-1)  # [B, Q, 2*d_model]
-        u_hat_shortcut = self.z_shortcut(shortcut_in)  # [B, Q, p]
-
-        u_hat = (u_hat_attn + u_hat_shortcut).reshape(B * Q, p)  # [B*Q, p]
-        direction_pre_norms = u_hat.norm(dim=-1)  # [B*Q]
-
-        # Scale: one scalar per patch from mean-pooled decoder output.
-        s_hat = self.scale_head(q_tokens).reshape(B * Q)  # [B*Q]
-
-        # Direction/scale → w_hat per patch.
-        w_hat_flat = _decode_direction_and_logscale(
-            u_hat=u_hat, s_hat=s_hat,
-            eps=self.output_eps, s_min=self.output_s_min, s_max=self.output_s_max,
-        )  # [B*Q, p]
-
-        # Normalized predicted directions: [B, d_out, T, p]
-        u_hat_norm = u_hat / (u_hat.norm(dim=-1, keepdim=True) + self.output_eps)
-        pred_dirs = u_hat_norm.view(B, d_out, T, p)
-
-        # Stitch patches back to matrix.
-        w_hat_patches = w_hat_flat.view(B, d_out, T, p)
-        W_hat_pad = w_hat_patches.view(B, d_out, d_in_pad).transpose(1, 2)
-        W_hat = W_hat_pad[:, :d_in, :]
+        latents = self._encode_latent_slots(
+            W,
+            T=T,
+            d_in_pad=d_in_pad,
+            dist_var_by_patch=dist_var_by_patch,
+            dist_patch_by_patch=dist_patch_by_patch,
+            dist_var_pooled=dist_var_pooled,
+        )
+        decode_outputs = self._decode_from_latent_slots(
+            latents,
+            dist_patch_by_patch=dist_patch_by_patch,
+            d_in=d_in,
+            d_out=d_out,
+            d_in_pad=d_in_pad,
+            T=T,
+            return_direction_pre_norms=return_direction_pre_norms,
+            disable_z_shortcut=disable_z_shortcut,
+        )
+        if return_direction_pre_norms:
+            W_hat, z, pred_dirs, direction_pre_norms = decode_outputs
+        else:
+            W_hat, z, pred_dirs = decode_outputs
 
         if squeeze_batch:
             outputs = (
