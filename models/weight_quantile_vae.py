@@ -1717,6 +1717,7 @@ class BigVAEConfig:
     dropout: float = 0.0
     pos_fourier_dim: int = 64
     use_latent_sampling: bool = True
+    disable_z_shortcut: bool = False
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
 
 
@@ -2358,6 +2359,7 @@ class BigWeightVAE(nn.Module):
             raise ValueError(f"d_in_pad must equal T*patch_size={expected_d_in_pad}, got {d_in_pad}")
 
         d_model = self.cfg.big_vae.d_model
+        shortcut_disabled = bool(disable_z_shortcut or self.cfg.big_vae.disable_z_shortcut)
         z = self.latent_norm(latent_slots.reshape(B, self.flat_lat_dim))
         lat = self.latent_to_decoder(z.view(B, num_latents, d_lat))
 
@@ -2396,7 +2398,7 @@ class BigWeightVAE(nn.Module):
         q_dir = self.q_tokens_norm(q_tokens)
         u_hat_attn = self.direction_head(q_dir)
 
-        if disable_z_shortcut:
+        if shortcut_disabled:
             u_hat_shortcut = torch.zeros_like(u_hat_attn)
         else:
             z_proj = self.z_shortcut_proj(z)
