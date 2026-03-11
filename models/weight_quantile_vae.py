@@ -2460,9 +2460,6 @@ class BigWeightVAE(nn.Module):
         if squeeze_batch:
             W = W.unsqueeze(0)
             X = X.unsqueeze(0)
-        if W.shape[0] > 1:
-            W = W[0:1].repeat(W.shape[0], 1, 1)
-            X = X[0:1].repeat(X.shape[0], 1, 1)
         B, d_in, d_out = W.shape
         Bx, n, d_in_x = X.shape
         if Bx != B or d_in_x != d_in:

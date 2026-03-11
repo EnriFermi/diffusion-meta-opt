@@ -1081,24 +1081,6 @@ def _slice_sample(
         x_slices.append(x_i)
 
     return torch.stack(W_slices), torch.stack(x_slices)
-
-
-def _make_batch_objects_identical(
-    W: torch.Tensor,
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if W.ndim != 3 or x.ndim != 3:
-        raise ValueError(f"W and x must be rank-3 batched tensors, got {tuple(W.shape)} and {tuple(x.shape)}")
-    if W.shape[0] != x.shape[0]:
-        raise ValueError(f"Batch size mismatch: W={tuple(W.shape)}, x={tuple(x.shape)}")
-    if W.shape[0] <= 1:
-        return W, x
-    return (
-        W[0:1].repeat(W.shape[0], 1, 1),
-        x[0:1].repeat(x.shape[0], 1, 1),
-    )
-
-
 def _tensor_debug_stats(tensor: torch.Tensor | None) -> dict[str, Any]:
     if tensor is None:
         return {"is_none": True}
@@ -1624,7 +1606,6 @@ def _run_worker(
                             patch_size_for_slice,
                             batch_size=slice_batch_size,
                         )
-                    W_s, x_s = _make_batch_objects_identical(W_s, x_s)
 
                     no_sync_ctx = contextlib.nullcontext()
                     if is_distributed and not sync_grad:
