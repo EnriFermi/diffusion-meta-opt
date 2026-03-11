@@ -2043,6 +2043,9 @@ class BigWeightVAE(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, p),
         )
+        if bool(cfg.big_vae.disable_z_shortcut):
+            self.z_shortcut_proj.requires_grad_(False)
+            self.z_shortcut.requires_grad_(False)
 
     @staticmethod
     def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
