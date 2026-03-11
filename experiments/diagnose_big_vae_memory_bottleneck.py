@@ -36,6 +36,7 @@ from experiments.diagnose_big_vae_identity import (
     _write_json,
     _sample_synthetic_deterministic,
 )
+from experiments.train_big_vae import _slice_sample as _train_slice_sample
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +151,6 @@ def _enforce_diagnostic_constraints(cfg: DictConfig) -> None:
         cfg.train.grad_clip_norm_by_part = {}
         cfg.train.behavioral_coef = 0.0
         cfg.train.structural_coef = 1.0
-        cfg.train.slice_batch_size = 16
         cfg.train.fixed_training_batch.enabled = True
         cfg.train.synthetic_layer_source.enabled = False
         cfg.train.telemetry.grad_layer_monitor.enabled = False
@@ -259,6 +259,47 @@ def _collect_source_batch(cfg: DictConfig, *, logger, artifact_root: Path) -> li
     return items
 
 
+def _slice_source_item_train_style(
+    item: dict[str, Any],
+    *,
+    cfg: DictConfig,
+    max_T_patches: int,
+    max_d_out: int,
+    batch_size: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    patch_size = int(cfg.model.get("patch_size", 16))
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(int(seed))
+        W_batch, x_batch = _train_slice_sample(
+            item["W"],
+            item["x"],
+            max_T_patches,
+            max_d_out,
+            patch_size,
+            batch_size=batch_size,
+        )
+    W_batch = W_batch.detach().cpu().clone()
+    x_batch = x_batch.detach().cpu().clone()
+    same_as_first = [
+        bool(torch.equal(W_batch[idx], W_batch[0]) and torch.equal(x_batch[idx], x_batch[0]))
+        for idx in range(W_batch.shape[0])
+    ]
+    slice_meta = {
+        "procedure": "train_big_vae._slice_sample",
+        "seed": int(seed),
+        "train_style_batch_size": int(batch_size),
+        "max_T_patches": int(max_T_patches),
+        "max_d_out": int(max_d_out),
+        "sliced_W_shape": list(W_batch.shape),
+        "sliced_x_shape": list(x_batch.shape),
+        "all_batch_entries_identical": bool(all(same_as_first)),
+        "same_as_first_mask": same_as_first,
+        "source_meta": _slim_source_meta(item["meta"]),
+    }
+    return W_batch, x_batch, slice_meta
+
+
 def _pair_candidate_score(item_a: dict[str, Any], item_b: dict[str, Any]) -> int:
     meta_a = item_a["meta"]
     meta_b = item_b["meta"]
@@ -275,87 +316,74 @@ def _pair_candidate_score(item_a: dict[str, Any], item_b: dict[str, Any]) -> int
 
 
 def _select_different_pair(
-    items: list[dict[str, Any]],
-    *,
-    patch_size: int,
-    max_T_patches: int,
-    max_d_out: int,
+    sliced_items: list[dict[str, Any]],
 ) -> tuple[int, int, dict[str, Any]]:
     best: tuple[int, int, int, dict[str, Any]] | None = None
-    for idx_a in range(len(items)):
-        for idx_b in range(idx_a + 1, len(items)):
-            item_a = items[idx_a]
-            item_b = items[idx_b]
-            T_a = int(item_a["W"].shape[0] // patch_size)
-            T_b = int(item_b["W"].shape[0] // patch_size)
-            d_out_use = min(int(item_a["W"].shape[1]), int(item_b["W"].shape[1]), max_d_out)
-            T_use = min(T_a, T_b, max_T_patches)
-            if T_use <= 0 or d_out_use <= 0:
+    for idx_a in range(len(sliced_items)):
+        for idx_b in range(idx_a + 1, len(sliced_items)):
+            item_a = sliced_items[idx_a]
+            item_b = sliced_items[idx_b]
+            if tuple(item_a["W_batch"].shape) != tuple(item_b["W_batch"].shape):
                 continue
-            tensors_differ = not torch.equal(item_a["W"], item_b["W"]) or not torch.equal(item_a["x"], item_b["x"])
+            if tuple(item_a["x_batch"].shape) != tuple(item_b["x_batch"].shape):
+                continue
+            tensors_differ = not torch.equal(item_a["W_batch"], item_b["W_batch"]) or not torch.equal(item_a["x_batch"], item_b["x_batch"])
             if not tensors_differ:
                 continue
             pair_meta = {
-                "T_total_a": T_a,
-                "T_total_b": T_b,
-                "T_use": int(T_use),
-                "d_out_use": int(d_out_use),
-                "score": int(_pair_candidate_score(item_a, item_b)),
+                "score": int(_pair_candidate_score(item_a["source_item"], item_b["source_item"])),
+                "train_style_W_shape": list(item_a["W_batch"].shape),
+                "train_style_x_shape": list(item_a["x_batch"].shape),
+                "batch_size": int(item_a["W_batch"].shape[0]),
+                "source_a_all_batch_entries_identical": bool(item_a["slice_meta"]["all_batch_entries_identical"]),
+                "source_b_all_batch_entries_identical": bool(item_b["slice_meta"]["all_batch_entries_identical"]),
             }
             candidate = (pair_meta["score"], idx_a, idx_b, pair_meta)
             if best is None or candidate > best:
                 best = candidate
     if best is None:
-        raise RuntimeError("Could not find two different source objects with at least one full patch and one output column")
+        raise RuntimeError("Could not find two different source objects whose train-style sliced batches have matching shapes")
     _, idx_a, idx_b, pair_meta = best
     return idx_a, idx_b, pair_meta
 
 
-def _slice_source_item(
-    item: dict[str, Any],
-    *,
-    patch_size: int,
-    T_use: int,
-    d_out_use: int,
-    seed: int,
+def _build_mixed_train_style_batch(
+    W_a: torch.Tensor,
+    x_a: torch.Tensor,
+    W_b: torch.Tensor,
+    x_b: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-    W = item["W"]
-    x = item["x"]
-    d_in, d_out = W.shape
-    T_total = int(d_in // patch_size)
-    if T_use <= 0 or T_use > T_total:
-        raise ValueError(f"Invalid T_use={T_use} for source shape {tuple(W.shape)} and patch_size={patch_size}")
-    if d_out_use <= 0 or d_out_use > d_out:
-        raise ValueError(f"Invalid d_out_use={d_out_use} for source shape {tuple(W.shape)}")
-
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(int(seed))
-    if T_use == T_total:
-        patch_idx = torch.arange(T_total, dtype=torch.long)
-    else:
-        patch_idx = torch.randperm(T_total, generator=generator)[:T_use].sort().values
-    offsets = torch.arange(patch_size, dtype=torch.long)
-    row_idx = (patch_idx.unsqueeze(1) * patch_size + offsets.unsqueeze(0)).flatten()
-    W_s = W.index_select(0, row_idx)
-    x_s = x.index_select(1, row_idx)
-
-    if d_out_use == d_out:
-        col_idx = torch.arange(d_out, dtype=torch.long)
-    else:
-        col_idx = torch.randperm(d_out, generator=generator)[:d_out_use].sort().values
-        W_s = W_s.index_select(1, col_idx)
-
-    slice_meta = {
-        "selected_patch_indices": patch_idx.tolist(),
-        "selected_row_indices": row_idx.tolist(),
-        "selected_col_indices": col_idx.tolist(),
-        "source_W_shape": list(W.shape),
-        "source_x_shape": list(x.shape),
-        "sliced_W_shape": list(W_s.shape),
-        "sliced_x_shape": list(x_s.shape),
-        "source_meta": _slim_source_meta(item["meta"]),
+    batch_size = int(W_a.shape[0])
+    if batch_size != int(W_b.shape[0]) or batch_size != int(x_a.shape[0]) or batch_size != int(x_b.shape[0]):
+        raise ValueError("Train-style batches must share the same batch dimension before mixing")
+    count_a = (batch_size + 1) // 2
+    count_b = batch_size - count_a
+    W_parts: list[torch.Tensor] = []
+    x_parts: list[torch.Tensor] = []
+    provenance: list[str] = []
+    idx_a = 0
+    idx_b = 0
+    while len(W_parts) < batch_size:
+        if idx_a < count_a:
+            W_parts.append(W_a[idx_a])
+            x_parts.append(x_a[idx_a])
+            provenance.append("a")
+            idx_a += 1
+        if len(W_parts) >= batch_size:
+            break
+        if idx_b < count_b:
+            W_parts.append(W_b[idx_b])
+            x_parts.append(x_b[idx_b])
+            provenance.append("b")
+            idx_b += 1
+    mixed_W = torch.stack(W_parts, dim=0)
+    mixed_x = torch.stack(x_parts, dim=0)
+    return mixed_W, mixed_x, {
+        "pattern": "alternating_a_b",
+        "source_a_count": int(count_a),
+        "source_b_count": int(count_b),
+        "provenance": provenance,
     }
-    return W_s.clone(), x_s.clone(), slice_meta
 
 
 def _frozen_target_payload(target: FrozenTarget) -> dict[str, Any]:
@@ -389,35 +417,49 @@ def _build_frozen_pairs(
         max_d_out = int(frozen_cfg.get("max_d_out"))
 
     source_items = _collect_source_batch(cfg, logger=logger, artifact_root=artifact_root)
-    idx_a, idx_b, pair_meta = _select_different_pair(
-        source_items,
-        patch_size=patch_size,
-        max_T_patches=max_T_patches,
-        max_d_out=max_d_out,
-    )
     seed = int(cfg.diagnostics.get("seed", 0))
-    T_use = int(pair_meta["T_use"])
-    d_out_use = int(pair_meta["d_out_use"])
+    train_style_batch_size = max(2, int(cfg.train.get("slice_batch_size", 2)))
+    sliced_items: list[dict[str, Any]] = []
+    for idx, item in enumerate(source_items):
+        W_batch, x_batch, slice_meta = _slice_source_item_train_style(
+            item,
+            cfg=cfg,
+            max_T_patches=max_T_patches,
+            max_d_out=max_d_out,
+            batch_size=train_style_batch_size,
+            seed=seed + 1000 + idx,
+        )
+        sliced_items.append(
+            {
+                "source_idx": int(idx),
+                "source_item": item,
+                "W_batch": W_batch,
+                "x_batch": x_batch,
+                "slice_meta": slice_meta,
+            }
+        )
+    sliced_meta = [
+        {
+            "source_idx": item["source_idx"],
+            "identity": list(_source_item_identity(item["source_item"])),
+            "slice_meta": _safe_scalar(item["slice_meta"]),
+        }
+        for item in sliced_items
+    ]
+    _write_json(artifact_root / "train_style_sliced_batch_meta.json", {"items": _safe_scalar(sliced_meta)})
 
-    W_a, x_a, slice_meta_a = _slice_source_item(
-        source_items[idx_a],
-        patch_size=patch_size,
-        T_use=T_use,
-        d_out_use=d_out_use,
-        seed=seed + 101,
-    )
-    W_b, x_b, slice_meta_b = _slice_source_item(
-        source_items[idx_b],
-        patch_size=patch_size,
-        T_use=T_use,
-        d_out_use=d_out_use,
-        seed=seed + 202,
-    )
+    idx_a, idx_b, pair_meta = _select_different_pair(sliced_items)
+    batch_a = sliced_items[idx_a]
+    batch_b = sliced_items[idx_b]
 
-    W_diff = torch.stack([W_a, W_b], dim=0)
-    x_diff = torch.stack([x_a, x_b], dim=0)
-    W_dup = torch.stack([W_a, W_a.clone()], dim=0)
-    x_dup = torch.stack([x_a, x_a.clone()], dim=0)
+    W_dup = batch_a["W_batch"].clone()
+    x_dup = batch_a["x_batch"].clone()
+    W_diff, x_diff, mix_meta = _build_mixed_train_style_batch(
+        batch_a["W_batch"],
+        batch_a["x_batch"],
+        batch_b["W_batch"],
+        batch_b["x_batch"],
+    )
 
     different_pair = _derive_frozen_target(
         W_diff,
@@ -436,25 +478,32 @@ def _build_frozen_pairs(
     duplicate_pair.meta["pair_variant"] = "duplicate_pair"
     for target in (different_pair, duplicate_pair):
         target.meta["source_batch_size"] = int(len(source_items))
-        target.meta["fixed_source_batch_size"] = int(cfg.train.get("slice_batch_size", 16))
+        target.meta["fixed_source_batch_size"] = int(train_style_batch_size)
         target.meta["selected_pair_indices"] = [int(idx_a), int(idx_b)]
         target.meta["selection_score"] = int(pair_meta["score"])
-        target.meta["selection_patch_T_use"] = int(T_use)
-        target.meta["selection_d_out_use"] = int(d_out_use)
         target.meta["source_kind"] = str(frozen_cfg.get("source_kind", "real"))
         target.meta["source_batch_identities"] = [list(_source_item_identity(item)) for item in source_items]
-        target.meta["different_pair_slice_meta"] = [slice_meta_a, slice_meta_b]
-        target.meta["duplicate_pair_slice_meta"] = [slice_meta_a, slice_meta_a]
+        target.meta["train_style_batch_shape"] = pair_meta["train_style_W_shape"]
+        target.meta["different_pair_slice_meta"] = [batch_a["slice_meta"], batch_b["slice_meta"]]
+        target.meta["duplicate_pair_slice_meta"] = [batch_a["slice_meta"]]
         target.meta["source_pair_meta"] = {
-            "sample_a": _slim_source_meta(source_items[idx_a]["meta"]),
-            "sample_b": _slim_source_meta(source_items[idx_b]["meta"]),
+            "sample_a": _slim_source_meta(batch_a["source_item"]["meta"]),
+            "sample_b": _slim_source_meta(batch_b["source_item"]["meta"]),
         }
+    duplicate_pair.meta["source_composition"] = {
+        "pattern": "single_source_train_style_batch",
+        "source_a_count": int(train_style_batch_size),
+        "source_b_count": 0,
+        "provenance": ["a"] * train_style_batch_size,
+    }
+    different_pair.meta["source_composition"] = mix_meta
 
     dump_payload = {
         "different_pair": _frozen_target_payload(different_pair),
         "duplicate_pair": _frozen_target_payload(duplicate_pair),
         "selected_pair_indices": [int(idx_a), int(idx_b)],
         "selection_meta": pair_meta,
+        "train_style_sliced_batch_meta": sliced_meta,
         "source_batch": [
             {
                 "sample_idx": idx,
@@ -479,10 +528,11 @@ def _build_frozen_pairs(
     immutability["all_equal"] = all(immutability.values())
 
     pair_sanity = {
-        "duplicate_w_samples_equal": bool(torch.equal(duplicate_pair.W_s[0], duplicate_pair.W_s[1])),
-        "duplicate_x_samples_equal": bool(torch.equal(duplicate_pair.x_s[0], duplicate_pair.x_s[1])),
-        "different_first_matches_duplicate_first_W": bool(torch.equal(different_pair.W_s[0], duplicate_pair.W_s[0])),
-        "different_first_matches_duplicate_first_x": bool(torch.equal(different_pair.x_s[0], duplicate_pair.x_s[0])),
+        "duplicate_batch_matches_selected_source_batch_W": bool(torch.equal(duplicate_pair.W_s, batch_a["W_batch"])),
+        "duplicate_batch_matches_selected_source_batch_x": bool(torch.equal(duplicate_pair.x_s, batch_a["x_batch"])),
+        "different_batch_shape_matches_duplicate_W": tuple(different_pair.W_s.shape) == tuple(duplicate_pair.W_s.shape),
+        "different_batch_shape_matches_duplicate_x": tuple(different_pair.x_s.shape) == tuple(duplicate_pair.x_s.shape),
+        "different_batch_uses_two_sources": int(mix_meta["source_a_count"]) > 0 and int(mix_meta["source_b_count"]) > 0,
     }
     pair_sanity["all_ok"] = all(pair_sanity.values())
     if not pair_sanity["all_ok"]:
@@ -550,12 +600,12 @@ def _mode_short_interpretation(mode_metrics: dict[str, Any], threshold: float, r
     diff_best = float(mode_metrics["variants"]["different_pair"]["best_loss"])
     ratio = float(mode_metrics["comparison"]["different_to_duplicate_ratio"])
     if dup_best > threshold:
-        return "duplicate_pair failed; debug branch is suspect"
+        return "single-source train-style batch failed; debug branch is suspect"
     if diff_best <= threshold:
-        return "different_pair converged; two-point separation succeeded"
+        return "mixed-source train-style batch converged"
     if ratio >= ratio_alert:
-        return "duplicate_pair converged but different_pair stayed high"
-    return "different_pair still failed without a strong duplicate-vs-different separation"
+        return "single-source batch converged but mixed-source batch stayed high"
+    return "mixed-source batch still failed without a strong single-vs-mixed gap"
 
 
 def _run_mode_variant(
@@ -835,23 +885,14 @@ def _conclusion_from_modes(modes: dict[str, dict[str, Any]], *, threshold: float
 
 
 def _validate_mode_consistency(modes: dict[str, dict[str, Any]], *, threshold: float, impossible_eps: float) -> None:
-    violations: list[dict[str, Any]] = []
     for key, payload in modes.items():
         duplicate_best = float(payload["variants"]["duplicate_pair"]["best_loss"])
         different_best = float(payload["variants"]["different_pair"]["best_loss"])
-        if different_best <= impossible_eps and duplicate_best > threshold:
-            violations.append(
-                {
-                    "mode": key,
-                    "duplicate_pair_best_loss": duplicate_best,
-                    "different_pair_best_loss": different_best,
-                }
+        if not math.isfinite(duplicate_best) or not math.isfinite(different_best):
+            raise RuntimeError(
+                f"Non-finite diagnostics summary detected for mode {key}: "
+                f"duplicate_pair_best_loss={duplicate_best}, different_pair_best_loss={different_best}"
             )
-    if violations:
-        raise RuntimeError(
-            "Impossible diagnostics outcome detected: different_pair converged to ~0 while duplicate_pair did not. "
-            f"Treat this run as invalid. Details: {violations}"
-        )
 
 
 def _comparison_rows(modes: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -916,6 +957,7 @@ def _write_summary_markdown(
         f"- selected pair indices: `{frozen_meta['selected_pair_indices']}`",
         f"- frozen pair description: `B={pair_meta['B']}`, `d_in={pair_meta['d_in']}`, `d_out={pair_meta['d_out']}`, `patch_size={pair_meta['patch_size']}`",
         f"- patch accounting: `T_forward={pair_meta['T_forward']}`, `T_loss={pair_meta['T_loss']}`, `used_rows_in_loss={pair_meta['used_rows_in_loss']}`",
+        f"- data procedure: `train_big_vae._slice_sample` with `slice_batch_size={pair_meta['fixed_source_batch_size']}`",
         f"- selected source pair: `{pair_meta['source_pair_meta']['sample_a']['model_name']}` / `{pair_meta['source_pair_meta']['sample_b']['model_name']}`",
         "",
         "## Duplicate Sanity",
