@@ -478,6 +478,16 @@ def _build_frozen_pairs(
     }
     immutability["all_equal"] = all(immutability.values())
 
+    pair_sanity = {
+        "duplicate_w_samples_equal": bool(torch.equal(duplicate_pair.W_s[0], duplicate_pair.W_s[1])),
+        "duplicate_x_samples_equal": bool(torch.equal(duplicate_pair.x_s[0], duplicate_pair.x_s[1])),
+        "different_first_matches_duplicate_first_W": bool(torch.equal(different_pair.W_s[0], duplicate_pair.W_s[0])),
+        "different_first_matches_duplicate_first_x": bool(torch.equal(different_pair.x_s[0], duplicate_pair.x_s[0])),
+    }
+    pair_sanity["all_ok"] = all(pair_sanity.values())
+    if not pair_sanity["all_ok"]:
+        raise RuntimeError(f"Frozen-pair construction invariant failed: {pair_sanity}")
+
     meta_payload = {
         "source_kind": str(frozen_cfg.get("source_kind", "real")),
         "source_batch_size": int(len(source_items)),
@@ -490,6 +500,7 @@ def _build_frozen_pairs(
         },
         "source_batch": dump_payload["source_batch"],
         "immutability": immutability,
+        "pair_sanity": pair_sanity,
     }
     _write_json(artifact_root / "frozen_pair_meta.json", _safe_scalar(meta_payload))
     return {
@@ -523,6 +534,15 @@ def _mode_rows_to_cosine_csv(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
         }
         for row in rows
     ]
+
+
+def _samplewise_dir_loss(frozen: FrozenTarget, pred_dirs: torch.Tensor) -> list[float]:
+    T_loss = int(frozen.meta["used_T_in_loss"])
+    pred_dirs_used = pred_dirs[:, :, :T_loss, :]
+    cos = (pred_dirs_used * frozen.u_target).sum(dim=-1)
+    per_output = (frozen.w_dir * (1.0 - cos)).sum(dim=-1)
+    per_sample = per_output.mean(dim=-1)
+    return [float(value.item()) for value in per_sample]
 
 
 def _mode_short_interpretation(mode_metrics: dict[str, Any], threshold: float, ratio_alert: float) -> str:
@@ -579,6 +599,7 @@ def _run_mode_variant(
         loss, _details = _exact_dir_loss(frozen, pred_dirs, W_hat=W_hat)
         direction_metrics = _direction_metrics(frozen, pred_dirs)
         direction_pre_norm_stats = _tensor_debug_stats_local(direction_pre_norms)
+        sample_losses = _samplewise_dir_loss(frozen, pred_dirs)
         row = {
             "mode": mode_spec.key,
             "variant": variant_name,
@@ -590,6 +611,8 @@ def _run_mode_variant(
             "direction_pre_norm_min": float(direction_pre_norm_stats.get("min", 0.0)),
             "direction_pre_norm_max": float(direction_pre_norm_stats.get("max", 0.0)),
         }
+        for sample_idx, sample_loss in enumerate(sample_losses):
+            row[f"sample_{sample_idx}_loss"] = float(sample_loss)
 
         if debug_shapes is None:
             debug_shapes = {
@@ -811,6 +834,26 @@ def _conclusion_from_modes(modes: dict[str, dict[str, Any]], *, threshold: float
     }
 
 
+def _validate_mode_consistency(modes: dict[str, dict[str, Any]], *, threshold: float, impossible_eps: float) -> None:
+    violations: list[dict[str, Any]] = []
+    for key, payload in modes.items():
+        duplicate_best = float(payload["variants"]["duplicate_pair"]["best_loss"])
+        different_best = float(payload["variants"]["different_pair"]["best_loss"])
+        if different_best <= impossible_eps and duplicate_best > threshold:
+            violations.append(
+                {
+                    "mode": key,
+                    "duplicate_pair_best_loss": duplicate_best,
+                    "different_pair_best_loss": different_best,
+                }
+            )
+    if violations:
+        raise RuntimeError(
+            "Impossible diagnostics outcome detected: different_pair converged to ~0 while duplicate_pair did not. "
+            f"Treat this run as invalid. Details: {violations}"
+        )
+
+
 def _comparison_rows(modes: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for key in ("A", "B", "C", "D"):
@@ -934,6 +977,11 @@ def _run(cfg: DictConfig) -> None:
 
     threshold = float(cfg.diagnostics.reporting.get("convergence_threshold", 1e-2))
     conclusions = _conclusion_from_modes(mode_metrics, threshold=threshold)
+    _validate_mode_consistency(
+        mode_metrics,
+        threshold=threshold,
+        impossible_eps=float(cfg.diagnostics.reporting.get("impossible_pair_eps", 1e-6)),
+    )
     comparison_rows = _comparison_rows(mode_metrics)
     _write_json(artifact_root / "comparison_table.json", {"rows": _safe_scalar(comparison_rows)})
     _write_csv(artifact_root / "comparison_table.csv", _safe_scalar(comparison_rows))

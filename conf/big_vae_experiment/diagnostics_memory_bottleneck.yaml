@@ -63,6 +63,7 @@ diagnostics:
     convergence_threshold: 0.01
     ratio_alert: 5.0
     ratio_eps: 1.0e-12
+    impossible_pair_eps: 1.0e-6
 
 hydra:
   job:
