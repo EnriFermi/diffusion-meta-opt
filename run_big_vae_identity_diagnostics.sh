@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 
 set -eu
 
@@ -19,7 +19,7 @@ fi
 # По умолчанию конфиг уже фиксирует single-device / no-noise debug режим:
 # distributed=false, amp=false, compile=false, dropout=0, weight_decay=0, grad clipping off.
 
-ENTRYPOINT=(python experiments/diagnose_big_vae_identity.py)
+SCRIPT_PATH="experiments/diagnose_big_vae_identity.py"
 REQUIRED_IMPORTS='import torch, omegaconf'
 
 if python -c "$REQUIRED_IMPORTS" >/dev/null 2>&1; then
@@ -29,19 +29,19 @@ else
 fi
 
 if [ -n "${PIPENV_ACTIVE:-}" ] && [ "$HAVE_RUNTIME" -eq 1 ]; then
-  exec "${ENTRYPOINT[@]}" "$@"
+  exec python "$SCRIPT_PATH" "$@"
 fi
 
 if [ -n "${CONDA_PREFIX:-}" ] && [ "$HAVE_RUNTIME" -eq 1 ]; then
-  exec "${ENTRYPOINT[@]}" "$@"
+  exec python "$SCRIPT_PATH" "$@"
 fi
 
 if command -v conda >/dev/null 2>&1; then
-  exec conda run -n "${DIAGNOSTICS_CONDA_ENV:-onerec}" "${ENTRYPOINT[@]}" "$@"
+  exec conda run -n "${DIAGNOSTICS_CONDA_ENV:-onerec}" python "$SCRIPT_PATH" "$@"
 fi
 
 if command -v pipenv >/dev/null 2>&1; then
-  exec pipenv run "${ENTRYPOINT[@]}" "$@"
+  exec pipenv run python "$SCRIPT_PATH" "$@"
 fi
 
-exec "${ENTRYPOINT[@]}" "$@"
+exec python "$SCRIPT_PATH" "$@"
