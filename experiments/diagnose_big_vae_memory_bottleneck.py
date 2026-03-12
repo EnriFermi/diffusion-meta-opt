@@ -216,6 +216,79 @@ def _source_item_identity(item: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _resolve_exact_fixed_batch_paths(cfg: DictConfig) -> dict[str, Path] | None:
+    frozen_cfg = cfg.diagnostics.frozen_pair
+    exact_cfg = frozen_cfg.get("exact_fixed_batch_paths", {})
+    if exact_cfg is None:
+        return None
+    if not isinstance(exact_cfg, (dict, DictConfig)):
+        raise TypeError("diagnostics.frozen_pair.exact_fixed_batch_paths must be a mapping")
+
+    resolved: dict[str, Path] = {}
+    for variant_name in ("duplicate_pair", "different_pair"):
+        path_text = str(exact_cfg.get(variant_name, "")).strip()
+        if not path_text:
+            continue
+        path = Path(path_text).expanduser()
+        if not path.is_absolute():
+            path = (_repo_root() / path).resolve()
+        resolved[variant_name] = path
+
+    if not resolved:
+        return None
+
+    missing = [name for name in ("duplicate_pair", "different_pair") if name not in resolved]
+    if missing:
+        raise ValueError(
+            "diagnostics.frozen_pair.exact_fixed_batch_paths must provide both "
+            f"'duplicate_pair' and 'different_pair' when enabled; missing={missing}"
+        )
+    return resolved
+
+
+def _load_exact_fixed_batch_dump(path: Path) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    if not path.exists():
+        raise FileNotFoundError(f"Exact fixed batch dump not found: {path}")
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise TypeError(f"Exact fixed batch dump must contain a dict payload, got {type(payload)!r}: {path}")
+
+    W_s = payload.get("fixed_batch_W", payload.get("W_s"))
+    x_s = payload.get("fixed_batch_x", payload.get("x_s"))
+    if not torch.is_tensor(W_s) or not torch.is_tensor(x_s):
+        raise KeyError(
+            f"Exact fixed batch dump must contain tensor keys 'fixed_batch_W'/'fixed_batch_x' or 'W_s'/'x_s': {path}"
+        )
+
+    W_s = W_s.detach().to(device="cpu", dtype=torch.float32, copy=True).contiguous()
+    x_s = x_s.detach().to(device="cpu", dtype=torch.float32, copy=True).contiguous()
+    if W_s.ndim != 3 or x_s.ndim != 3:
+        raise ValueError(
+            "Exact fixed batch tensors must be rank-3 batched tensors, got "
+            f"W={tuple(W_s.shape)} x={tuple(x_s.shape)} from {path}"
+        )
+    if int(W_s.shape[0]) != int(x_s.shape[0]) or int(W_s.shape[1]) != int(x_s.shape[2]):
+        raise ValueError(
+            "Exact fixed batch tensor shapes are inconsistent, got "
+            f"W={tuple(W_s.shape)} x={tuple(x_s.shape)} from {path}"
+        )
+
+    raw_meta = payload.get("meta", {})
+    meta = _safe_scalar(raw_meta if isinstance(raw_meta, dict) else {"raw_meta": raw_meta})
+    return W_s, x_s, meta
+
+
+def _batch_same_as_first_mask(
+    W_batch: torch.Tensor,
+    x_batch: torch.Tensor,
+) -> list[bool]:
+    return [
+        bool(torch.equal(W_batch[idx], W_batch[0]) and torch.equal(x_batch[idx], x_batch[0]))
+        for idx in range(int(W_batch.shape[0]))
+    ]
+
+
 def _collect_source_batch(cfg: DictConfig, *, logger, artifact_root: Path) -> list[dict[str, Any]]:
     frozen_cfg = cfg.diagnostics.frozen_pair
     source_kind = str(frozen_cfg.get("source_kind", "real")).strip().lower()
@@ -316,6 +389,135 @@ def _select_distinct_batch_entry_pair(
     return None
 
 
+def _build_frozen_pairs_from_exact_fixed_batch_paths(
+    cfg: DictConfig,
+    *,
+    artifact_root: Path,
+) -> tuple[dict[str, FrozenTarget], dict[str, Any]]:
+    exact_paths = _resolve_exact_fixed_batch_paths(cfg)
+    if exact_paths is None:
+        raise RuntimeError("Exact fixed batch paths must be configured before calling this helper")
+
+    patch_size = int(cfg.model.get("patch_size", 16))
+    gamma = float(cfg.train.struct_loss.gamma)
+
+    variant_batches: dict[str, tuple[torch.Tensor, torch.Tensor, dict[str, Any]]] = {}
+    for variant_name, path in exact_paths.items():
+        variant_batches[variant_name] = _load_exact_fixed_batch_dump(path)
+
+    dup_W, dup_x, dup_dump_meta = variant_batches["duplicate_pair"]
+    diff_W, diff_x, diff_dump_meta = variant_batches["different_pair"]
+    if tuple(dup_W.shape) != tuple(diff_W.shape) or tuple(dup_x.shape) != tuple(diff_x.shape):
+        raise ValueError(
+            "Exact duplicate/different fixed batches must have matching shapes for a fair comparison, got "
+            f"duplicate W/x={tuple(dup_W.shape)}/{tuple(dup_x.shape)} vs "
+            f"different W/x={tuple(diff_W.shape)}/{tuple(diff_x.shape)}"
+        )
+
+    dup_same_as_first = _batch_same_as_first_mask(dup_W, dup_x)
+    if not all(dup_same_as_first):
+        raise ValueError(
+            "The exact fixed batch provided for duplicate_pair is not actually duplicate across the batch: "
+            f"same_as_first_mask={dup_same_as_first}"
+        )
+
+    diff_distinct_pair = _select_distinct_batch_entry_pair(diff_W, diff_x)
+    if diff_distinct_pair is None:
+        raise ValueError("The exact fixed batch provided for different_pair does not contain two distinct batch entries")
+    diff_same_as_first = _batch_same_as_first_mask(diff_W, diff_x)
+
+    duplicate_pair = _derive_frozen_target(
+        dup_W,
+        dup_x,
+        patch_size=patch_size,
+        gamma=gamma,
+    )
+    different_pair = _derive_frozen_target(
+        diff_W,
+        diff_x,
+        patch_size=patch_size,
+        gamma=gamma,
+    )
+
+    exact_paths_text = {name: str(path) for name, path in exact_paths.items()}
+    duplicate_pair.meta["pair_variant"] = "duplicate_pair"
+    duplicate_pair.meta["source_kind"] = "exact_fixed_batch_dump"
+    duplicate_pair.meta["selection_rule"] = "exact_fixed_batch_paths"
+    duplicate_pair.meta["exact_fixed_batch_path"] = exact_paths_text["duplicate_pair"]
+    duplicate_pair.meta["exact_fixed_batch_dump_meta"] = dup_dump_meta
+    duplicate_pair.meta["loaded_batch_same_as_first_mask"] = dup_same_as_first
+    duplicate_pair.meta["source_composition"] = {
+        "pattern": "loaded_exact_fixed_batch",
+        "path": exact_paths_text["duplicate_pair"],
+    }
+
+    different_pair.meta["pair_variant"] = "different_pair"
+    different_pair.meta["source_kind"] = "exact_fixed_batch_dump"
+    different_pair.meta["selection_rule"] = "exact_fixed_batch_paths"
+    different_pair.meta["exact_fixed_batch_path"] = exact_paths_text["different_pair"]
+    different_pair.meta["exact_fixed_batch_dump_meta"] = diff_dump_meta
+    different_pair.meta["loaded_batch_same_as_first_mask"] = diff_same_as_first
+    different_pair.meta["selected_batch_entry_indices"] = [int(diff_distinct_pair[0]), int(diff_distinct_pair[1])]
+    different_pair.meta["source_composition"] = {
+        "pattern": "loaded_exact_fixed_batch",
+        "path": exact_paths_text["different_pair"],
+    }
+
+    dump_payload = {
+        "duplicate_pair": _frozen_target_payload(duplicate_pair),
+        "different_pair": _frozen_target_payload(different_pair),
+        "selection_meta": {
+            "selection_rule": "exact_fixed_batch_paths",
+            "exact_fixed_batch_paths": exact_paths_text,
+            "different_pair_selected_batch_entry_indices": [int(diff_distinct_pair[0]), int(diff_distinct_pair[1])],
+        },
+    }
+    dump_path = artifact_root / "frozen_pair_dump.pt"
+    torch.save(dump_payload, dump_path)
+
+    reloaded = torch.load(dump_path, map_location="cpu", weights_only=False)
+    immutability = {
+        "different_pair_W_equal": bool(torch.equal(reloaded["different_pair"]["W_s"], different_pair.W_s)),
+        "different_pair_x_equal": bool(torch.equal(reloaded["different_pair"]["x_s"], different_pair.x_s)),
+        "duplicate_pair_W_equal": bool(torch.equal(reloaded["duplicate_pair"]["W_s"], duplicate_pair.W_s)),
+        "duplicate_pair_x_equal": bool(torch.equal(reloaded["duplicate_pair"]["x_s"], duplicate_pair.x_s)),
+    }
+    immutability["all_equal"] = all(immutability.values())
+
+    pair_sanity = {
+        "duplicate_loaded_batch_all_samples_identical_W": bool(all(dup_same_as_first)),
+        "duplicate_loaded_batch_all_samples_identical_x": bool(all(dup_same_as_first)),
+        "different_loaded_batch_has_distinct_entries": bool(diff_distinct_pair is not None),
+        "batch_shape_matches_W": tuple(different_pair.W_s.shape) == tuple(duplicate_pair.W_s.shape),
+        "batch_shape_matches_x": tuple(different_pair.x_s.shape) == tuple(duplicate_pair.x_s.shape),
+    }
+    pair_sanity["all_ok"] = all(pair_sanity.values())
+    if not pair_sanity["all_ok"]:
+        raise RuntimeError(f"Exact fixed-batch loading invariant failed: {pair_sanity}")
+
+    meta_payload = {
+        "source_kind": "exact_fixed_batch_dump",
+        "source_batch_size": 0,
+        "fixed_source_batch_size": int(duplicate_pair.W_s.shape[0]),
+        "selected_source_index": None,
+        "selected_batch_entry_indices": [int(diff_distinct_pair[0]), int(diff_distinct_pair[1])],
+        "selection_meta": dump_payload["selection_meta"],
+        "pair_variants": {
+            "different_pair": _safe_scalar(different_pair.meta),
+            "duplicate_pair": _safe_scalar(duplicate_pair.meta),
+        },
+        "source_batch": [],
+        "immutability": immutability,
+        "pair_sanity": pair_sanity,
+        "exact_fixed_batch_paths": exact_paths_text,
+    }
+    _write_json(artifact_root / "frozen_pair_meta.json", _safe_scalar(meta_payload))
+    return {
+        "different_pair": different_pair,
+        "duplicate_pair": duplicate_pair,
+    }, meta_payload
+
+
 def _select_source_batch_and_pair(
     sliced_items: list[dict[str, Any]],
 ) -> tuple[int, int, int, dict[str, Any]]:
@@ -399,6 +601,9 @@ def _build_frozen_pairs(
     logger,
     artifact_root: Path,
 ) -> tuple[dict[str, FrozenTarget], dict[str, Any]]:
+    if _resolve_exact_fixed_batch_paths(cfg) is not None:
+        return _build_frozen_pairs_from_exact_fixed_batch_paths(cfg, artifact_root=artifact_root)
+
     frozen_cfg = cfg.diagnostics.frozen_pair
     patch_size = int(cfg.model.get("patch_size", 16))
     if bool(frozen_cfg.get("use_curriculum_slice", True)):
@@ -938,6 +1143,8 @@ def _write_summary_markdown(
     threshold: float,
 ) -> None:
     pair_meta = frozen_meta["pair_variants"]["different_pair"]
+    selection_meta = frozen_meta.get("selection_meta", {})
+    selection_rule = str(selection_meta.get("selection_rule", ""))
     table_lines = [
         "| Mode | Duplicate best | Different best | Different final | Interpretation |",
         "| --- | ---: | ---: | ---: | --- |",
@@ -963,17 +1170,36 @@ def _write_summary_markdown(
         for key in ("A", "B", "C", "D")
     ]
 
+    setup_lines = [
+        f"- checkpoint: `{checkpoint_path or '<random_init>'}`",
+        f"- frozen pair description: `B={pair_meta['B']}`, `d_in={pair_meta['d_in']}`, `d_out={pair_meta['d_out']}`, `patch_size={pair_meta['patch_size']}`",
+        f"- patch accounting: `T_forward={pair_meta['T_forward']}`, `T_loss={pair_meta['T_loss']}`, `used_rows_in_loss={pair_meta['used_rows_in_loss']}`",
+    ]
+    if selection_rule == "exact_fixed_batch_paths":
+        exact_paths = selection_meta.get("exact_fixed_batch_paths", {})
+        setup_lines.extend(
+            [
+                "- data procedure: exact fixed-batch replay from `train_big_vae` dumps",
+                f"- duplicate exact batch: `{exact_paths.get('duplicate_pair', '')}`",
+                f"- different exact batch: `{exact_paths.get('different_pair', '')}`",
+                f"- different-pair distinct entry indices: `{selection_meta.get('different_pair_selected_batch_entry_indices', [])}`",
+            ]
+        )
+    else:
+        setup_lines.extend(
+            [
+                f"- frozen source batch size: `{frozen_meta['source_batch_size']}`",
+                f"- selected source sample index: `{frozen_meta['selected_source_index']}`",
+                f"- selected batch entry indices: `{frozen_meta['selected_batch_entry_indices']}`",
+                f"- data procedure: `train_big_vae._slice_sample` with `slice_batch_size={pair_meta['fixed_source_batch_size']}`",
+                f"- captured source sample: `{pair_meta['captured_source_meta']['model_name']}` / `{pair_meta['captured_source_meta']['layer_name']}`",
+            ]
+        )
+
     lines = [
         "# Big VAE Memory Bottleneck Diagnostics",
         "",
-        f"- checkpoint: `{checkpoint_path or '<random_init>'}`",
-        f"- frozen source batch size: `{frozen_meta['source_batch_size']}`",
-        f"- selected source sample index: `{frozen_meta['selected_source_index']}`",
-        f"- selected batch entry indices: `{frozen_meta['selected_batch_entry_indices']}`",
-        f"- frozen pair description: `B={pair_meta['B']}`, `d_in={pair_meta['d_in']}`, `d_out={pair_meta['d_out']}`, `patch_size={pair_meta['patch_size']}`",
-        f"- patch accounting: `T_forward={pair_meta['T_forward']}`, `T_loss={pair_meta['T_loss']}`, `used_rows_in_loss={pair_meta['used_rows_in_loss']}`",
-        f"- data procedure: `train_big_vae._slice_sample` with `slice_batch_size={pair_meta['fixed_source_batch_size']}`",
-        f"- captured source sample: `{pair_meta['captured_source_meta']['model_name']}` / `{pair_meta['captured_source_meta']['layer_name']}`",
+        *setup_lines,
         "",
         "## Duplicate Sanity",
         "",
