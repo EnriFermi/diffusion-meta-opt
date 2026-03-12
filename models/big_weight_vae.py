@@ -38,6 +38,7 @@ class BigVAEConfig:
     pos_fourier_dim: int = 64
     use_latent_sampling: bool = True
     disable_z_shortcut: bool = False
+    disable_distribution_encoder: bool = False
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
 
 
@@ -250,6 +251,9 @@ class BigWeightVAE(nn.Module):
         d_dist = cfg.distribution.d_dist
 
         self.distribution_encoder = InputDistributionEncodingModule(cfg.distribution)
+        self.use_distribution_encoder = not bool(cfg.big_vae.disable_distribution_encoder)
+        if not self.use_distribution_encoder:
+            self.distribution_encoder.requires_grad_(False)
         d_patch = cfg.mini_vae.d_patch
         # self.patch_tokenizer = MixerPatchTokenizer(
         #     p=p,
@@ -504,14 +508,20 @@ class BigWeightVAE(nn.Module):
         device = X.device
         p = self.cfg.patch_size
         patch_idx_t, T, d_in_pad = self._build_patch_indices(d_in=d_in, patch_size=p, device=device)
+        d_var = self.cfg.distribution.d_var
+        d_dist = self.cfg.distribution.d_dist
+        if not self.use_distribution_encoder:
+            dist_var_by_patch = X.new_zeros((B, T, p, d_var))
+            dist_patch_by_patch = X.new_zeros((B, T, d_dist))
+            dist_var_pooled = X.new_zeros((B, T, d_var))
+            return T, d_in_pad, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled
+
         patch_idx_bt = patch_idx_t.unsqueeze(0).expand(B, -1, -1).contiguous()
         X_rep = X.unsqueeze(1).expand(B, T, n, d_in).reshape(B * T, n, d_in)
         patch_idx_flat = patch_idx_bt.reshape(B * T, p)
 
         dist_var_flat, dist_patch_flat = self.distribution_encoder(X_rep, patch_idx_flat)
 
-        d_var = self.cfg.distribution.d_var
-        d_dist = self.cfg.distribution.d_dist
         dist_var_by_patch = dist_var_flat.view(B, T, p, d_var)
         dist_patch_by_patch = dist_patch_flat.view(B, T, d_dist)
         dist_var_pooled = dist_var_by_patch.mean(dim=2)

@@ -192,6 +192,7 @@ def _build_model_cfg_local(cfg: DictConfig) -> ModelConfig:
             pos_fourier_dim=int(big_cfg.get("pos_fourier_dim", 64)),
             use_latent_sampling=bool(big_cfg.get("use_latent_sampling", True)),
             disable_z_shortcut=bool(big_cfg.get("disable_z_shortcut", False)),
+            disable_distribution_encoder=bool(big_cfg.get("disable_distribution_encoder", False)),
             encoder=EncoderConfig(
                 self_attn_mode=str(enc_cfg.get("self_attn_mode", "full")),
                 cross_attend_only_cls=bool(enc_cfg.get("cross_attend_only_cls", True)),
