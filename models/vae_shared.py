@@ -353,27 +353,30 @@ def _decode_direction_and_logscale(
 ) -> torch.Tensor:
     """
     Convert decoder outputs into weights:
-    U = u_hat / (||u_hat||_2 + eps), s = exp(s_hat), W_hat = s * U.
+    U = u_hat / (||u_hat||_2 + eps), log_s = bounded(s_hat), s = exp(log_s), W_hat = s * U.
+
+    The bounds are applied in log-space before exp(). This avoids masked overflow
+    in the forward graph when s_hat becomes very large.
     """
     if u_hat.ndim != 2:
         raise ValueError(f"u_hat must be [B, p], got {tuple(u_hat.shape)}")
     if s_hat.ndim == 1:
-        s = s_hat.unsqueeze(-1)
+        log_s = s_hat.unsqueeze(-1)
     elif s_hat.ndim == 2 and s_hat.shape[1] == 1:
-        s = s_hat
+        log_s = s_hat
     else:
         raise ValueError(f"s_hat must be [B] or [B,1], got {tuple(s_hat.shape)}")
-    if tuple(s.shape[:1]) != tuple(u_hat.shape[:1]):
-        raise ValueError(f"Batch mismatch: u_hat={tuple(u_hat.shape)}, s_hat={tuple(s_hat.shape)}")
+    if tuple(log_s.shape[:1]) != tuple(u_hat.shape[:1]):
+        raise ValueError(f"Batch mismatch: u_hat={tuple(u_hat.shape)}, s_hat={tuple(log_s.shape)}")
 
     u_norm = u_hat.norm(dim=1, keepdim=True).clamp_min(float(eps))
     u = u_hat / u_norm
 
-    s = torch.exp(s)
     if s_min != 0:
-        s = float(s_min) + F.softplus(s - float(s_min))
+        log_s = float(s_min) + F.softplus(log_s - float(s_min))
     if s_max is not None and s_max != 0:
-        s = float(s_max) - F.softplus(float(s_max) - s)
+        log_s = float(s_max) - F.softplus(float(s_max) - log_s)
+    s = torch.exp(log_s)
 
     return s * u
 

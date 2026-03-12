@@ -907,6 +907,51 @@ def _save_checkpoint(
     logger.info("Checkpoint saved: %s", step_path)
 
 
+def _maybe_dump_fixed_training_batch(
+    *,
+    W_s: torch.Tensor,
+    x_s: torch.Tensor,
+    cfg: DictConfig,
+    logger: logging.Logger,
+    global_step: int,
+    stage: int,
+    patch_size: int,
+    max_T_patches: int,
+    max_d_out: int,
+    slice_batch_size: int,
+) -> Path | None:
+    fixed_batch_cfg = cfg.train.get("fixed_training_batch", {})
+    if fixed_batch_cfg is None:
+        return None
+    if not isinstance(fixed_batch_cfg, (dict, DictConfig)):
+        raise TypeError("train.fixed_training_batch must be a mapping")
+
+    dump_path_text = str(fixed_batch_cfg.get("dump_path", "")).strip()
+    if not dump_path_text:
+        return None
+
+    dump_path = Path(dump_path_text)
+    dump_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "fixed_batch_W": W_s.detach().to(device="cpu", dtype=torch.float32, copy=True).contiguous(),
+        "fixed_batch_x": x_s.detach().to(device="cpu", dtype=torch.float32, copy=True).contiguous(),
+        "meta": {
+            "capture_step": int(global_step),
+            "stage": int(stage),
+            "patch_size": int(patch_size),
+            "max_T_patches": int(max_T_patches),
+            "max_d_out": int(max_d_out),
+            "slice_batch_size": int(slice_batch_size),
+            "W_shape": list(W_s.shape),
+            "x_shape": list(x_s.shape),
+            "data_seed": int(cfg.data.get("seed", 42)),
+        },
+    }
+    torch.save(payload, dump_path)
+    logger.info("Fixed training batch dump saved: %s", dump_path)
+    return dump_path
+
+
 def _next_valid_sample(
     dataset_iter: Iterator[Any],
     max_x_rows: int,
@@ -1587,6 +1632,18 @@ def _run_worker(
                                     tuple(fixed_batch_W.shape),
                                     tuple(fixed_batch_x.shape),
                                 )
+                                _maybe_dump_fixed_training_batch(
+                                    W_s=fixed_batch_W,
+                                    x_s=fixed_batch_x,
+                                    cfg=cfg,
+                                    logger=logger,
+                                    global_step=global_step,
+                                    stage=stage_num,
+                                    patch_size=patch_size_for_slice,
+                                    max_T_patches=curriculum_max_T,
+                                    max_d_out=curriculum_max_d_out,
+                                    slice_batch_size=slice_batch_size,
+                                )
                             if dataset is not None:
                                 dataset.close()
                                 dataset = None
@@ -1639,11 +1696,13 @@ def _run_worker(
                                 kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
                             else:
                                 kl_loss = mu.new_zeros(())
-                            total_loss = (
-                                behavioral_coef * behavioral_loss
-                                + structural_coef * structural_loss
-                                + kl_beta * kl_loss
-                            )
+                            total_loss = mu.new_zeros(())
+                            if behavioral_coef != 0.0:
+                                total_loss = total_loss + behavioral_coef * behavioral_loss
+                            if structural_coef != 0.0:
+                                total_loss = total_loss + structural_coef * structural_loss
+                            if kl_beta != 0.0:
+                                total_loss = total_loss + kl_beta * kl_loss
                             loss_for_backward = total_loss / grad_accum_steps
 
                         if rank == 0 and fixed_training_batch_enabled and direction_pre_norms is not None:
