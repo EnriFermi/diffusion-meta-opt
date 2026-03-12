@@ -1049,6 +1049,10 @@ class BigWeightVAE(nn.Module):
         if squeeze_batch != (X.ndim == 2):
             raise ValueError(f"W and X must be both batched or both unbatched, got W={tuple(W.shape)}, X={tuple(X.shape)}")
 
+        # W = W[0].repeat(W.shape[0], 1, 1)
+        # X = X[0].repeat(X.shape[0], 1, 1)
+        print(W[:, 0, 0], X[:, 0, 0])
+
         if squeeze_batch:
             W = W.unsqueeze(0)
             X = X.unsqueeze(0)

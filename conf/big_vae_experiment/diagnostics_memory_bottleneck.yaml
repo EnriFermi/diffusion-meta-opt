@@ -51,7 +51,7 @@ diagnostics:
   output_root: artifacts/big_vae_memory_bottleneck_diagnostics
   frozen_pair:
     source_kind: real
-    source_batch_size: 16
+    source_batch_size: 2
     max_x_rows: ${train.max_x_rows}
     use_curriculum_slice: true
     max_T_patches: null
