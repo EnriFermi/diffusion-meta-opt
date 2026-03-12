@@ -53,6 +53,7 @@ class ModelConfig:
     mini_vae: MiniVAEConfig = field(default_factory=MiniVAEConfig)
     big_vae: BigVAEConfig = field(default_factory=BigVAEConfig)
     beta: float = 1e-3
+    variant: str = "full"
 
 
 class LocalOutputSelfAttentionBlock(nn.Module):

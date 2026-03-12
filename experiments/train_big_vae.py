@@ -29,6 +29,7 @@ from models.weight_quantile_vae import (
     MiniVAEConfig,
     ModelConfig,
     WeightQuantileVAE,
+    build_weight_quantile_vae,
 )
 from training.optim import build_adamw_optimizer, build_cosine_scheduler
 from training.forensics import (
@@ -118,6 +119,7 @@ def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
     return ModelConfig(
         patch_size=int(model_cfg.get("patch_size", 16)),
         beta=float(model_cfg.get("beta", 1e-3)),
+        variant=str(model_cfg.get("variant", "full")),
         distribution=DistributionConfig(
             k_s=int(dist_cfg.get("k_s", 16)),
             Kq=int(dist_cfg.get("Kq", 32)),
@@ -1325,7 +1327,7 @@ def _run_worker(
                     dataset_iter = iter(dataset)
 
             model_cfg = _build_model_cfg(cfg)
-            model = WeightQuantileVAE(model_cfg).to(device)
+            model = build_weight_quantile_vae(model_cfg).to(device)
             model = _maybe_compile(model, cfg=cfg, logger=logger)
 
             if is_distributed:
