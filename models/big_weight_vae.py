@@ -249,11 +249,25 @@ class BigWeightVAE(nn.Module):
         p = cfg.patch_size
         d_var = cfg.distribution.d_var
         d_dist = cfg.distribution.d_dist
+        d_model = cfg.big_vae.d_model
+        d_lat = cfg.big_vae.d_lat
+        n_heads = cfg.big_vae.n_heads
+        num_latents = cfg.big_vae.num_latents
+        num_enc_layers = max(1, cfg.big_vae.num_encoder_layers)
+        num_dec_layers = max(1, cfg.big_vae.num_decoder_layers)
+        dropout = cfg.big_vae.dropout
 
-        self.distribution_encoder = InputDistributionEncodingModule(cfg.distribution)
         self.use_distribution_encoder = not bool(cfg.big_vae.disable_distribution_encoder)
-        if not self.use_distribution_encoder:
-            self.distribution_encoder.requires_grad_(False)
+        if self.use_distribution_encoder:
+            self.distribution_encoder: InputDistributionEncodingModule | None = InputDistributionEncodingModule(
+                cfg.distribution
+            )
+            patch_tokenizer_d_dist = d_dist
+            query_in_dim = d_model + d_dist
+        else:
+            self.distribution_encoder = None
+            patch_tokenizer_d_dist = 0
+            query_in_dim = d_model
         d_patch = cfg.mini_vae.d_patch
         # self.patch_tokenizer = MixerPatchTokenizer(
         #     p=p,
@@ -266,20 +280,12 @@ class BigWeightVAE(nn.Module):
         # )
         self.patch_tokenizer = ResidualPatchTokenizer(
             p=p,
-            d_dist=d_dist,
+            d_dist=patch_tokenizer_d_dist,
             d_patch=d_patch,
             hidden_dim = 256,
             num_layers= 3,
             dropout=0.0
         )
-
-        d_model = cfg.big_vae.d_model
-        d_lat = cfg.big_vae.d_lat
-        n_heads = cfg.big_vae.n_heads
-        num_latents = cfg.big_vae.num_latents
-        num_enc_layers = max(1, cfg.big_vae.num_encoder_layers)
-        num_dec_layers = max(1, cfg.big_vae.num_decoder_layers)
-        dropout = cfg.big_vae.dropout
 
         if d_model % n_heads != 0:
             raise ValueError(f"big_vae.d_model ({d_model}) must be divisible by big_vae.n_heads ({n_heads})")
@@ -303,20 +309,28 @@ class BigWeightVAE(nn.Module):
                 for _ in range(num_enc_layers)
             ]
         )
-        self.enc_dist_inject_projs = nn.ModuleList([nn.Linear(d_model + d_var, d_model) for _ in range(num_enc_layers)])
+        if self.use_distribution_encoder:
+            self.enc_dist_inject_projs: nn.ModuleList | None = nn.ModuleList(
+                [nn.Linear(d_model + d_var, d_model) for _ in range(num_enc_layers)]
+            )
+        else:
+            self.enc_dist_inject_projs = None
         self.flat_lat_dim = num_latents * d_lat
-        self.enc_dist_to_latent_heads = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(d_var, d_var * 2),
-                    nn.GELU(),
-                    nn.Linear(d_var * 2, d_var * 2),
-                    nn.GELU(),
-                    nn.Linear(d_var * 2, self.flat_lat_dim),
-                )
-                for _ in range(num_enc_layers)
-            ]
-        )
+        if self.use_distribution_encoder:
+            self.enc_dist_to_latent_heads: nn.ModuleList | None = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(d_var, d_var * 2),
+                        nn.GELU(),
+                        nn.Linear(d_var * 2, d_var * 2),
+                        nn.GELU(),
+                        nn.Linear(d_var * 2, self.flat_lat_dim),
+                    )
+                    for _ in range(num_enc_layers)
+                ]
+            )
+        else:
+            self.enc_dist_to_latent_heads = None
 
         self.latent_base = nn.Parameter(torch.randn(num_latents, d_lat) * 0.02)
         self.z_dim = self.flat_lat_dim
@@ -325,7 +339,7 @@ class BigWeightVAE(nn.Module):
         self.dec_L_latents = num_latents
         self.latent_to_decoder = nn.Linear(d_lat, d_model)
         self.pos_proj = nn.Linear(2 * cfg.big_vae.pos_fourier_dim, d_model)
-        self.query_proj = nn.Linear(d_model + d_dist, d_model)
+        self.query_proj = nn.Linear(query_in_dim, d_model)
         self.query_pos_proj = nn.Linear(d_model, d_model)
         self.decoder_layers = nn.ModuleList(
             [CrossAttnBlock(d_model=d_model, n_heads=n_heads, dropout=dropout, use_rope_2d=True) for _ in range(num_dec_layers)]
@@ -497,7 +511,7 @@ class BigWeightVAE(nn.Module):
         X: torch.Tensor,
         *,
         d_in: int,
-    ) -> tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[int, int, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         if X.ndim != 3:
             raise ValueError(f"X must be rank-3 [B, n, d_in], got {tuple(X.shape)}")
 
@@ -508,13 +522,10 @@ class BigWeightVAE(nn.Module):
         device = X.device
         p = self.cfg.patch_size
         patch_idx_t, T, d_in_pad = self._build_patch_indices(d_in=d_in, patch_size=p, device=device)
-        d_var = self.cfg.distribution.d_var
-        d_dist = self.cfg.distribution.d_dist
         if not self.use_distribution_encoder:
-            dist_var_by_patch = X.new_zeros((B, T, p, d_var))
-            dist_patch_by_patch = X.new_zeros((B, T, d_dist))
-            dist_var_pooled = X.new_zeros((B, T, d_var))
-            return T, d_in_pad, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled
+            return T, d_in_pad, None, None, None
+        if self.distribution_encoder is None:
+            raise RuntimeError("distribution_encoder is not initialized")
 
         patch_idx_bt = patch_idx_t.unsqueeze(0).expand(B, -1, -1).contiguous()
         X_rep = X.unsqueeze(1).expand(B, T, n, d_in).reshape(B * T, n, d_in)
@@ -522,6 +533,8 @@ class BigWeightVAE(nn.Module):
 
         dist_var_flat, dist_patch_flat = self.distribution_encoder(X_rep, patch_idx_flat)
 
+        d_var = self.cfg.distribution.d_var
+        d_dist = self.cfg.distribution.d_dist
         dist_var_by_patch = dist_var_flat.view(B, T, p, d_var)
         dist_patch_by_patch = dist_patch_flat.view(B, T, d_dist)
         dist_var_pooled = dist_var_by_patch.mean(dim=2)
@@ -533,9 +546,9 @@ class BigWeightVAE(nn.Module):
         *,
         T: int,
         d_in_pad: int,
-        dist_var_by_patch: torch.Tensor,
-        dist_patch_by_patch: torch.Tensor,
-        dist_var_pooled: torch.Tensor,
+        dist_var_by_patch: torch.Tensor | None,
+        dist_patch_by_patch: torch.Tensor | None,
+        dist_var_pooled: torch.Tensor | None,
         return_debug_info: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if W.ndim != 3:
@@ -546,35 +559,53 @@ class BigWeightVAE(nn.Module):
         d_var = self.cfg.distribution.d_var
         d_dist = self.cfg.distribution.d_dist
 
-        if tuple(dist_var_by_patch.shape[:3]) != (B, T, p):
-            raise ValueError(
-                "dist_var_by_patch must be [B, T, p, d_var], got "
-                f"{tuple(dist_var_by_patch.shape)} for expected {(B, T, p, d_var)}"
-            )
-        if int(dist_var_by_patch.shape[3]) != d_var:
-            raise ValueError(f"dist_var_by_patch last dim must be {d_var}, got {int(dist_var_by_patch.shape[3])}")
-        if tuple(dist_patch_by_patch.shape[:2]) != (B, T):
-            raise ValueError(
-                "dist_patch_by_patch must be [B, T, d_dist], got "
-                f"{tuple(dist_patch_by_patch.shape)} for expected {(B, T, d_dist)}"
-            )
-        if int(dist_patch_by_patch.shape[2]) != d_dist:
-            raise ValueError(f"dist_patch_by_patch last dim must be {d_dist}, got {int(dist_patch_by_patch.shape[2])}")
-        if tuple(dist_var_pooled.shape[:2]) != (B, T):
-            raise ValueError(
-                "dist_var_pooled must be [B, T, d_var], got "
-                f"{tuple(dist_var_pooled.shape)} for expected {(B, T, d_var)}"
-            )
+        if self.use_distribution_encoder:
+            if dist_var_by_patch is None or dist_patch_by_patch is None or dist_var_pooled is None:
+                raise ValueError("distribution tensors are required when distribution encoder is enabled")
+            if tuple(dist_var_by_patch.shape[:3]) != (B, T, p):
+                raise ValueError(
+                    "dist_var_by_patch must be [B, T, p, d_var], got "
+                    f"{tuple(dist_var_by_patch.shape)} for expected {(B, T, p, d_var)}"
+                )
+            if int(dist_var_by_patch.shape[3]) != d_var:
+                raise ValueError(f"dist_var_by_patch last dim must be {d_var}, got {int(dist_var_by_patch.shape[3])}")
+            if tuple(dist_patch_by_patch.shape[:2]) != (B, T):
+                raise ValueError(
+                    "dist_patch_by_patch must be [B, T, d_dist], got "
+                    f"{tuple(dist_patch_by_patch.shape)} for expected {(B, T, d_dist)}"
+                )
+            if int(dist_patch_by_patch.shape[2]) != d_dist:
+                raise ValueError(
+                    f"dist_patch_by_patch last dim must be {d_dist}, got {int(dist_patch_by_patch.shape[2])}"
+                )
+            if tuple(dist_var_pooled.shape[:2]) != (B, T):
+                raise ValueError(
+                    "dist_var_pooled must be [B, T, d_var], got "
+                    f"{tuple(dist_var_pooled.shape)} for expected {(B, T, d_var)}"
+                )
+        elif dist_var_by_patch is not None or dist_patch_by_patch is not None or dist_var_pooled is not None:
+            raise ValueError("distribution tensors must be None when distribution encoder is disabled")
 
         W_pad = torch.zeros(B, d_in_pad, d_out, device=W.device, dtype=W.dtype)
         W_pad[:, :d_in, :] = W
         w_patches = W_pad.transpose(1, 2).contiguous().view(B, d_out, T, p)
 
-        dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
-        dist_var_expanded = dist_var_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1, -1)
         w_flat = w_patches.reshape(B * d_out * T, p)
-        dist_patch_flat_expanded = dist_patch_expanded.reshape(B * d_out * T, d_dist)
-        dist_var_flat_expanded = dist_var_expanded.reshape(B * d_out * T, p, d_var)
+        if self.use_distribution_encoder:
+            assert dist_var_by_patch is not None
+            assert dist_patch_by_patch is not None
+            assert dist_var_pooled is not None
+            dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
+            dist_var_expanded = dist_var_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1, -1)
+            dist_patch_flat_expanded = dist_patch_expanded.reshape(B * d_out * T, d_dist)
+            dist_var_flat_expanded: torch.Tensor | None = dist_var_expanded.reshape(B * d_out * T, p, d_var)
+            dist_var_for_inject = dist_var_pooled.unsqueeze(1).expand(-1, d_out, -1, -1)
+            dist_var_global = dist_var_pooled.mean(dim=1)
+        else:
+            dist_patch_flat_expanded = w_flat.new_zeros((B * d_out * T, 0))
+            dist_var_flat_expanded = None
+            dist_var_for_inject = None
+            dist_var_global = None
 
         d_patch = self.cfg.mini_vae.d_patch
         patch_token_raw_flat = self.patch_tokenizer(
@@ -588,22 +619,24 @@ class BigWeightVAE(nn.Module):
         cls_tokens = self.cls_token.view(1, 1, 1, -1).expand(B, d_out, 1, -1)
         tokens_by_output = torch.cat([cls_tokens, patch_tokens], dim=2)
 
-        dist_var_for_inject = dist_var_pooled.unsqueeze(1).expand(-1, d_out, -1, -1)
-        dist_var_global = dist_var_pooled.mean(dim=1)
-
         latents = self.latent_base.unsqueeze(0).expand(B, -1, -1)
         num_latents = self.cfg.big_vae.num_latents
         d_lat = self.cfg.big_vae.d_lat
 
         for layer_idx, enc_layer in enumerate(self.encoder_layers):
-            cls_part = tokens_by_output[:, :, :1, :]
-            patch_part = tokens_by_output[:, :, 1:, :]
-            patch_with_dist = torch.cat([patch_part, dist_var_for_inject], dim=-1)
-            patch_part = self.enc_dist_inject_projs[layer_idx](patch_with_dist)
-            tokens_by_output = torch.cat([cls_part, patch_part], dim=2)
+            if self.use_distribution_encoder:
+                assert dist_var_for_inject is not None
+                assert dist_var_global is not None
+                assert self.enc_dist_inject_projs is not None
+                assert self.enc_dist_to_latent_heads is not None
+                cls_part = tokens_by_output[:, :, :1, :]
+                patch_part = tokens_by_output[:, :, 1:, :]
+                patch_with_dist = torch.cat([patch_part, dist_var_for_inject], dim=-1)
+                patch_part = self.enc_dist_inject_projs[layer_idx](patch_with_dist)
+                tokens_by_output = torch.cat([cls_part, patch_part], dim=2)
 
-            dist_lat_delta = self.enc_dist_to_latent_heads[layer_idx](dist_var_global)
-            latents = latents + dist_lat_delta.view(B, num_latents, d_lat)
+                dist_lat_delta = self.enc_dist_to_latent_heads[layer_idx](dist_var_global)
+                latents = latents + dist_lat_delta.view(B, num_latents, d_lat)
 
             tokens_by_output, latents = enc_layer(
                 tokens_by_output=tokens_by_output,
@@ -642,15 +675,21 @@ class BigWeightVAE(nn.Module):
     def _build_decoder_query_state(
         self,
         *,
-        dist_patch_by_patch: torch.Tensor,
+        batch_size: int,
+        dist_patch_by_patch: torch.Tensor | None,
         d_out: int,
         T: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        B = int(dist_patch_by_patch.shape[0])
         d_model = int(self.cfg.big_vae.d_model)
-        device = dist_patch_by_patch.device
+        if self.use_distribution_encoder:
+            if dist_patch_by_patch is None:
+                raise ValueError("dist_patch_by_patch is required when distribution encoder is enabled")
+            B = int(dist_patch_by_patch.shape[0])
+            device = dist_patch_by_patch.device
+        else:
+            B = int(batch_size)
+            device = self.cls_token.device
 
-        dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
         o_idx = torch.arange(d_out, device=device)
         t_idx = torch.arange(T, device=device)
         o_grid, t_grid = torch.meshgrid(o_idx, t_idx, indexing="ij")
@@ -663,8 +702,13 @@ class BigWeightVAE(nn.Module):
         q_base = self.pos_proj(pos_ot)
         q_pos_emb = self.query_pos_proj(q_base)
         q_base_expanded = q_base.unsqueeze(0).expand(B, -1, -1, -1)
-        q_cond_cat = torch.cat([q_base_expanded, dist_patch_expanded], dim=-1)
-        q_tokens = self.query_proj(q_cond_cat).reshape(B, d_out * T, d_model)
+        if self.use_distribution_encoder:
+            assert dist_patch_by_patch is not None
+            dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
+            q_inputs = torch.cat([q_base_expanded, dist_patch_expanded], dim=-1)
+        else:
+            q_inputs = q_base_expanded
+        q_tokens = self.query_proj(q_inputs).reshape(B, d_out * T, d_model)
         q_pos_emb_flat = q_pos_emb.reshape(1, d_out * T, d_model).expand(B, -1, -1)
         q_pos_o = o_grid.flatten().to(dtype=torch.float32)
         q_pos_t = t_grid.flatten().to(dtype=torch.float32)
@@ -847,7 +891,7 @@ class BigWeightVAE(nn.Module):
         self,
         latent_slots: torch.Tensor,
         *,
-        dist_patch_by_patch: torch.Tensor,
+        dist_patch_by_patch: torch.Tensor | None,
         d_in: int,
         d_out: int,
         d_in_pad: int,
@@ -871,11 +915,16 @@ class BigWeightVAE(nn.Module):
                 "latent_slots shape mismatch: "
                 f"got {(B, num_latents, d_lat)}, expected (*, {expected_num_latents}, {expected_d_lat})"
             )
-        if tuple(dist_patch_by_patch.shape[:2]) != (B, T):
-            raise ValueError(
-                "dist_patch_by_patch must be [B, T, d_dist], got "
-                f"{tuple(dist_patch_by_patch.shape)} for expected {(B, T, self.cfg.distribution.d_dist)}"
-            )
+        if self.use_distribution_encoder:
+            if dist_patch_by_patch is None:
+                raise ValueError("dist_patch_by_patch is required when distribution encoder is enabled")
+            if tuple(dist_patch_by_patch.shape[:2]) != (B, T):
+                raise ValueError(
+                    "dist_patch_by_patch must be [B, T, d_dist], got "
+                    f"{tuple(dist_patch_by_patch.shape)} for expected {(B, T, self.cfg.distribution.d_dist)}"
+                )
+        elif dist_patch_by_patch is not None:
+            raise ValueError("dist_patch_by_patch must be None when distribution encoder is disabled")
 
         p = self.cfg.patch_size
         expected_d_in_pad = T * p
@@ -886,6 +935,7 @@ class BigWeightVAE(nn.Module):
         lat = self.latent_to_decoder(z.view(B, num_latents, d_lat))
 
         q_tokens_base, q_pos_emb, q_pos_o, q_pos_t = self._build_decoder_query_state(
+            batch_size=B,
             dist_patch_by_patch=dist_patch_by_patch,
             d_out=d_out,
             T=T,
