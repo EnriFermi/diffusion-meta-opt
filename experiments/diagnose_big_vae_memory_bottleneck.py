@@ -840,6 +840,7 @@ def _run_mode_variant(
     debug_shapes: dict[str, Any] | None = None
 
     for step in range(steps + 1):
+        print(variant_name)
         optimizer.zero_grad(set_to_none=True)
         if mode_spec.key == "A":
             W_hat, _z, _logvar, pred_dirs, direction_pre_norms = model(
@@ -981,7 +982,7 @@ def _run_mode(
 
     all_rows: list[dict[str, Any]] = []
     variants_summary: dict[str, Any] = {}
-    for variant_name in ("duplicate_pair", "different_pair"):
+    for variant_name in ("different_pair", "duplicate_pair"):
         rows, summary = _run_mode_variant(
             frozen_variants[variant_name],
             cfg=cfg,
@@ -994,6 +995,7 @@ def _run_mode(
         )
         all_rows.extend(rows)
         variants_summary[variant_name] = summary
+        1 / 0
 
     threshold = float(cfg.diagnostics.reporting.get("convergence_threshold", 1e-2))
     ratio_eps = float(cfg.diagnostics.reporting.get("ratio_eps", 1e-12))

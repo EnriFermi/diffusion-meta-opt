@@ -61,7 +61,11 @@ class ResidualPatchTokenizer(nn.Module):
             nn.init.zeros_(self.weight_residual_proj.weight)
             self.weight_residual_proj.weight[:min_dim, :min_dim] = torch.eye(min_dim)
 
-    def forward(self, w_patch: torch.Tensor, dist_patch_embed: torch.Tensor) -> torch.Tensor:
+    def forward(self, 
+        w_patch: torch.Tensor, 
+        dist_var_tokens: torch.Tensor = None,
+        dist_patch_embed: torch.Tensor = None
+    ) -> torch.Tensor:
         if w_patch.ndim != 2:
             raise ValueError(f"w_patch must be [B, p], got {tuple(w_patch.shape)}")
         if dist_patch_embed.ndim != 2:

@@ -250,14 +250,22 @@ class BigWeightVAE(nn.Module):
 
         self.distribution_encoder = InputDistributionEncodingModule(cfg.distribution)
         d_patch = cfg.mini_vae.d_patch
-        self.patch_tokenizer = MixerPatchTokenizer(
+        # self.patch_tokenizer = MixerPatchTokenizer(
+        #     p=p,
+        #     d_var=d_var,
+        #     d_dist=d_dist,
+        #     d_patch=d_patch,
+        #     d_hidden=d_var,
+        #     num_mixer_layers=3,
+        #     dropout=cfg.big_vae.dropout,
+        # )
+        self.patch_tokenizer = ResidualPatchTokenizer(
             p=p,
-            d_var=d_var,
             d_dist=d_dist,
             d_patch=d_patch,
-            d_hidden=d_var,
-            num_mixer_layers=3,
-            dropout=cfg.big_vae.dropout,
+            hidden_dim = 256,
+            num_layers= 3,
+            dropout=0.0
         )
 
         d_model = cfg.big_vae.d_model
@@ -422,7 +430,7 @@ class BigWeightVAE(nn.Module):
             w = (r + eps) ** gamma
             w = w / (w.sum(dim=1, keepdim=True) + eps)
             cos = (u_hat_dir * u).sum(dim=-1)
-            L_dir = (w * (1.0 - cos)).sum(dim=1).mean()
+            L_dir = ((1.0 - cos)).sum(dim=1).mean() # w * 
 
         if use_scale:
             d = _ensure_log_r_hat() - log_r
@@ -877,9 +885,13 @@ class BigWeightVAE(nn.Module):
             debug_query_hint=debug_query_hint,
         )
 
+        #DEBUG
+        debug_direct_from_encoder_tokens = True
         if bool(debug_direct_from_encoder_tokens):
             if encoder_patch_tokens is None:
                 raise ValueError("encoder_patch_tokens are required when debug_direct_from_encoder_tokens=True")
+            #DEBUG
+            print('Anal bobra')
             outputs = self._decode_direct_from_encoder_patch_tokens(
                 encoder_patch_tokens,
                 z=z,
@@ -1065,13 +1077,14 @@ class BigWeightVAE(nn.Module):
             X,
             d_in=d_in,
         )
-        latents = self._encode_latent_slots(
+        latents, encode_debug = self._encode_latent_slots(
             W,
             T=T,
             d_in_pad=d_in_pad,
             dist_var_by_patch=dist_var_by_patch,
             dist_patch_by_patch=dist_patch_by_patch,
             dist_var_pooled=dist_var_pooled,
+            return_debug_info=True
         )
         decode_outputs = self._decode_from_latent_slots(
             latents,
@@ -1079,6 +1092,7 @@ class BigWeightVAE(nn.Module):
             d_in=d_in,
             d_out=d_out,
             d_in_pad=d_in_pad,
+            encoder_patch_tokens=encode_debug["encoder_patch_tokens"],
             T=T,
             return_direction_pre_norms=return_direction_pre_norms,
             disable_z_shortcut=disable_z_shortcut,

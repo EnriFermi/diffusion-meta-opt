@@ -88,7 +88,7 @@ telemetry:
     heatmap_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/grad_layer_rms_heatmap.png
     log_scale: true
   comet:
-    enabled: false
+    enabled: true
     api_key: ${oc.env:COMET_API_KEY,""}
     workspace: ${oc.env:COMET_WORKSPACE,""}
     project_name: big_weight_vae
