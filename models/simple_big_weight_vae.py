@@ -4,7 +4,10 @@ import torch
 import torch.nn as nn
 
 from models.big_weight_vae import LocalOutputSelfAttentionBlock, ModelConfig
+from models.distribution_encoder import InputDistributionEncodingModule
 from models.vae_shared import _decode_direction_and_logscale
+
+SIMPLE_DIRECT_USE_DISTRIBUTION_CONDITIONING = False
 
 
 class SimpleDirectBigWeightVAE(nn.Module):
@@ -12,7 +15,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
     Minimal BigVAE variant for debugging.
 
     Design goals:
-    - no distribution conditioning
+    - optional distribution conditioning behind a hardcoded flag in this file
     - no latent bottleneck
     - no decoder cross-attention
     - predict directions directly from final encoder patch tokens
@@ -30,11 +33,17 @@ class SimpleDirectBigWeightVAE(nn.Module):
         n_heads = int(cfg.big_vae.n_heads)
         num_enc_layers = max(1, int(cfg.big_vae.num_encoder_layers))
         dropout = float(cfg.big_vae.dropout)
+        d_dist = int(cfg.distribution.d_dist)
 
         if d_model % n_heads != 0:
             raise ValueError(f"big_vae.d_model ({d_model}) must be divisible by big_vae.n_heads ({n_heads})")
 
-        self.patch_tokenizer = nn.Linear(p, d_model)
+        self.use_distribution_conditioning = bool(SIMPLE_DIRECT_USE_DISTRIBUTION_CONDITIONING)
+        self.patch_tokenizer = nn.Linear(p + (d_dist if self.use_distribution_conditioning else 0), d_model)
+        if self.use_distribution_conditioning:
+            self.distribution_encoder = InputDistributionEncodingModule(cfg.distribution)
+        else:
+            self.distribution_encoder = None
         self.cls_token = nn.Parameter(torch.zeros(d_model))
         self.encoder_layers = nn.ModuleList(
             [
@@ -65,14 +74,47 @@ class SimpleDirectBigWeightVAE(nn.Module):
         d_in_pad = T * int(patch_size)
         return T, d_in_pad
 
+    def _encode_distribution_context(
+        self,
+        X: torch.Tensor,
+        *,
+        d_in: int,
+    ) -> torch.Tensor:
+        if not self.use_distribution_conditioning or self.distribution_encoder is None:
+            raise RuntimeError("distribution conditioning is disabled for SimpleDirectBigWeightVAE")
+        if X.ndim != 3:
+            raise ValueError(f"X must be rank-3 [B, n, d_in], got {tuple(X.shape)}")
+
+        B, n, d_in_x = X.shape
+        if d_in_x != d_in:
+            raise ValueError(f"X last dim ({d_in_x}) must match d_in ({d_in})")
+
+        p = int(self.cfg.patch_size)
+        T, d_in_pad = self._build_patch_geometry(d_in=d_in, patch_size=p)
+        del d_in_pad
+        patch_idx_t = torch.arange(T * p, device=X.device, dtype=torch.long).view(T, p)
+        patch_idx_t = patch_idx_t.clamp(max=max(0, d_in - 1))
+        patch_idx_bt = patch_idx_t.unsqueeze(0).expand(B, -1, -1).contiguous()
+        X_rep = X.unsqueeze(1).expand(B, T, n, d_in).reshape(B * T, n, d_in)
+        patch_idx_flat = patch_idx_bt.reshape(B * T, p)
+
+        _dist_var_flat, dist_patch_flat = self.distribution_encoder(X_rep, patch_idx_flat)
+        return dist_patch_flat.view(B, T, -1)
+
     def _encode_patch_tokens(
         self,
         W: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        X: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int, torch.Tensor | None]:
         if W.ndim != 3:
             raise ValueError(f"W must be rank-3 [B, d_in, d_out], got {tuple(W.shape)}")
+        if X.ndim != 3:
+            raise ValueError(f"X must be rank-3 [B, n, d_in], got {tuple(X.shape)}")
 
         B, d_in, d_out = W.shape
+        Bx, _, d_in_x = X.shape
+        if Bx != B or d_in_x != d_in:
+            raise ValueError(f"Shape mismatch: W={tuple(W.shape)}, X={tuple(X.shape)}")
         p = int(self.cfg.patch_size)
         T, d_in_pad = self._build_patch_geometry(d_in=d_in, patch_size=p)
 
@@ -80,7 +122,14 @@ class SimpleDirectBigWeightVAE(nn.Module):
         W_pad[:, :d_in, :] = W
         w_patches = W_pad.transpose(1, 2).contiguous().view(B, d_out, T, p)
 
-        patch_tokens = self.patch_tokenizer(w_patches.reshape(B * d_out * T, p))
+        dist_patch_by_patch: torch.Tensor | None = None
+        patch_token_inputs = w_patches
+        if self.use_distribution_conditioning:
+            dist_patch_by_patch = self._encode_distribution_context(X, d_in=d_in)
+            dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
+            patch_token_inputs = torch.cat([w_patches, dist_patch_expanded], dim=-1)
+
+        patch_tokens = self.patch_tokenizer(patch_token_inputs.reshape(B * d_out * T, patch_token_inputs.shape[-1]))
         patch_tokens = patch_tokens.view(B, d_out, T, -1)
         cls_tokens = self.cls_token.view(1, 1, 1, -1).expand(B, d_out, 1, -1)
         tokens_by_output = torch.cat([cls_tokens, patch_tokens], dim=2)
@@ -91,7 +140,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
             tokens_by_output = local_out.view(B, d_out, T + 1, tokens_by_output.shape[-1])
 
         encoder_patch_tokens = tokens_by_output[:, :, 1:, :]
-        return tokens_by_output, encoder_patch_tokens, T, d_in_pad
+        return tokens_by_output, encoder_patch_tokens, T, d_in_pad, dist_patch_by_patch
 
     def _decode_direct_from_encoder_tokens(
         self,
@@ -172,7 +221,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
         if Bx != B or d_in_x != d_in:
             raise ValueError(f"Shape mismatch: W={tuple(W.shape)}, X={tuple(X.shape)}")
 
-        tokens_by_output, encoder_patch_tokens, T, d_in_pad = self._encode_patch_tokens(W)
+        tokens_by_output, encoder_patch_tokens, T, d_in_pad, dist_patch_by_patch = self._encode_patch_tokens(W, X)
         decode_outputs = self._decode_direct_from_encoder_tokens(
             encoder_patch_tokens,
             d_in=d_in,
@@ -191,6 +240,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
         debug_info = {
             "T": int(T),
             "d_in_pad": int(d_in_pad),
+            "dist_patch_by_patch": dist_patch_by_patch,
             "encoder_tokens_by_output": tokens_by_output,
             "encoder_cls_tokens": tokens_by_output[:, :, :1, :],
             "encoder_patch_tokens": encoder_patch_tokens,
@@ -249,7 +299,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
         if Bx != B or d_in_x != d_in:
             raise ValueError(f"Shape mismatch: W={tuple(W.shape)}, X={tuple(X.shape)}")
 
-        _tokens_by_output, encoder_patch_tokens, T, d_in_pad = self._encode_patch_tokens(W)
+        _tokens_by_output, encoder_patch_tokens, T, d_in_pad, _dist_patch_by_patch = self._encode_patch_tokens(W, X)
         decode_outputs = self._decode_direct_from_encoder_tokens(
             encoder_patch_tokens,
             d_in=d_in,
