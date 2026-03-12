@@ -57,7 +57,7 @@ diagnostics:
     max_T_patches: null
     max_d_out: null
   training:
-    steps: 500
+    steps: 2000
     lr: ${train.lr}
   reporting:
     convergence_threshold: 0.01

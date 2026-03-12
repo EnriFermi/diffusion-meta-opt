@@ -4,14 +4,14 @@ beta: 0.001
 big_vae:
   d_model: 512
   d_lat: 256
-  num_latents: 1024
+  num_latents: 32
   # true -> VAE (sampling + KL), false -> AE (deterministic z, KL term forced to 0 in train loop)
   use_latent_sampling: false
   num_encoder_layers: 8
   num_decoder_layers: 8
   n_heads: 4
   ffn_mult: 4.0
-  dropout: 0.1
+  dropout: 0.0
   pos_fourier_dim: 256
   disable_z_shortcut: true
   encoder:

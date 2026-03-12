@@ -31,11 +31,11 @@ struct_loss:
   lambda_rel: 0.0
   huber_delta: 0.1
 grad_clip_norm_by_part:
-  distribution_encoder: 1.0
-  patch_tokenizer: 1.0
-  encoder: 1.0
-  decoder: 1.0
-  big_vae_other: 1.0
+  distribution_encoder: 0
+  patch_tokenizer: 0
+  encoder: 0
+  decoder: 0
+  big_vae_other: 0
  
 checkpoint_every: 500
 checkpoint_dir: ${training_artifacts.big_vae_checkpoint_dir}
