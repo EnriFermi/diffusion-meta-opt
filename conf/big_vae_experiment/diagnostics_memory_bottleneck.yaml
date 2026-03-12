@@ -56,6 +56,9 @@ diagnostics:
     use_curriculum_slice: true
     max_T_patches: null
     max_d_out: null
+    exact_fixed_batch_paths:
+      duplicate_pair: ""
+      different_pair: ""
   training:
     steps: 2000
     lr: ${train.lr}

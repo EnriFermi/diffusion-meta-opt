@@ -58,6 +58,8 @@ synthetic_layer_source:
 # reuses it for the full run instead of reslicing on every micro-step.
 fixed_training_batch:
   enabled: true
+  # When non-empty, save the exact captured batch for later diagnostics replay.
+  dump_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/fixed_training_batch.pt
 # Cap rows in x to reduce rare heavy samples that can stall steps.
 max_x_rows: 512
 steps_per_sample: 100000000
