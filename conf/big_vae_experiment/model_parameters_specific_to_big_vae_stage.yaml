@@ -14,7 +14,7 @@ big_vae:
   dropout: 0.0
   pos_fourier_dim: 256
   disable_z_shortcut: true
-  disable_distribution_encoder: false
+  disable_distribution_encoder: true
   encoder:
     self_attn_mode: full
     cross_attend_only_cls: false

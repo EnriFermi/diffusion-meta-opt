@@ -897,7 +897,7 @@ class BigWeightVAE(nn.Module):
         )
 
         #DEBUG
-        debug_direct_from_encoder_tokens = True
+        # debug_direct_from_encoder_tokens = True
         if bool(debug_direct_from_encoder_tokens):
             if encoder_patch_tokens is None:
                 raise ValueError("encoder_patch_tokens are required when debug_direct_from_encoder_tokens=True")
