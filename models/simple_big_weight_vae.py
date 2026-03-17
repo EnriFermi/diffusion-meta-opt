@@ -8,7 +8,7 @@ from models.distribution_encoder import InputDistributionEncodingModule
 from models.vae_shared import CrossAttnBlock, PerceiverResamplerBlock, _decode_direction_and_logscale, sinusoidal_embedding
 
 SIMPLE_DIRECT_USE_DISTRIBUTION_CONDITIONING = False
-SIMPLE_DIRECT_USE_LATENT_BOTTLENECK = False
+SIMPLE_DIRECT_USE_LATENT_BOTTLENECK = True
 
 
 class SimpleDirectBigWeightVAE(nn.Module):
@@ -553,6 +553,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
             kv_pos_t = None
             resolved_kv_source = "encoder_patch_tokens"
         else:
+            print('AMA HERE')
             decoder_kv, kv_pos_o, kv_pos_t, resolved_kv_source = self._build_decoder_kv_state(
                 decoder_latents=decoder_latents,
                 encoder_patch_tokens=encoder_patch_tokens,
@@ -683,6 +684,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
         return_direction_pre_norms: bool = False,
         disable_z_shortcut: bool = False,
     ) -> tuple[torch.Tensor, ...]:
+        print('W.shape', W.shape)
         if W.ndim not in {2, 3}:
             raise ValueError(f"W must be rank-2 or rank-3, got {tuple(W.shape)}")
         if X.ndim not in {2, 3}:
