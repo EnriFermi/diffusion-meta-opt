@@ -449,7 +449,7 @@ class BigWeightVAE(nn.Module):
             w = (r + eps) ** gamma
             w = w / (w.sum(dim=1, keepdim=True) + eps)
             cos = (u_hat_dir * u).sum(dim=-1)
-            L_dir = ((1.0 - cos)).sum(dim=1).mean() # w * 
+            L_dir = ((1.0 - cos)).mean(dim=1).mean()
 
         if use_scale:
             d = _ensure_log_r_hat() - log_r
