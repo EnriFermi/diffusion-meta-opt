@@ -25,6 +25,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
     """
 
     def __init__(self, cfg: ModelConfig) -> None:
+        print('SimpleDirectBigWeightVAE')
         super().__init__()
         self.cfg = cfg
 
@@ -191,7 +192,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
             return W_hat, pred_dirs, direction_pre_norms
         return W_hat, pred_dirs
 
-    def forward_debug(
+    def _forward_debug(
         self,
         W: torch.Tensor,
         X: torch.Tensor,
