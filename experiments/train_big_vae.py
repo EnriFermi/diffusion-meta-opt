@@ -354,6 +354,7 @@ def _grad_stat_group_prefixes() -> dict[str, tuple[str, ...]]:
         "patch_tokenizer": ("patch_tokenizer.", "patch_token_proj.", "cls_token"),
         "encoder": (
             "encoder_layers.",
+            "latent_resampler_layers.",
             "enc_dist_inject_projs.",
             "enc_dist_to_latent_heads.",
             "latent_base",
