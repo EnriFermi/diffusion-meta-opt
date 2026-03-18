@@ -61,6 +61,19 @@ model:
     pos_fourier_dim: 256
     disable_z_shortcut: true
     disable_distribution_encoder: true
+    latent_bottleneck_kind: ttm
+    ttm:
+      proc_tokens: 8
+      process_depth: 2
+      summarizer_mode: mlp
+      summarizer_hidden_mult: 2.0
+      num_blocks: 1
+      share_weights: false
+      dropout: 0.0
+      use_type_embeddings: true
+      use_positional_embeddings: true
+      memory_init: learned
+      return_aux: false
     encoder:
       self_attn_mode: full
       cross_attend_only_cls: false

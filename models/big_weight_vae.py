@@ -26,6 +26,21 @@ class EncoderConfig:
 
 
 @dataclass(slots=True)
+class TTMMemoryConfig:
+    proc_tokens: int = 8
+    process_depth: int = 2
+    summarizer_mode: str = "mlp"
+    summarizer_hidden_mult: float = 2.0
+    num_blocks: int = 1
+    share_weights: bool = False
+    dropout: float = 0.0
+    use_type_embeddings: bool = True
+    use_positional_embeddings: bool = True
+    memory_init: str = "learned"
+    return_aux: bool = False
+
+
+@dataclass(slots=True)
 class BigVAEConfig:
     d_model: int = 256
     d_lat: int = 256
@@ -39,6 +54,8 @@ class BigVAEConfig:
     use_latent_sampling: bool = True
     disable_z_shortcut: bool = False
     disable_distribution_encoder: bool = False
+    latent_bottleneck_kind: str = "perceiver_resampler"
+    ttm: TTMMemoryConfig = field(default_factory=TTMMemoryConfig)
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
 
 
@@ -1262,6 +1279,7 @@ __all__ = [
     "LocalOutputSelfAttentionBlock",
     "ModelConfig",
     "ResamplerConfig",
+    "TTMMemoryConfig",
     "WeightQuantileVAE",
     "smoke_test_big_weight_vae",
     "MixerPatchTokenizer",
