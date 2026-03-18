@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 
 import torch
@@ -480,6 +481,389 @@ class PerceiverResamplerBlock(nn.Module):
         return latents
 
 
+class TokenSummarizer(nn.Module):
+    """Summarize a variable-length token set into a fixed number of output tokens."""
+
+    def __init__(
+        self,
+        dim: int,
+        out_tokens: int,
+        mode: str = "mlp",
+        hidden_mult: float = 2.0,
+        dropout: float = 0.0,
+        use_input_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        if int(dim) <= 0:
+            raise ValueError(f"dim must be positive, got {dim}")
+        if int(out_tokens) <= 0:
+            raise ValueError(f"out_tokens must be positive, got {out_tokens}")
+
+        mode_value = str(mode).strip().lower()
+        if mode_value not in {"mlp", "latent_query"}:
+            raise ValueError(f"mode must be 'mlp' or 'latent_query', got {mode!r}")
+
+        self.dim = int(dim)
+        self.out_tokens = int(out_tokens)
+        self.mode = mode_value
+        self.input_norm = nn.LayerNorm(self.dim) if bool(use_input_norm) else nn.Identity()
+
+        if self.mode == "mlp":
+            hidden_dim = max(1, int(float(hidden_mult) * self.dim))
+            self.hidden = nn.Linear(self.dim, hidden_dim)
+            self.out_proj = nn.Linear(hidden_dim, self.out_tokens)
+            self.dropout = nn.Dropout(dropout)
+            self.lat_queries = None
+        else:
+            self.hidden = None
+            self.out_proj = None
+            self.dropout = nn.Dropout(0.0)
+            self.lat_queries = nn.Parameter(torch.empty(self.out_tokens, self.dim))
+            nn.init.normal_(self.lat_queries, mean=0.0, std=0.02)
+
+    def forward(self, V: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # V: [B, P, D]
+        if V.ndim != 3:
+            raise ValueError(f"V must be [B, P, D], got {tuple(V.shape)}")
+        if int(V.shape[-1]) != self.dim:
+            raise ValueError(f"V last dim ({int(V.shape[-1])}) must equal dim ({self.dim})")
+
+        V_norm = self.input_norm(V)
+        if self.mode == "mlp":
+            assert self.hidden is not None and self.out_proj is not None
+            hidden = self.dropout(F.gelu(self.hidden(V_norm)))
+            logits = self.out_proj(hidden).permute(0, 2, 1)
+        else:
+            assert self.lat_queries is not None
+            scale = float(self.dim) ** -0.5
+            logits = torch.einsum("kd,bpd->bkp", self.lat_queries, V_norm) * scale
+
+        A = torch.softmax(logits, dim=-1)
+        Z = torch.matmul(A, V)
+        return Z, A
+
+
+class _TransformerProcessLayer(nn.Module):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float) -> None:
+        super().__init__()
+        if int(dim) % int(num_heads) != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
+
+        hidden_dim = max(1, int(float(mlp_ratio) * int(dim)))
+        self.norm_attn = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+        self.norm_mlp = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, Z: torch.Tensor) -> torch.Tensor:
+        # Z: [B, R, D]
+        attn_in = self.norm_attn(Z)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        Z = Z + self.attn_dropout(attn_out)
+        Z = Z + self.mlp(self.norm_mlp(Z))
+        return Z
+
+
+class TransformerProcess(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                _TransformerProcessLayer(
+                    dim=int(dim),
+                    num_heads=int(num_heads),
+                    mlp_ratio=float(mlp_ratio),
+                    dropout=float(dropout),
+                )
+                for _ in range(max(0, int(depth)))
+            ]
+        )
+
+    def forward(self, Z: torch.Tensor) -> torch.Tensor:
+        # Z: [B, R, D]
+        for layer in self.layers:
+            Z = layer(Z)
+        return Z
+
+
+class TTMMemoryBlock(nn.Module):
+    """Token Turing Machine latent-memory block with summarization read/write."""
+
+    def __init__(
+        self,
+        dim: int,
+        mem_tokens: int,
+        proc_tokens: int,
+        process_depth: int,
+        num_heads: int,
+        summarizer_mode: str = "mlp",
+        summarizer_hidden_mult: float = 2.0,
+        dropout: float = 0.0,
+        use_type_embeddings: bool = True,
+        use_positional_embeddings: bool = True,
+        memory_init: str = "learned",
+        return_aux: bool = False,
+    ) -> None:
+        super().__init__()
+        if int(dim) % int(num_heads) != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
+        memory_init_value = str(memory_init).strip().lower()
+        if memory_init_value not in {"learned", "zeros"}:
+            raise ValueError(f"memory_init must be 'learned' or 'zeros', got {memory_init!r}")
+
+        self.dim = int(dim)
+        self.mem_tokens = int(mem_tokens)
+        self.proc_tokens = int(proc_tokens)
+        self.use_type_embeddings = bool(use_type_embeddings)
+        self.use_positional_embeddings = bool(use_positional_embeddings)
+        self.memory_init = memory_init_value
+        self.return_aux = bool(return_aux)
+        self.max_input_tokens = 4096
+
+        self.read_summarizer = TokenSummarizer(
+            dim=self.dim,
+            out_tokens=self.proc_tokens,
+            mode=summarizer_mode,
+            hidden_mult=float(summarizer_hidden_mult),
+            dropout=float(dropout),
+            use_input_norm=True,
+        )
+        self.process = TransformerProcess(
+            dim=self.dim,
+            depth=int(process_depth),
+            num_heads=int(num_heads),
+            mlp_ratio=4.0,
+            dropout=float(dropout),
+        )
+        self.write_summarizer = TokenSummarizer(
+            dim=self.dim,
+            out_tokens=self.mem_tokens,
+            mode=summarizer_mode,
+            hidden_mult=float(summarizer_hidden_mult),
+            dropout=float(dropout),
+            use_input_norm=True,
+        )
+
+        if self.memory_init == "learned":
+            self.memory_seed = nn.Parameter(torch.empty(1, self.mem_tokens, self.dim))
+            nn.init.normal_(self.memory_seed, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("memory_seed", None)
+
+        if self.use_type_embeddings:
+            self.type_mem = nn.Parameter(torch.empty(1, 1, self.dim))
+            self.type_in = nn.Parameter(torch.empty(1, 1, self.dim))
+            self.type_out = nn.Parameter(torch.empty(1, 1, self.dim))
+            nn.init.normal_(self.type_mem, mean=0.0, std=0.02)
+            nn.init.normal_(self.type_in, mean=0.0, std=0.02)
+            nn.init.normal_(self.type_out, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("type_mem", None)
+            self.register_parameter("type_in", None)
+            self.register_parameter("type_out", None)
+
+        if self.use_positional_embeddings:
+            self.mem_pos = nn.Parameter(torch.empty(1, self.mem_tokens, self.dim))
+            self.input_pos_emb = nn.Parameter(torch.empty(1, self.max_input_tokens, self.dim))
+            nn.init.normal_(self.mem_pos, mean=0.0, std=0.02)
+            nn.init.normal_(self.input_pos_emb, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("mem_pos", None)
+            self.register_parameter("input_pos_emb", None)
+
+    def init_memory(
+        self,
+        batch_size: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        if int(batch_size) <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+        if self.memory_init == "learned":
+            assert self.memory_seed is not None
+            memory = self.memory_seed.expand(int(batch_size), -1, -1)
+            return memory.to(device=device if device is not None else memory.device, dtype=dtype or memory.dtype)
+
+        if device is None:
+            if self.mem_pos is not None:
+                device = self.mem_pos.device
+            else:
+                device = torch.device("cpu")
+        if dtype is None:
+            if self.mem_pos is not None:
+                dtype = self.mem_pos.dtype
+            else:
+                dtype = torch.float32
+        return torch.zeros((int(batch_size), self.mem_tokens, self.dim), device=device, dtype=dtype)
+
+    def _resolve_input_pos(self, X: torch.Tensor, input_pos: torch.Tensor | None) -> torch.Tensor | None:
+        if not self.use_positional_embeddings:
+            return None
+
+        B, N, _ = X.shape
+        if input_pos is not None:
+            if input_pos.ndim != 3:
+                raise ValueError(f"input_pos must be [1 or B, N, D], got {tuple(input_pos.shape)}")
+            if int(input_pos.shape[-1]) != self.dim or int(input_pos.shape[1]) != N:
+                raise ValueError(
+                    f"input_pos must be [1 or B, {N}, {self.dim}], got {tuple(input_pos.shape)}"
+                )
+            if int(input_pos.shape[0]) == 1:
+                return input_pos.expand(B, -1, -1)
+            if int(input_pos.shape[0]) == B:
+                return input_pos
+            raise ValueError(f"input_pos batch must be 1 or {B}, got {int(input_pos.shape[0])}")
+
+        if N > self.max_input_tokens:
+            raise ValueError(
+                f"input length ({N}) exceeds learned input_pos_emb capacity ({self.max_input_tokens})"
+            )
+        assert self.input_pos_emb is not None
+        return self.input_pos_emb[:, :N, :].expand(B, -1, -1)
+
+    def forward(
+        self,
+        X: torch.Tensor,
+        M: torch.Tensor | None = None,
+        input_pos: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # X: [B, N, D], M: [B, K, D]
+        if X.ndim != 3:
+            raise ValueError(f"X must be [B, N, D], got {tuple(X.shape)}")
+        if int(X.shape[-1]) != self.dim:
+            raise ValueError(f"X last dim ({int(X.shape[-1])}) must equal dim ({self.dim})")
+
+        B = int(X.shape[0])
+        if M is None:
+            M = self.init_memory(batch_size=B, device=X.device, dtype=X.dtype)
+        if M.ndim != 3:
+            raise ValueError(f"M must be [B, K, D], got {tuple(M.shape)}")
+        if tuple(M.shape[1:]) != (self.mem_tokens, self.dim):
+            raise ValueError(
+                f"M must be [B, {self.mem_tokens}, {self.dim}], got {tuple(M.shape)}"
+            )
+        if int(M.shape[0]) != B:
+            raise ValueError(f"M batch ({int(M.shape[0])}) must match X batch ({B})")
+
+        resolved_input_pos = self._resolve_input_pos(X, input_pos)
+
+        X_read = X
+        M_read = M
+        if self.use_positional_embeddings:
+            assert self.mem_pos is not None
+            M_read = M_read + self.mem_pos[:, : self.mem_tokens, :]
+            if resolved_input_pos is not None:
+                X_read = X_read + resolved_input_pos
+        if self.use_type_embeddings:
+            assert self.type_mem is not None and self.type_in is not None
+            M_read = M_read + self.type_mem
+            X_read = X_read + self.type_in
+
+        V_read = torch.cat([M_read, X_read], dim=1)
+        Z, A_read = self.read_summarizer(V_read)
+        O = self.process(Z)
+
+        X_write = X
+        M_write = M
+        O_write = O
+        if self.use_positional_embeddings:
+            assert self.mem_pos is not None
+            M_write = M_write + self.mem_pos[:, : self.mem_tokens, :]
+            if resolved_input_pos is not None:
+                X_write = X_write + resolved_input_pos
+        if self.use_type_embeddings:
+            assert self.type_mem is not None and self.type_in is not None and self.type_out is not None
+            M_write = M_write + self.type_mem
+            X_write = X_write + self.type_in
+            O_write = O_write + self.type_out
+
+        V_write = torch.cat([M_write, O_write, X_write], dim=1)
+        M_new, A_write = self.write_summarizer(V_write)
+
+        if not self.return_aux:
+            return M_new
+        aux = {
+            "read_tokens": Z,
+            "process_tokens": O,
+            "read_weights": A_read,
+            "write_weights": A_write,
+        }
+        return M_new, aux
+
+
+class TTMMemoryStack(nn.Module):
+    def __init__(
+        self,
+        num_blocks: int,
+        block: TTMMemoryBlock,
+        share_weights: bool = False,
+    ) -> None:
+        super().__init__()
+        if int(num_blocks) <= 0:
+            raise ValueError(f"num_blocks must be positive, got {num_blocks}")
+
+        self.num_blocks = int(num_blocks)
+        self.share_weights = bool(share_weights)
+        if self.share_weights:
+            self.shared_block = block
+            self.blocks = None
+        else:
+            self.shared_block = None
+            self.blocks = nn.ModuleList([copy.deepcopy(block) for _ in range(self.num_blocks)])
+
+    def _get_block(self, index: int) -> TTMMemoryBlock:
+        if self.share_weights:
+            assert self.shared_block is not None
+            return self.shared_block
+        assert self.blocks is not None
+        return self.blocks[index]
+
+    def forward(
+        self,
+        X: torch.Tensor,
+        M: torch.Tensor | None = None,
+        input_pos: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, list[dict[str, torch.Tensor]]]]:
+        # X: [B, N, D], M: [B, K, D]
+        block0 = self._get_block(0)
+        if M is None:
+            M = block0.init_memory(batch_size=int(X.shape[0]), device=X.device, dtype=X.dtype)
+
+        aux_list: list[dict[str, torch.Tensor]] = []
+        for block_idx in range(self.num_blocks):
+            block = self._get_block(block_idx)
+            block_out = block(X, M=M, input_pos=input_pos)
+            if isinstance(block_out, tuple):
+                M, aux = block_out
+                aux_list.append(aux)
+            else:
+                M = block_out
+
+        if not aux_list:
+            return M
+        return M, {"blocks": aux_list}
+
+
 class CrossAttnBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float, use_rope_2d: bool = False) -> None:
         super().__init__()
@@ -600,5 +984,9 @@ __all__ = [
     "MLP",
     "PerceiverResamplerBlock",
     "RoPeMixed2D",
+    "TTMMemoryBlock",
+    "TTMMemoryStack",
+    "TokenSummarizer",
+    "TransformerProcess",
     "sinusoidal_embedding",
 ]

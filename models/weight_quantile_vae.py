@@ -9,6 +9,7 @@ from models.big_weight_vae import (
     LocalOutputSelfAttentionBlock,
     ModelConfig,
     ResamplerConfig,
+    TTMMemoryConfig,
     WeightQuantileVAE,
     smoke_test_big_weight_vae,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "ResidualPatchTokenizer",
     "ResamplerConfig",
     "RoPeMixed2D",
+    "TTMMemoryConfig",
     "TransformerNoCompressionPatchEncoder",
     "WeightQuantileVAE",
     "build_weight_quantile_vae",

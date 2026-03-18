@@ -24,7 +24,7 @@ try:
 except Exception:  # pragma: no cover - compatibility for older PyTorch
     from torch.cuda.amp import GradScaler
 
-from models.big_weight_vae import BigVAEConfig, BigWeightVAE, EncoderConfig, ModelConfig
+from models.big_weight_vae import BigVAEConfig, BigWeightVAE, EncoderConfig, ModelConfig, TTMMemoryConfig
 from models.distribution_encoder import DistributionConfig
 from models.mini_patch_vae import MiniVAEConfig
 from procedural_simple_vae_pipeline.model import build_procedural_simple_vae
@@ -355,7 +355,14 @@ def _build_model_cfg(cfg: dict[str, Any]) -> ModelConfig:
     mini_cfg = model_cfg.get("mini_vae", {})
     big_cfg = model_cfg.get("big_vae", {})
     enc_cfg = big_cfg.get("encoder", {})
-    if not isinstance(dist_cfg, dict) or not isinstance(mini_cfg, dict) or not isinstance(big_cfg, dict) or not isinstance(enc_cfg, dict):
+    ttm_cfg = big_cfg.get("ttm", {})
+    if (
+        not isinstance(dist_cfg, dict)
+        or not isinstance(mini_cfg, dict)
+        or not isinstance(big_cfg, dict)
+        or not isinstance(enc_cfg, dict)
+        or not isinstance(ttm_cfg, dict)
+    ):
         raise TypeError("model sub-sections must be mappings")
 
     patch_size = int(model_cfg.get("patch_size", 16))
@@ -412,6 +419,20 @@ def _build_model_cfg(cfg: dict[str, Any]) -> ModelConfig:
             use_latent_sampling=bool(big_cfg.get("use_latent_sampling", True)),
             disable_z_shortcut=bool(big_cfg.get("disable_z_shortcut", False)),
             disable_distribution_encoder=bool(big_cfg.get("disable_distribution_encoder", False)),
+            latent_bottleneck_kind=str(big_cfg.get("latent_bottleneck_kind", "ttm")),
+            ttm=TTMMemoryConfig(
+                proc_tokens=int(ttm_cfg.get("proc_tokens", 8)),
+                process_depth=int(ttm_cfg.get("process_depth", 2)),
+                summarizer_mode=str(ttm_cfg.get("summarizer_mode", "mlp")),
+                summarizer_hidden_mult=float(ttm_cfg.get("summarizer_hidden_mult", 2.0)),
+                num_blocks=int(ttm_cfg.get("num_blocks", 1)),
+                share_weights=bool(ttm_cfg.get("share_weights", False)),
+                dropout=float(ttm_cfg.get("dropout", big_cfg.get("dropout", 0.0))),
+                use_type_embeddings=bool(ttm_cfg.get("use_type_embeddings", True)),
+                use_positional_embeddings=bool(ttm_cfg.get("use_positional_embeddings", True)),
+                memory_init=str(ttm_cfg.get("memory_init", "learned")),
+                return_aux=bool(ttm_cfg.get("return_aux", False)),
+            ),
             encoder=EncoderConfig(
                 self_attn_mode=str(enc_cfg.get("self_attn_mode", "full")),
                 cross_attend_only_cls=bool(enc_cfg.get("cross_attend_only_cls", True)),

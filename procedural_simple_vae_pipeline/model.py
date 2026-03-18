@@ -5,11 +5,17 @@ import torch.nn as nn
 
 from models.big_weight_vae import LocalOutputSelfAttentionBlock, ModelConfig
 from models.distribution_encoder import InputDistributionEncodingModule
-from models.vae_shared import CrossAttnBlock, PerceiverResamplerBlock, _decode_direction_and_logscale, sinusoidal_embedding
+from models.vae_shared import (
+    CrossAttnBlock,
+    PerceiverResamplerBlock,
+    TTMMemoryBlock,
+    TTMMemoryStack,
+    _decode_direction_and_logscale,
+    sinusoidal_embedding,
+)
 
 PROCEDURAL_SIMPLE_USE_DISTRIBUTION_CONDITIONING = False
-PROCEDURAL_SIMPLE_USE_LATENT_BOTTLENECK = True
-PROCEDURAL_SIMPLE_USE_SLOT_ATTENTION_LATENT_BOTTLENECK = False
+PROCEDURAL_SIMPLE_DEFAULT_LATENT_BOTTLENECK_KIND = "ttm"
 
 
 class SlotAttentionBottleneckBlock(nn.Module):
@@ -74,6 +80,17 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
     shared model used by the existing big VAE pipeline.
     """
 
+    @staticmethod
+    def _normalize_latent_bottleneck_kind(kind: str) -> str:
+        value = str(kind).strip().lower()
+        if value not in {"disabled", "perceiver_resampler", "slot_attention", "ttm"}:
+            raise ValueError(
+                "big_vae.latent_bottleneck_kind must be one of "
+                "'disabled', 'perceiver_resampler', 'slot_attention', 'ttm', "
+                f"got {kind!r}"
+            )
+        return value
+
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         self.cfg = cfg
@@ -92,16 +109,13 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             raise ValueError(f"big_vae.d_model ({d_model}) must be divisible by big_vae.n_heads ({n_heads})")
 
         self.use_distribution_conditioning = bool(PROCEDURAL_SIMPLE_USE_DISTRIBUTION_CONDITIONING)
-        self.use_latent_bottleneck = bool(PROCEDURAL_SIMPLE_USE_LATENT_BOTTLENECK)
-        self.use_slot_attention_latent_bottleneck = bool(
-            self.use_latent_bottleneck and PROCEDURAL_SIMPLE_USE_SLOT_ATTENTION_LATENT_BOTTLENECK
+        self.latent_bottleneck_kind = self._normalize_latent_bottleneck_kind(
+            getattr(cfg.big_vae, "latent_bottleneck_kind", PROCEDURAL_SIMPLE_DEFAULT_LATENT_BOTTLENECK_KIND)
         )
-        self.latent_bottleneck_kind = (
-            "slot_attention"
-            if self.use_slot_attention_latent_bottleneck
-            else ("perceiver_resampler" if self.use_latent_bottleneck else "disabled")
-        )
-        if self.use_latent_bottleneck and not self.use_slot_attention_latent_bottleneck and d_lat % n_heads != 0:
+        self.use_latent_bottleneck = self.latent_bottleneck_kind != "disabled"
+        self.use_slot_attention_latent_bottleneck = self.latent_bottleneck_kind == "slot_attention"
+        self.use_ttm_latent_bottleneck = self.latent_bottleneck_kind == "ttm"
+        if self.use_latent_bottleneck and d_lat % n_heads != 0:
             raise ValueError(f"big_vae.d_lat ({d_lat}) must be divisible by big_vae.n_heads ({n_heads})")
 
         self.patch_tokenizer = nn.Linear(p + (d_dist if self.use_distribution_conditioning else 0), d_model)
@@ -129,8 +143,8 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
         self.z_dim = int(num_latents * d_lat)
         self.flat_lat_dim = self.z_dim
         if self.use_latent_bottleneck:
-            self.latent_base = nn.Parameter(torch.randn(num_latents, d_lat) * 0.02)
             if self.use_slot_attention_latent_bottleneck:
+                self.latent_base = nn.Parameter(torch.randn(num_latents, d_lat) * 0.02)
                 self.latent_resampler_layers = None
                 self.slot_attention_token_pos_proj: nn.Linear | None = nn.Linear(
                     2 * int(cfg.big_vae.pos_fourier_dim),
@@ -146,27 +160,67 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
                         for _ in range(num_enc_layers)
                     ]
                 )
+                self.latent_ttm_input_proj = None
+                self.latent_ttm_token_pos_proj = None
+                self.latent_ttm_stack = None
             else:
-                self.latent_resampler_layers = nn.ModuleList(
-                    [
-                        PerceiverResamplerBlock(
-                            d_latent=d_lat,
-                            d_token=d_model,
-                            n_heads=n_heads,
-                            dropout=dropout,
-                            use_rope_2d=True,
-                        )
-                        for _ in range(num_enc_layers)
-                    ]
-                )
                 self.slot_attention_token_pos_proj = None
                 self.latent_slot_attention_layers = None
+                if self.use_ttm_latent_bottleneck:
+                    ttm_cfg = cfg.big_vae.ttm
+                    self.register_parameter("latent_base", None)
+                    self.latent_resampler_layers = None
+                    self.latent_ttm_input_proj: nn.Linear | None = nn.Linear(d_model, d_lat)
+                    self.latent_ttm_token_pos_proj: nn.Linear | None
+                    if bool(ttm_cfg.use_positional_embeddings):
+                        self.latent_ttm_token_pos_proj = nn.Linear(2 * int(cfg.big_vae.pos_fourier_dim), d_lat)
+                    else:
+                        self.latent_ttm_token_pos_proj = None
+                    ttm_block = TTMMemoryBlock(
+                        dim=d_lat,
+                        mem_tokens=num_latents,
+                        proc_tokens=int(ttm_cfg.proc_tokens),
+                        process_depth=int(ttm_cfg.process_depth),
+                        num_heads=n_heads,
+                        summarizer_mode=str(ttm_cfg.summarizer_mode),
+                        summarizer_hidden_mult=float(ttm_cfg.summarizer_hidden_mult),
+                        dropout=float(ttm_cfg.dropout),
+                        use_type_embeddings=bool(ttm_cfg.use_type_embeddings),
+                        use_positional_embeddings=bool(ttm_cfg.use_positional_embeddings),
+                        memory_init=str(ttm_cfg.memory_init),
+                        return_aux=bool(ttm_cfg.return_aux),
+                    )
+                    self.latent_ttm_stack: TTMMemoryStack | None = TTMMemoryStack(
+                        num_blocks=max(1, int(ttm_cfg.num_blocks)),
+                        block=ttm_block,
+                        share_weights=bool(ttm_cfg.share_weights),
+                    )
+                else:
+                    self.latent_base = nn.Parameter(torch.randn(num_latents, d_lat) * 0.02)
+                    self.latent_resampler_layers = nn.ModuleList(
+                        [
+                            PerceiverResamplerBlock(
+                                d_latent=d_lat,
+                                d_token=d_model,
+                                n_heads=n_heads,
+                                dropout=dropout,
+                                use_rope_2d=True,
+                            )
+                            for _ in range(num_enc_layers)
+                        ]
+                    )
+                    self.latent_ttm_input_proj = None
+                    self.latent_ttm_token_pos_proj = None
+                    self.latent_ttm_stack = None
             self.latent_norm: nn.LayerNorm | None = nn.LayerNorm(self.flat_lat_dim)
         else:
             self.register_parameter("latent_base", None)
             self.latent_resampler_layers = None
             self.slot_attention_token_pos_proj = None
             self.latent_slot_attention_layers = None
+            self.latent_ttm_input_proj = None
+            self.latent_ttm_token_pos_proj = None
+            self.latent_ttm_stack = None
             self.latent_norm = None
 
         self.latent_to_decoder = nn.Linear(d_lat, d_model)
@@ -330,10 +384,10 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
         *,
         d_out: int,
         T: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, object] | None]:
         if not self.use_latent_bottleneck:
             raise RuntimeError("latent bottleneck is disabled for ProceduralSimpleBigWeightVAE")
-        if self.latent_base is None or self.latent_norm is None:
+        if self.latent_norm is None:
             raise RuntimeError("latent bottleneck modules are not initialized")
 
         B = int(encoder_patch_tokens.shape[0])
@@ -342,39 +396,64 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             d_out=d_out,
             T=T,
         )
-        latents = self.latent_base.unsqueeze(0).expand(B, -1, -1)
-        latent_pos = (
-            (torch.arange(self.dec_L_latents, device=encoder_patch_tokens.device, dtype=torch.float32) + 0.5)
-            / max(float(self.dec_L_latents), 1.0)
-        )
-        if self.use_slot_attention_latent_bottleneck:
-            if self.latent_slot_attention_layers is None or self.slot_attention_token_pos_proj is None:
-                raise RuntimeError("slot attention bottleneck modules are not initialized")
+        ttm_aux: dict[str, object] | None = None
+        if self.use_ttm_latent_bottleneck:
+            # TTM sees only the final encoder patch embeddings, not intermediate encoder states.
+            if self.latent_ttm_input_proj is None or self.latent_ttm_stack is None:
+                raise RuntimeError("TTM bottleneck modules are not initialized")
             pos_dim = int(self.cfg.big_vae.pos_fourier_dim)
-            pos_o = sinusoidal_embedding(token_pos_o, pos_dim)
-            pos_t = sinusoidal_embedding(token_pos_t, pos_dim)
-            token_pos_features = torch.cat([pos_o, pos_t], dim=-1)
-            slot_tokens = patch_flat + self.slot_attention_token_pos_proj(token_pos_features).unsqueeze(0)
-            for bottleneck_layer in self.latent_slot_attention_layers:
-                latents = bottleneck_layer(
-                    slots=latents,
-                    tokens=slot_tokens,
-                )
+            ttm_inputs = self.latent_ttm_input_proj(patch_flat)
+            input_pos: torch.Tensor | None = None
+            if self.latent_ttm_token_pos_proj is not None:
+                pos_o = sinusoidal_embedding(token_pos_o, pos_dim)
+                pos_t = sinusoidal_embedding(token_pos_t, pos_dim)
+                token_pos_features = torch.cat([pos_o, pos_t], dim=-1)
+                input_pos = self.latent_ttm_token_pos_proj(token_pos_features).unsqueeze(0)
+            ttm_out = self.latent_ttm_stack(
+                ttm_inputs,
+                M=None,
+                input_pos=input_pos,
+            )
+            if isinstance(ttm_out, tuple):
+                latents, ttm_aux = ttm_out
+            else:
+                latents = ttm_out
         else:
-            if self.latent_resampler_layers is None:
-                raise RuntimeError("perceiver bottleneck modules are not initialized")
-            for bottleneck_layer in self.latent_resampler_layers:
-                latents = bottleneck_layer(
-                    latents=latents,
-                    tokens=patch_flat,
-                    latent_pos=latent_pos,
-                    token_pos=token_pos_o,
-                    token_pos2=token_pos_t,
-                )
+            if self.latent_base is None:
+                raise RuntimeError("latent bottleneck seed is not initialized")
+            latents = self.latent_base.unsqueeze(0).expand(B, -1, -1)
+            latent_pos = (
+                (torch.arange(self.dec_L_latents, device=encoder_patch_tokens.device, dtype=torch.float32) + 0.5)
+                / max(float(self.dec_L_latents), 1.0)
+            )
+            if self.use_slot_attention_latent_bottleneck:
+                if self.latent_slot_attention_layers is None or self.slot_attention_token_pos_proj is None:
+                    raise RuntimeError("slot attention bottleneck modules are not initialized")
+                pos_dim = int(self.cfg.big_vae.pos_fourier_dim)
+                pos_o = sinusoidal_embedding(token_pos_o, pos_dim)
+                pos_t = sinusoidal_embedding(token_pos_t, pos_dim)
+                token_pos_features = torch.cat([pos_o, pos_t], dim=-1)
+                slot_tokens = patch_flat + self.slot_attention_token_pos_proj(token_pos_features).unsqueeze(0)
+                for bottleneck_layer in self.latent_slot_attention_layers:
+                    latents = bottleneck_layer(
+                        slots=latents,
+                        tokens=slot_tokens,
+                    )
+            else:
+                if self.latent_resampler_layers is None:
+                    raise RuntimeError("perceiver bottleneck modules are not initialized")
+                for bottleneck_layer in self.latent_resampler_layers:
+                    latents = bottleneck_layer(
+                        latents=latents,
+                        tokens=patch_flat,
+                        latent_pos=latent_pos,
+                        token_pos=token_pos_o,
+                        token_pos2=token_pos_t,
+                    )
 
         z = self.latent_norm(latents.reshape(B, self.flat_lat_dim))
         decoder_latents = self.latent_to_decoder(z.view(B, self.dec_L_latents, int(self.cfg.big_vae.d_lat)))
-        return latents, z, decoder_latents
+        return latents, z, decoder_latents, ttm_aux
 
     def _build_decoder_query_state(
         self,
@@ -609,7 +688,7 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             raise ValueError("dist_patch_by_patch must be None when distribution conditioning is disabled")
 
         if self.use_latent_bottleneck:
-            latent_slots, z, decoder_latents = self._encode_latent_slots_from_patch_tokens(
+            latent_slots, z, decoder_latents, latent_bottleneck_debug = self._encode_latent_slots_from_patch_tokens(
                 encoder_patch_tokens,
                 d_out=d_out,
                 T=T,
@@ -618,6 +697,7 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             latent_slots = None
             z = encoder_patch_tokens.new_zeros((B, self.z_dim))
             decoder_latents = None
+            latent_bottleneck_debug = None
 
         q_tokens_base, q_pos_emb, q_pos_o, q_pos_t = self._build_decoder_query_state(
             batch_size=B,
@@ -692,6 +772,8 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             }
             if latent_slots is not None:
                 debug_info["latent_slots"] = latent_slots
+            if latent_bottleneck_debug is not None:
+                debug_info["latent_bottleneck_debug"] = latent_bottleneck_debug
             return outputs + (debug_info,)
         return outputs
 
