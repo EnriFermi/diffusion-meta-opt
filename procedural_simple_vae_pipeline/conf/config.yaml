@@ -13,7 +13,7 @@ training_artifacts:
 
 model:
   variant: procedural_simple
-  patch_size: 64
+  patch_size: 16
   beta: 0.001
   distribution:
     k_s: 64
@@ -31,8 +31,8 @@ model:
     z_dim: 64
     d_e: 128
     encoder_latent_dim: 0
-    pos_lat_dim: 0
-    pos_dim: 32
+    pos_lat_dim: 64
+    pos_dim: 64
     num_attn_layers_encoder: 2
     num_layers_decoder: 2
     decoder_bilinear_rank: 0
@@ -45,16 +45,16 @@ model:
     stub_mlp_use_batchnorm: false
     stub_resampler_d_model: 0
     init_style: llm
-    n_heads: 4
+    n_heads: 1
     d_patch: 64
     dropout: 0.0
   big_vae:
     d_model: 512
-    d_lat: 32
-    num_latents: 4
+    d_lat: 256
+    num_latents: 1024
     use_latent_sampling: false
-    num_encoder_layers: 1
-    num_decoder_layers: 1
+    num_encoder_layers: 16
+    num_decoder_layers: 4
     n_heads: 4
     ffn_mult: 4.0
     dropout: 0.0
@@ -67,7 +67,7 @@ model:
 
 train:
   device: cuda:0
-  distributed: auto
+  distributed: false
   num_gpus: 0
   backend: auto
   master_addr: "127.0.0.1"
