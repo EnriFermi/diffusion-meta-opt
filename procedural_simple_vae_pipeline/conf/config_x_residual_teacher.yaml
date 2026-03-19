@@ -31,8 +31,8 @@ model:
     z_dim: 64
     d_e: 128
     encoder_latent_dim: 0
-    pos_lat_dim: 64
-    pos_dim: 64
+    pos_lat_dim: 0
+    pos_dim: 32
     num_attn_layers_encoder: 2
     num_layers_decoder: 2
     decoder_bilinear_rank: 0
@@ -45,16 +45,16 @@ model:
     stub_mlp_use_batchnorm: false
     stub_resampler_d_model: 0
     init_style: llm
-    n_heads: 1
+    n_heads: 4
     d_patch: 64
     dropout: 0.0
   big_vae:
     d_model: 512
-    d_lat: 256
-    num_latents: 64
+    d_lat: 32
+    num_latents: 4
     use_latent_sampling: false
     num_encoder_layers: 1
-    num_decoder_layers: 2
+    num_decoder_layers: 1
     n_heads: 4
     ffn_mult: 4.0
     dropout: 0.0
@@ -63,12 +63,12 @@ model:
     disable_distribution_encoder: true
     latent_bottleneck_kind: ttm
     ttm:
-      proc_tokens: 32
+      proc_tokens: 8
       process_depth: 2
       summarizer_mode: mlp
       summarizer_hidden_mult: 2.0
-      num_blocks: 8
-      share_weights: true
+      num_blocks: 1
+      share_weights: false
       dropout: 0.0
       use_type_embeddings: true
       use_positional_embeddings: true
@@ -80,7 +80,7 @@ model:
 
 train:
   device: cuda:0
-  distributed: false
+  distributed: auto
   num_gpus: 0
   backend: auto
   master_addr: "127.0.0.1"
@@ -98,7 +98,7 @@ train:
   grad_accum_steps: 1
   warmup_steps: 0
   min_lr_ratio: 0.01
-  lr: 3e-5
+  lr: 5e-4
   weight_decay: 0.0
   betas: [0.9, 0.999]
   eps: 1.0e-8
@@ -119,26 +119,15 @@ train:
     huber_delta: 0.1
 
   synthetic:
-    # `patch_stats_teacher`: W itself is generated from patch-wise X statistics.
-    # `x_residual_teacher`: encoder sees only W_base, while target is W_base + residual(X).
-    # The second mode is the stronger probe for whether encoder conditioning alpha leaves zero.
-    kind: iid_gaussian
-    # X is also sampled from Normal to preserve the same operator loss API as big_vae train.
-    batch_size: 16
+    # Encoder input sees only the observed/base part of W.
+    # Target reconstruction adds an X-dependent residual that cannot be recovered from W_input alone.
+    kind: x_residual_teacher
+    batch_size: 32
     n_rows: 256
     d_in: 256
-    d_out: 64
+    d_out: 32
     x_std: 1.0
     w_std: 1.0
-    patch_stats_teacher:
-      patch_mean_std: 1.5
-      patch_scale_min: 0.5
-      patch_scale_max: 1.5
-      mixture_shift_std: 0.75
-      signal_scale: 1.0
-      weight_noise_std: 0.01
-      q_low: 0.15
-      q_high: 0.85
     x_residual_teacher:
       patch_mean_std: 1.5
       patch_scale_min: 0.5
