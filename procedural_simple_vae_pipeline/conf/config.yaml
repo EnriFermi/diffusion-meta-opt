@@ -13,7 +13,7 @@ training_artifacts:
 
 model:
   variant: procedural_simple
-  patch_size: 16
+  patch_size: 64
   beta: 0.001
   distribution:
     k_s: 64
@@ -50,11 +50,11 @@ model:
     dropout: 0.0
   big_vae:
     d_model: 512
-    d_lat: 256
-    num_latents: 1024
+    d_lat: 64
+    num_latents: 64
     use_latent_sampling: false
-    num_encoder_layers: 16
-    num_decoder_layers: 4
+    num_encoder_layers: 1
+    num_decoder_layers: 2
     n_heads: 4
     ffn_mult: 4.0
     dropout: 0.0
@@ -63,12 +63,12 @@ model:
     disable_distribution_encoder: true
     latent_bottleneck_kind: ttm
     ttm:
-      proc_tokens: 8
+      proc_tokens: 32
       process_depth: 2
       summarizer_mode: mlp
       summarizer_hidden_mult: 2.0
-      num_blocks: 1
-      share_weights: false
+      num_blocks: 8
+      share_weights: true
       dropout: 0.0
       use_type_embeddings: true
       use_positional_embeddings: true
@@ -98,7 +98,7 @@ train:
   grad_accum_steps: 1
   warmup_steps: 0
   min_lr_ratio: 0.01
-  lr: 5e-4
+  lr: 3e-5
   weight_decay: 0.0
   betas: [0.9, 0.999]
   eps: 1.0e-8
@@ -120,9 +120,9 @@ train:
 
   synthetic:
     # X is also sampled from Normal to preserve the same operator loss API as big_vae train.
-    batch_size: 32
+    batch_size: 16
     n_rows: 256
     d_in: 256
-    d_out: 32
+    d_out: 64
     x_std: 1.0
     w_std: 1.0
