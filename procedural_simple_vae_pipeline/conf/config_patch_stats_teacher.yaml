@@ -119,10 +119,9 @@ train:
     huber_delta: 0.1
 
   synthetic:
-    # Switch to `patch_stats_teacher` to make patch-wise input distribution highly predictive of W.
-    # This is useful for checking whether encoder conditioning alpha grows away from zero.
-    kind: iid_gaussian
-    # X is also sampled from Normal to preserve the same operator loss API as big_vae train.
+    # This profile is intended for probing whether encoder conditioning alpha leaves zero.
+    # It assumes distribution conditioning is enabled in procedural_simple_vae_pipeline/model.py.
+    kind: patch_stats_teacher
     batch_size: 32
     n_rows: 256
     d_in: 256
