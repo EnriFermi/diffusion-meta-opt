@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.big_weight_vae import LocalOutputSelfAttentionBlock, ModelConfig
 from models.distribution_encoder import InputDistributionEncodingModule
@@ -15,6 +16,7 @@ from models.vae_shared import (
 )
 
 PROCEDURAL_SIMPLE_USE_DISTRIBUTION_CONDITIONING = False
+PROCEDURAL_SIMPLE_DEFAULT_ENCODER_CONDITIONING_KIND = "token_adapter"
 PROCEDURAL_SIMPLE_DEFAULT_LATENT_BOTTLENECK_KIND = "ttm"
 
 
@@ -72,6 +74,81 @@ class SlotAttentionBottleneckBlock(nn.Module):
         return slots
 
 
+class TokenConditioningAdapter(nn.Module):
+    """Token-wise residual conditioning for encoder patch tokens."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        d_y: int,
+        dropout: float,
+        d_hidden: int | None = None,
+        d_gate: int | None = None,
+    ) -> None:
+        super().__init__()
+        hidden_dim = int(d_hidden) if d_hidden is not None else int(4 * d_model)
+        gate_dim = int(d_gate) if d_gate is not None else int(d_model)
+
+        self.y_proj = nn.Linear(d_y, d_model)
+        self.h_norm = nn.LayerNorm(d_model)
+        self.c_norm = nn.LayerNorm(d_model)
+
+        self.mix_h = nn.Linear(d_model, hidden_dim)
+        self.mix_c = nn.Linear(d_model, hidden_dim)
+        self.mix_out = nn.Linear(hidden_dim, d_model)
+
+        self.gate_h = nn.Linear(d_model, gate_dim)
+        self.gate_c = nn.Linear(d_model, gate_dim)
+        self.gate_out = nn.Linear(gate_dim, d_model)
+
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.conditioning_dropout = nn.Dropout(dropout)
+
+        nn.init.zeros_(self.mix_out.weight)
+        nn.init.zeros_(self.mix_out.bias)
+        nn.init.constant_(self.gate_out.bias, -2.0)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        y_ctx: torch.Tensor,
+        map_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        if h.ndim != 3:
+            raise ValueError(f"h must be [B, T_x, d_model], got {tuple(h.shape)}")
+        if y_ctx.ndim != 3:
+            raise ValueError(f"y_ctx must be [B, T_y, d_y], got {tuple(y_ctx.shape)}")
+        if map_idx.ndim != 2:
+            raise ValueError(f"map_idx must be [B, T_x], got {tuple(map_idx.shape)}")
+        if int(h.shape[0]) != int(y_ctx.shape[0]) or int(h.shape[0]) != int(map_idx.shape[0]):
+            raise ValueError(
+                "Batch size mismatch between h, y_ctx, and map_idx: "
+                f"{tuple(h.shape)}, {tuple(y_ctx.shape)}, {tuple(map_idx.shape)}"
+            )
+        if int(h.shape[1]) != int(map_idx.shape[1]):
+            raise ValueError(
+                f"map_idx token length must match h token length, got {tuple(map_idx.shape)} vs {tuple(h.shape)}"
+            )
+
+        gather_idx = map_idx.to(device=y_ctx.device, dtype=torch.long).clamp(min=0, max=max(0, int(y_ctx.shape[1]) - 1))
+        y_match = y_ctx.gather(dim=1, index=gather_idx.unsqueeze(-1).expand(-1, -1, int(y_ctx.shape[2])))
+
+        c = self.y_proj(y_match)
+        c = self.conditioning_dropout(c)
+
+        h_n = self.h_norm(h)
+        c_n = self.c_norm(c)
+
+        mixed = F.gelu(self.mix_h(h_n) + self.mix_c(c_n))
+        residual = self.mix_out(mixed)
+
+        gate_in = F.gelu(self.gate_h(h_n) + self.gate_c(c_n))
+        gate = torch.sigmoid(self.gate_out(gate_in))
+
+        return h + self.alpha * gate * residual
+
+
 class ProceduralSimpleBigWeightVAE(nn.Module):
     """
     Isolated clone of SimpleDirectBigWeightVAE for procedural-weight experiments.
@@ -87,6 +164,17 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             raise ValueError(
                 "big_vae.latent_bottleneck_kind must be one of "
                 "'disabled', 'perceiver_resampler', 'slot_attention', 'ttm', "
+                f"got {kind!r}"
+            )
+        return value
+
+    @staticmethod
+    def _normalize_encoder_conditioning_kind(kind: str) -> str:
+        value = str(kind).strip().lower()
+        if value not in {"concat", "token_adapter"}:
+            raise ValueError(
+                "encoder_conditioning_kind must be one of "
+                "'concat', 'token_adapter', "
                 f"got {kind!r}"
             )
         return value
@@ -109,6 +197,15 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             raise ValueError(f"big_vae.d_model ({d_model}) must be divisible by big_vae.n_heads ({n_heads})")
 
         self.use_distribution_conditioning = bool(PROCEDURAL_SIMPLE_USE_DISTRIBUTION_CONDITIONING)
+        self.encoder_conditioning_kind = self._normalize_encoder_conditioning_kind(
+            getattr(cfg.big_vae, "encoder_conditioning_kind", PROCEDURAL_SIMPLE_DEFAULT_ENCODER_CONDITIONING_KIND)
+        )
+        self.use_concat_encoder_conditioning = bool(
+            self.use_distribution_conditioning and self.encoder_conditioning_kind == "concat"
+        )
+        self.use_token_adapter_encoder_conditioning = bool(
+            self.use_distribution_conditioning and self.encoder_conditioning_kind == "token_adapter"
+        )
         self.latent_bottleneck_kind = self._normalize_latent_bottleneck_kind(
             getattr(cfg.big_vae, "latent_bottleneck_kind", PROCEDURAL_SIMPLE_DEFAULT_LATENT_BOTTLENECK_KIND)
         )
@@ -118,13 +215,26 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
         if self.use_latent_bottleneck and d_lat % n_heads != 0:
             raise ValueError(f"big_vae.d_lat ({d_lat}) must be divisible by big_vae.n_heads ({n_heads})")
 
-        self.patch_tokenizer = nn.Linear(p + (d_dist if self.use_distribution_conditioning else 0), d_model)
+        self.patch_tokenizer = nn.Linear(p + (d_dist if self.use_concat_encoder_conditioning else 0), d_model)
         if self.use_distribution_conditioning:
             self.distribution_encoder = InputDistributionEncodingModule(cfg.distribution)
             query_in_dim = d_model + d_dist
         else:
             self.distribution_encoder = None
             query_in_dim = d_model
+        if self.use_token_adapter_encoder_conditioning:
+            self.encoder_conditioning_adapters: nn.ModuleList | None = nn.ModuleList(
+                [
+                    TokenConditioningAdapter(
+                        d_model=d_model,
+                        d_y=d_dist,
+                        dropout=dropout,
+                    )
+                    for _ in range(num_enc_layers)
+                ]
+            )
+        else:
+            self.encoder_conditioning_adapters = None
         self.cls_token = nn.Parameter(torch.zeros(d_model))
         self.encoder_layers = nn.ModuleList(
             [
@@ -311,18 +421,37 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
         patch_token_inputs = w_patches
         if self.use_distribution_conditioning:
             dist_patch_by_patch = self._encode_distribution_context(X, d_in=d_in)
-            dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
-            patch_token_inputs = torch.cat([w_patches, dist_patch_expanded], dim=-1)
+            if self.use_concat_encoder_conditioning:
+                dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
+                patch_token_inputs = torch.cat([w_patches, dist_patch_expanded], dim=-1)
 
         patch_tokens = self.patch_tokenizer(patch_token_inputs.reshape(B * d_out * T, patch_token_inputs.shape[-1]))
         patch_tokens = patch_tokens.view(B, d_out, T, -1)
         cls_tokens = self.cls_token.view(1, 1, 1, -1).expand(B, d_out, 1, -1)
         tokens_by_output = torch.cat([cls_tokens, patch_tokens], dim=2)
+        if self.use_token_adapter_encoder_conditioning:
+            if dist_patch_by_patch is None or self.encoder_conditioning_adapters is None:
+                raise RuntimeError("token-adapter conditioning requires distribution context and adapter modules")
+            dist_ctx_by_output = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1).reshape(B * d_out, T, -1)
+            map_idx = torch.arange(T, device=W.device, dtype=torch.long).view(1, T).expand(B * d_out, -1)
+        else:
+            dist_ctx_by_output = None
+            map_idx = None
 
-        for enc_layer in self.encoder_layers:
-            local_in = tokens_by_output.view(B * d_out, T + 1, tokens_by_output.shape[-1])
+        for layer_idx, enc_layer in enumerate(self.encoder_layers):
+            local_in = tokens_by_output.reshape(B * d_out, T + 1, tokens_by_output.shape[-1])
             local_out = enc_layer(local_in)
-            tokens_by_output = local_out.view(B, d_out, T + 1, tokens_by_output.shape[-1])
+            if self.use_token_adapter_encoder_conditioning:
+                assert dist_ctx_by_output is not None
+                assert map_idx is not None
+                assert self.encoder_conditioning_adapters is not None
+                patch_out = self.encoder_conditioning_adapters[layer_idx](
+                    h=local_out[:, 1:, :],
+                    y_ctx=dist_ctx_by_output,
+                    map_idx=map_idx,
+                )
+                local_out = torch.cat([local_out[:, :1, :], patch_out], dim=1)
+            tokens_by_output = local_out.reshape(B, d_out, T + 1, tokens_by_output.shape[-1])
 
         encoder_patch_tokens = tokens_by_output[:, :, 1:, :]
         return tokens_by_output, encoder_patch_tokens, T, d_in_pad, dist_patch_by_patch
@@ -759,6 +888,7 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             pred_dirs = outputs[2]
             debug_info: dict[str, object] = {
                 "debug_latent_bottleneck_kind": self.latent_bottleneck_kind,
+                "debug_encoder_conditioning_kind": self.encoder_conditioning_kind,
                 "debug_decoder_kv_source": resolved_kv_source,
                 "debug_query_hint": self._normalize_debug_query_hint(debug_query_hint),
                 "debug_direct_from_encoder_tokens": bool(debug_direct_from_encoder_tokens),

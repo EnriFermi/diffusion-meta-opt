@@ -513,6 +513,25 @@ def _reduce_metrics(metrics: dict[str, float], device: torch.device, is_distribu
     return {key: float(values[idx].item()) for idx, key in enumerate(keys)}
 
 
+def _get_encoder_conditioning_alpha_values(model: torch.nn.Module) -> list[float]:
+    target = model.module if isinstance(model, DDP) else model
+    compiled_target = getattr(target, "_orig_mod", None)
+    if compiled_target is not None:
+        target = compiled_target
+
+    adapters = getattr(target, "encoder_conditioning_adapters", None)
+    if adapters is None:
+        return []
+
+    alpha_values: list[float] = []
+    for adapter in adapters:
+        alpha = getattr(adapter, "alpha", None)
+        if alpha is None:
+            continue
+        alpha_values.append(float(alpha.detach().reshape(-1)[0].item()))
+    return alpha_values
+
+
 def _run_worker(
     rank: int,
     world_size: int,
@@ -721,8 +740,12 @@ def _run_worker(
             if rank == 0 and global_step % log_every == 0:
                 now = time.time()
                 elapsed = max(now - window_start, 1e-6)
+                alpha_values = _get_encoder_conditioning_alpha_values(model)
+                alpha_suffix = ""
+                if alpha_values:
+                    alpha_suffix = " enc_alpha=[" + ",".join(f"{value:.6f}" for value in alpha_values) + "]"
                 logger.info(
-                    "step=%s/%s loss=%.6f behavioral=%.6f structural=%.6f kl=%.6f lr=%.3e steps_per_s=%.2f elapsed=%.1fs",
+                    "step=%s/%s loss=%.6f behavioral=%.6f structural=%.6f kl=%.6f lr=%.3e steps_per_s=%.2f elapsed=%.1fs%s",
                     global_step,
                     max_steps,
                     loss_window / window_steps,
@@ -732,6 +755,7 @@ def _run_worker(
                     float(optimizer.param_groups[0]["lr"]),
                     window_steps / elapsed,
                     now - t0,
+                    alpha_suffix,
                 )
                 loss_window = 0.0
                 behavioral_window = 0.0
