@@ -119,26 +119,15 @@ train:
     huber_delta: 0.1
 
   synthetic:
-    # `patch_stats_teacher`: W itself is generated from patch-wise X statistics.
-    # `x_residual_teacher`: encoder sees only W_base, while target is W_base + residual(X).
-    # The second mode is the stronger probe for whether encoder conditioning alpha leaves zero.
-    kind: iid_gaussian
-    # X is also sampled from Normal to preserve the same operator loss API as big_vae train.
+    # Encoder input sees only the observed/base part of W.
+    # Target reconstruction adds an X-dependent residual that cannot be recovered from W_input alone.
+    kind: x_residual_teacher
     batch_size: 32
     n_rows: 256
     d_in: 256
     d_out: 32
     x_std: 1.0
     w_std: 1.0
-    patch_stats_teacher:
-      patch_mean_std: 1.5
-      patch_scale_min: 0.5
-      patch_scale_max: 1.5
-      mixture_shift_std: 0.75
-      signal_scale: 1.0
-      weight_noise_std: 0.01
-      q_low: 0.15
-      q_high: 0.85
     x_residual_teacher:
       patch_mean_std: 1.5
       patch_scale_min: 0.5

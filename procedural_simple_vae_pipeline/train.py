@@ -481,77 +481,46 @@ def _load_model_weights_from_checkpoint(model: torch.nn.Module, path: str, logge
     logger.info("Model weights loaded successfully (step=%s)", ckpt.get("step", "?"))
 
 
-def _sample_procedural_batch(cfg: dict[str, Any], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    train_cfg = cfg.get("train", {})
-    synth_cfg = train_cfg.get("synthetic", {}) if isinstance(train_cfg, dict) else {}
-    if not isinstance(synth_cfg, dict):
-        raise TypeError("train.synthetic must be a mapping")
-
-    batch_size = max(1, int(synth_cfg.get("batch_size", 8)))
-    n_rows = max(1, int(synth_cfg.get("n_rows", 256)))
-    d_in = max(1, int(synth_cfg.get("d_in", 256)))
-    d_out = max(1, int(synth_cfg.get("d_out", 32)))
-    x_std = float(synth_cfg.get("x_std", 1.0))
-    w_std = float(synth_cfg.get("w_std", 1.0))
-    kind = str(synth_cfg.get("kind", "iid_gaussian")).strip().lower()
-
-    if x_std <= 0.0:
-        raise ValueError(f"train.synthetic.x_std must be > 0, got {x_std}")
-    if w_std <= 0.0:
-        raise ValueError(f"train.synthetic.w_std must be > 0, got {w_std}")
-
-    if kind == "iid_gaussian":
-        x = torch.randn((batch_size, n_rows, d_in), device=device, dtype=torch.float32) * x_std
-        W = torch.randn((batch_size, d_in, d_out), device=device, dtype=torch.float32) * w_std
-        return x, W
-
-    if kind != "patch_stats_teacher":
-        raise ValueError(
-            "train.synthetic.kind must be one of 'iid_gaussian', 'patch_stats_teacher', "
-            f"got {kind!r}"
-        )
-
+def _build_patch_stats_teacher_residual(
+    *,
+    cfg: dict[str, Any],
+    teacher_cfg: dict[str, Any],
+    batch_size: int,
+    n_rows: int,
+    d_in: int,
+    d_out: int,
+    x_std: float,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
     model_cfg = cfg.get("model", {})
     if not isinstance(model_cfg, dict):
         raise TypeError("model must be a mapping")
     patch_size = max(1, int(model_cfg.get("patch_size", 16)))
     if d_in % patch_size != 0:
         raise ValueError(
-            "train.synthetic.kind='patch_stats_teacher' currently requires d_in to be divisible by model.patch_size, "
+            "teacher synthetic modes currently require d_in to be divisible by model.patch_size, "
             f"got d_in={d_in} patch_size={patch_size}"
         )
-
-    teacher_cfg = synth_cfg.get("patch_stats_teacher", {})
-    if not isinstance(teacher_cfg, dict):
-        raise TypeError("train.synthetic.patch_stats_teacher must be a mapping")
 
     patch_mean_std = float(teacher_cfg.get("patch_mean_std", x_std))
     patch_scale_min = float(teacher_cfg.get("patch_scale_min", 0.5))
     patch_scale_max = float(teacher_cfg.get("patch_scale_max", 1.5))
     mixture_shift_std = float(teacher_cfg.get("mixture_shift_std", 0.75 * x_std))
-    signal_scale = float(teacher_cfg.get("signal_scale", w_std))
-    weight_noise_std = float(teacher_cfg.get("weight_noise_std", 0.01 * w_std))
     q_low = float(teacher_cfg.get("q_low", 0.15))
     q_high = float(teacher_cfg.get("q_high", 0.85))
 
     if patch_mean_std <= 0.0:
-        raise ValueError(f"train.synthetic.patch_stats_teacher.patch_mean_std must be > 0, got {patch_mean_std}")
+        raise ValueError(f"teacher.patch_mean_std must be > 0, got {patch_mean_std}")
     if patch_scale_min <= 0.0 or patch_scale_max < patch_scale_min:
         raise ValueError(
-            "train.synthetic.patch_stats_teacher patch scales must satisfy "
+            "teacher patch scales must satisfy "
             f"0 < patch_scale_min <= patch_scale_max, got {patch_scale_min}, {patch_scale_max}"
         )
     if mixture_shift_std < 0.0:
-        raise ValueError(
-            f"train.synthetic.patch_stats_teacher.mixture_shift_std must be >= 0, got {mixture_shift_std}"
-        )
-    if weight_noise_std < 0.0:
-        raise ValueError(
-            f"train.synthetic.patch_stats_teacher.weight_noise_std must be >= 0, got {weight_noise_std}"
-        )
+        raise ValueError(f"teacher.mixture_shift_std must be >= 0, got {mixture_shift_std}")
     if not (0.0 <= q_low < 0.5 < q_high <= 1.0):
         raise ValueError(
-            "train.synthetic.patch_stats_teacher quantiles must satisfy 0 <= q_low < 0.5 < q_high <= 1, "
+            "teacher quantiles must satisfy 0 <= q_low < 0.5 < q_high <= 1, "
             f"got q_low={q_low} q_high={q_high}"
         )
 
@@ -588,20 +557,111 @@ def _sample_procedural_batch(cfg: dict[str, Any], device: torch.device) -> tuple
     basis_c = torch.cos(0.07 * (feat_idx + 1.0) + 0.19 * (out_idx + 1.0))
     basis_d = torch.sin(0.11 * (feat_idx + 1.0) + 0.23 * (out_idx + 1.0))
 
-    teacher_signal = (
+    residual_patches = (
         q_mid_patch.unsqueeze(-1) * basis_a
         + 0.7 * q_spread_patch.unsqueeze(-1) * basis_b
         + 0.35 * q_center_patch.unsqueeze(-1) * basis_c
         + 0.2 * patch_global_center.unsqueeze(-1) * basis_d
         + 0.15 * patch_global_spread.unsqueeze(-1) * basis_c
-    )
-    W_patches = (signal_scale / max(float(patch_size) ** 0.5, 1.0)) * teacher_signal
-    if weight_noise_std > 0.0:
-        W_patches = W_patches + weight_noise_std * torch.randn_like(W_patches)
+    ) / max(float(patch_size) ** 0.5, 1.0)
 
     x = x_patches.reshape(batch_size, n_rows, d_in)
-    W = W_patches.reshape(batch_size, d_in, d_out)
-    return x, W
+    residual = residual_patches.reshape(batch_size, d_in, d_out)
+    return x, residual
+
+
+def _sample_procedural_batch(cfg: dict[str, Any], device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    train_cfg = cfg.get("train", {})
+    synth_cfg = train_cfg.get("synthetic", {}) if isinstance(train_cfg, dict) else {}
+    if not isinstance(synth_cfg, dict):
+        raise TypeError("train.synthetic must be a mapping")
+
+    batch_size = max(1, int(synth_cfg.get("batch_size", 8)))
+    n_rows = max(1, int(synth_cfg.get("n_rows", 256)))
+    d_in = max(1, int(synth_cfg.get("d_in", 256)))
+    d_out = max(1, int(synth_cfg.get("d_out", 32)))
+    x_std = float(synth_cfg.get("x_std", 1.0))
+    w_std = float(synth_cfg.get("w_std", 1.0))
+    kind = str(synth_cfg.get("kind", "iid_gaussian")).strip().lower()
+
+    if x_std <= 0.0:
+        raise ValueError(f"train.synthetic.x_std must be > 0, got {x_std}")
+    if w_std <= 0.0:
+        raise ValueError(f"train.synthetic.w_std must be > 0, got {w_std}")
+
+    if kind == "iid_gaussian":
+        x = torch.randn((batch_size, n_rows, d_in), device=device, dtype=torch.float32) * x_std
+        W = torch.randn((batch_size, d_in, d_out), device=device, dtype=torch.float32) * w_std
+        return x, W, W
+
+    if kind == "patch_stats_teacher":
+        teacher_cfg = synth_cfg.get("patch_stats_teacher", {})
+        if not isinstance(teacher_cfg, dict):
+            raise TypeError("train.synthetic.patch_stats_teacher must be a mapping")
+        signal_scale = float(teacher_cfg.get("signal_scale", w_std))
+        weight_noise_std = float(teacher_cfg.get("weight_noise_std", 0.01 * w_std))
+        if weight_noise_std < 0.0:
+            raise ValueError(
+                f"train.synthetic.patch_stats_teacher.weight_noise_std must be >= 0, got {weight_noise_std}"
+            )
+
+        x, residual_signal = _build_patch_stats_teacher_residual(
+            cfg=cfg,
+            teacher_cfg=teacher_cfg,
+            batch_size=batch_size,
+            n_rows=n_rows,
+            d_in=d_in,
+            d_out=d_out,
+            x_std=x_std,
+            device=device,
+        )
+        W = signal_scale * residual_signal
+        if weight_noise_std > 0.0:
+            W = W + weight_noise_std * torch.randn_like(W)
+        return x, W, W
+
+    if kind == "x_residual_teacher":
+        teacher_cfg = synth_cfg.get("x_residual_teacher", {})
+        if not isinstance(teacher_cfg, dict):
+            raise TypeError("train.synthetic.x_residual_teacher must be a mapping")
+        observed_w_std = float(teacher_cfg.get("observed_w_std", 0.35 * w_std))
+        observed_noise_std = float(teacher_cfg.get("observed_noise_std", 0.02 * w_std))
+        residual_scale = float(teacher_cfg.get("residual_scale", 1.0 * w_std))
+        target_noise_std = float(teacher_cfg.get("target_noise_std", 0.0))
+        if observed_w_std < 0.0:
+            raise ValueError(f"train.synthetic.x_residual_teacher.observed_w_std must be >= 0, got {observed_w_std}")
+        if observed_noise_std < 0.0:
+            raise ValueError(
+                f"train.synthetic.x_residual_teacher.observed_noise_std must be >= 0, got {observed_noise_std}"
+            )
+        if target_noise_std < 0.0:
+            raise ValueError(
+                f"train.synthetic.x_residual_teacher.target_noise_std must be >= 0, got {target_noise_std}"
+            )
+
+        x, residual_signal = _build_patch_stats_teacher_residual(
+            cfg=cfg,
+            teacher_cfg=teacher_cfg,
+            batch_size=batch_size,
+            n_rows=n_rows,
+            d_in=d_in,
+            d_out=d_out,
+            x_std=x_std,
+            device=device,
+        )
+        w_base = observed_w_std * torch.randn((batch_size, d_in, d_out), device=device, dtype=torch.float32)
+        W_in = w_base
+        if observed_noise_std > 0.0:
+            W_in = W_in + observed_noise_std * torch.randn_like(W_in)
+        W_target = w_base + residual_scale * residual_signal
+        if target_noise_std > 0.0:
+            W_target = W_target + target_noise_std * torch.randn_like(W_target)
+        return x, W_in, W_target
+
+    raise ValueError(
+        "train.synthetic.kind must be one of 'iid_gaussian', 'patch_stats_teacher', 'x_residual_teacher', "
+        f"got {kind!r}"
+    )
 
 
 def _reduce_metrics(metrics: dict[str, float], device: torch.device, is_distributed: bool) -> dict[str, float]:
@@ -728,22 +788,36 @@ def _run_worker(
             float(synth_cfg.get("x_std", 1.0)),
             float(synth_cfg.get("w_std", 1.0)),
         )
-        if str(synth_cfg.get("kind", "iid_gaussian")).strip().lower() == "patch_stats_teacher":
-            teacher_cfg = synth_cfg.get("patch_stats_teacher", {})
+        synth_kind = str(synth_cfg.get("kind", "iid_gaussian")).strip().lower()
+        if synth_kind in {"patch_stats_teacher", "x_residual_teacher"}:
+            teacher_key = "patch_stats_teacher" if synth_kind == "patch_stats_teacher" else "x_residual_teacher"
+            teacher_cfg = synth_cfg.get(teacher_key, {})
             if not isinstance(teacher_cfg, dict):
-                raise TypeError("train.synthetic.patch_stats_teacher must be a mapping")
+                raise TypeError(f"train.synthetic.{teacher_key} must be a mapping")
             logger.info(
                 "Synthetic teacher: patch_mean_std=%s patch_scale_min=%s patch_scale_max=%s "
-                "mixture_shift_std=%s signal_scale=%s weight_noise_std=%s q_low=%s q_high=%s",
+                "mixture_shift_std=%s q_low=%s q_high=%s",
                 float(teacher_cfg.get("patch_mean_std", synth_cfg.get("x_std", 1.0))),
                 float(teacher_cfg.get("patch_scale_min", 0.5)),
                 float(teacher_cfg.get("patch_scale_max", 1.5)),
                 float(teacher_cfg.get("mixture_shift_std", 0.75 * float(synth_cfg.get("x_std", 1.0)))),
-                float(teacher_cfg.get("signal_scale", synth_cfg.get("w_std", 1.0))),
-                float(teacher_cfg.get("weight_noise_std", 0.01 * float(synth_cfg.get("w_std", 1.0)))),
                 float(teacher_cfg.get("q_low", 0.15)),
                 float(teacher_cfg.get("q_high", 0.85)),
             )
+            if synth_kind == "patch_stats_teacher":
+                logger.info(
+                    "Synthetic teacher target: signal_scale=%s weight_noise_std=%s",
+                    float(teacher_cfg.get("signal_scale", synth_cfg.get("w_std", 1.0))),
+                    float(teacher_cfg.get("weight_noise_std", 0.01 * float(synth_cfg.get("w_std", 1.0)))),
+                )
+            if synth_kind == "x_residual_teacher":
+                logger.info(
+                    "Synthetic residual task: observed_w_std=%s observed_noise_std=%s residual_scale=%s target_noise_std=%s",
+                    float(teacher_cfg.get("observed_w_std", 0.35 * float(synth_cfg.get("w_std", 1.0)))),
+                    float(teacher_cfg.get("observed_noise_std", 0.02 * float(synth_cfg.get("w_std", 1.0)))),
+                    float(teacher_cfg.get("residual_scale", 1.0 * float(synth_cfg.get("w_std", 1.0)))),
+                    float(teacher_cfg.get("target_noise_std", 0.0)),
+                )
         logger.info(
             "Runtime: device=%s distributed=%s world_size=%s amp=%s compile=%s checkpoint_dir=%s",
             device,
@@ -775,17 +849,17 @@ def _run_worker(
 
             for micro_idx in range(grad_accum_steps):
                 sync_grad = micro_idx == grad_accum_steps - 1
-                x_batch, W_batch = _sample_procedural_batch(cfg=cfg, device=device)
+                x_batch, W_input_batch, W_target_batch = _sample_procedural_batch(cfg=cfg, device=device)
                 no_sync_ctx = contextlib.nullcontext()
                 if is_distributed and not sync_grad:
                     no_sync_ctx = model.no_sync()  # type: ignore[union-attr]
 
                 with no_sync_ctx:
                     with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
-                        W_hat, mu, logvar, pred_dirs = model(W_batch, x_batch)
-                        behavioral_loss = BigWeightVAE.operator_recon_loss(x_batch, W_batch, W_hat)
+                        W_hat, mu, logvar, pred_dirs = model(W_input_batch, x_batch)
+                        behavioral_loss = BigWeightVAE.operator_recon_loss(x_batch, W_target_batch, W_hat)
                         structural_loss, _ = BigWeightVAE.patch_structure_loss(
-                            W_batch,
+                            W_target_batch,
                             W_hat,
                             patch_size=int(model_cfg.patch_size),
                             gamma=struct_gamma,
