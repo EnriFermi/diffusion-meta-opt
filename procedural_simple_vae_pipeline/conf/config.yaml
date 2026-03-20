@@ -119,6 +119,7 @@ train:
     huber_delta: 0.1
 
   synthetic:
+    # `masked_ab_from_x`: first half of W along d_out is visible, second half is masked, and X carries the hidden code C.
     # `patch_stats_teacher`: W itself is generated from patch-wise X statistics.
     # `x_residual_teacher`: encoder sees only W_base, while target is W_base + residual(X).
     # The second mode is the stronger probe for whether encoder conditioning alpha leaves zero.
@@ -130,6 +131,11 @@ train:
     d_out: 64
     x_std: 1.0
     w_std: 1.0
+    masked_ab_from_x:
+      a_std: 1.0
+      c_std: 1.0
+      x_noise_std: 1.0
+      mask_value: 0.0
     patch_stats_teacher:
       patch_mean_std: 1.5
       patch_scale_min: 0.5
