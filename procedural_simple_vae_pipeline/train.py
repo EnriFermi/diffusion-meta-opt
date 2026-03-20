@@ -570,6 +570,51 @@ def _build_patch_stats_teacher_residual(
     return x, residual
 
 
+def _build_masked_ab_from_x_batch(
+    *,
+    synth_cfg: dict[str, Any],
+    batch_size: int,
+    n_rows: int,
+    d_in: int,
+    d_out: int,
+    x_std: float,
+    w_std: float,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    teacher_cfg = synth_cfg.get("masked_ab_from_x", {})
+    if not isinstance(teacher_cfg, dict):
+        raise TypeError("train.synthetic.masked_ab_from_x must be a mapping")
+    if d_out % 2 != 0:
+        raise ValueError(
+            "train.synthetic.kind='masked_ab_from_x' requires d_out to be even, "
+            f"got d_out={d_out}"
+        )
+
+    a_std = float(teacher_cfg.get("a_std", w_std))
+    c_std = float(teacher_cfg.get("c_std", w_std))
+    x_noise_std = float(teacher_cfg.get("x_noise_std", x_std))
+    mask_value = float(teacher_cfg.get("mask_value", 0.0))
+    if a_std < 0.0:
+        raise ValueError(f"train.synthetic.masked_ab_from_x.a_std must be >= 0, got {a_std}")
+    if c_std < 0.0:
+        raise ValueError(f"train.synthetic.masked_ab_from_x.c_std must be >= 0, got {c_std}")
+    if x_noise_std <= 0.0:
+        raise ValueError(f"train.synthetic.masked_ab_from_x.x_noise_std must be > 0, got {x_noise_std}")
+
+    half_out = d_out // 2
+    A = a_std * torch.randn((batch_size, d_in, half_out), device=device, dtype=torch.float32)
+    C = c_std * torch.randn((batch_size, d_in, 1), device=device, dtype=torch.float32)
+    B = A + C
+
+    W_target = torch.cat([A, B], dim=2)
+    masked_half = torch.full_like(B, mask_value)
+    W_input = torch.cat([A, masked_half], dim=2)
+
+    x_mean = C.squeeze(-1)
+    X = x_mean.unsqueeze(1) + x_noise_std * torch.randn((batch_size, n_rows, d_in), device=device, dtype=torch.float32)
+    return X, W_input, W_target
+
+
 def _sample_procedural_batch(cfg: dict[str, Any], device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     train_cfg = cfg.get("train", {})
     synth_cfg = train_cfg.get("synthetic", {}) if isinstance(train_cfg, dict) else {}
@@ -593,6 +638,18 @@ def _sample_procedural_batch(cfg: dict[str, Any], device: torch.device) -> tuple
         x = torch.randn((batch_size, n_rows, d_in), device=device, dtype=torch.float32) * x_std
         W = torch.randn((batch_size, d_in, d_out), device=device, dtype=torch.float32) * w_std
         return x, W, W
+
+    if kind == "masked_ab_from_x":
+        return _build_masked_ab_from_x_batch(
+            synth_cfg=synth_cfg,
+            batch_size=batch_size,
+            n_rows=n_rows,
+            d_in=d_in,
+            d_out=d_out,
+            x_std=x_std,
+            w_std=w_std,
+            device=device,
+        )
 
     if kind == "patch_stats_teacher":
         teacher_cfg = synth_cfg.get("patch_stats_teacher", {})
@@ -659,7 +716,8 @@ def _sample_procedural_batch(cfg: dict[str, Any], device: torch.device) -> tuple
         return x, W_in, W_target
 
     raise ValueError(
-        "train.synthetic.kind must be one of 'iid_gaussian', 'patch_stats_teacher', 'x_residual_teacher', "
+        "train.synthetic.kind must be one of "
+        "'iid_gaussian', 'masked_ab_from_x', 'patch_stats_teacher', 'x_residual_teacher', "
         f"got {kind!r}"
     )
 
@@ -789,6 +847,17 @@ def _run_worker(
             float(synth_cfg.get("w_std", 1.0)),
         )
         synth_kind = str(synth_cfg.get("kind", "iid_gaussian")).strip().lower()
+        if synth_kind == "masked_ab_from_x":
+            teacher_cfg = synth_cfg.get("masked_ab_from_x", {})
+            if not isinstance(teacher_cfg, dict):
+                raise TypeError("train.synthetic.masked_ab_from_x must be a mapping")
+            logger.info(
+                "Synthetic masked-half task: a_std=%s c_std=%s x_noise_std=%s mask_value=%s",
+                float(teacher_cfg.get("a_std", synth_cfg.get("w_std", 1.0))),
+                float(teacher_cfg.get("c_std", synth_cfg.get("w_std", 1.0))),
+                float(teacher_cfg.get("x_noise_std", synth_cfg.get("x_std", 1.0))),
+                float(teacher_cfg.get("mask_value", 0.0)),
+            )
         if synth_kind in {"patch_stats_teacher", "x_residual_teacher"}:
             teacher_key = "patch_stats_teacher" if synth_kind == "patch_stats_teacher" else "x_residual_teacher"
             teacher_cfg = synth_cfg.get(teacher_key, {})
