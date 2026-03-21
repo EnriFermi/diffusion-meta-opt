@@ -1,0 +1,63 @@
+model:
+  distribution_latent_dim: 64
+  K: 64
+  dropout: 0.0
+
+dataset:
+  b: 1024
+  n_real: 64
+  max_modes: 5
+  loc_std_range: [0.01, 0.3]
+  scale_range: [0.001, 0.15]
+  df_range: [2.5, 30.0]
+  skew_range: [-5.0, 5.0]
+  # Strategy selection weights (null = use built-in defaults).
+  # Set individual weights to 0 to disable a strategy.
+  strategy_weights:
+    mixture_gauss_t_skew: 0.13
+    laplace: 0.05
+    sinh_arcsinh: 0.07
+    piecewise_linear_qf: 0.05
+    sparse_dense: 0.07
+    uniform_segments: 0.04
+    signed_lognormal: 0.05
+    beta_transformed: 0.05
+    alpha_stable: 0.04
+    quantile_warping: 0.05
+    contaminated_normal: 0.05
+    generalized_gaussian: 0.04
+    cauchy_mixture: 0.03
+    triangular_mixture: 0.04
+    bimodal_gap: 0.04
+    truncated_normal: 0.03
+    folded_normal: 0.03
+    logistic_mixture: 0.04
+    raised_cosine: 0.03
+    staircase_quantized: 0.04
+    signed_exponential: 0.03
+
+train:
+  device: cuda:0
+  max_steps: 200000
+  batch_size: 256
+  n_critic: 5
+  lambda_gp: 10.0
+  lr: 1.0e-4
+  betas: [0.0, 0.9]
+  seed: 42
+  log_every: 50
+  checkpoint_every: 5000
+  eval_every: 1000
+  eval_n_distributions: 32
+  checkpoint_dir: ./artifacts/distribution_encoder
+  resume_checkpoint: ""
+
+telemetry:
+  comet:
+    enabled: true
+    api_key: ${oc.env:COMET_API_KEY,""}
+    workspace: ${oc.env:COMET_WORKSPACE,""}
+    project_name: distribution_encoder_wgan
+    experiment_name: wgan-gp-baseline
+    tags: []
+    log_code: false
