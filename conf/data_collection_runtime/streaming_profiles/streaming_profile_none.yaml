@@ -1,0 +1,5 @@
+defaults:
+  - streaming_common_settings
+  - _self_
+
+mode: none

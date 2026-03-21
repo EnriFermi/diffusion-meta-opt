@@ -1,0 +1,78 @@
+# @package _global_
+defaults:
+  - /run_profiles@_global_: train_big_vae
+  - _self_
+
+train:
+  distributed: false
+  num_gpus: 1
+  device: "cuda:0"
+  amp: false
+  compile: false
+  compile_dynamic: false
+  compile_disable_cudagraphs: false
+  tf32: false
+  cudnn_benchmark: false
+  weight_decay: 0.0
+  grad_clip_norm: 0.0
+  grad_clip_norm_by_part: {}
+  behavioral_coef: 0.0
+  structural_coef: 1.0
+  fixed_training_batch:
+    enabled: false
+  synthetic_layer_source:
+    enabled: false
+  telemetry:
+    grad_layer_monitor:
+      enabled: false
+    comet:
+      enabled: false
+
+model:
+  distribution:
+    dropout: 0.0
+  mini_vae:
+    dropout: 0.0
+  big_vae:
+    dropout: 0.0
+    use_latent_sampling: false
+
+diagnostics:
+  seed: 1234
+  checkpoint_path: ${train.resume_checkpoint}
+  output_root: artifacts/big_vae_identity_diagnostics
+  frozen_target:
+    source_kind: real
+    batch_size: 1
+    max_x_rows: ${train.max_x_rows}
+    use_curriculum_slice: true
+    max_T_patches: null
+    max_d_out: null
+    synthetic:
+      n_rows: 256
+      d_in: 512
+      d_out: 8
+      x_std: 1.0
+      w_std: 1.0
+  experiments:
+    loss_only:
+      steps: 1500
+      lr_sgd: 0.5
+      lr_adam: 0.05
+    interpolation:
+      num_points: 51
+    alt_losses:
+      steps: 1200
+      optimizer: adam
+      lr: 0.05
+    free_latent_decoder:
+      steps: 1000
+      lr: 0.05
+    clean_e2e:
+      steps: 500
+      lr: 0.0005
+
+hydra:
+  job:
+    name: diagnose_big_vae_identity
+    chdir: false

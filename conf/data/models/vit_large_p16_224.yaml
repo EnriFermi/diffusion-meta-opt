@@ -1,0 +1,22 @@
+name: vit_large_p16_224
+provider: transformers
+runner: hf_vit_runner
+model_family: vit
+hf_repo: google/vit-large-patch16-224
+revision: null
+gated: false
+cache_subdir: models/${.name}
+batch_size: 16
+sampling_weight: 1.0
+device: auto
+dtype: float16
+run_mode: encoder_only
+hook_filter:
+  include_regex: null
+  exclude_regex: null
+limits:
+  max_records_per_layer: 200000
+  max_layers: null
+preprocess:
+  processor: auto
+trust_remote_code: false

@@ -21,7 +21,15 @@ class HFSiglipRunner(HFBaseRunner):
         return self._from_pretrained(SiglipModel, token=token)
 
     def _load_processor(self, token: str | None) -> Any:
-        from transformers import AutoProcessor
+        from transformers import AutoImageProcessor, AutoProcessor
+
+        # In vision-only mode tokenizer is not required; AutoProcessor may
+        # still attempt tokenizer loading and crash on some transformers versions.
+        if self.run_mode in {"vision_only", "encoder_only"}:
+            try:
+                return self._from_pretrained(AutoImageProcessor, token=token)
+            except Exception:
+                return self._from_pretrained(AutoProcessor, token=token)
 
         return self._from_pretrained(AutoProcessor, token=token)
 

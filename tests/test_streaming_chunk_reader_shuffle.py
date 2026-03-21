@@ -91,6 +91,45 @@ class TestStreamingChunkReaderShuffle(unittest.TestCase):
 
             self.assertEqual(order, list(range(10)))
 
+    def test_randomize_chunk_order_changes_first_chunk_across_seeds(self) -> None:
+        first_chunk_prefixes: set[int] = set()
+
+        for seed in range(6):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = LocalDiskChunkStore(root_dir=root / "store", max_ready_chunks=20, low_watermark_chunks=10)
+                writer = ChunkWriter(
+                    store=store,
+                    spool_dir=root / "spool",
+                    chunk_size_samples=5,
+                    compression="none",
+                    spool_max_pending_chunks=20,
+                )
+                writer.open_window(window_chunks=1, window_id=0)
+                for i in range(10):
+                    writer.append(_sample(i))
+                writer.close_window(flush_partial=True)
+
+                reader = ChunkReader(
+                    store=store,
+                    cache_dir=root / "consumer_cache",
+                    prefetch_max_chunks=2,
+                    delete_remote_after="consume",
+                    distributed_cfg={"enabled": False},
+                    randomize_chunk_order=True,
+                    randomize_within_chunk=False,
+                    random_seed=seed,
+                )
+                try:
+                    first = int(reader.next_sample(block=True, timeout=1.0).meta["i"])
+                finally:
+                    reader.close()
+                    writer.close()
+
+                first_chunk_prefixes.add(first // 5)
+
+        self.assertGreaterEqual(len(first_chunk_prefixes), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

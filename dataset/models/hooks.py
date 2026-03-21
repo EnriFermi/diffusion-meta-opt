@@ -33,14 +33,12 @@ def make_linear_hook(layer_name: str, buffers_dict: dict[str, dict[str, Any]], c
         if input_tensor is not None:
             buffer["input_shape_list"].append(tuple(input_tensor.shape))
             flat_inputs = flatten_to_2d(input_tensor.detach())
-            flat_inputs = flat_inputs.to(device="cpu", dtype=torch.float32, copy=True)
             _append_with_cap(buffer["inputs"], flat_inputs, max_records_int)
 
         output_tensor = _extract_first_tensor(outputs)
         if output_tensor is not None:
             buffer["output_shape_list"].append(tuple(output_tensor.shape))
             flat_outputs = flatten_to_2d(output_tensor.detach())
-            flat_outputs = flat_outputs.to(device="cpu", dtype=torch.float32, copy=True)
             _append_with_cap(buffer["outputs"], flat_outputs, max_records_int)
 
     return hook

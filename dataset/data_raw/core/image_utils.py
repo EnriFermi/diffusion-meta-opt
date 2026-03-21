@@ -5,12 +5,12 @@ import random
 from pathlib import Path
 from typing import Any
 
-import torch
 from PIL import Image
-from torchvision import transforms
 
 
 def seed_everything(seed: int) -> None:
+    import torch
+
     random.seed(seed)
     torch.manual_seed(seed)
     try:
@@ -31,7 +31,7 @@ def decode_to_pil(value: Any) -> Image.Image:
         if value.get("bytes") is not None:
             return Image.open(io.BytesIO(value["bytes"])).convert("RGB")
         if value.get("path"):
-            return Image.open(value["path"]).convert("RGB")
+            return _open_pil_path(str(value["path"]))
 
     if isinstance(value, (bytes, bytearray)):
         return Image.open(io.BytesIO(value)).convert("RGB")
@@ -54,11 +54,33 @@ def decode_to_pil(value: Any) -> Image.Image:
 
 
 def load_image(path: str | Path) -> Image.Image:
-    with Image.open(path) as image:
-        return image.convert("RGB")
+    return _open_pil_path(str(path))
 
 
-def build_tensor_transform(image_size: int) -> transforms.Compose:
+def _open_pil_path(path: str) -> Image.Image:
+    # Fast path: regular local filesystem path.
+    try:
+        with Image.open(path) as image:
+            return image.convert("RGB")
+    except Exception as local_exc:
+        # Some HF datasets expose image references as virtual paths
+        # like `zip://...::http://...`; these must be opened via fsspec.
+        if "://" not in path and "::" not in path:
+            raise local_exc
+
+    try:
+        import fsspec
+    except Exception as exc:
+        raise RuntimeError(f"Cannot open non-local image path without fsspec: {path}") from exc
+
+    with fsspec.open(path, mode="rb").open() as handle:
+        with Image.open(handle) as image:
+            return image.convert("RGB")
+
+
+def build_tensor_transform(image_size: int) -> Any:
+    from torchvision import transforms
+
     return transforms.Compose(
         [
             transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BILINEAR),

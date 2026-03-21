@@ -1,0 +1,17 @@
+# @package _global_
+defaults:
+  - global_app_hydra_logging_and_model_registry
+  - _self_
+
+training_artifacts:
+  base_root_dir: ./artifacts/training
+  separate_run_dirs: true
+  runs_dir: ${training_artifacts.base_root_dir}/runs
+  run_id: ""
+  root_dir: ${training_artifacts.base_root_dir}
+  logs_dir: ${training_artifacts.root_dir}/logs
+  reports_dir: ${training_artifacts.root_dir}/reports
+  crashes_dir: ${training_artifacts.root_dir}/crashes
+  mini_vae_checkpoint_dir: ${training_artifacts.root_dir}/checkpoints/mini_patch_vae
+  big_vae_checkpoint_dir: ${training_artifacts.root_dir}/checkpoints/weight_quantile_vae
+  mini_encoder_latest_checkpoint: ${training_artifacts.mini_vae_checkpoint_dir}/mini_encoder_latest.pt

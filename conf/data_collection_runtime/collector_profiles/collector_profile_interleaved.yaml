@@ -1,0 +1,7 @@
+defaults:
+  - collector_common_settings
+  - _self_
+
+# Interleaved collection profile.
+mode: auto
+device: null

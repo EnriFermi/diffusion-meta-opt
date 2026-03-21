@@ -1,0 +1,98 @@
+max_steps: 1000000
+grad_accum_steps: 1
+distributed: false
+num_gpus: 1
+
+amp: false
+tf32: false
+cudnn_benchmark: false
+compile: false
+compile_mode: reduce-overhead
+compile_dynamic: true
+# Keep torch.compile while avoiding inductor CUDAGraph output-buffer reuse issues.
+compile_disable_cudagraphs: true
+# Pull model artifacts up front to reduce collector cold-start stalls.
+predownload_models: true
+
+warmup_steps: 0
+min_lr_ratio: 0.01
+kl_beta: 0.0
+weight_decay: 0.0
+lr: 5e-4
+
+behavioral_coef: 0.0
+structural_coef: 1.0
+contrastive_coef: 0.0
+struct_loss:
+  gamma: 0.5
+  lambda_scale: 0.0
+  lambda_rec: 0.0
+  lambda_dir: 1.0
+  lambda_rel: 0.0
+  huber_delta: 0.1
+grad_clip_norm_by_part:
+  distribution_encoder: 0
+  patch_tokenizer: 0
+  encoder: 0
+  decoder: 0
+  big_vae_other: 0
+ 
+checkpoint_every: 500
+checkpoint_dir: ${training_artifacts.big_vae_checkpoint_dir}
+
+stage: 1
+stage_base_T_patches: 8
+stage_base_d_out: 8
+stage_scale_factor: 2
+# Optional synthetic data mode for quick smoke/debug runs.
+# When enabled, train loop samples x and W from Normal and does not start collectors.
+synthetic_layer_source:
+  enabled: false
+  n_rows: 256
+  d_in: 256
+  d_out: 32
+  x_std: 1.0
+  w_std: 1.0
+# Optional one-batch overfit mode.
+# When enabled, train loop captures one already-sliced training batch once and
+# reuses it for the full run instead of reslicing on every micro-step.
+fixed_training_batch:
+  enabled: false
+  # When non-empty, save the exact captured batch for later diagnostics replay.
+  dump_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/fixed_training_batch.pt
+# Cap rows in x to reduce rare heavy samples that can stall steps.
+max_x_rows: 512
+steps_per_sample: 100000000
+slice_batch_size: 32
+resume_checkpoint: ""
+
+forensics:
+  stdio_redirect: false
+
+telemetry:
+  grad_layer_monitor:
+    enabled: true
+    every_steps: 5
+    # Empty means monitor all trainable layers.
+    include_prefixes: []
+    weights_only: true
+    topk_layers: 32
+    save_csv: true
+    reset_csv_on_start: true
+    csv_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/grad_layer_rms.csv
+    save_plot: false
+    plot_every_steps: 100
+    plot_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/grad_layer_rms.png
+    save_heatmap: false
+    heatmap_max_layers: 160
+    heatmap_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/grad_layer_rms_heatmap.png
+    log_scale: true
+  comet:
+    enabled: true
+    api_key: ${oc.env:COMET_API_KEY,""}
+    workspace: ${oc.env:COMET_WORKSPACE,""}
+    project_name: big_weight_vae
+    experiment_name: ""
+    tags: []
+    offline_directory: ""
+    log_code: false

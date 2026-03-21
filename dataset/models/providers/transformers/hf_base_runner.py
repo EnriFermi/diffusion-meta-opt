@@ -182,19 +182,29 @@ class HFBaseRunner(BaseVirtualModel):
                 continue
 
             module = state["module"]
-            weight = module.weight.detach().to(device="cpu", dtype=torch.float32, copy=True)
+            # torch.nn.Linear stores weights as [out_features, in_features], but
+            # the downstream training pipeline expects [d_in, d_out].
+            weight = module.weight.detach().transpose(0, 1).contiguous().to(
+                device="cpu",
+                dtype=torch.float32,
+                copy=True,
+            )
 
             input_chunks = state["inputs"]
             output_chunks = state["outputs"]
 
             if input_chunks:
-                inputs = torch.cat(input_chunks, dim=0)
+                inputs = torch.cat(input_chunks, dim=0).to(
+                    device="cpu", dtype=torch.float32
+                )
             else:
                 in_features = int(getattr(module, "in_features", 0))
                 inputs = torch.empty((0, in_features), dtype=torch.float32)
 
             if output_chunks:
-                outputs = torch.cat(output_chunks, dim=0)
+                outputs = torch.cat(output_chunks, dim=0).to(
+                    device="cpu", dtype=torch.float32
+                )
             else:
                 out_features = int(getattr(module, "out_features", 0))
                 outputs = torch.empty((0, out_features), dtype=torch.float32)

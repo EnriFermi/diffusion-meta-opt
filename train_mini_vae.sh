@@ -1,0 +1,41 @@
+#!/bin/sh
+set -eu
+
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$ROOT_DIR"
+
+# Comet credentials (set once here, or override via environment when needed).
+COMET_API_KEY_DEFAULT="0md4tVC4ShvXun7DmrX9BUweQ"
+COMET_WORKSPACE_DEFAULT="mike-5531"
+export COMET_API_KEY="${COMET_API_KEY:-$COMET_API_KEY_DEFAULT}"
+export COMET_WORKSPACE="${COMET_WORKSPACE:-$COMET_WORKSPACE_DEFAULT}"
+
+# If running inside a conda environment, prefer its runtime libraries.
+# This avoids C++ ABI mismatches (e.g. libstdc++ from system vs conda).
+if [ -n "${CONDA_PREFIX:-}" ]; then
+  export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+# Примеры:
+#   ./train_mini_vae.sh
+#   HF_TOKEN=hf_xxx ./train_mini_vae.sh mini_train.device=cuda:0
+#   ./train_mini_vae.sh mini_train.max_steps=5000 mini_train.patches_per_sample=24
+#
+# Entrypoint: python -m experiments.train_mini_vae
+# Корневой конфиг: conf/mini_vae_train.yaml (run_profiles/train_mini_vae).
+# Все аргументы передаются как обычные Hydra-overrides.
+
+if [ -n "${PIPENV_ACTIVE:-}" ]; then
+  exec python -m experiments.train_mini_vae "$@"
+fi
+
+# Avoid mixing pipenv with an active conda runtime.
+if [ -n "${CONDA_PREFIX:-}" ]; then
+  exec python -m experiments.train_mini_vae "$@"
+fi
+
+if command -v pipenv >/dev/null 2>&1; then
+  exec pipenv run python -m experiments.train_mini_vae "$@"
+fi
+
+exec python -m experiments.train_mini_vae "$@"

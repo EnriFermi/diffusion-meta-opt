@@ -1,0 +1,39 @@
+name: pascal_voc_2012
+description: "PASCAL VOC 2012 image tasks (classification/segmentation subsets via custom dataset script)."
+enabled: true
+gated: false
+sampling_weight: 1.0
+models:
+  - segformer_b5_cityscapes
+  - detr_resnet50
+collector_device: null
+
+hf:
+  repo: HuggingFaceM4/pascal_voc
+  subset: voc2012_main
+  split: train
+  streaming: false
+  shuffle_buffer: 1000
+  trust_remote_code: true
+
+schema:
+  image_mode: image_field
+  image_field: image
+  image_field_candidates: [image, img]
+  url_field: null
+  url_field_candidates: []
+  id_field: null
+  extra_fields: [label]
+
+cache:
+  num_chunks_kept: 2
+  chunk_size_images: 256
+
+worker:
+  idle_sleep_s: 0.5
+  get_timeout_s: 5.0
+  request_timeout_s: 10
+  max_retries: 2
+  max_worker_restarts: 5
+
+licensing_note: "Uses custom pascal_voc dataset script; keep trust_remote_code=true."

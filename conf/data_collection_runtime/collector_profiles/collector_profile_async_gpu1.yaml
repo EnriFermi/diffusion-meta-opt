@@ -1,0 +1,24 @@
+defaults:
+  - collector_common_settings
+  - _self_
+
+# Async collection profile pinned to cuda:1.
+mode: auto
+device: null
+device_candidates: ["cuda:1", "cuda:0"]
+allow_async_on_train_device: true
+pin_gpu: true
+release_device_on_unload: false
+empty_cuda_cache_on_unload: false
+
+jobs_per_selected_model: 2
+dataset_sampling_strategy: uniform_random
+num_inflight_jobs: 2
+
+in_memory_buffer:
+  capacity_samples: 5000
+  fill_target_samples: 5000
+  low_watermark_samples: 3000
+
+layer_output_splitting:
+  xy_samples_random_slice: 512

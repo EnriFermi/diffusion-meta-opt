@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import faulthandler
 import logging
 import multiprocessing as mp
+import os
 import random
+import signal
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 from queue import Empty, Full
@@ -20,6 +24,76 @@ from dataset.data_raw.providers.hf.datasets_server_sampler import DatasetServerS
 from dataset.data_raw.providers.hf.hf_loader import load_hf_dataset
 from dataset.data_raw.providers.hf.url_fetch import fetch_image_to_cache
 from dataset.logging_utils import configure_root_logging
+from training.forensics import emit_fatal_report, maybe_enable_core_dumps, maybe_redirect_stdio
+
+_FAULT_HANDLER_FILES: list[Any] = []
+
+
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except Exception:
+        return f"SIG{signum}"
+
+
+def _format_process_exit(exit_code: int | None) -> str:
+    if exit_code is None:
+        return "exitcode=None"
+    if exit_code >= 0:
+        return f"exitcode={exit_code}"
+
+    signum = -int(exit_code)
+    reason = f"exitcode={exit_code} ({_signal_name(signum)}/{signum})"
+    if signum == getattr(signal, "SIGSEGV", -999):
+        reason += " [segmentation fault]"
+    elif signum == getattr(signal, "SIGABRT", -999):
+        reason += " [abort]"
+    elif signum == getattr(signal, "SIGBUS", -999):
+        reason += " [bus error]"
+    elif signum == getattr(signal, "SIGILL", -999):
+        reason += " [illegal instruction]"
+    elif signum == getattr(signal, "SIGFPE", -999):
+        reason += " [floating point exception]"
+    return reason
+
+
+def _enable_fault_handler_log(log_path: Path, *, label: str, logger: logging.Logger) -> Path | None:
+    fault_path = log_path.with_name(f"{log_path.stem}_fault_{label}_pid{os.getpid()}.log")
+    try:
+        handle = fault_path.open("a", encoding="utf-8", buffering=1)
+        handle.write(f"\n=== fault-handler start pid={os.getpid()} ts={time.time():.3f} ===\n")
+        faulthandler.enable(file=handle, all_threads=True)
+        for sig_name in ("SIGUSR1", "SIGUSR2"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue
+            try:
+                faulthandler.register(sig, file=handle, all_threads=True, chain=True)
+            except Exception:
+                continue
+        _FAULT_HANDLER_FILES.append(handle)
+        return fault_path
+    except Exception as exc:
+        logger.warning("Failed to initialize worker fault-handler log file: %s", exc)
+        return None
+
+
+def _build_forensics_cfg(dataset_cfg: dict[str, Any]) -> dict[str, Any]:
+    runtime_forensics = dataset_cfg.get("runtime_forensics", {})
+    if not isinstance(runtime_forensics, dict):
+        runtime_forensics = {}
+    training_artifacts = runtime_forensics.get("training_artifacts", {})
+    if not isinstance(training_artifacts, dict):
+        training_artifacts = {}
+    train_forensics = runtime_forensics.get("train_forensics", {})
+    if not isinstance(train_forensics, dict):
+        train_forensics = {}
+    return {
+        "training_artifacts": training_artifacts,
+        "train": {
+            "forensics": train_forensics,
+        },
+    }
 
 
 class HFVirtualDataset(BaseVirtualDataset):
@@ -59,6 +133,13 @@ class HFVirtualDataset(BaseVirtualDataset):
         self._known_chunks: set[str] = set()
         self._chunk_queue: deque[dict[str, Any]] = deque()
         self._served_samples = 0
+        self._status_started_at = float(time.time())
+        self._worker_started_at: float | None = None
+        self._chunks_ready_total = 0
+        self._chunks_evicted_total = 0
+        self._records_materialized_total = 0
+        self._chunk_build_time_total_s = 0.0
+        self._last_chunk_ready_at: float | None = None
 
         self._init_meta_if_missing()
         self._load_existing_chunks()
@@ -131,6 +212,20 @@ class HFVirtualDataset(BaseVirtualDataset):
     def stats(self) -> dict[str, Any]:
         self._drain_worker_events()
         self._ensure_worker_alive()
+        now = float(time.time())
+        total_uptime_s = max(1e-6, now - self._status_started_at)
+
+        worker_pid = None
+        worker_exitcode = None
+        if self._worker is not None:
+            try:
+                worker_pid = int(self._worker.pid) if self._worker.pid is not None else None
+            except Exception:
+                worker_pid = None
+            try:
+                worker_exitcode = self._worker.exitcode
+            except Exception:
+                worker_exitcode = None
 
         return {
             "dataset": self.name,
@@ -139,8 +234,21 @@ class HFVirtualDataset(BaseVirtualDataset):
             "chunks_loaded": len(self._chunk_queue),
             "images_on_disk": self.chunk_cache.count_images(),
             "worker_alive": bool(self._worker and self._worker.is_alive()),
+            "worker_pid": worker_pid,
+            "worker_exitcode": worker_exitcode,
             "worker_restarts": self._worker_restarts,
+            "worker_permanently_stopped": bool(self._worker_permanently_stopped),
+            "worker_last_error": self._last_worker_error,
             "samples_served": self._served_samples,
+            "chunks_ready_total": int(self._chunks_ready_total),
+            "chunks_evicted_total": int(self._chunks_evicted_total),
+            "records_materialized": int(self._records_materialized_total),
+            "chunk_build_time_total_s": float(self._chunk_build_time_total_s),
+            "samples_per_second": float(self._served_samples / total_uptime_s),
+            "chunk_ready_rate_per_second": float(self._chunks_ready_total / total_uptime_s),
+            "avg_chunk_build_seconds": float(self._chunk_build_time_total_s / max(1, int(self._chunks_ready_total))),
+            "worker_uptime_s": float(0.0 if self._worker_started_at is None else max(0.0, now - self._worker_started_at)),
+            "last_chunk_ready_at": self._last_chunk_ready_at,
         }
 
     def _spawn_worker(self, force: bool) -> None:
@@ -167,7 +275,7 @@ class HFVirtualDataset(BaseVirtualDataset):
         }
 
         self._worker = self._ctx.Process(
-            target=hf_dataset_prefetch_worker,
+            target=hf_dataset_prefetch_worker_entry,
             args=(worker_payload, self._events_queue, self._stop_event),
             daemon=True,
             name=f"{self.name}_prefetch",
@@ -186,12 +294,16 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         if self._worker_restarts >= self.max_worker_restarts:
             if not self._worker_permanently_stopped:
-                self.logger.error("Worker exited with code %s", self._worker.exitcode)
+                exit_reason = _format_process_exit(self._worker.exitcode)
+                self.logger.error("Worker exited unexpectedly: %s", exit_reason)
                 self.logger.error("Max worker restarts reached: %s", self.max_worker_restarts)
+                self._last_worker_error = f"worker process terminated: {exit_reason}"
             self._worker_permanently_stopped = True
             return
 
-        self.logger.error("Worker exited with code %s", self._worker.exitcode)
+        exit_reason = _format_process_exit(self._worker.exitcode)
+        self.logger.error("Worker exited unexpectedly: %s", exit_reason)
+        self._last_worker_error = f"worker process terminated: {exit_reason}"
         self._worker_restarts += 1
         self._spawn_worker(force=True)
 
@@ -207,9 +319,33 @@ class HFVirtualDataset(BaseVirtualDataset):
 
             event_type = event.get("type")
             if event_type == "chunk_ready":
+                self._chunks_ready_total += 1
+                records_count = event.get("records_count")
+                if records_count is not None:
+                    try:
+                        self._records_materialized_total += max(0, int(records_count))
+                    except Exception:
+                        pass
+                build_seconds = event.get("build_seconds")
+                if build_seconds is not None:
+                    try:
+                        self._chunk_build_time_total_s += max(0.0, float(build_seconds))
+                    except Exception:
+                        pass
+                self._last_chunk_ready_at = float(time.time())
                 self._register_chunk(str(event["chunk_id"]))
             elif event_type == "chunk_evicted":
+                self._chunks_evicted_total += 1
                 self._forget_chunk(str(event["chunk_id"]))
+            elif event_type == "worker_started":
+                timestamp = event.get("timestamp")
+                if timestamp is not None:
+                    try:
+                        self._worker_started_at = float(timestamp)
+                    except Exception:
+                        self._worker_started_at = float(time.time())
+                else:
+                    self._worker_started_at = float(time.time())
             elif event_type == "error":
                 message = str(event.get("message", "unknown worker error"))
                 self._last_worker_error = message
@@ -339,11 +475,16 @@ class HFVirtualDataset(BaseVirtualDataset):
 
 def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any, stop_event: Any) -> None:
     dataset_cfg = to_plain_dict(worker_payload["dataset_cfg"])
+    forensics_cfg = _build_forensics_cfg(dataset_cfg)
     hf_cfg = to_plain_dict({"hf": worker_payload["hf_cfg"]})["hf"]
 
     dataset_name = str(dataset_cfg["name"])
+    log_path = _configure_logging(dataset_cfg)
     logger = logging.getLogger(f"dataset.worker.{dataset_name}")
-    _configure_logging(dataset_cfg)
+    maybe_enable_core_dumps(forensics_cfg, section="train", logger=logger)
+    fault_path = _enable_fault_handler_log(log_path, label=f"{dataset_name}_worker", logger=logger)
+    if fault_path is not None:
+        logger.info("Worker fault log file: %s", fault_path)
 
     top_cfg = {"hf": hf_cfg}
     allow_missing_token = not bool(dataset_cfg.get("gated", False))
@@ -400,8 +541,28 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
             dataset = load_hf_dataset(dataset_cfg, token=token, seed=seed)
         except Exception as exc:
             message = _format_dataset_load_error(dataset_cfg=dataset_cfg, exc=exc)
+            traceback_text = traceback.format_exc()
+            report_path = emit_fatal_report(
+                forensics_cfg,
+                role=f"dataset_worker_{dataset_name}",
+                error=str(exc),
+                traceback_text=traceback_text,
+                extra={
+                    "dataset": dataset_name,
+                    "phase": "load_hf_dataset",
+                },
+                section="train",
+            )
             logger.exception("Dataset load failed for %s", dataset_name)
-            _emit_event(events_queue, {"type": "error", "dataset": dataset_name, "message": message})
+            _emit_event(
+                events_queue,
+                {
+                    "type": "error",
+                    "dataset": dataset_name,
+                    "message": message,
+                    "fatal_report_path": report_path,
+                },
+            )
             return
 
     dataset_size = _safe_len(dataset) if (dataset is not None and not streaming) else None
@@ -409,6 +570,15 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
     stream_counter = 0
 
     logger.info("Worker started for dataset=%s streaming=%s", dataset_name, streaming)
+    _emit_event(
+        events_queue,
+        {
+            "type": "worker_started",
+            "dataset": dataset_name,
+            "pid": int(os.getpid()),
+            "timestamp": float(time.time()),
+        },
+    )
 
     while not stop_event.is_set():
         try:
@@ -464,15 +634,24 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
                 if record is None:
                     continue
 
-                materialized = _materialize_image(
-                    record=record,
-                    sample_id=sample_id,
-                    dataset_cfg=dataset_cfg,
-                    cache=cache,
-                    chunk_id=chunk_id,
-                    timeout=request_timeout_s,
-                    retries=max_retries,
-                )
+                try:
+                    materialized = _materialize_image(
+                        record=record,
+                        sample_id=sample_id,
+                        dataset_cfg=dataset_cfg,
+                        cache=cache,
+                        chunk_id=chunk_id,
+                        timeout=request_timeout_s,
+                        retries=max_retries,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Image materialization failed for dataset=%s sample_id=%s: %s",
+                        dataset_name,
+                        sample_id,
+                        exc,
+                    )
+                    continue
                 if materialized is None:
                     continue
 
@@ -487,7 +666,16 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
 
             if records:
                 cache.finalize_chunk(chunk_id, records)
-                _emit_event(events_queue, {"type": "chunk_ready", "chunk_id": chunk_id, "dataset": dataset_name})
+                _emit_event(
+                    events_queue,
+                    {
+                        "type": "chunk_ready",
+                        "chunk_id": chunk_id,
+                        "dataset": dataset_name,
+                        "records_count": int(len(records)),
+                        "build_seconds": float(max(0.0, time.monotonic() - chunk_started_at)),
+                    },
+                )
             else:
                 cache.remove_chunk(chunk_id)
                 time.sleep(idle_sleep_s)
@@ -495,6 +683,45 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
             logger.exception("Worker loop failure for dataset=%s", dataset_name)
             _emit_event(events_queue, {"type": "error", "dataset": dataset_name, "message": str(exc)})
             time.sleep(max(1.0, idle_sleep_s))
+
+
+def hf_dataset_prefetch_worker_entry(worker_payload: dict[str, Any], events_queue: Any, stop_event: Any) -> None:
+    dataset_cfg = to_plain_dict(worker_payload.get("dataset_cfg", {}))
+    dataset_name = str(dataset_cfg.get("name", "unknown_dataset"))
+    forensics_cfg = _build_forensics_cfg(dataset_cfg)
+    maybe_redirect_stdio(
+        forensics_cfg,
+        role=f"dataset_worker_{dataset_name}",
+        section="train",
+    )
+    logger = logging.getLogger(f"dataset.worker.{dataset_name}")
+    maybe_enable_core_dumps(forensics_cfg, section="train", logger=logger)
+    try:
+        hf_dataset_prefetch_worker(worker_payload, events_queue, stop_event)
+    except BaseException as exc:
+        traceback_text = traceback.format_exc()
+        report_path = emit_fatal_report(
+            forensics_cfg,
+            role=f"dataset_worker_{dataset_name}",
+            error=str(exc),
+            traceback_text=traceback_text,
+            extra={
+                "dataset": dataset_name,
+                "phase": "worker_entry_unhandled_exception",
+            },
+            section="train",
+        )
+        _emit_event(
+            events_queue,
+            {
+                "type": "error",
+                "dataset": dataset_name,
+                "message": f"fatal_worker_exception: {exc}",
+                "fatal_report_path": report_path,
+            },
+        )
+        logger.exception("Dataset worker crashed with unhandled exception")
+        raise
 
 
 def _safe_len(dataset: Any) -> int | None:
@@ -728,9 +955,9 @@ def _format_dataset_load_error(dataset_cfg: dict[str, Any], exc: Exception) -> s
     return base
 
 
-def _configure_logging(dataset_cfg: dict[str, Any]) -> None:
+def _configure_logging(dataset_cfg: dict[str, Any]) -> Path:
     runtime_cfg = {
         "data": {"log_level": str(dataset_cfg.get("log_level", "INFO"))},
         "logging": dataset_cfg.get("runtime_logging", {}),
     }
-    configure_root_logging(cfg=runtime_cfg, rank=0, force=True)
+    return configure_root_logging(cfg=runtime_cfg, rank=0, force=True)

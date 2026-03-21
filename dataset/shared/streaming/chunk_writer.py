@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import Counter
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -154,6 +155,7 @@ class ChunkWriter:
         chunk_id = _new_chunk_id(window_id=self._window_id, slot=slot, sequence=self._sequence)
         self._sequence += 1
 
+        chunk_summary = _build_chunk_sample_summary(samples)
         local_path = self.spool_dir / f"{chunk_id}{chunk_suffix(self.compression)}"
         meta = {
             "chunk_id": chunk_id,
@@ -162,6 +164,7 @@ class ChunkWriter:
             "window_id": self._window_id,
             "window_slot": int(slot),
             "window_chunks": int(self._window_chunks),
+            "sample_summary": chunk_summary,
         }
 
         save_chunk(local_path, samples=samples, meta=meta, compression=self.compression)
@@ -211,3 +214,65 @@ class ChunkWriter:
 
 def _new_chunk_id(window_id: int, slot: int, sequence: int) -> str:
     return f"final_chunk_w{int(window_id):05d}_s{int(slot):03d}_{int(time.time() * 1000)}_{sequence:08d}"
+
+
+def _build_chunk_sample_summary(samples: list[SharedSample], preview_items: int = 4) -> dict[str, Any]:
+    model_counts: Counter[str] = Counter()
+    layer_counts: Counter[str] = Counter()
+    dataset_counts: Counter[str] = Counter()
+    model_run_ids: set[int] = set()
+    sample_preview: list[dict[str, Any]] = []
+
+    for idx, sample in enumerate(samples):
+        model_counts[str(sample.model_name)] += 1
+        layer_counts[str(sample.layer_name)] += 1
+
+        meta = sample.meta if isinstance(sample.meta, dict) else {}
+        run_id = meta.get("model_run_id")
+        if run_id is not None:
+            try:
+                model_run_ids.add(int(run_id))
+            except Exception:
+                pass
+
+        image_meta = meta.get("image_meta", [])
+        datasets: set[str] = set()
+        if isinstance(image_meta, list):
+            for item in image_meta:
+                if not isinstance(item, dict):
+                    continue
+                ds_name = item.get("dataset_name")
+                if ds_name is not None:
+                    datasets.add(str(ds_name))
+        for ds_name in datasets:
+            dataset_counts[ds_name] += 1
+
+        if idx < int(preview_items):
+            sample_preview.append(
+                {
+                    "sample_idx": int(idx),
+                    "model_name": str(sample.model_name),
+                    "layer_name": str(sample.layer_name),
+                    "datasets": sorted(datasets),
+                    "model_run_id": int(run_id) if run_id is not None else None,
+                    "xy_sampling_mode": meta.get("xy_sampling_mode"),
+                    "selected_row_count": int(meta.get("selected_row_count", 0))
+                    if meta.get("selected_row_count") is not None
+                    else None,
+                    "selected_row_indices_preview": list(meta.get("selected_row_indices_preview", []))[:8]
+                    if isinstance(meta.get("selected_row_indices_preview"), list)
+                    else [],
+                }
+            )
+
+    return {
+        "num_samples": int(len(samples)),
+        "unique_models": int(len(model_counts)),
+        "unique_layers": int(len(layer_counts)),
+        "unique_datasets": int(len(dataset_counts)),
+        "unique_model_run_ids": int(len(model_run_ids)),
+        "top_models": [[name, int(count)] for name, count in model_counts.most_common(5)],
+        "top_layers": [[name, int(count)] for name, count in layer_counts.most_common(5)],
+        "top_datasets": [[name, int(count)] for name, count in dataset_counts.most_common(5)],
+        "sample_preview": sample_preview,
+    }

@@ -1,0 +1,16 @@
+defaults:
+  - data_profile_common_settings
+  - _self_
+
+path: ${oc.env:DATA_ROOT,./data/datasets}
+
+enabled_datasets:
+  # Mini-VAE test split (interleaved test-eval).
+  - coco2017
+  - visual_genome
+  - funsd
+  - cord_v2
+  - docvqa_1200
+  - oxford_pets
+
+dataset_overrides: {}
