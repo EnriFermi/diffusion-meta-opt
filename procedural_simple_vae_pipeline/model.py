@@ -18,6 +18,7 @@ from models.vae_shared import (
 PROCEDURAL_SIMPLE_USE_DISTRIBUTION_CONDITIONING = True
 PROCEDURAL_SIMPLE_DEFAULT_ENCODER_CONDITIONING_KIND = "token_adapter"
 PROCEDURAL_SIMPLE_DEFAULT_LATENT_BOTTLENECK_KIND = "perceiver_resampler"
+PROCEDURAL_SIMPLE_DEFAULT_PATCH_TOKENIZER_KIND = "linear"
 
 
 class SlotAttentionBottleneckBlock(nn.Module):
@@ -149,6 +150,100 @@ class TokenConditioningAdapter(nn.Module):
         return h + torch.abs(self.alpha) * gate * residual
 
 
+class PatchConditioner(nn.Module):
+    """Per-position patch conditioning from scalar weights and dist-var embeddings."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        d_x: int,
+        dropout: float,
+        d_x_small: int | None = None,
+        d_hidden: int | None = None,
+    ) -> None:
+        super().__init__()
+        x_small_dim = int(d_x_small) if d_x_small is not None else min(64, max(16, d_model // 8))
+        hidden_dim = int(d_hidden) if d_hidden is not None else int(4 * d_model)
+
+        self.y_mlp = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.x_proj = nn.Linear(d_x, x_small_dim)
+        self.x_to_d = nn.Linear(x_small_dim, d_model)
+        self.delta_mlp = nn.Sequential(
+            nn.Linear(3 * d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+        )
+        self.gate = nn.Parameter(torch.full((d_model,), -2.0))
+
+        out_proj = self.delta_mlp[-1]
+        if isinstance(out_proj, nn.Linear):
+            nn.init.zeros_(out_proj.weight)
+            nn.init.zeros_(out_proj.bias)
+
+    def forward(
+        self,
+        y_patch: torch.Tensor,
+        x_patch: torch.Tensor,
+    ) -> torch.Tensor:
+        if y_patch.ndim != 2:
+            raise ValueError(f"y_patch must be [B, P], got {tuple(y_patch.shape)}")
+        if x_patch.ndim != 3:
+            raise ValueError(f"x_patch must be [B, P, Dx], got {tuple(x_patch.shape)}")
+        if int(y_patch.shape[0]) != int(x_patch.shape[0]) or int(y_patch.shape[1]) != int(x_patch.shape[1]):
+            raise ValueError(
+                "y_patch and x_patch must agree on [B, P], got "
+                f"{tuple(y_patch.shape)} vs {tuple(x_patch.shape)}"
+            )
+
+        e = self.y_mlp(y_patch.unsqueeze(-1))
+        x_small = self.x_proj(x_patch)
+        x_feat = self.x_to_d(x_small)
+        cond_input = torch.cat([e, x_feat, e * x_feat], dim=-1)
+        delta = self.delta_mlp(cond_input)
+        gate = torch.sigmoid(self.gate).view(1, 1, -1)
+        return e + gate * delta
+
+
+class PatchConditionedTokenizer(nn.Module):
+    """Patch tokenizer that adds a conditioned summary from dist-var per-input embeddings."""
+
+    def __init__(
+        self,
+        *,
+        p: int,
+        d_model: int,
+        d_x: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.base_proj = nn.Linear(p, d_model)
+        self.conditioner = PatchConditioner(
+            d_model=d_model,
+            d_x=d_x,
+            dropout=dropout,
+        )
+        self.summary_norm = nn.LayerNorm(d_model)
+        self.summary_out = nn.Linear(d_model, d_model)
+
+        nn.init.zeros_(self.summary_out.weight)
+        nn.init.zeros_(self.summary_out.bias)
+
+    def forward(
+        self,
+        y_patch: torch.Tensor,
+        x_patch: torch.Tensor,
+    ) -> torch.Tensor:
+        conditioned = self.conditioner(y_patch=y_patch, x_patch=x_patch)
+        conditioned_summary = self.summary_norm(conditioned.mean(dim=1))
+        return self.base_proj(y_patch) + self.summary_out(conditioned_summary)
+
+
 class ProceduralSimpleBigWeightVAE(nn.Module):
     """
     Isolated clone of SimpleDirectBigWeightVAE for procedural-weight experiments.
@@ -179,6 +274,17 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             )
         return value
 
+    @staticmethod
+    def _normalize_patch_tokenizer_kind(kind: str) -> str:
+        value = str(kind).strip().lower()
+        if value not in {"linear", "patch_conditioner"}:
+            raise ValueError(
+                "patch_tokenizer_kind must be one of "
+                "'linear', 'patch_conditioner', "
+                f"got {kind!r}"
+            )
+        return value
+
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         self.cfg = cfg
@@ -200,12 +306,16 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
         self.encoder_conditioning_kind = self._normalize_encoder_conditioning_kind(
             getattr(cfg.big_vae, "encoder_conditioning_kind", PROCEDURAL_SIMPLE_DEFAULT_ENCODER_CONDITIONING_KIND)
         )
+        self.patch_tokenizer_kind = self._normalize_patch_tokenizer_kind(
+            getattr(cfg.big_vae, "patch_tokenizer_kind", PROCEDURAL_SIMPLE_DEFAULT_PATCH_TOKENIZER_KIND)
+        )
         self.use_concat_encoder_conditioning = bool(
             self.use_distribution_conditioning and self.encoder_conditioning_kind == "concat"
         )
         self.use_token_adapter_encoder_conditioning = bool(
             self.use_distribution_conditioning and self.encoder_conditioning_kind == "token_adapter"
         )
+        self.use_patch_conditioner_tokenizer = self.patch_tokenizer_kind == "patch_conditioner"
         self.latent_bottleneck_kind = self._normalize_latent_bottleneck_kind(
             getattr(cfg.big_vae, "latent_bottleneck_kind", PROCEDURAL_SIMPLE_DEFAULT_LATENT_BOTTLENECK_KIND)
         )
@@ -215,7 +325,26 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
         if self.use_latent_bottleneck and d_lat % n_heads != 0:
             raise ValueError(f"big_vae.d_lat ({d_lat}) must be divisible by big_vae.n_heads ({n_heads})")
 
-        self.patch_tokenizer = nn.Linear(p + (d_dist if self.use_concat_encoder_conditioning else 0), d_model)
+        if self.use_patch_conditioner_tokenizer and not self.use_distribution_conditioning:
+            raise ValueError(
+                "patch_tokenizer_kind='patch_conditioner' requires "
+                "PROCEDURAL_SIMPLE_USE_DISTRIBUTION_CONDITIONING=True"
+            )
+        if self.use_patch_conditioner_tokenizer and self.use_concat_encoder_conditioning:
+            raise ValueError(
+                "patch_tokenizer_kind='patch_conditioner' is incompatible with "
+                "encoder_conditioning_kind='concat'; use 'token_adapter' instead"
+            )
+
+        if self.use_patch_conditioner_tokenizer:
+            self.patch_tokenizer = PatchConditionedTokenizer(
+                p=p,
+                d_model=d_model,
+                d_x=int(cfg.distribution.d_var),
+                dropout=dropout,
+            )
+        else:
+            self.patch_tokenizer = nn.Linear(p + (d_dist if self.use_concat_encoder_conditioning else 0), d_model)
         if self.use_distribution_conditioning:
             self.distribution_encoder = InputDistributionEncodingModule(cfg.distribution)
             query_in_dim = d_model + d_dist
@@ -374,7 +503,7 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
         X: torch.Tensor,
         *,
         d_in: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.use_distribution_conditioning or self.distribution_encoder is None:
             raise RuntimeError("distribution conditioning is disabled for ProceduralSimpleBigWeightVAE")
         if X.ndim != 3:
@@ -393,8 +522,8 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
         X_rep = X.unsqueeze(1).expand(B, T, n, d_in).reshape(B * T, n, d_in)
         patch_idx_flat = patch_idx_bt.reshape(B * T, p)
 
-        _dist_var_flat, dist_patch_flat = self.distribution_encoder(X_rep, patch_idx_flat)
-        return dist_patch_flat.view(B, T, -1)
+        dist_var_flat, dist_patch_flat = self.distribution_encoder(X_rep, patch_idx_flat)
+        return dist_var_flat.view(B, T, p, -1), dist_patch_flat.view(B, T, -1)
 
     def _encode_patch_tokens(
         self,
@@ -417,15 +546,25 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
         W_pad[:, :d_in, :] = W
         w_patches = W_pad.transpose(1, 2).contiguous().view(B, d_out, T, p)
 
+        dist_var_by_patch: torch.Tensor | None = None
         dist_patch_by_patch: torch.Tensor | None = None
         patch_token_inputs = w_patches
         if self.use_distribution_conditioning:
-            dist_patch_by_patch = self._encode_distribution_context(X, d_in=d_in)
+            dist_var_by_patch, dist_patch_by_patch = self._encode_distribution_context(X, d_in=d_in)
             if self.use_concat_encoder_conditioning:
                 dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
                 patch_token_inputs = torch.cat([w_patches, dist_patch_expanded], dim=-1)
 
-        patch_tokens = self.patch_tokenizer(patch_token_inputs.reshape(B * d_out * T, patch_token_inputs.shape[-1]))
+        if self.use_patch_conditioner_tokenizer:
+            if dist_var_by_patch is None:
+                raise RuntimeError("patch_conditioner patch tokenizer requires dist_var_by_patch")
+            dist_var_expanded = dist_var_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1, -1)
+            patch_tokens = self.patch_tokenizer(
+                y_patch=w_patches.reshape(B * d_out * T, p),
+                x_patch=dist_var_expanded.reshape(B * d_out * T, p, dist_var_by_patch.shape[-1]),
+            )
+        else:
+            patch_tokens = self.patch_tokenizer(patch_token_inputs.reshape(B * d_out * T, patch_token_inputs.shape[-1]))
         patch_tokens = patch_tokens.view(B, d_out, T, -1)
         cls_tokens = self.cls_token.view(1, 1, 1, -1).expand(B, d_out, 1, -1)
         tokens_by_output = torch.cat([cls_tokens, patch_tokens], dim=2)
@@ -889,6 +1028,7 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             debug_info: dict[str, object] = {
                 "debug_latent_bottleneck_kind": self.latent_bottleneck_kind,
                 "debug_encoder_conditioning_kind": self.encoder_conditioning_kind,
+                "debug_patch_tokenizer_kind": self.patch_tokenizer_kind,
                 "debug_decoder_kv_source": resolved_kv_source,
                 "debug_query_hint": self._normalize_debug_query_hint(debug_query_hint),
                 "debug_direct_from_encoder_tokens": bool(debug_direct_from_encoder_tokens),
