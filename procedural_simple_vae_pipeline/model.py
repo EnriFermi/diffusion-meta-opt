@@ -15,9 +15,9 @@ from models.vae_shared import (
     sinusoidal_embedding,
 )
 
-PROCEDURAL_SIMPLE_USE_DISTRIBUTION_CONDITIONING = False
+PROCEDURAL_SIMPLE_USE_DISTRIBUTION_CONDITIONING = True
 PROCEDURAL_SIMPLE_DEFAULT_ENCODER_CONDITIONING_KIND = "token_adapter"
-PROCEDURAL_SIMPLE_DEFAULT_LATENT_BOTTLENECK_KIND = "ttm"
+PROCEDURAL_SIMPLE_DEFAULT_LATENT_BOTTLENECK_KIND = "perceiver_resampler"
 
 
 class SlotAttentionBottleneckBlock(nn.Module):
@@ -102,7 +102,7 @@ class TokenConditioningAdapter(nn.Module):
         self.gate_c = nn.Linear(d_model, gate_dim)
         self.gate_out = nn.Linear(gate_dim, d_model)
 
-        self.alpha = nn.Parameter(torch.zeros(1))
+        self.alpha = nn.Parameter(torch.ones(1) * 1e-4)
         self.conditioning_dropout = nn.Dropout(dropout)
 
         nn.init.zeros_(self.mix_out.weight)
@@ -146,7 +146,7 @@ class TokenConditioningAdapter(nn.Module):
         gate_in = F.gelu(self.gate_h(h_n) + self.gate_c(c_n))
         gate = torch.sigmoid(self.gate_out(gate_in))
 
-        return h + self.alpha * gate * residual
+        return h + torch.abs(self.alpha) * gate * residual
 
 
 class ProceduralSimpleBigWeightVAE(nn.Module):
