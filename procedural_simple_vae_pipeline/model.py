@@ -150,41 +150,105 @@ class TokenConditioningAdapter(nn.Module):
         return h + self.alpha * gate * residual
 
 
-class PatchConditioner(nn.Module):
-    """Per-position patch conditioning from scalar weights and dist-var embeddings."""
+def _zero_init_last_linear(module: nn.Module) -> None:
+    last_linear: nn.Linear | None = None
+    for submodule in reversed(list(module.modules())):
+        if isinstance(submodule, nn.Linear):
+            last_linear = submodule
+            break
+    if last_linear is None:
+        return
+    nn.init.zeros_(last_linear.weight)
+    if last_linear.bias is not None:
+        nn.init.zeros_(last_linear.bias)
+
+
+class ConditionedMLPBlock(nn.Module):
+    """Conditioned residual MLP block for patch-token refinement."""
 
     def __init__(
         self,
         *,
         d_model: int,
-        d_x: int,
+        d_hidden: int,
+        d_cond: int,
         dropout: float,
-        d_x_small: int | None = None,
-        d_hidden: int | None = None,
     ) -> None:
         super().__init__()
-        x_small_dim = int(d_x_small) if d_x_small is not None else min(64, max(16, d_model // 8))
-        hidden_dim = int(d_hidden) if d_hidden is not None else int(4 * d_model)
-
-        self.y_mlp = nn.Sequential(
-            nn.Linear(1, d_model),
+        self.norm = nn.LayerNorm(d_model)
+        self.fc1 = nn.Linear(d_model, d_hidden)
+        self.fc2 = nn.Linear(d_hidden, d_model)
+        cond_hidden = max(int(d_cond), int(d_model))
+        self.cond = nn.Sequential(
+            nn.Linear(d_cond, cond_hidden),
             nn.GELU(),
-            nn.Linear(d_model, d_model),
+            nn.Dropout(dropout),
+            nn.Linear(cond_hidden, 3 * d_model),
         )
-        self.x_proj = nn.Linear(d_x, x_small_dim)
-        self.x_to_d = nn.Linear(x_small_dim, d_model)
-        self.delta_mlp = nn.Sequential(
-            nn.Linear(3 * d_model, hidden_dim),
+        self.alpha = nn.Parameter(torch.zeros(d_model))
+        _zero_init_last_linear(self.cond)
+
+    def forward(self, u: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        if u.ndim != 2:
+            raise ValueError(f"u must be [B, D], got {tuple(u.shape)}")
+        if c.ndim != 2:
+            raise ValueError(f"c must be [B, Dc], got {tuple(c.shape)}")
+        if int(u.shape[0]) != int(c.shape[0]):
+            raise ValueError(f"u and c batch must match, got {tuple(u.shape)} vs {tuple(c.shape)}")
+
+        h = self.norm(u)
+        abg = self.cond(c)
+        a, b, g = abg.chunk(3, dim=-1)
+        h_mod = (1.0 + a) * h + b
+        delta = self.fc2(F.gelu(self.fc1(h_mod)))
+        return u + self.alpha * torch.sigmoid(g) * delta
+
+
+class PatchConditionedTokenizer(nn.Module):
+    """Patch token encoder with a Y-only base path and X-conditioned MLP refinement."""
+
+    def __init__(
+        self,
+        *,
+        p: int,
+        d_model: int,
+        d_x: int,
+        dropout: float,
+        d_hidden: int | None = None,
+        d_c_proj: int | None = None,
+        d_c: int | None = None,
+        num_blocks: int = 2,
+    ) -> None:
+        super().__init__()
+        hidden_dim = int(d_hidden) if d_hidden is not None else int(4 * d_model)
+        cond_proj_dim = int(d_c_proj) if d_c_proj is not None else min(64, max(16, d_model // 8))
+        cond_dim = int(d_c) if d_c is not None else max(32, d_model // 4)
+
+        self.y_encoder = nn.Sequential(
+            nn.Linear(p, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, d_model),
         )
-        self.gate = nn.Parameter(torch.tensor(1.0e-2))
-
-        out_proj = self.delta_mlp[-1]
-        if isinstance(out_proj, nn.Linear):
-            nn.init.zeros_(out_proj.weight)
-            nn.init.zeros_(out_proj.bias)
+        self.x_proj = nn.Linear(d_x, cond_proj_dim)
+        x_hidden_dim = max(hidden_dim, cond_dim)
+        self.x_encoder = nn.Sequential(
+            nn.Linear(p * cond_proj_dim, x_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(x_hidden_dim, cond_dim),
+        )
+        self.blocks = nn.ModuleList(
+            [
+                ConditionedMLPBlock(
+                    d_model=d_model,
+                    d_hidden=hidden_dim,
+                    d_cond=cond_dim,
+                    dropout=dropout,
+                )
+                for _ in range(max(1, int(num_blocks)))
+            ]
+        )
 
     def forward(
         self,
@@ -201,47 +265,12 @@ class PatchConditioner(nn.Module):
                 f"{tuple(y_patch.shape)} vs {tuple(x_patch.shape)}"
             )
 
-        e = self.y_mlp(y_patch.unsqueeze(-1))
+        u = self.y_encoder(y_patch)
         x_small = self.x_proj(x_patch)
-        x_feat = self.x_to_d(x_small)
-        cond_input = torch.cat([e, x_feat, e * x_feat], dim=-1)
-        delta = self.delta_mlp(cond_input)
-        gate = self.gate.abs().view(1, 1, 1)
-        return e + gate * delta
-
-
-class PatchConditionedTokenizer(nn.Module):
-    """Patch tokenizer that adds a conditioned summary from dist-var per-input embeddings."""
-
-    def __init__(
-        self,
-        *,
-        p: int,
-        d_model: int,
-        d_x: int,
-        dropout: float,
-    ) -> None:
-        super().__init__()
-        self.base_proj = nn.Linear(p, d_model)
-        self.conditioner = PatchConditioner(
-            d_model=d_model,
-            d_x=d_x,
-            dropout=dropout,
-        )
-        self.summary_norm = nn.LayerNorm(d_model)
-        self.summary_out = nn.Linear(d_model, d_model)
-
-        nn.init.zeros_(self.summary_out.weight)
-        nn.init.zeros_(self.summary_out.bias)
-
-    def forward(
-        self,
-        y_patch: torch.Tensor,
-        x_patch: torch.Tensor,
-    ) -> torch.Tensor:
-        conditioned = self.conditioner(y_patch=y_patch, x_patch=x_patch)
-        conditioned_summary = self.summary_norm(conditioned.mean(dim=1))
-        return self.base_proj(y_patch) + self.summary_out(conditioned_summary)
+        c = self.x_encoder(x_small.flatten(start_dim=1))
+        for block in self.blocks:
+            u = block(u, c)
+        return u
 
 
 class ProceduralSimpleBigWeightVAE(nn.Module):
