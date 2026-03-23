@@ -179,7 +179,7 @@ class PatchConditioner(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, d_model),
         )
-        self.gate = nn.Parameter(torch.full((d_model,), -2.0))
+        self.gate = nn.Parameter(torch.tensor(1.0e-2))
 
         out_proj = self.delta_mlp[-1]
         if isinstance(out_proj, nn.Linear):
@@ -206,7 +206,7 @@ class PatchConditioner(nn.Module):
         x_feat = self.x_to_d(x_small)
         cond_input = torch.cat([e, x_feat, e * x_feat], dim=-1)
         delta = self.delta_mlp(cond_input)
-        gate = torch.sigmoid(self.gate).view(1, 1, -1)
+        gate = self.gate.abs().view(1, 1, 1)
         return e + gate * delta
 
 
