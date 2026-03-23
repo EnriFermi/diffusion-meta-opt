@@ -751,6 +751,35 @@ def _get_encoder_conditioning_alpha_values(model: torch.nn.Module) -> list[float
     return alpha_values
 
 
+def _get_patch_conditioner_gate_stats(model: torch.nn.Module) -> dict[str, object] | None:
+    target = model.module if isinstance(model, DDP) else model
+    compiled_target = getattr(target, "_orig_mod", None)
+    if compiled_target is not None:
+        target = compiled_target
+
+    patch_tokenizer = getattr(target, "patch_tokenizer", None)
+    conditioner = getattr(patch_tokenizer, "conditioner", None)
+    gate = getattr(conditioner, "gate", None)
+    if gate is None:
+        return None
+
+    gate_raw = gate.detach().reshape(-1).to(dtype=torch.float32)
+    if gate_raw.numel() == 0:
+        return None
+    gate_effective = gate_raw.abs()
+    preview_count = min(8, int(gate_effective.numel()))
+    return {
+        "raw_mean": float(gate_raw.mean().item()),
+        "raw_min": float(gate_raw.min().item()),
+        "raw_max": float(gate_raw.max().item()),
+        "mean": float(gate_effective.mean().item()),
+        "min": float(gate_effective.min().item()),
+        "max": float(gate_effective.max().item()),
+        "preview": [float(value) for value in gate_effective[:preview_count].tolist()],
+        "numel": int(gate_effective.numel()),
+    }
+
+
 def _run_worker(
     rank: int,
     world_size: int,
@@ -1005,6 +1034,7 @@ def _run_worker(
                 alpha_suffix = ""
                 if alpha_values:
                     alpha_suffix = " enc_alpha=[" + ",".join(f"{value:.6f}" for value in alpha_values) + "]"
+                patch_gate_stats = _get_patch_conditioner_gate_stats(model)
                 logger.info(
                     "step=%s/%s loss=%.6f behavioral=%.6f structural=%.6f kl=%.6f lr=%.3e steps_per_s=%.2f elapsed=%.1fs%s",
                     global_step,
@@ -1018,6 +1048,21 @@ def _run_worker(
                     now - t0,
                     alpha_suffix,
                 )
+                if patch_gate_stats is not None:
+                    gate_preview = ",".join(f"{value:.6f}" for value in patch_gate_stats["preview"])
+                    logger.info(
+                        "patch_gate step=%s eff_mean=%.6f eff_min=%.6f eff_max=%.6f "
+                        "raw_mean=%.6f raw_min=%.6f raw_max=%.6f dims=%s head=[%s]",
+                        global_step,
+                        float(patch_gate_stats["mean"]),
+                        float(patch_gate_stats["min"]),
+                        float(patch_gate_stats["max"]),
+                        float(patch_gate_stats["raw_mean"]),
+                        float(patch_gate_stats["raw_min"]),
+                        float(patch_gate_stats["raw_max"]),
+                        int(patch_gate_stats["numel"]),
+                        gate_preview,
+                    )
                 loss_window = 0.0
                 behavioral_window = 0.0
                 structural_window = 0.0
