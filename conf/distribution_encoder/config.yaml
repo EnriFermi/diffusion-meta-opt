@@ -1,63 +1,91 @@
+# =============================================================================
+# Distribution Encoder — unified config for WGAN-GP and Latent Set VAE stages
+# =============================================================================
+
 model:
-  distribution_latent_dim: 64
-  K: 64
-  dropout: 0.0
+  distribution_latent_dim: 64                  # Output dim of DistrEncoder (distribution embedding size)
+  K: 64                                        # Number of quantile points per 1D distribution
+  dropout: 0.0                                 # Dropout in DistrEncoder shape branch (0.0 = off)
 
+# Used by both WGAN training and Latent VAE training for on-the-fly generation.
 dataset:
-  b: 256
-  n_real: 64
-  max_modes: 5
-  loc_std_range: [0.01, 0.3]
-  scale_range: [0.001, 0.15]
-  df_range: [2.5, 30.0]
-  skew_range: [-5.0, 5.0]
-  # Strategy selection weights (null = use built-in defaults).
-  # Set individual weights to 0 to disable a strategy.
+  b: 256                                       # Samples drawn per distribution for quantile computation
+  n_real: 64                                   # Real samples per distribution passed to the Critic
+  max_modes: 5                                 # Max mixture components; actual count ~ TruncPoisson(2.5, [1, max_modes])
+  loc_std_range: [0.01, 6.5]                   # Range for per-mode location std (controls mode center spread)
+  scale_range: [0.001, 0.15]                   # Range for per-mode scale sigma (controls component width)
+  df_range: [2.5, 30.0]                        # Student-t degrees of freedom range (lower = heavier tails)
+  skew_range: [-5.0, 5.0]                      # Skew-normal alpha range (negative = left skew)
+  # Probability weights for synthetic distribution strategies.
+  # Set to 0 to disable; weights are auto-normalized to sum=1.
   strategy_weights:
-    mixture_gauss_t_skew: 0.13
-    laplace: 0.05
-    sinh_arcsinh: 0.07
-    piecewise_linear_qf: 0.05
-    sparse_dense: 0.07
-    uniform_segments: 0.04
-    signed_lognormal: 0.05
-    beta_transformed: 0.05
-    alpha_stable: 0.04
-    quantile_warping: 0.05
-    contaminated_normal: 0.05
-    generalized_gaussian: 0.04
-    cauchy_mixture: 0.03
-    triangular_mixture: 0.04
-    bimodal_gap: 0.04
-    truncated_normal: 0.03
-    folded_normal: 0.03
-    logistic_mixture: 0.04
-    raised_cosine: 0.03
-    staircase_quantized: 0.04
-    signed_exponential: 0.03
+    mixture_gauss_t_skew: 0.13                 # Mixture of Gaussian + Student-t + skew-normal
+    laplace: 0.05                              # Mixture of Laplace (L1-regularized weights)
+    sinh_arcsinh: 0.07                         # Sinh-arcsinh transform (independent skew & tail control)
+    piecewise_linear_qf: 0.05                  # Direct piecewise-linear quantile function construction
+    sparse_dense: 0.07                         # Sparse spike at zero + dense Gaussian clusters (pruning)
+    uniform_segments: 0.04                     # Piecewise-constant density (quantized weight levels)
+    signed_lognormal: 0.05                     # Signed lognormal magnitude (bimodal by magnitude)
+    beta_transformed: 0.05                     # Rescaled Beta distribution (bounded, flexible shape)
+    alpha_stable: 0.04                         # Alpha-stable / heavy Student-t (power-law tails)
+    quantile_warping: 0.05                     # Warped Gaussian quantile function (monotonic deformations)
+    contaminated_normal: 0.05                  # Gaussian + outlier injection (1-10% from wider dist)
+    generalized_gaussian: 0.04                 # Generalized Gaussian (shape beta: Laplace..Uniform)
+    cauchy_mixture: 0.03                       # Mixture of Cauchy (extremely heavy tails, no moments)
+    triangular_mixture: 0.04                   # Mixture of triangular distributions (piecewise-linear density)
+    bimodal_gap: 0.04                          # Tight clusters with gaps (binary/ternary quantization)
+    truncated_normal: 0.03                     # Truncated Gaussian (weight/gradient clipping)
+    folded_normal: 0.03                        # |N(mu,sigma)| with random sign per sample
+    logistic_mixture: 0.04                     # Mixture of Logistic (slightly heavier than Gaussian)
+    raised_cosine: 0.03                        # Mixture of raised cosine (smooth bounded bell)
+    staircase_quantized: 0.04                  # k-bit quantized levels + Gaussian jitter (INT4/INT8)
+    signed_exponential: 0.03                   # Signed exponential with asymmetric decay rates
 
+# WGAN-GP training. Run: python -m distribution_encoder.train [overrides]
 train:
-  device: cuda:0
-  max_steps: 200000
-  batch_size: 2048
-  n_critic: 5
-  lambda_gp: 10.0
-  lr: 1.0e-4
-  betas: [0.0, 0.9]
-  seed: 42
-  log_every: 50
-  checkpoint_every: 5000
-  eval_every: 1000
-  eval_n_distributions: 32
-  checkpoint_dir: ./artifacts/distribution_encoder
-  resume_checkpoint: ""
+  device: cuda:0                               # Training device (cuda:0, cuda:1, cpu, mps)
+  max_steps: 100000                            # Total training steps
+  batch_size: 2048                             # Distributions per training batch
+  n_critic: 5                                  # Critic updates per 1 Generator update
+  lambda_gp: 10.0                              # Gradient penalty coefficient (WGAN-GP lambda)
+  lr: 1.0e-4                                   # Adam learning rate for Critic and Generator
+  betas: [0.0, 0.9]                            # Adam betas (no momentum on beta1 for WGAN-GP)
+  seed: 42                                     # Random seed for reproducibility
+  log_every: 50                                # Log metrics to console/Comet every N steps
+  checkpoint_every: 5000                       # Save WGAN + DistrEncoder checkpoints every N steps
+  eval_every: 1000                             # Run evaluation (W1, KS-stat) every N steps
+  eval_n_distributions: 32                     # Number of held-out distributions for evaluation
+  checkpoint_dir: ./artifacts/distribution_encoder  # Directory for WGAN + DistrEncoder checkpoints
+  resume_checkpoint: ""                        # Path to resume from (empty = train from scratch)
 
+# Latent Set VAE — compresses N distribution latents into one z vector.
+# Requires a trained DistrEncoder checkpoint from the WGAN stage.
+# Run: python -m distribution_encoder.train_latent_vae [overrides]
+latent_vae:
+  z_dim: 64                                    # Dimension of compressed VAE latent space
+  hidden_dim: 256                              # Hidden dim in DeepSets encoder/decoder MLPs
+  n_distributions: 16                          # Number of distributions per set (must match at inference)
+  distr_encoder_checkpoint: ./artifacts/distribution_encoder/distr_encoder_final.pt  # Frozen DistrEncoder ckpt
+  batch_size: 256                              # Distribution sets per training step
+  max_steps: 50000                             # Total training steps
+  lr: 3.0e-4                                   # Adam learning rate
+  betas: [0.9, 0.999]                          # Adam betas (standard VAE, unlike WGAN)
+  beta_kl: 0.1                                 # KL weight (lower = better recon, higher = smoother latent)
+  seed: 42                                     # Random seed
+  device: cuda:0                               # Training device
+  log_every: 50                                # Log metrics every N steps
+  eval_every: 500                              # Eval (recon + KL on held-out batch) every N steps
+  checkpoint_every: 5000                       # Save VAE checkpoint every N steps
+  checkpoint_dir: ./artifacts/latent_vae       # Directory for VAE checkpoints
+  resume_checkpoint: ""                        # Path to resume VAE training (empty = from scratch)
+
+# Comet ML telemetry — shared by both WGAN and VAE training loops.
 telemetry:
   comet:
-    enabled: true
-    api_key: ${oc.env:COMET_API_KEY,""}
-    workspace: ${oc.env:COMET_WORKSPACE,""}
-    project_name: distribution_encoder_wgan
-    experiment_name: wgan-gp-baseline
-    tags: []
-    log_code: false
+    enabled: true                              # Set to false to disable all Comet logging
+    api_key: ${oc.env:COMET_API_KEY,""}        # API key (or set COMET_API_KEY env var)
+    workspace: ${oc.env:COMET_WORKSPACE,""}    # Comet workspace name
+    project_name: distribution_encoder_wgan    # Project name in Comet dashboard
+    experiment_name: wgan-gp-baseline          # Experiment name visible in Comet UI
+    tags: []                                   # Optional tags for filtering experiments
+    log_code: false                            # Whether to log source code to Comet

@@ -1,6 +1,7 @@
 from distribution_encoder.modules import DistrEncoder, RandomnessEncoder, Generator, Critic
 from distribution_encoder.wgan import WGAN_GP
 from distribution_encoder.dataset import static_quantilize, SyntheticDistributionDataset
+from distribution_encoder.latent_vae import LatentSetVAE, DistributionSetEncoder
 
 __all__ = [
     "DistrEncoder",
@@ -10,4 +11,6 @@ __all__ = [
     "WGAN_GP",
     "static_quantilize",
     "SyntheticDistributionDataset",
+    "LatentSetVAE",
+    "DistributionSetEncoder",
 ]

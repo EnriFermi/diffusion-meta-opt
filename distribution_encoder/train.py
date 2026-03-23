@@ -9,7 +9,6 @@ from typing import Any
 import hydra
 import torch
 from omegaconf import DictConfig
-from scipy.stats import ks_2samp, wasserstein_distance as scipy_wasserstein
 from torch.utils.data import DataLoader
 
 from distribution_encoder.dataset import SyntheticDistributionDataset, static_quantilize
@@ -119,6 +118,7 @@ def evaluate(
 ) -> dict[str, float]:
     """Generate samples from held-out distributions and compute metrics."""
     from distribution_encoder.dataset import _sample_mixture_numpy
+    from scipy.stats import ks_2samp, wasserstein_distance as scipy_wasserstein
     import numpy as np
 
     rng = np.random.default_rng(seed=9999)
@@ -333,6 +333,16 @@ def train(cfg: DictConfig) -> None:
             }, ckpt_path)
             log.info("Saved checkpoint: %s", ckpt_path)
 
+            # Save DistrEncoder separately for downstream use
+            enc_path = checkpoint_dir / f"distr_encoder_step_{step + 1}.pt"
+            torch.save({
+                "step": step + 1,
+                "K": K,
+                "dim": dim,
+                "model": wgan.generator.distr_encoder.state_dict(),
+            }, enc_path)
+            log.info("Saved DistrEncoder checkpoint: %s", enc_path)
+
     # Final checkpoint
     ckpt_path = checkpoint_dir / "wgan_final.pt"
     torch.save({
@@ -341,7 +351,16 @@ def train(cfg: DictConfig) -> None:
         "critic_opt": critic_opt.state_dict(),
         "gen_opt": gen_opt.state_dict(),
     }, ckpt_path)
+
+    enc_path = checkpoint_dir / "distr_encoder_final.pt"
+    torch.save({
+        "step": max_steps,
+        "K": K,
+        "dim": dim,
+        "model": wgan.generator.distr_encoder.state_dict(),
+    }, enc_path)
     log.info("Training complete. Final checkpoint: %s", ckpt_path)
+    log.info("DistrEncoder checkpoint: %s", enc_path)
 
     tracker.end()
 
