@@ -493,8 +493,16 @@ class BigWeightVAE(nn.Module):
         )
 
         self.q_tokens_norm = nn.LayerNorm(d_model)
-        self.direction_head = nn.Linear(d_model, p)
-        self.scale_head = nn.Linear(d_model, 1)
+        self.direction_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, p),
+        )
+        self.scale_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
         self.debug_query_hint_proj = nn.Linear(d_model, d_model)
         self.debug_encoder_direct_direction_head = nn.Linear(d_model, p)
         self.output_eps = 1e-6
@@ -1264,6 +1272,7 @@ class BigWeightVAE(nn.Module):
         debug_info = {
             "T": int(T),
             "d_in_pad": int(d_in_pad),
+            "dist_var_by_patch": dist_var_by_patch,
             "dist_patch_by_patch": dist_patch_by_patch,
             "encoder_tokens_by_output": encode_debug["encoder_tokens_by_output"],
             "encoder_cls_tokens": encode_debug["encoder_cls_tokens"],

@@ -320,6 +320,13 @@ class CometTracker:
                 "collector.device": str(collector_cfg.get("device", "")),
                 "train.device": str(train_cfg.get("device", "")),
             }
+            resume_state_cfg = train_cfg.get("resume_state", {})
+            if isinstance(resume_state_cfg, (dict, DictConfig)):
+                comet_params["train.resume_state.enabled"] = bool(resume_state_cfg.get("enabled", False))
+                comet_params["train.resume_state.auto_resume"] = bool(resume_state_cfg.get("auto_resume", True))
+                comet_params["train.resume_state.save_every"] = int(
+                    resume_state_cfg.get("save_every", train_cfg.get("checkpoint_every", 0))
+                )
             clip_by_part_cfg = train_cfg.get("grad_clip_norm_by_part", {})
             if isinstance(clip_by_part_cfg, (dict, DictConfig)):
                 for group_name in _grad_stat_group_prefixes():
@@ -923,11 +930,25 @@ def _collector_tracked_children(collector: Any) -> list[dict[str, Any]]:
     return tracked
 
 
+def _save_checkpoint_payload(
+    payload: dict[str, Any],
+    path: Path,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        torch.save(payload, tmp_path)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _save_checkpoint(
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LambdaLR,
-    scaler: GradScaler,
     cfg: DictConfig,
     step_idx: int,
     logger: logging.Logger,
@@ -942,17 +963,52 @@ def _save_checkpoint(
         "step": step_idx,
         "stage": stage,
         "model_state": model_to_save.state_dict(),
+        "config": OmegaConf.to_container(cfg, resolve=True),
+    }
+
+    step_path = checkpoint_dir / f"step_{step_idx:07d}.pt"
+    latest_path = checkpoint_dir / "latest.pt"
+    _save_checkpoint_payload(payload, step_path)
+    _save_checkpoint_payload(payload, latest_path)
+    logger.info("Model checkpoint saved: %s", step_path)
+
+
+def _save_resume_state_checkpoint(
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    scaler: GradScaler,
+    cfg: DictConfig,
+    step_idx: int,
+    logger: logging.Logger,
+    stage: int,
+    state_dir: Path,
+) -> None:
+    model_to_save = model.module if isinstance(model, DDP) else model
+    payload = {
+        "step": step_idx,
+        "stage": stage,
+        "model_state": model_to_save.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "scaler_state": scaler.state_dict(),
         "config": OmegaConf.to_container(cfg, resolve=True),
     }
 
-    step_path = checkpoint_dir / f"step_{step_idx:07d}.pt"
-    latest_path = checkpoint_dir / "latest.pt"
-    torch.save(payload, step_path)
-    torch.save(payload, latest_path)
-    logger.info("Checkpoint saved: %s", step_path)
+    state_path = state_dir / f"step_{step_idx:07d}.pt"
+    _save_checkpoint_payload(payload, state_path)
+
+    for stale_path in sorted(state_dir.glob("step_*.pt")):
+        if stale_path == state_path:
+            continue
+        try:
+            stale_path.unlink()
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            logger.warning("Could not delete stale resume-state checkpoint %s: %s", stale_path, exc)
+    logger.info("Resume-state checkpoint saved: %s", state_path)
 
 
 def _maybe_dump_fixed_training_batch(
@@ -1225,6 +1281,48 @@ def _load_model_weights_from_checkpoint(
     logger.info("Model weights loaded successfully (step=%s)", ckpt.get("step", "?"))
 
 
+def _find_latest_resume_state_checkpoint(state_dir: Path) -> Path | None:
+    if not state_dir.exists() or not state_dir.is_dir():
+        return None
+    step_paths = sorted(path for path in state_dir.glob("step_*.pt") if path.is_file())
+    if step_paths:
+        return step_paths[-1]
+    latest_path = state_dir / "latest.pt"
+    if latest_path.is_file():
+        return latest_path
+    return None
+
+
+def _load_training_state_from_checkpoint(
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    scaler: GradScaler,
+    path: Path,
+    logger: logging.Logger,
+) -> int:
+    logger.info("Loading training state from checkpoint: %s", path)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    target = model.module if isinstance(model, DDP) else model
+    target.load_state_dict(ckpt["model_state"], strict=True)
+
+    optimizer_state = ckpt.get("optimizer_state")
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+    scheduler_state = ckpt.get("scheduler_state")
+    if scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
+    scaler_state = ckpt.get("scaler_state")
+    if scaler_state is not None:
+        scaler.load_state_dict(scaler_state)
+
+    step = int(ckpt.get("step", 0) or 0)
+    stage = ckpt.get("stage", "?")
+    logger.info("Training state loaded successfully (step=%s stage=%s)", step, stage)
+    return step
+
+
 def _get_encoder_conditioning_alpha_values(model: nn.Module) -> list[float]:
     target = model.module if isinstance(model, DDP) else model
     compiled_target = getattr(target, "_orig_mod", None)
@@ -1271,6 +1369,45 @@ def _get_patch_tokenizer_block_alpha_stats(model: nn.Module) -> list[dict[str, f
             }
         )
     return out
+
+
+def _get_patch_latent_variance_stats(
+    model: nn.Module,
+    W: torch.Tensor,
+    X: torch.Tensor,
+) -> dict[str, float] | None:
+    target = model.module if isinstance(model, DDP) else model
+    compiled_target = getattr(target, "_orig_mod", None)
+    if compiled_target is not None:
+        target = compiled_target
+
+    forward_debug = getattr(target, "forward_debug", None)
+    if not callable(forward_debug):
+        return None
+
+    was_training = bool(target.training)
+    try:
+        target.eval()
+        with torch.no_grad():
+            outputs = forward_debug(W, X)
+        if not outputs or not isinstance(outputs[-1], dict):
+            return None
+        debug_info = outputs[-1]
+        dist_var_by_patch = debug_info.get("dist_var_by_patch")
+        if not torch.is_tensor(dist_var_by_patch):
+            return None
+        dist_var_flat = dist_var_by_patch.detach().to(dtype=torch.float32).flatten(start_dim=2)
+        if dist_var_flat.numel() == 0:
+            return None
+        patch_var = dist_var_flat.var(dim=-1, unbiased=False)
+        return {
+            "mean": float(patch_var.mean().item()),
+            "std": float(patch_var.std(unbiased=False).item()),
+            "min": float(patch_var.min().item()),
+            "max": float(patch_var.max().item()),
+        }
+    finally:
+        target.train(was_training)
 
 
 def _run_worker(
@@ -1451,10 +1588,6 @@ def _run_worker(
                         gradient_as_bucket_view=True,
                     )
 
-            resume_checkpoint = str(cfg.train.get("resume_checkpoint", "")).strip()
-            if resume_checkpoint:
-                _load_model_weights_from_checkpoint(model, resume_checkpoint, logger)
-
             optimizer = _build_optimizer(model=model, cfg=cfg, device=device)
             scheduler = _build_scheduler(optimizer=optimizer, cfg=cfg)
             comet_tracker = CometTracker(cfg=cfg, logger=logger, rank=rank)
@@ -1472,6 +1605,22 @@ def _run_worker(
 
             amp_enabled, amp_dtype = _resolve_amp(cfg=cfg, device=device)
             scaler = GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
+            resume_checkpoint = str(cfg.train.get("resume_checkpoint", "")).strip()
+            resumed_training_step = 0
+            resume_state_path: Path | None = None
+            if resume_state_enabled and resume_state_auto_resume:
+                resume_state_path = _find_latest_resume_state_checkpoint(resume_state_dir)
+            if resume_state_path is not None:
+                resumed_training_step = _load_training_state_from_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    path=resume_state_path,
+                    logger=logger,
+                )
+            elif resume_checkpoint:
+                _load_model_weights_from_checkpoint(model, resume_checkpoint, logger)
             cudagraph_step_begin = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
             use_cudagraph_step_begin = (
                 bool(cfg.train.get("compile", False))
@@ -1553,6 +1702,20 @@ def _run_worker(
                 int(forensics_cfg.get("heartbeat_steps", log_every)),
             )
             checkpoint_every = max(1, int(cfg.train.get("checkpoint_every", 200)))
+            resume_state_cfg = cfg.train.get("resume_state", {})
+            if resume_state_cfg is None:
+                resume_state_cfg = {}
+            if not isinstance(resume_state_cfg, (dict, DictConfig)):
+                raise TypeError("train.resume_state must be a mapping")
+            resume_state_enabled = bool(resume_state_cfg.get("enabled", False))
+            resume_state_auto_resume = bool(resume_state_cfg.get("auto_resume", True))
+            resume_state_save_every = max(1, int(resume_state_cfg.get("save_every", checkpoint_every)))
+            default_resume_state_dir = (
+                Path(str(cfg.train.get("checkpoint_dir", "./checkpoints/weight_quantile_vae")))
+                / f"stage_{stage_num}"
+                / "resume_state"
+            )
+            resume_state_dir = Path(str(resume_state_cfg.get("dir", str(default_resume_state_dir))))
             telemetry_cfg = cfg.train.get("telemetry", {})
             if not isinstance(telemetry_cfg, (dict, DictConfig)):
                 raise TypeError("train.telemetry must be a mapping")
@@ -1611,6 +1774,13 @@ def _run_worker(
             steps_per_sample = max(1, int(cfg.train.get("steps_per_sample", 1)))
             if rank == 0:
                 logger.info("Steps per sample: %s", steps_per_sample)
+                if resume_state_enabled:
+                    logger.info(
+                        "Resume-state checkpointing: dir=%s save_every=%s auto_resume=%s",
+                        resume_state_dir,
+                        resume_state_save_every,
+                        resume_state_auto_resume,
+                    )
                 if kl_schedule_enabled:
                     logger.info(
                         "BigVAE latent mode: %s (use_latent_sampling=%s, kl_beta_target=%s, "
@@ -1690,7 +1860,7 @@ def _run_worker(
             fixed_batch_W: torch.Tensor | None = None
             direction_pre_norm_stats_latest: dict[str, Any] | None = None
 
-            for step_idx in range(max_steps):
+            for step_idx in range(resumed_training_step, max_steps):
                 global_step = step_idx + 1
                 current_kl_beta = _compute_kl_beta_for_step(
                     global_step,
@@ -2270,6 +2440,7 @@ def _run_worker(
                     cache_metric = dataset.cache_size() if dataset is not None else 0
                     encoder_alpha_values = _get_encoder_conditioning_alpha_values(model)
                     patch_tokenizer_alpha_stats = _get_patch_tokenizer_block_alpha_stats(model)
+                    patch_latent_variance_stats = _get_patch_latent_variance_stats(model, W_s[:1], x_s[:1])
                     logger.info(
                         "step=%s/%s loss=%.6f behav=%.6f struct=%.6f "
                         "s_dir=%.6f s_scl=%.6f s_rec=%.6f s_rel=%.6f "
@@ -2306,6 +2477,15 @@ def _run_worker(
                                 )
                                 for block_idx, stats in enumerate(patch_tokenizer_alpha_stats)
                             ),
+                        )
+                    if patch_latent_variance_stats is not None:
+                        logger.info(
+                            "patch_latent_var step=%s mean=%.6f std=%.6f min=%.6f max=%.6f",
+                            global_step,
+                            float(patch_latent_variance_stats["mean"]),
+                            float(patch_latent_variance_stats["std"]),
+                            float(patch_latent_variance_stats["min"]),
+                            float(patch_latent_variance_stats["max"]),
                         )
                     if fixed_training_batch_enabled and direction_pre_norm_stats_latest is not None:
                         logger.info(
@@ -2390,6 +2570,11 @@ def _run_worker(
                                 comet_metrics[f"patch_tokenizer/alpha_block_{block_idx}_max_abs"] = float(
                                     stats["max_abs"]
                                 )
+                        if patch_latent_variance_stats is not None:
+                            comet_metrics["patch_latent_variance/mean"] = float(patch_latent_variance_stats["mean"])
+                            comet_metrics["patch_latent_variance/std"] = float(patch_latent_variance_stats["std"])
+                            comet_metrics["patch_latent_variance/min"] = float(patch_latent_variance_stats["min"])
+                            comet_metrics["patch_latent_variance/max"] = float(patch_latent_variance_stats["max"])
                         if partwise_grad_clip_enabled:
                             for group_name in grad_group_prefixes:
                                 comet_metrics[f"grad/{group_name}_global_norm_before_clip"] = float(
@@ -2474,8 +2659,20 @@ def _run_worker(
                         heartbeat_payload["tracked_children"] = _collector_tracked_children(collector)
                     monitor_send_event(monitor_queue, heartbeat_payload)
 
-                if rank == 0 and (global_step % checkpoint_every == 0 or global_step == max_steps):
+                should_save_model_checkpoint = (global_step % checkpoint_every == 0 or global_step == max_steps)
+                should_save_resume_state = resume_state_enabled and (
+                    global_step % resume_state_save_every == 0 or global_step == max_steps
+                )
+                if rank == 0 and should_save_model_checkpoint:
                     _save_checkpoint(
+                        model=model,
+                        cfg=cfg,
+                        step_idx=global_step,
+                        logger=logger,
+                        stage=stage_num,
+                    )
+                if rank == 0 and should_save_resume_state:
+                    _save_resume_state_checkpoint(
                         model=model,
                         optimizer=optimizer,
                         scheduler=scheduler,
@@ -2484,6 +2681,7 @@ def _run_worker(
                         step_idx=global_step,
                         logger=logger,
                         stage=stage_num,
+                        state_dir=resume_state_dir,
                     )
 
             if rank == 0:
