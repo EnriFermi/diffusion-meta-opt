@@ -1603,6 +1603,23 @@ def _run_worker(
                 except Exception as exc:
                     logger.warning("Comet parameter-count log failed: %s", exc)
 
+            stage_num = max(1, int(cfg.train.get("stage", 1)))
+            checkpoint_every = max(1, int(cfg.train.get("checkpoint_every", 200)))
+            resume_state_cfg = cfg.train.get("resume_state", {})
+            if resume_state_cfg is None:
+                resume_state_cfg = {}
+            if not isinstance(resume_state_cfg, (dict, DictConfig)):
+                raise TypeError("train.resume_state must be a mapping")
+            resume_state_enabled = bool(resume_state_cfg.get("enabled", False))
+            resume_state_auto_resume = bool(resume_state_cfg.get("auto_resume", True))
+            resume_state_save_every = max(1, int(resume_state_cfg.get("save_every", checkpoint_every)))
+            default_resume_state_dir = (
+                Path(str(cfg.train.get("checkpoint_dir", "./checkpoints/weight_quantile_vae")))
+                / f"stage_{stage_num}"
+                / "resume_state"
+            )
+            resume_state_dir = Path(str(resume_state_cfg.get("dir", str(default_resume_state_dir))))
+
             amp_enabled, amp_dtype = _resolve_amp(cfg=cfg, device=device)
             scaler = GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
             resume_checkpoint = str(cfg.train.get("resume_checkpoint", "")).strip()
@@ -1683,7 +1700,6 @@ def _run_worker(
 
             patch_size_for_slice = int(cfg.model.get("patch_size", 16))
             curriculum_max_T, curriculum_max_d_out = _compute_curriculum_slice_sizes(cfg)
-            stage_num = max(1, int(cfg.train.get("stage", 1)))
             slice_batch_size = max(1, int(cfg.train.get("slice_batch_size", 1)))
             if rank == 0:
                 logger.info(
@@ -1701,21 +1717,6 @@ def _run_worker(
                 1,
                 int(forensics_cfg.get("heartbeat_steps", log_every)),
             )
-            checkpoint_every = max(1, int(cfg.train.get("checkpoint_every", 200)))
-            resume_state_cfg = cfg.train.get("resume_state", {})
-            if resume_state_cfg is None:
-                resume_state_cfg = {}
-            if not isinstance(resume_state_cfg, (dict, DictConfig)):
-                raise TypeError("train.resume_state must be a mapping")
-            resume_state_enabled = bool(resume_state_cfg.get("enabled", False))
-            resume_state_auto_resume = bool(resume_state_cfg.get("auto_resume", True))
-            resume_state_save_every = max(1, int(resume_state_cfg.get("save_every", checkpoint_every)))
-            default_resume_state_dir = (
-                Path(str(cfg.train.get("checkpoint_dir", "./checkpoints/weight_quantile_vae")))
-                / f"stage_{stage_num}"
-                / "resume_state"
-            )
-            resume_state_dir = Path(str(resume_state_cfg.get("dir", str(default_resume_state_dir))))
             telemetry_cfg = cfg.train.get("telemetry", {})
             if not isinstance(telemetry_cfg, (dict, DictConfig)):
                 raise TypeError("train.telemetry must be a mapping")
