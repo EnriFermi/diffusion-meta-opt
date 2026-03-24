@@ -16,16 +16,16 @@ predownload_models: true
 
 warmup_steps: 100000
 min_lr_ratio: 0.1
-kl_beta: 0.0
+kl_beta: 0.1
 kl_schedule:
-  enabled: false
+  enabled: true
   start_beta: 0.0
-  warmup_steps: 0
-  ramp_steps: 0
-weight_decay: 0.0
+  warmup_steps: 100000
+  ramp_steps: 100000
+weight_decay: 0.01
 lr: 5e-5
 
-behavioral_coef: 0.0
+behavioral_coef: 1.0
 structural_coef: 1.0
 contrastive_coef: 0.0
 struct_loss:
@@ -33,7 +33,7 @@ struct_loss:
   lambda_scale: 1.0
   lambda_rec: 0.0
   lambda_dir: 1.0
-  lambda_rel: 1.0
+  lambda_rel: 0.1
   huber_delta: 0.1
 grad_clip_norm_by_part:
   distribution_encoder: 0
@@ -42,12 +42,12 @@ grad_clip_norm_by_part:
   decoder: 0
   big_vae_other: 0
  
-checkpoint_every: 500
+checkpoint_every: 3000
 checkpoint_dir: ${training_artifacts.big_vae_checkpoint_dir}
 
 stage: 1
-stage_base_T_patches: 8
-stage_base_d_out: 8
+stage_base_T_patches: 16
+stage_base_d_out: 16
 stage_scale_factor: 2
 # Optional synthetic data mode for quick smoke/debug runs.
 # When enabled, train loop samples x and W from Normal and does not start collectors.

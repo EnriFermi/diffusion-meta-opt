@@ -3,13 +3,13 @@ beta: 0.001
 
 big_vae:
   d_model: 512
-  d_lat: 32
-  num_latents: 4
+  d_lat: 256
+  num_latents: 8
   # true -> VAE (sampling + KL), false -> AE (deterministic z, KL term forced to 0 in train loop)
   use_latent_sampling: false
-  num_encoder_layers: 1
-  num_decoder_layers: 1
-  n_heads: 4
+  num_encoder_layers: 15
+  num_decoder_layers: 3
+  n_heads: 8
   ffn_mult: 4.0
   dropout: 0.0
   pos_fourier_dim: 256
