@@ -42,7 +42,7 @@ grad_clip_norm_by_part:
   decoder: 0
   big_vae_other: 0
  
-checkpoint_every: 3000
+checkpoint_every: 10000
 checkpoint_dir: ${training_artifacts.big_vae_checkpoint_dir}
 resume_state:
   enabled: true
