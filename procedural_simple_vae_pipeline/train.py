@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import inspect
 import logging
 import math
 import os
@@ -268,8 +269,56 @@ def _maybe_compile(model: torch.nn.Module, cfg: dict[str, Any], logger: logging.
 
     compile_mode = str(train_cfg.get("compile_mode", "max-autotune"))
     dynamic = bool(train_cfg.get("compile_dynamic", True))
-    logger.info("Compiling procedural_simple_vae with torch.compile(mode=%s, dynamic=%s)", compile_mode, dynamic)
-    return torch.compile(model, mode=compile_mode, dynamic=dynamic)
+    backend = train_cfg.get("compile_backend")
+    disable_cudagraphs = bool(train_cfg.get("compile_disable_cudagraphs", False))
+    backend_name = str(backend).strip() if backend is not None else ""
+
+    logger.info(
+        "Compiling procedural_simple_vae with torch.compile(mode=%s, dynamic=%s%s)",
+        compile_mode,
+        dynamic,
+        f", backend={backend_name}" if backend_name else "",
+    )
+
+    compile_kwargs: dict[str, Any] = {"dynamic": dynamic}
+    if backend_name:
+        compile_kwargs["backend"] = backend_name
+
+    disabled_cudagraphs_via_config = False
+    if disable_cudagraphs:
+        try:
+            import torch._inductor.config as inductor_config
+
+            triton_cfg = getattr(inductor_config, "triton", None)
+            if triton_cfg is not None and hasattr(triton_cfg, "cudagraphs"):
+                setattr(triton_cfg, "cudagraphs", False)
+                disabled_cudagraphs_via_config = True
+            elif hasattr(inductor_config, "cudagraphs"):
+                setattr(inductor_config, "cudagraphs", False)
+                disabled_cudagraphs_via_config = True
+        except Exception as exc:
+            logger.warning("Failed to disable inductor cudagraphs via torch._inductor.config: %s", exc)
+
+        if disabled_cudagraphs_via_config:
+            logger.info("Disabled inductor cudagraphs for procedural_simple_vae")
+        else:
+            compile_signature = inspect.signature(torch.compile).parameters
+            if "options" in compile_signature:
+                compile_kwargs["options"] = {"triton.cudagraphs": False}
+                logger.info(
+                    "Disabling inductor cudagraphs for procedural_simple_vae via torch.compile options; "
+                    "this will omit mode=%s because mode and options are mutually exclusive",
+                    compile_mode,
+                )
+            else:
+                logger.warning(
+                    "compile_disable_cudagraphs=true was requested, but no supported cudagraph switch was found; "
+                    "continuing with default inductor settings"
+                )
+
+    if "options" not in compile_kwargs:
+        compile_kwargs["mode"] = compile_mode
+    return torch.compile(model, **compile_kwargs)
 
 
 def _resolve_amp(cfg: dict[str, Any], device: torch.device) -> tuple[bool, torch.dtype | None]:

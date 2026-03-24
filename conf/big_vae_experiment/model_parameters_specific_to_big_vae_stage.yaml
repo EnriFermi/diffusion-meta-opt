@@ -14,7 +14,13 @@ big_vae:
   dropout: 0.0
   pos_fourier_dim: 256
   disable_z_shortcut: true
-  disable_distribution_encoder: true
+  disable_distribution_encoder: false
+  # residual -> current ResidualPatchTokenizer
+  # conditioned_mlp -> Y-only base patch token + X-conditioned residual MLP stack
+  patch_tokenizer_kind: conditioned_mlp
+  # legacy -> existing pooled-var injection + latent delta
+  # token_adapter -> per-layer gated residual conditioning on dist_patch_by_patch
+  distribution_encoder_conditioning_kind: legacy
   encoder:
     self_attn_mode: full
     cross_attend_only_cls: false

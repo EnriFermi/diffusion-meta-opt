@@ -159,6 +159,8 @@ def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
             use_latent_sampling=bool(big_cfg.get("use_latent_sampling", True)),
             disable_z_shortcut=bool(big_cfg.get("disable_z_shortcut", False)),
             disable_distribution_encoder=bool(big_cfg.get("disable_distribution_encoder", False)),
+            patch_tokenizer_kind=str(big_cfg.get("patch_tokenizer_kind", "residual")),
+            distribution_encoder_conditioning_kind=str(big_cfg.get("distribution_encoder_conditioning_kind", "legacy")),
             encoder=EncoderConfig(
                 self_attn_mode=str(enc_cfg.get("self_attn_mode", "full")),
                 cross_attend_only_cls=bool(enc_cfg.get("cross_attend_only_cls", True)),
@@ -284,6 +286,11 @@ class CometTracker:
                 "train.structural_coef": float(train_cfg.get("structural_coef", 0.0)),
                 "model.patch_size": int(model_cfg.get("patch_size", 16)),
                 "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
+                "model.big_vae.disable_distribution_encoder": bool(big_cfg.get("disable_distribution_encoder", False)),
+                "model.big_vae.patch_tokenizer_kind": str(big_cfg.get("patch_tokenizer_kind", "residual")),
+                "model.big_vae.distribution_encoder_conditioning_kind": str(
+                    big_cfg.get("distribution_encoder_conditioning_kind", "legacy")
+                ),
                 "streaming.mode": str(streaming_cfg.get("mode", "none")),
                 "collector.mode": str(collector_cfg.get("mode", "auto")),
                 "collector.device": str(collector_cfg.get("device", "")),
@@ -357,6 +364,7 @@ def _grad_stat_group_prefixes() -> dict[str, tuple[str, ...]]:
             "latent_resampler_layers.",
             "enc_dist_inject_projs.",
             "enc_dist_to_latent_heads.",
+            "encoder_conditioning_adapters.",
             "latent_base",
             "latent_norm.",
             "to_mu.",
@@ -384,6 +392,18 @@ def _grad_group_name_for_param(name: str, groups: dict[str, tuple[str, ...]]) ->
         if any(name.startswith(prefix) for prefix in prefixes):
             return group_name
     return "big_vae_other"
+
+
+def _parameter_count_summary(model: nn.Module) -> tuple[int, int, int]:
+    total_params = 0
+    trainable_params = 0
+    for param in model.parameters():
+        count = int(param.numel())
+        total_params += count
+        if param.requires_grad:
+            trainable_params += count
+    frozen_params = total_params - trainable_params
+    return total_params, trainable_params, frozen_params
 
 
 def _collect_params_by_grad_group(model: nn.Module, groups: dict[str, tuple[str, ...]]) -> dict[str, list[nn.Parameter]]:
@@ -1181,6 +1201,54 @@ def _load_model_weights_from_checkpoint(
     logger.info("Model weights loaded successfully (step=%s)", ckpt.get("step", "?"))
 
 
+def _get_encoder_conditioning_alpha_values(model: nn.Module) -> list[float]:
+    target = model.module if isinstance(model, DDP) else model
+    compiled_target = getattr(target, "_orig_mod", None)
+    if compiled_target is not None:
+        target = compiled_target
+
+    adapters = getattr(target, "encoder_conditioning_adapters", None)
+    if adapters is None:
+        return []
+
+    alpha_values: list[float] = []
+    for adapter in adapters:
+        alpha = getattr(adapter, "alpha", None)
+        if alpha is None or not torch.is_tensor(alpha) or alpha.numel() == 0:
+            continue
+        alpha_values.append(float(alpha.detach().reshape(-1)[0].item()))
+    return alpha_values
+
+
+def _get_patch_tokenizer_block_alpha_stats(model: nn.Module) -> list[dict[str, float]]:
+    target = model.module if isinstance(model, DDP) else model
+    compiled_target = getattr(target, "_orig_mod", None)
+    if compiled_target is not None:
+        target = compiled_target
+
+    patch_tokenizer = getattr(target, "patch_tokenizer", None)
+    blocks = getattr(patch_tokenizer, "blocks", None)
+    if blocks is None:
+        return []
+
+    out: list[dict[str, float]] = []
+    for block in blocks:
+        alpha = getattr(block, "alpha", None)
+        if alpha is None or not torch.is_tensor(alpha):
+            continue
+        alpha_flat = alpha.detach().reshape(-1).to(dtype=torch.float32)
+        if alpha_flat.numel() == 0:
+            continue
+        out.append(
+            {
+                "mean": float(alpha_flat.mean().item()),
+                "abs_mean": float(alpha_flat.abs().mean().item()),
+                "max_abs": float(alpha_flat.abs().max().item()),
+            }
+        )
+    return out
+
+
 def _run_worker(
     rank: int,
     world_size: int,
@@ -1330,6 +1398,15 @@ def _run_worker(
 
             model_cfg = _build_model_cfg(cfg)
             model = build_weight_quantile_vae(model_cfg).to(device)
+            total_params, trainable_params, frozen_params = _parameter_count_summary(model)
+            if rank == 0:
+                logger.info(
+                    "Model params: total=%s trainable=%s frozen=%s variant=%s",
+                    f"{total_params:,}",
+                    f"{trainable_params:,}",
+                    f"{frozen_params:,}",
+                    getattr(model_cfg, "variant", "full"),
+                )
             model = _maybe_compile(model, cfg=cfg, logger=logger)
 
             if is_distributed:
@@ -1357,6 +1434,17 @@ def _run_worker(
             optimizer = _build_optimizer(model=model, cfg=cfg, device=device)
             scheduler = _build_scheduler(optimizer=optimizer, cfg=cfg)
             comet_tracker = CometTracker(cfg=cfg, logger=logger, rank=rank)
+            if rank == 0 and comet_tracker is not None and comet_tracker.experiment is not None:
+                try:
+                    comet_tracker.experiment.log_parameters(
+                        {
+                            "model.param_count.total": int(total_params),
+                            "model.param_count.trainable": int(trainable_params),
+                            "model.param_count.frozen": int(frozen_params),
+                        }
+                    )
+                except Exception as exc:
+                    logger.warning("Comet parameter-count log failed: %s", exc)
 
             amp_enabled, amp_dtype = _resolve_amp(cfg=cfg, device=device)
             scaler = GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
@@ -2126,6 +2214,8 @@ def _run_worker(
                     speed = window_steps / dt
 
                     cache_metric = dataset.cache_size() if dataset is not None else 0
+                    encoder_alpha_values = _get_encoder_conditioning_alpha_values(model)
+                    patch_tokenizer_alpha_stats = _get_patch_tokenizer_block_alpha_stats(model)
                     logger.info(
                         "step=%s/%s loss=%.6f behav=%.6f struct=%.6f "
                         "s_dir=%.6f s_scl=%.6f s_rec=%.6f s_rel=%.6f "
@@ -2144,6 +2234,24 @@ def _run_worker(
                         speed,
                         cache_metric,
                     )
+                    if encoder_alpha_values:
+                        logger.info(
+                            "encoder_alpha step=%s values=[%s]",
+                            global_step,
+                            ",".join(f"{value:.6f}" for value in encoder_alpha_values),
+                        )
+                    if patch_tokenizer_alpha_stats:
+                        logger.info(
+                            "patch_tokenizer_alpha step=%s %s",
+                            global_step,
+                            "; ".join(
+                                (
+                                    f"block{block_idx}:mean={stats['mean']:.6f},"
+                                    f"abs_mean={stats['abs_mean']:.6f},max_abs={stats['max_abs']:.6f}"
+                                )
+                                for block_idx, stats in enumerate(patch_tokenizer_alpha_stats)
+                            ),
+                        )
                     if fixed_training_batch_enabled and direction_pre_norm_stats_latest is not None:
                         logger.info(
                             "direction_pre_norm step=%s mean=%.6f std=%.6f min=%.6f max=%.6f "
@@ -2202,6 +2310,30 @@ def _run_worker(
                             "param/rms": float(grad_stats.get("param/rms", 0.0)),
                             "grad_to_param_rms_ratio": float(grad_stats.get("grad_to_param_rms_ratio", 0.0)),
                         }
+                        if encoder_alpha_values:
+                            comet_metrics["encoder_conditioning/alpha_mean"] = float(
+                                sum(encoder_alpha_values) / max(1, len(encoder_alpha_values))
+                            )
+                            comet_metrics["encoder_conditioning/alpha_max_abs"] = float(
+                                max(abs(value) for value in encoder_alpha_values)
+                            )
+                            for layer_idx, value in enumerate(encoder_alpha_values):
+                                comet_metrics[f"encoder_conditioning/alpha_layer_{layer_idx}"] = float(value)
+                        if patch_tokenizer_alpha_stats:
+                            patch_abs_means = [float(stats["abs_mean"]) for stats in patch_tokenizer_alpha_stats]
+                            patch_max_abs = [float(stats["max_abs"]) for stats in patch_tokenizer_alpha_stats]
+                            comet_metrics["patch_tokenizer/alpha_abs_mean"] = float(
+                                sum(patch_abs_means) / max(1, len(patch_abs_means))
+                            )
+                            comet_metrics["patch_tokenizer/alpha_max_abs"] = float(max(patch_max_abs))
+                            for block_idx, stats in enumerate(patch_tokenizer_alpha_stats):
+                                comet_metrics[f"patch_tokenizer/alpha_block_{block_idx}_mean"] = float(stats["mean"])
+                                comet_metrics[f"patch_tokenizer/alpha_block_{block_idx}_abs_mean"] = float(
+                                    stats["abs_mean"]
+                                )
+                                comet_metrics[f"patch_tokenizer/alpha_block_{block_idx}_max_abs"] = float(
+                                    stats["max_abs"]
+                                )
                         if partwise_grad_clip_enabled:
                             for group_name in grad_group_prefixes:
                                 comet_metrics[f"grad/{group_name}_global_norm_before_clip"] = float(

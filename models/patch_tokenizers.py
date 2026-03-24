@@ -2,6 +2,61 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+def _zero_init_last_linear(module: nn.Module) -> None:
+    last_linear: nn.Linear | None = None
+    for submodule in reversed(list(module.modules())):
+        if isinstance(submodule, nn.Linear):
+            last_linear = submodule
+            break
+    if last_linear is None:
+        return
+    nn.init.zeros_(last_linear.weight)
+    if last_linear.bias is not None:
+        nn.init.zeros_(last_linear.bias)
+
+
+class ConditionedMLPBlock(nn.Module):
+    """Conditioned residual MLP block for patch-token refinement."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        d_hidden: int,
+        d_cond: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.fc1 = nn.Linear(d_model, d_hidden)
+        self.fc2 = nn.Linear(d_hidden, d_model)
+        cond_hidden = max(int(d_cond), int(d_model))
+        self.cond = nn.Sequential(
+            nn.Linear(d_cond, cond_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(cond_hidden, 3 * d_model),
+        )
+        self.alpha = nn.Parameter(torch.zeros(d_model))
+        _zero_init_last_linear(self.cond)
+
+    def forward(self, u: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        if u.ndim != 2:
+            raise ValueError(f"u must be [B, D], got {tuple(u.shape)}")
+        if c.ndim != 2:
+            raise ValueError(f"c must be [B, Dc], got {tuple(c.shape)}")
+        if int(u.shape[0]) != int(c.shape[0]):
+            raise ValueError(f"u and c batch must match, got {tuple(u.shape)} vs {tuple(c.shape)}")
+
+        h = self.norm(u)
+        abg = self.cond(c)
+        a, b, g = abg.chunk(3, dim=-1)
+        h_mod = (1.0 + a) * h + b
+        delta = self.fc2(F.gelu(self.fc1(h_mod)))
+        return u + self.alpha * torch.sigmoid(g) * delta
 
 
 class ResidualPatchTokenizer(nn.Module):
@@ -164,7 +219,85 @@ class MixerPatchTokenizer(nn.Module):
         return self.final_proj(x_cat)
 
 
+class PatchConditionedMLPTokenizer(nn.Module):
+    """
+    Patch token encoder with a Y-only base path and X-conditioned MLP refinement.
+
+    Input:  w_patch [B, p], dist_var_tokens [B, p, d_var]
+    Output: patch_token [B, d_patch]
+    """
+
+    def __init__(
+        self,
+        p: int,
+        d_var: int,
+        d_patch: int,
+        hidden_dim: int | None = None,
+        cond_proj_dim: int | None = None,
+        cond_dim: int | None = None,
+        num_blocks: int = 2,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.p = int(p)
+        self.d_patch = int(d_patch)
+        hidden = int(hidden_dim) if hidden_dim is not None else int(4 * d_patch)
+        c_proj = int(cond_proj_dim) if cond_proj_dim is not None else min(64, max(16, d_patch // 2))
+        c_dim = int(cond_dim) if cond_dim is not None else max(32, d_patch)
+
+        self.y_encoder = nn.Sequential(
+            nn.Linear(self.p, hidden),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden, self.d_patch),
+        )
+        self.x_proj = nn.Linear(int(d_var), c_proj)
+        x_hidden = max(hidden, c_dim)
+        self.x_encoder = nn.Sequential(
+            nn.Linear(self.p * c_proj, x_hidden),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(x_hidden, c_dim),
+        )
+        self.blocks = nn.ModuleList(
+            [
+                ConditionedMLPBlock(
+                    d_model=self.d_patch,
+                    d_hidden=hidden,
+                    d_cond=c_dim,
+                    dropout=dropout,
+                )
+                for _ in range(max(1, int(num_blocks)))
+            ]
+        )
+
+    def forward(
+        self,
+        w_patch: torch.Tensor,
+        dist_var_tokens: torch.Tensor,
+        dist_patch_embed: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if w_patch.ndim != 2:
+            raise ValueError(f"w_patch must be [B, p], got {tuple(w_patch.shape)}")
+        if dist_var_tokens.ndim != 3:
+            raise ValueError(f"dist_var_tokens must be [B, p, d_var], got {tuple(dist_var_tokens.shape)}")
+        if int(w_patch.shape[0]) != int(dist_var_tokens.shape[0]) or int(w_patch.shape[1]) != int(dist_var_tokens.shape[1]):
+            raise ValueError(
+                "w_patch and dist_var_tokens must agree on [B, p], got "
+                f"{tuple(w_patch.shape)} vs {tuple(dist_var_tokens.shape)}"
+            )
+
+        u = self.y_encoder(w_patch)
+        x_small = self.x_proj(dist_var_tokens)
+        c = self.x_encoder(x_small.flatten(start_dim=1))
+        for block in self.blocks:
+            u = block(u, c)
+        return u
+
+
 __all__ = [
+    "ConditionedMLPBlock",
     "MixerPatchTokenizer",
+    "PatchConditionedMLPTokenizer",
     "ResidualPatchTokenizer",
 ]

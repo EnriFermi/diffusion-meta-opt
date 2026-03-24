@@ -193,6 +193,8 @@ def _build_model_cfg_local(cfg: DictConfig) -> ModelConfig:
             use_latent_sampling=bool(big_cfg.get("use_latent_sampling", True)),
             disable_z_shortcut=bool(big_cfg.get("disable_z_shortcut", False)),
             disable_distribution_encoder=bool(big_cfg.get("disable_distribution_encoder", False)),
+            patch_tokenizer_kind=str(big_cfg.get("patch_tokenizer_kind", "residual")),
+            distribution_encoder_conditioning_kind=str(big_cfg.get("distribution_encoder_conditioning_kind", "legacy")),
             encoder=EncoderConfig(
                 self_attn_mode=str(enc_cfg.get("self_attn_mode", "full")),
                 cross_attend_only_cls=bool(enc_cfg.get("cross_attend_only_cls", True)),
@@ -242,6 +244,7 @@ def _grad_stat_group_prefixes() -> dict[str, tuple[str, ...]]:
             "latent_resampler_layers.",
             "enc_dist_inject_projs.",
             "enc_dist_to_latent_heads.",
+            "encoder_conditioning_adapters.",
             "latent_base",
             "latent_norm.",
         ),
