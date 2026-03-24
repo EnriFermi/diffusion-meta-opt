@@ -6,7 +6,7 @@ big_vae:
   d_lat: 256
   num_latents: 8
   # true -> VAE (sampling + KL), false -> AE (deterministic z, KL term forced to 0 in train loop)
-  use_latent_sampling: false
+  use_latent_sampling: true
   num_encoder_layers: 15
   num_decoder_layers: 3
   n_heads: 8
@@ -20,7 +20,7 @@ big_vae:
   patch_tokenizer_kind: conditioned_mlp
   # legacy -> existing pooled-var injection + latent delta
   # token_adapter -> per-layer gated residual conditioning on dist_patch_by_patch
-  distribution_encoder_conditioning_kind: legacy
+  distribution_encoder_conditioning_kind: token_adapter
   encoder:
     self_attn_mode: full
     cross_attend_only_cls: false

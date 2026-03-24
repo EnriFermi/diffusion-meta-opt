@@ -3,10 +3,10 @@ grad_accum_steps: 5
 distributed: false
 num_gpus: 1
 
-amp: false
-tf32: false
-cudnn_benchmark: false
-compile: false
+amp: true
+tf32: true
+cudnn_benchmark: true
+compile: true
 compile_mode: reduce-overhead
 compile_dynamic: true
 # Keep torch.compile while avoiding inductor CUDAGraph output-buffer reuse issues.
@@ -52,7 +52,7 @@ resume_state:
 
 stage: 1
 stage_base_T_patches: 16
-stage_base_d_out: 16
+stage_base_d_out: 8
 stage_scale_factor: 2
 # Optional synthetic data mode for quick smoke/debug runs.
 # When enabled, train loop samples x and W from Normal and does not start collectors.
