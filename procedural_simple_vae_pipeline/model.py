@@ -306,13 +306,15 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
     @staticmethod
     def _normalize_patch_tokenizer_kind(kind: str) -> str:
         value = str(kind).strip().lower()
-        if value not in {"linear", "patch_conditioner"}:
-            raise ValueError(
-                "patch_tokenizer_kind must be one of "
-                "'linear', 'patch_conditioner', "
-                f"got {kind!r}"
-            )
-        return value
+        if value in {"linear", "residual", "default", "legacy"}:
+            return "linear"
+        if value in {"patch_conditioner", "conditioned_mlp", "patch_conditioned_mlp"}:
+            return "patch_conditioner"
+        raise ValueError(
+            "patch_tokenizer_kind must be one of "
+            "'linear', 'patch_conditioner', "
+            f"got {kind!r}"
+        )
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()

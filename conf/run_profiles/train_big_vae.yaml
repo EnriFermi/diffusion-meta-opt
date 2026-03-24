@@ -26,4 +26,4 @@ hydra:
 
 model:
   # full | simple_direct
-  variant: simple_direct
+  variant: full

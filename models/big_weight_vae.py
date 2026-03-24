@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from models.distribution_encoder import DistributionConfig, InputDistributionEncodingModule
 from models.mini_patch_vae import MiniVAEConfig
-from models.patch_tokenizers import MixerPatchTokenizer, ResidualPatchTokenizer
+from models.patch_tokenizers import MixerPatchTokenizer, PatchConditionedMLPTokenizer, ResidualPatchTokenizer
 from models.vae_shared import (
     CrossAttnBlock,
     MLP,
@@ -54,6 +54,8 @@ class BigVAEConfig:
     use_latent_sampling: bool = True
     disable_z_shortcut: bool = False
     disable_distribution_encoder: bool = False
+    patch_tokenizer_kind: str = "residual"
+    distribution_encoder_conditioning_kind: str = "legacy"
     latent_bottleneck_kind: str = "perceiver_resampler"
     ttm: TTMMemoryConfig = field(default_factory=TTMMemoryConfig)
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
@@ -147,6 +149,80 @@ class LocalOutputSelfAttentionBlock(nn.Module):
         return tokens
 
 
+class TokenConditioningAdapter(nn.Module):
+    """Token-wise residual conditioning for encoder patch tokens."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        d_y: int,
+        dropout: float,
+        d_hidden: int | None = None,
+        d_gate: int | None = None,
+    ) -> None:
+        super().__init__()
+        hidden_dim = int(d_hidden) if d_hidden is not None else int(4 * d_model)
+        gate_dim = int(d_gate) if d_gate is not None else int(d_model)
+
+        self.y_proj = nn.Linear(d_y, d_model)
+        self.h_norm = nn.LayerNorm(d_model)
+        self.c_norm = nn.LayerNorm(d_model)
+
+        self.mix_h = nn.Linear(d_model, hidden_dim)
+        self.mix_c = nn.Linear(d_model, hidden_dim)
+        self.mix_out = nn.Linear(hidden_dim, d_model)
+
+        self.gate_h = nn.Linear(d_model, gate_dim)
+        self.gate_c = nn.Linear(d_model, gate_dim)
+        self.gate_out = nn.Linear(gate_dim, d_model)
+
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.conditioning_dropout = nn.Dropout(dropout)
+
+        nn.init.zeros_(self.mix_out.weight)
+        nn.init.zeros_(self.mix_out.bias)
+        nn.init.constant_(self.gate_out.bias, -2.0)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        y_ctx: torch.Tensor,
+        map_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        if h.ndim != 3:
+            raise ValueError(f"h must be [B, T_x, d_model], got {tuple(h.shape)}")
+        if y_ctx.ndim != 3:
+            raise ValueError(f"y_ctx must be [B, T_y, d_y], got {tuple(y_ctx.shape)}")
+        if map_idx.ndim != 2:
+            raise ValueError(f"map_idx must be [B, T_x], got {tuple(map_idx.shape)}")
+        if int(h.shape[0]) != int(y_ctx.shape[0]) or int(h.shape[0]) != int(map_idx.shape[0]):
+            raise ValueError(
+                "Batch size mismatch between h, y_ctx, and map_idx: "
+                f"{tuple(h.shape)}, {tuple(y_ctx.shape)}, {tuple(map_idx.shape)}"
+            )
+        if int(h.shape[1]) != int(map_idx.shape[1]):
+            raise ValueError(
+                f"map_idx token length must match h token length, got {tuple(map_idx.shape)} vs {tuple(h.shape)}"
+            )
+
+        gather_idx = map_idx.to(device=y_ctx.device, dtype=torch.long).clamp(min=0, max=max(0, int(y_ctx.shape[1]) - 1))
+        y_match = y_ctx.gather(dim=1, index=gather_idx.unsqueeze(-1).expand(-1, -1, int(y_ctx.shape[2])))
+
+        c = self.y_proj(y_match)
+        c = self.conditioning_dropout(c)
+
+        h_n = self.h_norm(h)
+        c_n = self.c_norm(c)
+
+        mixed = F.gelu(self.mix_h(h_n) + self.mix_c(c_n))
+        residual = self.mix_out(mixed)
+
+        gate_in = F.gelu(self.gate_h(h_n) + self.gate_c(c_n))
+        gate = torch.sigmoid(self.gate_out(gate_in))
+        return h + self.alpha * gate * residual
+
+
 class LatentEncoderLayer(nn.Module):
     """
     One big-encoder block:
@@ -188,12 +264,31 @@ class LatentEncoderLayer(nn.Module):
         tokens_by_output: torch.Tensor,
         latents: torch.Tensor,
         cross_attend_only_cls: bool,
+        patch_conditioner: TokenConditioningAdapter | None = None,
+        patch_conditioning_ctx: torch.Tensor | None = None,
+        patch_conditioning_map_idx: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, d_out, L_local, d_model = tokens_by_output.shape
 
-        local_in = tokens_by_output.view(B * d_out, L_local, d_model)
+        local_in = tokens_by_output.reshape(B * d_out, L_local, d_model)
         local_out = self.local_block(local_in)
-        tokens = local_out.view(B, d_out, L_local, d_model)
+        tokens = local_out.reshape(B, d_out, L_local, d_model)
+        if patch_conditioner is not None:
+            if patch_conditioning_ctx is None or patch_conditioning_map_idx is None:
+                raise ValueError("patch conditioning context and map_idx are required when patch_conditioner is set")
+            patch_tokens = tokens[:, :, 1:, :].reshape(B * d_out, L_local - 1, d_model)
+            patch_tokens = patch_conditioner(
+                h=patch_tokens,
+                y_ctx=patch_conditioning_ctx,
+                map_idx=patch_conditioning_map_idx,
+            )
+            tokens = torch.cat(
+                [
+                    tokens[:, :, :1, :],
+                    patch_tokens.reshape(B, d_out, L_local - 1, d_model),
+                ],
+                dim=2,
+            )
 
         device = tokens.device
         if cross_attend_only_cls:
@@ -275,6 +370,16 @@ class BigWeightVAE(nn.Module):
         dropout = cfg.big_vae.dropout
 
         self.use_distribution_encoder = not bool(cfg.big_vae.disable_distribution_encoder)
+        self.patch_tokenizer_kind = self._normalize_patch_tokenizer_kind(cfg.big_vae.patch_tokenizer_kind)
+        self.distribution_encoder_conditioning_kind = self._normalize_distribution_encoder_conditioning_kind(
+            cfg.big_vae.distribution_encoder_conditioning_kind
+        )
+        self.use_legacy_distribution_encoder_conditioning = bool(
+            self.use_distribution_encoder and self.distribution_encoder_conditioning_kind == "legacy"
+        )
+        self.use_token_adapter_distribution_encoder_conditioning = bool(
+            self.use_distribution_encoder and self.distribution_encoder_conditioning_kind == "token_adapter"
+        )
         if self.use_distribution_encoder:
             self.distribution_encoder: InputDistributionEncodingModule | None = InputDistributionEncodingModule(
                 cfg.distribution
@@ -286,23 +391,35 @@ class BigWeightVAE(nn.Module):
             patch_tokenizer_d_dist = 0
             query_in_dim = d_model
         d_patch = cfg.mini_vae.d_patch
-        # self.patch_tokenizer = MixerPatchTokenizer(
-        #     p=p,
-        #     d_var=d_var,
-        #     d_dist=d_dist,
-        #     d_patch=d_patch,
-        #     d_hidden=d_var,
-        #     num_mixer_layers=3,
-        #     dropout=cfg.big_vae.dropout,
-        # )
-        self.patch_tokenizer = ResidualPatchTokenizer(
-            p=p,
-            d_dist=patch_tokenizer_d_dist,
-            d_patch=d_patch,
-            hidden_dim = 256,
-            num_layers= 3,
-            dropout=0.0
-        )
+        if self.patch_tokenizer_kind == "conditioned_mlp":
+            if not self.use_distribution_encoder:
+                raise ValueError(
+                    "big_vae.patch_tokenizer_kind='conditioned_mlp' requires disable_distribution_encoder=false"
+                )
+            self.patch_tokenizer = PatchConditionedMLPTokenizer(
+                p=p,
+                d_var=d_var,
+                d_patch=d_patch,
+                dropout=dropout,
+            )
+        else:
+            # self.patch_tokenizer = MixerPatchTokenizer(
+            #     p=p,
+            #     d_var=d_var,
+            #     d_dist=d_dist,
+            #     d_patch=d_patch,
+            #     d_hidden=d_var,
+            #     num_mixer_layers=3,
+            #     dropout=cfg.big_vae.dropout,
+            # )
+            self.patch_tokenizer = ResidualPatchTokenizer(
+                p=p,
+                d_dist=patch_tokenizer_d_dist,
+                d_patch=d_patch,
+                hidden_dim=256,
+                num_layers=3,
+                dropout=0.0,
+            )
 
         if d_model % n_heads != 0:
             raise ValueError(f"big_vae.d_model ({d_model}) must be divisible by big_vae.n_heads ({n_heads})")
@@ -326,14 +443,14 @@ class BigWeightVAE(nn.Module):
                 for _ in range(num_enc_layers)
             ]
         )
-        if self.use_distribution_encoder:
+        if self.use_legacy_distribution_encoder_conditioning:
             self.enc_dist_inject_projs: nn.ModuleList | None = nn.ModuleList(
                 [nn.Linear(d_model + d_var, d_model) for _ in range(num_enc_layers)]
             )
         else:
             self.enc_dist_inject_projs = None
         self.flat_lat_dim = num_latents * d_lat
-        if self.use_distribution_encoder:
+        if self.use_legacy_distribution_encoder_conditioning:
             self.enc_dist_to_latent_heads: nn.ModuleList | None = nn.ModuleList(
                 [
                     nn.Sequential(
@@ -348,6 +465,19 @@ class BigWeightVAE(nn.Module):
             )
         else:
             self.enc_dist_to_latent_heads = None
+        if self.use_token_adapter_distribution_encoder_conditioning:
+            self.encoder_conditioning_adapters: nn.ModuleList | None = nn.ModuleList(
+                [
+                    TokenConditioningAdapter(
+                        d_model=d_model,
+                        d_y=d_dist,
+                        dropout=dropout,
+                    )
+                    for _ in range(num_enc_layers)
+                ]
+            )
+        else:
+            self.encoder_conditioning_adapters = None
 
         self.latent_base = nn.Parameter(torch.randn(num_latents, d_lat) * 0.02)
         self.z_dim = self.flat_lat_dim
@@ -381,6 +511,30 @@ class BigWeightVAE(nn.Module):
         if bool(cfg.big_vae.disable_z_shortcut):
             self.z_shortcut_proj.requires_grad_(False)
             self.z_shortcut.requires_grad_(False)
+
+    @staticmethod
+    def _normalize_patch_tokenizer_kind(kind: str) -> str:
+        value = str(kind).strip().lower()
+        if value in {"residual", "default", "legacy"}:
+            return "residual"
+        if value in {"conditioned_mlp", "patch_conditioned_mlp"}:
+            return "conditioned_mlp"
+        raise ValueError(
+            "big_vae.patch_tokenizer_kind must be one of "
+            "'residual', 'conditioned_mlp', "
+            f"got {kind!r}"
+        )
+
+    @staticmethod
+    def _normalize_distribution_encoder_conditioning_kind(kind: str) -> str:
+        value = str(kind).strip().lower()
+        if value not in {"legacy", "token_adapter"}:
+            raise ValueError(
+                "big_vae.distribution_encoder_conditioning_kind must be one of "
+                "'legacy', 'token_adapter', "
+                f"got {kind!r}"
+            )
+        return value
 
     @staticmethod
     def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -567,7 +721,7 @@ class BigWeightVAE(nn.Module):
         dist_patch_by_patch: torch.Tensor | None,
         dist_var_pooled: torch.Tensor | None,
         return_debug_info: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, object]]:
         if W.ndim != 3:
             raise ValueError(f"W must be rank-3 [B, d_in, d_out], got {tuple(W.shape)}")
 
@@ -635,13 +789,21 @@ class BigWeightVAE(nn.Module):
 
         cls_tokens = self.cls_token.view(1, 1, 1, -1).expand(B, d_out, 1, -1)
         tokens_by_output = torch.cat([cls_tokens, patch_tokens], dim=2)
+        if self.use_token_adapter_distribution_encoder_conditioning:
+            assert dist_patch_by_patch is not None
+            assert self.encoder_conditioning_adapters is not None
+            dist_patch_ctx_by_output = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1).reshape(B * d_out, T, d_dist)
+            patch_map_idx = torch.arange(T, device=W.device, dtype=torch.long).view(1, T).expand(B * d_out, -1)
+        else:
+            dist_patch_ctx_by_output = None
+            patch_map_idx = None
 
         latents = self.latent_base.unsqueeze(0).expand(B, -1, -1)
         num_latents = self.cfg.big_vae.num_latents
         d_lat = self.cfg.big_vae.d_lat
 
         for layer_idx, enc_layer in enumerate(self.encoder_layers):
-            if self.use_distribution_encoder:
+            if self.use_legacy_distribution_encoder_conditioning:
                 assert dist_var_for_inject is not None
                 assert dist_var_global is not None
                 assert self.enc_dist_inject_projs is not None
@@ -659,10 +821,19 @@ class BigWeightVAE(nn.Module):
                 tokens_by_output=tokens_by_output,
                 latents=latents,
                 cross_attend_only_cls=self.cfg.big_vae.encoder.cross_attend_only_cls,
+                patch_conditioner=(
+                    self.encoder_conditioning_adapters[layer_idx]
+                    if self.use_token_adapter_distribution_encoder_conditioning and self.encoder_conditioning_adapters is not None
+                    else None
+                ),
+                patch_conditioning_ctx=dist_patch_ctx_by_output,
+                patch_conditioning_map_idx=patch_map_idx,
             )
 
         if return_debug_info:
             return latents, {
+                "debug_patch_tokenizer_kind": self.patch_tokenizer_kind,
+                "debug_encoder_conditioning_kind": self.distribution_encoder_conditioning_kind,
                 "encoder_tokens_by_output": tokens_by_output,
                 "encoder_cls_tokens": tokens_by_output[:, :, :1, :],
                 "encoder_patch_tokens": tokens_by_output[:, :, 1:, :],
@@ -968,8 +1139,6 @@ class BigWeightVAE(nn.Module):
         if bool(debug_direct_from_encoder_tokens):
             if encoder_patch_tokens is None:
                 raise ValueError("encoder_patch_tokens are required when debug_direct_from_encoder_tokens=True")
-            #DEBUG
-            print('Anal bobra')
             outputs = self._decode_direct_from_encoder_patch_tokens(
                 encoder_patch_tokens,
                 z=z,
@@ -1015,6 +1184,8 @@ class BigWeightVAE(nn.Module):
         if return_debug_info:
             pred_dirs = outputs[2]
             debug_info: dict[str, object] = {
+                "debug_patch_tokenizer_kind": self.patch_tokenizer_kind,
+                "debug_encoder_conditioning_kind": self.distribution_encoder_conditioning_kind,
                 "debug_decoder_kv_source": self._normalize_debug_decoder_kv_source(debug_decoder_kv_source),
                 "debug_query_hint": self._normalize_debug_query_hint(debug_query_hint),
                 "debug_direct_from_encoder_tokens": bool(debug_direct_from_encoder_tokens),
@@ -1141,7 +1312,6 @@ class BigWeightVAE(nn.Module):
 
         # W = W[0].repeat(W.shape[0], 1, 1)
         # X = X[0].repeat(X.shape[0], 1, 1)
-        print(W[:, 0, 0], X[:, 0, 0])
 
         if squeeze_batch:
             W = W.unsqueeze(0)
