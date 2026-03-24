@@ -44,6 +44,11 @@ grad_clip_norm_by_part:
  
 checkpoint_every: 500
 checkpoint_dir: ${training_artifacts.big_vae_checkpoint_dir}
+resume_state:
+  enabled: true
+  auto_resume: true
+  save_every: ${train.checkpoint_every}
+  dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/resume_state
 
 stage: 1
 stage_base_T_patches: 8
