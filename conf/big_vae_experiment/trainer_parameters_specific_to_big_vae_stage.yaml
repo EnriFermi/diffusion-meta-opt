@@ -1,5 +1,5 @@
 max_steps: 1000000
-grad_accum_steps: 1
+grad_accum_steps: 5
 distributed: false
 num_gpus: 1
 
@@ -18,7 +18,7 @@ warmup_steps: 0
 min_lr_ratio: 0.01
 kl_beta: 0.0
 weight_decay: 0.0
-lr: 5e-4
+lr: 5e-6
 
 behavioral_coef: 0.0
 structural_coef: 1.0
@@ -62,8 +62,8 @@ fixed_training_batch:
   dump_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/fixed_training_batch.pt
 # Cap rows in x to reduce rare heavy samples that can stall steps.
 max_x_rows: 512
-steps_per_sample: 100000000
-slice_batch_size: 32
+steps_per_sample: 1
+slice_batch_size: 64
 resume_checkpoint: ""
 
 forensics:
