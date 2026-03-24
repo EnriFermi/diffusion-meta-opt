@@ -199,6 +199,26 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: DictConfig) -> torch
     )
 
 
+def _compute_kl_beta_for_step(
+    global_step: int,
+    *,
+    target_beta: float,
+    schedule_enabled: bool,
+    start_beta: float,
+    warmup_steps: int,
+    ramp_steps: int,
+) -> float:
+    if not schedule_enabled:
+        return float(target_beta)
+    if global_step <= max(0, int(warmup_steps)):
+        return float(start_beta)
+    if ramp_steps <= 0:
+        return float(target_beta)
+    progress = min(1.0, max(0.0, float(global_step - warmup_steps) / float(ramp_steps)))
+    cosine_progress = 0.5 * (1.0 - math.cos(math.pi * progress))
+    return float(start_beta + (target_beta - start_beta) * cosine_progress)
+
+
 def _resolve_amp(cfg: DictConfig, device: torch.device) -> tuple[bool, torch.dtype | None]:
     return runtime_resolve_amp(cfg, device, section="train")
 
@@ -282,6 +302,10 @@ class CometTracker:
                 "train.lr": float(train_cfg.get("lr", 0.0)),
                 "train.grad_accum_steps": int(train_cfg.get("grad_accum_steps", 1)),
                 "train.kl_beta": float(train_cfg.get("kl_beta", 0.0)),
+                "train.kl_schedule.enabled": bool(train_cfg.get("kl_schedule", {}).get("enabled", False)),
+                "train.kl_schedule.start_beta": float(train_cfg.get("kl_schedule", {}).get("start_beta", 0.0)),
+                "train.kl_schedule.warmup_steps": int(train_cfg.get("kl_schedule", {}).get("warmup_steps", 0)),
+                "train.kl_schedule.ramp_steps": int(train_cfg.get("kl_schedule", {}).get("ramp_steps", 0)),
                 "train.behavioral_coef": float(train_cfg.get("behavioral_coef", 0.0)),
                 "train.structural_coef": float(train_cfg.get("structural_coef", 0.0)),
                 "model.patch_size": int(model_cfg.get("patch_size", 16)),
@@ -1458,6 +1482,15 @@ def _run_worker(
             max_steps = max(1, int(cfg.train.get("max_steps", 1000)))
             grad_accum_steps = max(1, int(cfg.train.get("grad_accum_steps", 1)))
             kl_beta = float(cfg.train.get("kl_beta", 1e-3))
+            kl_schedule_cfg = cfg.train.get("kl_schedule", {})
+            if kl_schedule_cfg is None:
+                kl_schedule_cfg = {}
+            if not isinstance(kl_schedule_cfg, (dict, DictConfig)):
+                raise TypeError("train.kl_schedule must be a mapping")
+            kl_schedule_enabled = bool(kl_schedule_cfg.get("enabled", False))
+            kl_schedule_start_beta = float(kl_schedule_cfg.get("start_beta", 0.0))
+            kl_schedule_warmup_steps = max(0, int(kl_schedule_cfg.get("warmup_steps", 0)))
+            kl_schedule_ramp_steps = max(0, int(kl_schedule_cfg.get("ramp_steps", 0)))
             model_unwrapped = model.module if isinstance(model, DDP) else model
             cfg_holder = model_unwrapped
             if not hasattr(cfg_holder, "cfg") and hasattr(cfg_holder, "_orig_mod"):
@@ -1578,12 +1611,24 @@ def _run_worker(
             steps_per_sample = max(1, int(cfg.train.get("steps_per_sample", 1)))
             if rank == 0:
                 logger.info("Steps per sample: %s", steps_per_sample)
-                logger.info(
-                    "BigVAE latent mode: %s (use_latent_sampling=%s, kl_beta=%s)",
-                    "VAE" if use_latent_sampling else "AE",
-                    use_latent_sampling,
-                    kl_beta,
-                )
+                if kl_schedule_enabled:
+                    logger.info(
+                        "BigVAE latent mode: %s (use_latent_sampling=%s, kl_beta_target=%s, "
+                        "kl_schedule=start@%.6f warmup=%s ramp=%s)",
+                        "VAE" if use_latent_sampling else "AE",
+                        use_latent_sampling,
+                        kl_beta,
+                        kl_schedule_start_beta,
+                        kl_schedule_warmup_steps,
+                        kl_schedule_ramp_steps,
+                    )
+                else:
+                    logger.info(
+                        "BigVAE latent mode: %s (use_latent_sampling=%s, kl_beta=%s)",
+                        "VAE" if use_latent_sampling else "AE",
+                        use_latent_sampling,
+                        kl_beta,
+                    )
                 if unknown_clip_groups:
                     logger.warning(
                         "Ignoring unknown train.grad_clip_norm_by_part groups: %s",
@@ -1647,6 +1692,14 @@ def _run_worker(
 
             for step_idx in range(max_steps):
                 global_step = step_idx + 1
+                current_kl_beta = _compute_kl_beta_for_step(
+                    global_step,
+                    target_beta=kl_beta,
+                    schedule_enabled=kl_schedule_enabled,
+                    start_beta=kl_schedule_start_beta,
+                    warmup_steps=kl_schedule_warmup_steps,
+                    ramp_steps=kl_schedule_ramp_steps,
+                )
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -1793,8 +1846,8 @@ def _run_worker(
                                 total_loss = total_loss + behavioral_coef * behavioral_loss
                             if structural_coef != 0.0:
                                 total_loss = total_loss + structural_coef * structural_loss
-                            if kl_beta != 0.0:
-                                total_loss = total_loss + kl_beta * kl_loss
+                            if current_kl_beta != 0.0:
+                                total_loss = total_loss + current_kl_beta * kl_loss
                             loss_for_backward = total_loss / grad_accum_steps
 
                         if rank == 0 and fixed_training_batch_enabled and direction_pre_norms is not None:
@@ -1813,6 +1866,7 @@ def _run_worker(
                                     "behavioral": _scalar_debug_value(behavioral_loss),
                                     "structural": _scalar_debug_value(structural_loss),
                                     "kl": _scalar_debug_value(kl_loss),
+                                    "kl_beta": float(current_kl_beta),
                                     "struct_dir": _scalar_debug_value(struct_details["L_dir"]),
                                     "struct_scale": _scalar_debug_value(struct_details["L_scale"]),
                                     "struct_rec": _scalar_debug_value(struct_details["L_rec"]),
@@ -2219,7 +2273,7 @@ def _run_worker(
                     logger.info(
                         "step=%s/%s loss=%.6f behav=%.6f struct=%.6f "
                         "s_dir=%.6f s_scl=%.6f s_rec=%.6f s_rel=%.6f "
-                        "kl=%.6f lr=%.6e steps/s=%.2f cache=%s",
+                        "kl=%.6f kl_beta=%.6f lr=%.6e steps/s=%.2f cache=%s",
                         global_step,
                         max_steps,
                         avg_loss,
@@ -2230,6 +2284,7 @@ def _run_worker(
                         avg_struct_rec,
                         avg_struct_rel,
                         avg_kl,
+                        current_kl_beta,
                         lr,
                         speed,
                         cache_metric,
@@ -2277,6 +2332,7 @@ def _run_worker(
                             "train/struct_rec": float(avg_struct_rec),
                             "train/struct_rel": float(avg_struct_rel),
                             "train/lr": float(lr),
+                            "train/kl_beta": float(current_kl_beta),
                             "train/steps_per_sec": float(speed),
                             "data/cache_size": float(cache_metric),
                             "grad/global_norm_before_clip": float(grad_stats.get("grad/global_norm_before_clip", 0.0)),

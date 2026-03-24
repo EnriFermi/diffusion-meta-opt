@@ -17,6 +17,11 @@ predownload_models: true
 warmup_steps: 100000
 min_lr_ratio: 0.1
 kl_beta: 0.0
+kl_schedule:
+  enabled: false
+  start_beta: 0.0
+  warmup_steps: 0
+  ramp_steps: 0
 weight_decay: 0.0
 lr: 5e-5
 
