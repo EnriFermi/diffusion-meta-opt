@@ -661,11 +661,31 @@ class BigWeightVAE(nn.Module):
         return total, details
 
     @staticmethod
-    def operator_recon_loss(X: torch.Tensor, W: torch.Tensor, W_hat: torch.Tensor) -> torch.Tensor:
+    def operator_recon_loss(
+        X: torch.Tensor,
+        W: torch.Tensor,
+        W_hat: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         d_in = W.shape[-2]
+        pred = X @ W_hat if X.ndim == 2 else torch.matmul(X, W_hat)
+        target = X @ W if X.ndim == 2 else torch.matmul(X, W)
+        if x_mask is None:
+            return (F.mse_loss(pred, target) / d_in).sqrt()
+
         if X.ndim == 2:
-            return (F.mse_loss(X @ W_hat, X @ W) / d_in).sqrt()
-        return (F.mse_loss(torch.matmul(X, W_hat), torch.matmul(X, W)) / d_in).sqrt()
+            if x_mask.ndim != 1 or int(x_mask.shape[0]) != int(X.shape[0]):
+                raise ValueError(f"x_mask must be [n] for unbatched X, got {tuple(x_mask.shape)}")
+            mask = x_mask.to(device=pred.device, dtype=pred.dtype).unsqueeze(-1)
+        else:
+            if x_mask.ndim != 2 or tuple(x_mask.shape) != tuple(X.shape[:2]):
+                raise ValueError(f"x_mask must be [B,n] for batched X, got {tuple(x_mask.shape)} vs {tuple(X.shape[:2])}")
+            mask = x_mask.to(device=pred.device, dtype=pred.dtype).unsqueeze(-1)
+
+        diff_sq = (pred - target).pow(2) * mask
+        denom = mask.sum().clamp_min(1.0) * float(pred.shape[-1])
+        mse = diff_sq.sum() / denom
+        return (mse / d_in).sqrt()
 
     @staticmethod
     def _channel_norm_over_sequence(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -690,6 +710,7 @@ class BigWeightVAE(nn.Module):
         X: torch.Tensor,
         *,
         d_in: int,
+        x_mask: torch.Tensor | None = None,
     ) -> tuple[int, int, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         if X.ndim != 3:
             raise ValueError(f"X must be rank-3 [B, n, d_in], got {tuple(X.shape)}")
@@ -697,6 +718,11 @@ class BigWeightVAE(nn.Module):
         B, n, d_in_x = X.shape
         if d_in_x != d_in:
             raise ValueError(f"X last dim ({d_in_x}) must match d_in ({d_in})")
+        if x_mask is not None:
+            if x_mask.ndim != 2:
+                raise ValueError(f"x_mask must be rank-2 [B, n], got {tuple(x_mask.shape)}")
+            if tuple(x_mask.shape) != (B, n):
+                raise ValueError(f"x_mask shape must be {(B, n)}, got {tuple(x_mask.shape)}")
 
         device = X.device
         p = self.cfg.patch_size
@@ -708,9 +734,14 @@ class BigWeightVAE(nn.Module):
 
         patch_idx_bt = patch_idx_t.unsqueeze(0).expand(B, -1, -1).contiguous()
         X_rep = X.unsqueeze(1).expand(B, T, n, d_in).reshape(B * T, n, d_in)
+        x_mask_rep = (
+            x_mask.unsqueeze(1).expand(B, T, n).reshape(B * T, n)
+            if x_mask is not None
+            else None
+        )
         patch_idx_flat = patch_idx_bt.reshape(B * T, p)
 
-        dist_var_flat, dist_patch_flat = self.distribution_encoder(X_rep, patch_idx_flat)
+        dist_var_flat, dist_patch_flat = self.distribution_encoder(X_rep, patch_idx_flat, sample_mask=x_mask_rep)
 
         d_var = self.cfg.distribution.d_var
         d_dist = self.cfg.distribution.d_dist
@@ -1213,6 +1244,7 @@ class BigWeightVAE(nn.Module):
         W: torch.Tensor,
         X: torch.Tensor,
         *,
+        x_mask: torch.Tensor | None = None,
         return_direction_pre_norms: bool = False,
         disable_z_shortcut: bool = False,
         debug_decoder_kv_source: str = "latents",
@@ -1231,6 +1263,10 @@ class BigWeightVAE(nn.Module):
         if squeeze_batch:
             W = W.unsqueeze(0)
             X = X.unsqueeze(0)
+            if x_mask is not None:
+                if x_mask.ndim != 1:
+                    raise ValueError(f"x_mask must be rank-1 when X is unbatched, got {tuple(x_mask.shape)}")
+                x_mask = x_mask.unsqueeze(0)
         B, d_in, d_out = W.shape
         Bx, _, d_in_x = X.shape
         if Bx != B or d_in_x != d_in:
@@ -1239,6 +1275,7 @@ class BigWeightVAE(nn.Module):
         T, d_in_pad, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled = self._encode_distribution_context(
             X,
             d_in=d_in,
+            x_mask=x_mask,
         )
         latents, encode_debug = self._encode_latent_slots(
             W,
@@ -1301,6 +1338,7 @@ class BigWeightVAE(nn.Module):
         W: torch.Tensor,
         X: torch.Tensor,
         *,
+        x_mask: torch.Tensor | None = None,
         return_direction_pre_norms: bool = False,
         disable_z_shortcut: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[
@@ -1325,6 +1363,10 @@ class BigWeightVAE(nn.Module):
         if squeeze_batch:
             W = W.unsqueeze(0)
             X = X.unsqueeze(0)
+            if x_mask is not None:
+                if x_mask.ndim != 1:
+                    raise ValueError(f"x_mask must be rank-1 when X is unbatched, got {tuple(x_mask.shape)}")
+                x_mask = x_mask.unsqueeze(0)
         B, d_in, d_out = W.shape
         Bx, _, d_in_x = X.shape
         if Bx != B or d_in_x != d_in:
@@ -1333,6 +1375,7 @@ class BigWeightVAE(nn.Module):
         T, d_in_pad, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled = self._encode_distribution_context(
             X,
             d_in=d_in,
+            x_mask=x_mask,
         )
         latents, encode_debug = self._encode_latent_slots(
             W,

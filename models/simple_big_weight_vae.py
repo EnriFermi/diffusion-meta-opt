@@ -218,6 +218,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
         X: torch.Tensor,
         *,
         d_in: int,
+        x_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not self.use_distribution_conditioning or self.distribution_encoder is None:
             raise RuntimeError("distribution conditioning is disabled for SimpleDirectBigWeightVAE")
@@ -227,6 +228,11 @@ class SimpleDirectBigWeightVAE(nn.Module):
         B, n, d_in_x = X.shape
         if d_in_x != d_in:
             raise ValueError(f"X last dim ({d_in_x}) must match d_in ({d_in})")
+        if x_mask is not None:
+            if x_mask.ndim != 2:
+                raise ValueError(f"x_mask must be rank-2 [B, n], got {tuple(x_mask.shape)}")
+            if tuple(x_mask.shape) != (B, n):
+                raise ValueError(f"x_mask shape must be {(B, n)}, got {tuple(x_mask.shape)}")
 
         p = int(self.cfg.patch_size)
         T, d_in_pad = self._build_patch_geometry(d_in=d_in, patch_size=p)
@@ -235,15 +241,21 @@ class SimpleDirectBigWeightVAE(nn.Module):
         patch_idx_t = patch_idx_t.clamp(max=max(0, d_in - 1))
         patch_idx_bt = patch_idx_t.unsqueeze(0).expand(B, -1, -1).contiguous()
         X_rep = X.unsqueeze(1).expand(B, T, n, d_in).reshape(B * T, n, d_in)
+        x_mask_rep = (
+            x_mask.unsqueeze(1).expand(B, T, n).reshape(B * T, n)
+            if x_mask is not None
+            else None
+        )
         patch_idx_flat = patch_idx_bt.reshape(B * T, p)
 
-        _dist_var_flat, dist_patch_flat = self.distribution_encoder(X_rep, patch_idx_flat)
+        _dist_var_flat, dist_patch_flat = self.distribution_encoder(X_rep, patch_idx_flat, sample_mask=x_mask_rep)
         return dist_patch_flat.view(B, T, -1)
 
     def _encode_patch_tokens(
         self,
         W: torch.Tensor,
         X: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, int, int, torch.Tensor | None]:
         if W.ndim != 3:
             raise ValueError(f"W must be rank-3 [B, d_in, d_out], got {tuple(W.shape)}")
@@ -264,7 +276,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
         dist_patch_by_patch: torch.Tensor | None = None
         patch_token_inputs = w_patches
         if self.use_distribution_conditioning:
-            dist_patch_by_patch = self._encode_distribution_context(X, d_in=d_in)
+            dist_patch_by_patch = self._encode_distribution_context(X, d_in=d_in, x_mask=x_mask)
             dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
             patch_token_inputs = torch.cat([w_patches, dist_patch_expanded], dim=-1)
 
@@ -709,6 +721,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
         W: torch.Tensor,
         X: torch.Tensor,
         *,
+        x_mask: torch.Tensor | None = None,
         return_direction_pre_norms: bool = False,
         disable_z_shortcut: bool = False,
         debug_decoder_kv_source: str = "latents",
@@ -727,12 +740,20 @@ class SimpleDirectBigWeightVAE(nn.Module):
         if squeeze_batch:
             W = W.unsqueeze(0)
             X = X.unsqueeze(0)
+            if x_mask is not None:
+                if x_mask.ndim != 1:
+                    raise ValueError(f"x_mask must be rank-1 when X is unbatched, got {tuple(x_mask.shape)}")
+                x_mask = x_mask.unsqueeze(0)
         B, d_in, d_out = W.shape
         Bx, _, d_in_x = X.shape
         if Bx != B or d_in_x != d_in:
             raise ValueError(f"Shape mismatch: W={tuple(W.shape)}, X={tuple(X.shape)}")
 
-        tokens_by_output, encoder_patch_tokens, T, d_in_pad, dist_patch_by_patch = self._encode_patch_tokens(W, X)
+        tokens_by_output, encoder_patch_tokens, T, d_in_pad, dist_patch_by_patch = self._encode_patch_tokens(
+            W,
+            X,
+            x_mask=x_mask,
+        )
         decode_outputs = self._decode_from_encoder_outputs(
             encoder_patch_tokens,
             dist_patch_by_patch=dist_patch_by_patch,
@@ -783,6 +804,7 @@ class SimpleDirectBigWeightVAE(nn.Module):
         W: torch.Tensor,
         X: torch.Tensor,
         *,
+        x_mask: torch.Tensor | None = None,
         return_direction_pre_norms: bool = False,
         disable_z_shortcut: bool = False,
     ) -> tuple[torch.Tensor, ...]:
@@ -799,12 +821,20 @@ class SimpleDirectBigWeightVAE(nn.Module):
         if squeeze_batch:
             W = W.unsqueeze(0)
             X = X.unsqueeze(0)
+            if x_mask is not None:
+                if x_mask.ndim != 1:
+                    raise ValueError(f"x_mask must be rank-1 when X is unbatched, got {tuple(x_mask.shape)}")
+                x_mask = x_mask.unsqueeze(0)
         B, d_in, d_out = W.shape
         Bx, _, d_in_x = X.shape
         if Bx != B or d_in_x != d_in:
             raise ValueError(f"Shape mismatch: W={tuple(W.shape)}, X={tuple(X.shape)}")
 
-        _tokens_by_output, encoder_patch_tokens, T, d_in_pad, dist_patch_by_patch = self._encode_patch_tokens(W, X)
+        _tokens_by_output, encoder_patch_tokens, T, d_in_pad, dist_patch_by_patch = self._encode_patch_tokens(
+            W,
+            X,
+            x_mask=x_mask,
+        )
         decode_outputs = self._decode_from_encoder_outputs(
             encoder_patch_tokens,
             dist_patch_by_patch=dist_patch_by_patch,

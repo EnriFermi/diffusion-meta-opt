@@ -39,6 +39,7 @@ class FrozenTarget:
     r_target: torch.Tensor
     w_dir: torch.Tensor
     meta: dict[str, Any]
+    x_mask_s: torch.Tensor | None = None
 
     def to(self, device: torch.device) -> "FrozenTarget":
         return FrozenTarget(
@@ -49,6 +50,7 @@ class FrozenTarget:
             r_target=self.r_target.to(device),
             w_dir=self.w_dir.to(device),
             meta=dict(self.meta),
+            x_mask_s=self.x_mask_s.to(device) if self.x_mask_s is not None else None,
         )
 
     def save(self, path: Path) -> None:
@@ -60,6 +62,7 @@ class FrozenTarget:
             "r_target": self.r_target.detach().cpu(),
             "w_dir": self.w_dir.detach().cpu(),
             "meta": self.meta,
+            "x_mask_s": self.x_mask_s.detach().cpu() if self.x_mask_s is not None else None,
         }
         torch.save(payload, path)
 
@@ -74,6 +77,7 @@ class FrozenTarget:
             r_target=payload["r_target"],
             w_dir=payload["w_dir"],
             meta=dict(payload["meta"]),
+            x_mask_s=payload.get("x_mask_s"),
         )
 
 
@@ -1163,6 +1167,7 @@ def _experiment_4(
             T, d_in_pad, _dist_var_by_patch, dist_patch_by_patch, _dist_var_pooled = model._encode_distribution_context(
                 frozen.x_s,
                 d_in=int(frozen.meta["d_in"]),
+                x_mask=frozen.x_mask_s,
             )
 
         init_slots = model.latent_base.detach().unsqueeze(0).expand(int(frozen.meta["B"]), -1, -1).clone()
@@ -1311,6 +1316,7 @@ def _experiment_5(
             W_hat, _z, _logvar, pred_dirs, direction_pre_norms = model(
                 frozen.W_s,
                 frozen.x_s,
+                x_mask=frozen.x_mask_s,
                 return_direction_pre_norms=True,
                 disable_z_shortcut=disable_z_shortcut,
             )

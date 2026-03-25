@@ -13,10 +13,11 @@ defaults:
 
   - _self_
 
-# BigVAE speed tuning: fewer model switches + lighter per-layer x/y payload.
+# BigVAE speed tuning for explicit model-diverse batches:
+# keep collector bursts short so the queue contains different models often enough.
 collector:
   max_loaded_models: 5
-  jobs_per_selected_model: 8
+  jobs_per_selected_model: 1
   layer_output_splitting:
     xy_samples_random_slice: 256
 
