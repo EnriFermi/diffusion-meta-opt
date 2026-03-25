@@ -18,8 +18,8 @@ def _zero_init_last_linear(module: nn.Module) -> None:
         nn.init.zeros_(last_linear.bias)
 
 
-class ConditionedMLPBlock(nn.Module):
-    """Conditioned residual MLP block for patch-token refinement."""
+class AlignedConditionedPatchBlock(nn.Module):
+    """Aligned per-position Y/X residual update block for patch-token refinement."""
 
     def __init__(
         self,
@@ -27,36 +27,45 @@ class ConditionedMLPBlock(nn.Module):
         d_model: int,
         d_hidden: int,
         d_cond: int,
+        d_rank: int,
         dropout: float,
     ) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, d_hidden)
-        self.fc2 = nn.Linear(d_hidden, d_model)
-        cond_hidden = max(int(d_cond), int(d_model))
-        self.cond = nn.Sequential(
-            nn.Linear(d_cond, cond_hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(cond_hidden, 3 * d_model),
-        )
-        self.alpha = nn.Parameter(torch.zeros(d_model))
-        _zero_init_last_linear(self.cond)
+        self.base_fc1 = nn.Linear(d_model, d_hidden)
+        self.base_fc2 = nn.Linear(d_hidden, d_model)
 
-    def forward(self, u: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        if u.ndim != 2:
-            raise ValueError(f"u must be [B, D], got {tuple(u.shape)}")
-        if c.ndim != 2:
-            raise ValueError(f"c must be [B, Dc], got {tuple(c.shape)}")
-        if int(u.shape[0]) != int(c.shape[0]):
-            raise ValueError(f"u and c batch must match, got {tuple(u.shape)} vs {tuple(c.shape)}")
+        self.u_proj = nn.Linear(d_model, d_rank)
+        self.x_proj = nn.Linear(d_cond, d_rank)
+        self.cond_fc1 = nn.Linear(d_rank, d_hidden)
+        self.cond_fc2 = nn.Linear(d_hidden, d_model)
+        self.gate_fc = nn.Linear(d_rank, d_model)
+        self.alpha = nn.Parameter(torch.zeros(1, 1, d_model))
 
-        h = self.norm(u)
-        abg = self.cond(c)
-        a, b, g = abg.chunk(3, dim=-1)
-        h_mod = (1.0 + a) * h + b
-        delta = self.fc2(F.gelu(self.fc1(h_mod)))
-        return u + self.alpha * torch.sigmoid(g) * delta
+        nn.init.zeros_(self.cond_fc2.weight)
+        nn.init.zeros_(self.cond_fc2.bias)
+        nn.init.zeros_(self.gate_fc.weight)
+        nn.init.zeros_(self.gate_fc.bias)
+
+    def forward(self, u: torch.Tensor, x_c: torch.Tensor) -> torch.Tensor:
+        if u.ndim != 3:
+            raise ValueError(f"u must be [B, P, D], got {tuple(u.shape)}")
+        if x_c.ndim != 3:
+            raise ValueError(f"x_c must be [B, P, Dc], got {tuple(x_c.shape)}")
+        if tuple(u.shape[:2]) != tuple(x_c.shape[:2]):
+            raise ValueError(f"u and x_c must align on [B, P], got {tuple(u.shape)} vs {tuple(x_c.shape)}")
+
+        h0 = self.norm(u)
+        base = self.base_fc2(F.gelu(self.base_fc1(h0)))
+
+        p_u = self.u_proj(h0)
+        p_x = self.x_proj(x_c)
+        inter = p_u * p_x
+
+        hidden = F.gelu(self.cond_fc1(inter))
+        delta = self.cond_fc2(hidden)
+        gate = torch.sigmoid(self.gate_fc(inter))
+        return u + base + self.alpha * gate * delta
 
 
 class ResidualPatchTokenizer(nn.Module):
@@ -221,7 +230,7 @@ class MixerPatchTokenizer(nn.Module):
 
 class PatchConditionedMLPTokenizer(nn.Module):
     """
-    Patch token encoder with a Y-only base path and X-conditioned MLP refinement.
+    Patch token encoder with aligned per-position Y/X conditioning.
 
     Input:  w_patch [B, p], dist_var_tokens [B, p, d_var]
     Output: patch_token [B, d_patch]
@@ -234,7 +243,6 @@ class PatchConditionedMLPTokenizer(nn.Module):
         d_patch: int,
         hidden_dim: int | None = None,
         cond_proj_dim: int | None = None,
-        cond_dim: int | None = None,
         num_blocks: int = 2,
         dropout: float = 0.0,
     ) -> None:
@@ -243,32 +251,28 @@ class PatchConditionedMLPTokenizer(nn.Module):
         self.d_patch = int(d_patch)
         hidden = int(hidden_dim) if hidden_dim is not None else int(4 * d_patch)
         c_proj = int(cond_proj_dim) if cond_proj_dim is not None else min(64, max(16, d_patch // 2))
-        c_dim = int(cond_dim) if cond_dim is not None else max(32, d_patch)
+        rank_dim = max(8, min(self.d_patch, c_proj))
 
-        self.y_encoder = nn.Sequential(
-            nn.Linear(self.p, hidden),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(hidden, self.d_patch),
-        )
+        self.y_proj = nn.Linear(1, self.d_patch)
         self.x_proj = nn.Linear(int(d_var), c_proj)
-        x_hidden = max(hidden, c_dim)
-        self.x_encoder = nn.Sequential(
-            nn.Linear(self.p * c_proj, x_hidden),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(x_hidden, c_dim),
-        )
         self.blocks = nn.ModuleList(
             [
-                ConditionedMLPBlock(
+                AlignedConditionedPatchBlock(
                     d_model=self.d_patch,
                     d_hidden=hidden,
-                    d_cond=c_dim,
+                    d_cond=c_proj,
+                    d_rank=rank_dim,
                     dropout=dropout,
                 )
                 for _ in range(max(1, int(num_blocks)))
             ]
+        )
+        self.summary = nn.Sequential(
+            nn.LayerNorm(self.p * self.d_patch),
+            nn.Linear(self.p * self.d_patch, hidden),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden, self.d_patch),
         )
 
     def forward(
@@ -287,15 +291,18 @@ class PatchConditionedMLPTokenizer(nn.Module):
                 f"{tuple(w_patch.shape)} vs {tuple(dist_var_tokens.shape)}"
             )
 
-        u = self.y_encoder(w_patch)
+        u = self.y_proj(w_patch.unsqueeze(-1))
         x_small = self.x_proj(dist_var_tokens)
-        c = self.x_encoder(x_small.flatten(start_dim=1))
         for block in self.blocks:
-            u = block(u, c)
-        return u
+            u = block(u, x_small)
+        return self.summary(u.flatten(start_dim=1))
+
+
+ConditionedMLPBlock = AlignedConditionedPatchBlock
 
 
 __all__ = [
+    "AlignedConditionedPatchBlock",
     "ConditionedMLPBlock",
     "MixerPatchTokenizer",
     "PatchConditionedMLPTokenizer",
