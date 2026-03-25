@@ -74,6 +74,19 @@ fixed_training_batch:
 max_x_rows: 512
 steps_per_sample: 1
 slice_batch_size: 64
+# Optional mixed-source batch mode for big_vae.
+# Default path builds the whole batch from one source snapshot and reslices it.
+# When enabled, train loop pulls several ready snapshots, keeps only those that
+# can satisfy current curriculum shape, and assembles the batch round-robin.
+# This reduces gradient bias toward a single model/dataset pair, but increases
+# collector pressure roughly in proportion to `max_source_samples`.
+batch_source_mixing:
+  enabled: true
+  # Only round_robin is supported for now.
+  strategy: round_robin
+  # 0 -> use full slice_batch_size, i.e. aim for one source snapshot per batch item.
+  # Positive value -> cap the number of distinct source snapshots per refresh.
+  max_source_samples: 8
 resume_checkpoint: ""
 
 forensics:

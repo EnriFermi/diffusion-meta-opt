@@ -8,7 +8,7 @@ import os
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Sequence
 
 import hydra
 import torch
@@ -54,6 +54,9 @@ from training.runtime import (
     seed_everything as runtime_seed_everything,
     set_speed_optimizations as runtime_set_speed_optimizations,
 )
+
+
+SourceSample = tuple[torch.Tensor, torch.Tensor]
 
 
 def _promote_run_profile_to_root(cfg: DictConfig) -> None:
@@ -1083,14 +1086,23 @@ def _next_valid_sample(
                 logger.warning("Skipping invalid sample repeatedly; attempts=%s", attempts)
             continue
 
-        x = x.detach().to(dtype=torch.float32, device="cpu", copy=True).contiguous()
-        W = W.detach().to(dtype=torch.float32, device="cpu", copy=True).contiguous()
+        x = _prepare_cpu_sample_tensor(x)
+        W = _prepare_cpu_sample_tensor(W)
 
         if max_x_rows > 0 and x.shape[0] > max_x_rows:
             keep = torch.randperm(x.shape[0])[:max_x_rows]
             x = x[keep]
 
         return x, W
+
+
+def _prepare_cpu_sample_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    tensor = tensor.detach()
+    if tensor.device.type != "cpu" or tensor.dtype != torch.float32:
+        return tensor.to(device="cpu", dtype=torch.float32, copy=True).contiguous()
+    if not tensor.is_contiguous():
+        return tensor.contiguous()
+    return tensor
 
 
 def _broadcast_tensor_2d(
@@ -1124,7 +1136,7 @@ def _broadcast_tensor_2d(
     return payload
 
 
-def _fetch_batch(
+def _fetch_batch_cpu(
     rank: int,
     device: torch.device,
     dataset_iter: Iterator[Any] | None,
@@ -1146,13 +1158,31 @@ def _fetch_batch(
 
         x = _broadcast_tensor_2d(x_cpu, device=device, src=0)
         W = _broadcast_tensor_2d(W_cpu, device=device, src=0)
-        return x, W
+        return _prepare_cpu_sample_tensor(x), _prepare_cpu_sample_tensor(W)
 
     if dataset_iter is None:
         raise RuntimeError("dataset iterator is required for sharded mode")
 
-    x_cpu, W_cpu = _next_valid_sample(
+    return _next_valid_sample(
         dataset_iter=dataset_iter,
+        max_x_rows=max_x_rows,
+        logger=logger,
+    )
+
+
+def _fetch_batch(
+    rank: int,
+    device: torch.device,
+    dataset_iter: Iterator[Any] | None,
+    use_broadcast: bool,
+    max_x_rows: int,
+    logger: logging.Logger,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x_cpu, W_cpu = _fetch_batch_cpu(
+        rank=rank,
+        device=device,
+        dataset_iter=dataset_iter,
+        use_broadcast=use_broadcast,
         max_x_rows=max_x_rows,
         logger=logger,
     )
@@ -1160,6 +1190,55 @@ def _fetch_batch(
         x_cpu.to(device=device, non_blocking=True),
         W_cpu.to(device=device, non_blocking=True),
     )
+
+
+def _fetch_source_samples(
+    *,
+    rank: int,
+    device: torch.device,
+    dataset_iter: Iterator[Any] | None,
+    use_broadcast: bool,
+    max_x_rows: int,
+    logger: logging.Logger,
+    num_samples: int,
+    min_d_in: int = 0,
+    min_d_out: int = 0,
+) -> list[SourceSample]:
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be > 0, got {num_samples}")
+
+    selected: list[SourceSample] = []
+    fallback_sample: SourceSample | None = None
+    attempts = 0
+    max_attempts = max(int(num_samples) * 8, int(num_samples))
+
+    while len(selected) < num_samples and attempts < max_attempts:
+        x_cpu, W_cpu = _fetch_batch_cpu(
+            rank=rank,
+            device=device,
+            dataset_iter=dataset_iter,
+            use_broadcast=use_broadcast,
+            max_x_rows=max_x_rows,
+            logger=logger,
+        )
+        attempts += 1
+
+        if fallback_sample is None:
+            fallback_sample = (x_cpu, W_cpu)
+
+        if min_d_in > 0 and int(W_cpu.shape[0]) < int(min_d_in):
+            continue
+        if min_d_out > 0 and int(W_cpu.shape[1]) < int(min_d_out):
+            continue
+
+        selected.append((x_cpu, W_cpu))
+
+    if not selected:
+        if fallback_sample is None:
+            raise RuntimeError("failed to fetch any source samples")
+        selected.append(fallback_sample)
+
+    return selected
 
 
 def _sample_synthetic_layer(
@@ -1178,6 +1257,93 @@ def _sample_synthetic_layer(
     x = torch.randn((effective_n_rows, int(d_in)), device=device, dtype=torch.float32) * float(x_std)
     W = torch.randn((int(d_in), int(d_out)), device=device, dtype=torch.float32) * float(w_std)
     return x, W
+
+
+def _subsample_x_rows(x: torch.Tensor, target_rows: int) -> torch.Tensor:
+    if target_rows <= 0:
+        raise ValueError(f"target_rows must be > 0, got {target_rows}")
+    if int(x.shape[0]) <= int(target_rows):
+        return x
+    keep = torch.randperm(int(x.shape[0]), device=x.device)[: int(target_rows)]
+    return x[keep]
+
+
+def _round_robin_source_indices(num_sources: int, batch_size: int, start_offset: int = 0) -> list[int]:
+    if num_sources <= 0:
+        raise ValueError(f"num_sources must be > 0, got {num_sources}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+    start = int(start_offset) % int(num_sources)
+    return [int((start + batch_idx) % num_sources) for batch_idx in range(batch_size)]
+
+
+def _build_training_batch_from_source_samples(
+    source_samples: Sequence[SourceSample],
+    *,
+    max_T_patches: int,
+    max_d_out: int,
+    patch_size: int,
+    batch_size: int,
+    start_offset: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not source_samples:
+        raise ValueError("source_samples must not be empty")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+
+    common_x_rows = min(int(x.shape[0]) for x, _ in source_samples)
+    normalized_sources = [
+        (_subsample_x_rows(x, common_x_rows), W)
+        for x, W in source_samples
+    ]
+
+    assignment = _round_robin_source_indices(
+        num_sources=len(normalized_sources),
+        batch_size=batch_size,
+        start_offset=start_offset,
+    )
+    counts = [0] * len(normalized_sources)
+    for source_idx in assignment:
+        counts[source_idx] += 1
+
+    source_batches: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    expected_w_shape: tuple[int, int] | None = None
+    expected_x_shape: tuple[int, int] | None = None
+    for source_idx, count in enumerate(counts):
+        if count <= 0:
+            continue
+        x_src, W_src = normalized_sources[source_idx]
+        W_part, x_part = _slice_sample(
+            W_src,
+            x_src,
+            max_T_patches=max_T_patches,
+            max_d_out=max_d_out,
+            patch_size=patch_size,
+            batch_size=count,
+        )
+        w_shape = (int(W_part.shape[1]), int(W_part.shape[2]))
+        x_shape = (int(x_part.shape[1]), int(x_part.shape[2]))
+        if expected_w_shape is None:
+            expected_w_shape = w_shape
+            expected_x_shape = x_shape
+        elif w_shape != expected_w_shape or x_shape != expected_x_shape:
+            raise ValueError(
+                "round-robin batch mixing requires all selected source samples to slice to the same shape, got "
+                f"W={w_shape}/x={x_shape} vs expected W={expected_w_shape}/x={expected_x_shape}"
+            )
+        source_batches[source_idx] = (W_part, x_part)
+
+    source_offsets = [0] * len(normalized_sources)
+    ordered_W: list[torch.Tensor] = []
+    ordered_x: list[torch.Tensor] = []
+    for source_idx in assignment:
+        W_part, x_part = source_batches[source_idx]
+        cursor = source_offsets[source_idx]
+        ordered_W.append(W_part[cursor: cursor + 1])
+        ordered_x.append(x_part[cursor: cursor + 1])
+        source_offsets[source_idx] += 1
+
+    return torch.cat(ordered_W, dim=0), torch.cat(ordered_x, dim=0)
 
 
 def _compute_curriculum_slice_sizes(cfg: DictConfig) -> tuple[int, int]:
@@ -1701,11 +1867,52 @@ def _run_worker(
             patch_size_for_slice = int(cfg.model.get("patch_size", 16))
             curriculum_max_T, curriculum_max_d_out = _compute_curriculum_slice_sizes(cfg)
             slice_batch_size = max(1, int(cfg.train.get("slice_batch_size", 1)))
+            batch_source_mixing_cfg = cfg.train.get("batch_source_mixing", {})
+            if batch_source_mixing_cfg is None:
+                batch_source_mixing_cfg = {}
+            if not isinstance(batch_source_mixing_cfg, (dict, DictConfig)):
+                raise TypeError("train.batch_source_mixing must be a mapping")
+            batch_source_mixing_enabled = bool(batch_source_mixing_cfg.get("enabled", False))
+            batch_source_mixing_strategy = str(batch_source_mixing_cfg.get("strategy", "round_robin")).strip().lower()
+            if batch_source_mixing_strategy != "round_robin":
+                raise ValueError(
+                    "train.batch_source_mixing.strategy must be 'round_robin', "
+                    f"got {batch_source_mixing_strategy!r}"
+                )
+            raw_max_source_samples = batch_source_mixing_cfg.get("max_source_samples", 0)
+            if raw_max_source_samples is None:
+                parsed_max_source_samples = 0
+            elif isinstance(raw_max_source_samples, str) and raw_max_source_samples.strip().lower() in {"", "none", "null"}:
+                parsed_max_source_samples = 0
+            else:
+                parsed_max_source_samples = int(raw_max_source_samples)
+            if parsed_max_source_samples < 0:
+                raise ValueError("train.batch_source_mixing.max_source_samples must be >= 0")
+            if batch_source_mixing_enabled:
+                requested_source_samples_per_refresh = (
+                    slice_batch_size if parsed_max_source_samples == 0 else min(slice_batch_size, parsed_max_source_samples)
+                )
+            else:
+                requested_source_samples_per_refresh = 1
+            batch_source_mixing_active = batch_source_mixing_enabled and requested_source_samples_per_refresh > 1
+            min_mixed_source_d_in = int(curriculum_max_T * patch_size_for_slice) if batch_source_mixing_active else 0
+            min_mixed_source_d_out = int(curriculum_max_d_out) if batch_source_mixing_active else 0
             if rank == 0:
                 logger.info(
                     "Curriculum slicing: stage=%s max_T_patches=%s max_d_out=%s patch_size=%s slice_batch_size=%s",
                     stage_num, curriculum_max_T, curriculum_max_d_out, patch_size_for_slice, slice_batch_size,
                 )
+                if batch_source_mixing_enabled:
+                    logger.info(
+                        "Batch source mixing: enabled=%s strategy=%s requested_source_samples=%s "
+                        "min_source_shape_for_full_mixing=(d_in>=%s,d_out>=%s) collector_pressure_vs_single~%sx",
+                        batch_source_mixing_active,
+                        batch_source_mixing_strategy,
+                        requested_source_samples_per_refresh,
+                        min_mixed_source_d_in,
+                        min_mixed_source_d_out,
+                        requested_source_samples_per_refresh,
+                    )
 
             log_every = max(1, int(cfg.train.get("log_every", 10)))
             log_worker_status_every = max(
@@ -1855,11 +2062,12 @@ def _run_worker(
                 "top_layers_ratio_pre_clip": [],
             }
 
-            current_x: torch.Tensor | None = None
-            current_W: torch.Tensor | None = None
+            current_source_samples: list[SourceSample] | None = None
+            current_source_round_robin_offset = 0
             fixed_batch_x: torch.Tensor | None = None
             fixed_batch_W: torch.Tensor | None = None
             direction_pre_norm_stats_latest: dict[str, Any] | None = None
+            source_mixing_shortfall_logged = False
 
             for step_idx in range(resumed_training_step, max_steps):
                 global_step = step_idx + 1
@@ -1887,31 +2095,64 @@ def _run_worker(
                 if fixed_training_batch_enabled:
                     should_refresh_source_sample = (
                         (fixed_batch_x is None or fixed_batch_W is None)
-                        and (current_x is None or current_W is None)
+                        and not current_source_samples
                     )
                 else:
-                    should_refresh_source_sample = current_x is None or step_idx % steps_per_sample == 0
+                    should_refresh_source_sample = current_source_samples is None or step_idx % steps_per_sample == 0
 
                 if should_refresh_source_sample:
                     if synthetic_layer_enabled:
-                        current_x, current_W = _sample_synthetic_layer(
-                            device=device,
-                            n_rows=synthetic_n_rows,
-                            d_in=synthetic_d_in,
-                            d_out=synthetic_d_out,
-                            x_std=synthetic_x_std,
-                            w_std=synthetic_w_std,
-                            max_x_rows=max_x_rows,
-                        )
+                        synthetic_source_device = torch.device("cpu") if batch_source_mixing_active else device
+                        current_source_samples = [
+                            _sample_synthetic_layer(
+                                device=synthetic_source_device,
+                                n_rows=synthetic_n_rows,
+                                d_in=synthetic_d_in,
+                                d_out=synthetic_d_out,
+                                x_std=synthetic_x_std,
+                                w_std=synthetic_w_std,
+                                max_x_rows=max_x_rows,
+                            )
+                            for _ in range(requested_source_samples_per_refresh)
+                        ]
                     else:
-                        current_x, current_W = _fetch_batch(
-                            rank=rank,
-                            device=device,
-                            dataset_iter=dataset_iter,
-                            use_broadcast=use_broadcast,
-                            max_x_rows=max_x_rows,
-                            logger=logger,
+                        if batch_source_mixing_active:
+                            current_source_samples = _fetch_source_samples(
+                                rank=rank,
+                                device=device,
+                                dataset_iter=dataset_iter,
+                                use_broadcast=use_broadcast,
+                                max_x_rows=max_x_rows,
+                                logger=logger,
+                                num_samples=requested_source_samples_per_refresh,
+                                min_d_in=min_mixed_source_d_in,
+                                min_d_out=min_mixed_source_d_out,
+                            )
+                        else:
+                            current_x, current_W = _fetch_batch(
+                                rank=rank,
+                                device=device,
+                                dataset_iter=dataset_iter,
+                                use_broadcast=use_broadcast,
+                                max_x_rows=max_x_rows,
+                                logger=logger,
+                            )
+                            current_source_samples = [(current_x, current_W)]
+                    current_source_round_robin_offset = 0
+                    if (
+                        batch_source_mixing_active
+                        and current_source_samples is not None
+                        and len(current_source_samples) < requested_source_samples_per_refresh
+                        and not source_mixing_shortfall_logged
+                        and rank == 0
+                    ):
+                        logger.info(
+                            "Batch source mixing shortfall: requested=%s compatible source samples, fetched=%s. "
+                            "Training continues with reduced diversity for this refresh.",
+                            requested_source_samples_per_refresh,
+                            len(current_source_samples),
                         )
+                        source_mixing_shortfall_logged = True
 
                 loss_acc = 0.0
                 behavioral_acc = 0.0
@@ -1929,18 +2170,20 @@ def _run_worker(
 
                     if fixed_training_batch_enabled:
                         if fixed_batch_x is None or fixed_batch_W is None:
-                            if current_x is None or current_W is None:
+                            if not current_source_samples:
                                 raise RuntimeError("fixed training batch capture requires a loaded source sample")
-                            fixed_batch_W, fixed_batch_x = _slice_sample(
-                                current_W,
-                                current_x,
-                                curriculum_max_T,
-                                curriculum_max_d_out,
-                                patch_size_for_slice,
+                            fixed_batch_W, fixed_batch_x = _build_training_batch_from_source_samples(
+                                current_source_samples,
+                                max_T_patches=curriculum_max_T,
+                                max_d_out=curriculum_max_d_out,
+                                patch_size=patch_size_for_slice,
                                 batch_size=slice_batch_size,
+                                start_offset=current_source_round_robin_offset,
                             )
-                            current_x = None
-                            current_W = None
+                            fixed_batch_W = fixed_batch_W.to(device=device, non_blocking=True)
+                            fixed_batch_x = fixed_batch_x.to(device=device, non_blocking=True)
+                            current_source_samples = None
+                            current_source_round_robin_offset = 0
                             if rank == 0:
                                 logger.info(
                                     "Captured fixed training batch at step=%s: W=%s x=%s",
@@ -1969,16 +2212,21 @@ def _run_worker(
                             dataset_iter = None
                         W_s, x_s = fixed_batch_W, fixed_batch_x
                     else:
-                        if current_x is None or current_W is None:
+                        if not current_source_samples:
                             raise RuntimeError("training step requires a loaded source sample")
-                        W_s, x_s = _slice_sample(
-                            current_W,
-                            current_x,
-                            curriculum_max_T,
-                            curriculum_max_d_out,
-                            patch_size_for_slice,
+                        W_s, x_s = _build_training_batch_from_source_samples(
+                            current_source_samples,
+                            max_T_patches=curriculum_max_T,
+                            max_d_out=curriculum_max_d_out,
+                            patch_size=patch_size_for_slice,
                             batch_size=slice_batch_size,
+                            start_offset=current_source_round_robin_offset,
                         )
+                        W_s = W_s.to(device=device, non_blocking=True)
+                        x_s = x_s.to(device=device, non_blocking=True)
+                        current_source_round_robin_offset = (
+                            current_source_round_robin_offset + slice_batch_size
+                        ) % len(current_source_samples)
 
                     no_sync_ctx = contextlib.nullcontext()
                     if is_distributed and not sync_grad:
