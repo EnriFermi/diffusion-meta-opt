@@ -1,5 +1,5 @@
 max_steps: 5000000
-grad_accum_steps: 5
+grad_accum_steps: 1
 distributed: false
 num_gpus: 1
 
@@ -14,7 +14,7 @@ compile_disable_cudagraphs: true
 # Pull model artifacts up front to reduce collector cold-start stalls.
 predownload_models: true
 
-warmup_steps: 100000
+warmup_steps: 0
 min_lr_ratio: 0.1
 kl_beta: 0.1
 kl_schedule:
@@ -23,7 +23,7 @@ kl_schedule:
   warmup_steps: 100000
   ramp_steps: 100000
 weight_decay: 0.01
-lr: 5e-5
+lr: 1e-6
 
 behavioral_coef: 1.0
 structural_coef: 1.0
@@ -51,8 +51,8 @@ resume_state:
   dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/resume_state
 
 stage: 1
-stage_base_T_patches: 16
-stage_base_d_out: 8
+stage_base_T_patches: 4
+stage_base_d_out: 2
 stage_scale_factor: 2
 # Optional synthetic data mode for quick smoke/debug runs.
 # When enabled, train loop samples x and W from Normal and does not start collectors.
