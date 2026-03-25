@@ -246,7 +246,7 @@ def _resolve_exact_fixed_batch_paths(cfg: DictConfig) -> dict[str, Path] | None:
     return resolved
 
 
-def _load_exact_fixed_batch_dump(path: Path) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+def _load_exact_fixed_batch_dump(path: Path) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any]]:
     if not path.exists():
         raise FileNotFoundError(f"Exact fixed batch dump not found: {path}")
 
@@ -256,6 +256,7 @@ def _load_exact_fixed_batch_dump(path: Path) -> tuple[torch.Tensor, torch.Tensor
 
     W_s = payload.get("fixed_batch_W", payload.get("W_s"))
     x_s = payload.get("fixed_batch_x", payload.get("x_s"))
+    x_mask_s = payload.get("fixed_batch_x_mask", payload.get("x_mask_s"))
     if not torch.is_tensor(W_s) or not torch.is_tensor(x_s):
         raise KeyError(
             f"Exact fixed batch dump must contain tensor keys 'fixed_batch_W'/'fixed_batch_x' or 'W_s'/'x_s': {path}"
@@ -263,6 +264,10 @@ def _load_exact_fixed_batch_dump(path: Path) -> tuple[torch.Tensor, torch.Tensor
 
     W_s = W_s.detach().to(device="cpu", dtype=torch.float32, copy=True).contiguous()
     x_s = x_s.detach().to(device="cpu", dtype=torch.float32, copy=True).contiguous()
+    if x_mask_s is not None:
+        if not torch.is_tensor(x_mask_s):
+            raise TypeError(f"Exact fixed batch x_mask must be a tensor when present, got {type(x_mask_s)!r}: {path}")
+        x_mask_s = x_mask_s.detach().to(device="cpu", dtype=torch.bool, copy=True).contiguous()
     if W_s.ndim != 3 or x_s.ndim != 3:
         raise ValueError(
             "Exact fixed batch tensors must be rank-3 batched tensors, got "
@@ -273,18 +278,35 @@ def _load_exact_fixed_batch_dump(path: Path) -> tuple[torch.Tensor, torch.Tensor
             "Exact fixed batch tensor shapes are inconsistent, got "
             f"W={tuple(W_s.shape)} x={tuple(x_s.shape)} from {path}"
         )
+    if x_mask_s is not None and tuple(x_mask_s.shape) != tuple(x_s.shape[:2]):
+        raise ValueError(
+            "Exact fixed batch x_mask shape is inconsistent with x, got "
+            f"x_mask={tuple(x_mask_s.shape)} x={tuple(x_s.shape)} from {path}"
+        )
 
     raw_meta = payload.get("meta", {})
     meta = _safe_scalar(raw_meta if isinstance(raw_meta, dict) else {"raw_meta": raw_meta})
-    return W_s, x_s, meta
+    return W_s, x_s, x_mask_s, meta
 
 
 def _batch_same_as_first_mask(
     W_batch: torch.Tensor,
     x_batch: torch.Tensor,
+    x_mask_batch: torch.Tensor | None = None,
 ) -> list[bool]:
+    if x_mask_batch is not None and tuple(x_mask_batch.shape) != tuple(x_batch.shape[:2]):
+        raise ValueError(
+            f"x_mask_batch shape must match x_batch sample axes, got {tuple(x_mask_batch.shape)} vs {tuple(x_batch.shape[:2])}"
+        )
     return [
-        bool(torch.equal(W_batch[idx], W_batch[0]) and torch.equal(x_batch[idx], x_batch[0]))
+        bool(
+            torch.equal(W_batch[idx], W_batch[0])
+            and torch.equal(x_batch[idx], x_batch[0])
+            and (
+                x_mask_batch is None
+                or torch.equal(x_mask_batch[idx], x_mask_batch[0])
+            )
+        )
         for idx in range(int(W_batch.shape[0]))
     ]
 
@@ -380,11 +402,21 @@ def _slice_source_item_train_style_batch(
 def _select_distinct_batch_entry_pair(
     W_batch: torch.Tensor,
     x_batch: torch.Tensor,
+    x_mask_batch: torch.Tensor | None = None,
 ) -> tuple[int, int] | None:
+    if x_mask_batch is not None and tuple(x_mask_batch.shape) != tuple(x_batch.shape[:2]):
+        raise ValueError(
+            f"x_mask_batch shape must match x_batch sample axes, got {tuple(x_mask_batch.shape)} vs {tuple(x_batch.shape[:2])}"
+        )
     batch_size = int(W_batch.shape[0])
     for idx_a in range(batch_size):
         for idx_b in range(idx_a + 1, batch_size):
-            if not torch.equal(W_batch[idx_a], W_batch[idx_b]) or not torch.equal(x_batch[idx_a], x_batch[idx_b]):
+            same_mask = True if x_mask_batch is None else torch.equal(x_mask_batch[idx_a], x_mask_batch[idx_b])
+            if (
+                not torch.equal(W_batch[idx_a], W_batch[idx_b])
+                or not torch.equal(x_batch[idx_a], x_batch[idx_b])
+                or not same_mask
+            ):
                 return idx_a, idx_b
     return None
 
@@ -401,30 +433,37 @@ def _build_frozen_pairs_from_exact_fixed_batch_paths(
     patch_size = int(cfg.model.get("patch_size", 16))
     gamma = float(cfg.train.struct_loss.gamma)
 
-    variant_batches: dict[str, tuple[torch.Tensor, torch.Tensor, dict[str, Any]]] = {}
+    variant_batches: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any]]] = {}
     for variant_name, path in exact_paths.items():
         variant_batches[variant_name] = _load_exact_fixed_batch_dump(path)
 
-    dup_W, dup_x, dup_dump_meta = variant_batches["duplicate_pair"]
-    diff_W, diff_x, diff_dump_meta = variant_batches["different_pair"]
+    dup_W, dup_x, dup_x_mask, dup_dump_meta = variant_batches["duplicate_pair"]
+    diff_W, diff_x, diff_x_mask, diff_dump_meta = variant_batches["different_pair"]
     if tuple(dup_W.shape) != tuple(diff_W.shape) or tuple(dup_x.shape) != tuple(diff_x.shape):
         raise ValueError(
             "Exact duplicate/different fixed batches must have matching shapes for a fair comparison, got "
             f"duplicate W/x={tuple(dup_W.shape)}/{tuple(dup_x.shape)} vs "
             f"different W/x={tuple(diff_W.shape)}/{tuple(diff_x.shape)}"
         )
+    if (dup_x_mask is None) != (diff_x_mask is None):
+        raise ValueError("Exact duplicate/different fixed batches must either both provide x_mask or both omit it")
+    if dup_x_mask is not None and tuple(dup_x_mask.shape) != tuple(diff_x_mask.shape):
+        raise ValueError(
+            "Exact duplicate/different fixed batch x_mask tensors must have matching shapes, got "
+            f"duplicate={tuple(dup_x_mask.shape)} vs different={tuple(diff_x_mask.shape)}"
+        )
 
-    dup_same_as_first = _batch_same_as_first_mask(dup_W, dup_x)
+    dup_same_as_first = _batch_same_as_first_mask(dup_W, dup_x, dup_x_mask)
     if not all(dup_same_as_first):
         raise ValueError(
             "The exact fixed batch provided for duplicate_pair is not actually duplicate across the batch: "
             f"same_as_first_mask={dup_same_as_first}"
         )
 
-    diff_distinct_pair = _select_distinct_batch_entry_pair(diff_W, diff_x)
+    diff_distinct_pair = _select_distinct_batch_entry_pair(diff_W, diff_x, diff_x_mask)
     if diff_distinct_pair is None:
         raise ValueError("The exact fixed batch provided for different_pair does not contain two distinct batch entries")
-    diff_same_as_first = _batch_same_as_first_mask(diff_W, diff_x)
+    diff_same_as_first = _batch_same_as_first_mask(diff_W, diff_x, diff_x_mask)
 
     duplicate_pair = _derive_frozen_target(
         dup_W,
@@ -432,12 +471,14 @@ def _build_frozen_pairs_from_exact_fixed_batch_paths(
         patch_size=patch_size,
         gamma=gamma,
     )
+    duplicate_pair.x_mask_s = dup_x_mask
     different_pair = _derive_frozen_target(
         diff_W,
         diff_x,
         patch_size=patch_size,
         gamma=gamma,
     )
+    different_pair.x_mask_s = diff_x_mask
 
     exact_paths_text = {name: str(path) for name, path in exact_paths.items()}
     duplicate_pair.meta["pair_variant"] = "duplicate_pair"
@@ -587,6 +628,7 @@ def _frozen_target_payload(target: FrozenTarget) -> dict[str, Any]:
     return {
         "W_s": target.W_s.detach().cpu(),
         "x_s": target.x_s.detach().cpu(),
+        "x_mask_s": target.x_mask_s.detach().cpu() if target.x_mask_s is not None else None,
         "X_patch_target": target.X_patch_target.detach().cpu(),
         "u_target": target.u_target.detach().cpu(),
         "r_target": target.r_target.detach().cpu(),
@@ -846,6 +888,7 @@ def _run_mode_variant(
             W_hat, _z, _logvar, pred_dirs, direction_pre_norms = model(
                 frozen.W_s,
                 frozen.x_s,
+                x_mask=frozen.x_mask_s,
                 return_direction_pre_norms=True,
             )
             debug_info = None
@@ -853,6 +896,7 @@ def _run_mode_variant(
             W_hat, _z, _logvar, pred_dirs, direction_pre_norms, debug_info = model.forward_debug(
                 frozen.W_s,
                 frozen.x_s,
+                x_mask=frozen.x_mask_s,
                 return_direction_pre_norms=True,
                 debug_decoder_kv_source=mode_spec.debug_decoder_kv_source,
                 debug_query_hint=mode_spec.debug_query_hint,
@@ -882,6 +926,7 @@ def _run_mode_variant(
                     _, _, _, _, _, debug_info = model.forward_debug(
                         frozen.W_s,
                         frozen.x_s,
+                        x_mask=frozen.x_mask_s,
                         return_direction_pre_norms=True,
                     )
             debug_shapes = {

@@ -84,9 +84,11 @@ batch_source_mixing:
   enabled: true
   # Only round_robin is supported for now.
   strategy: round_robin
+  # none | model
+  uniqueness: model
   # 0 -> use full slice_batch_size, i.e. aim for one source snapshot per batch item.
   # Positive value -> cap the number of distinct source snapshots per refresh.
-  max_source_samples: 8
+  max_source_samples: 4
 resume_checkpoint: ""
 
 forensics:

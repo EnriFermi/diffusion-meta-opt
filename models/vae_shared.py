@@ -42,6 +42,50 @@ def _quantile_over_samples(X_q: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     return q_vals.permute(1, 0, 2).contiguous()
 
 
+def _masked_quantile_over_samples(X_q: torch.Tensor, q: torch.Tensor, sample_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Mask-aware quantile over sample axis.
+
+    X_q: [B, n, p]
+    sample_mask: [B, n] with True for valid rows
+    q: [k]
+    returns: [k, B, p]
+    """
+    if X_q.ndim != 3:
+        raise ValueError(f"X_q must be [B,n,p], got {tuple(X_q.shape)}")
+    if q.ndim != 1:
+        raise ValueError(f"q must be rank-1, got {tuple(q.shape)}")
+    if sample_mask.ndim != 2:
+        raise ValueError(f"sample_mask must be [B,n], got {tuple(sample_mask.shape)}")
+    if tuple(sample_mask.shape) != tuple(X_q.shape[:2]):
+        raise ValueError(
+            f"sample_mask shape must match X_q sample axes, got {tuple(sample_mask.shape)} vs {tuple(X_q.shape[:2])}"
+        )
+
+    mask = sample_mask.to(device=X_q.device, dtype=torch.bool)
+    valid_counts = mask.sum(dim=1).clamp_min(1)
+    fill_value = torch.full((), float("inf"), device=X_q.device, dtype=X_q.dtype)
+    masked_values = torch.where(mask.unsqueeze(-1), X_q, fill_value)
+    sorted_vals, _ = torch.sort(masked_values, dim=1)
+
+    q = q.to(device=X_q.device, dtype=X_q.dtype).clamp(0.0, 1.0)
+    pos = q.unsqueeze(0) * (valid_counts.to(dtype=X_q.dtype).unsqueeze(1) - 1.0)
+
+    lower = torch.floor(pos).to(dtype=torch.long)
+    upper = torch.ceil(pos).to(dtype=torch.long)
+    alpha = (pos - lower.to(dtype=X_q.dtype)).unsqueeze(-1)
+
+    B, _, p = sorted_vals.shape
+    k = q.shape[0]
+    lower_idx = lower.unsqueeze(-1).expand(B, k, p)
+    upper_idx = upper.unsqueeze(-1).expand(B, k, p)
+
+    lower_vals = sorted_vals.gather(dim=1, index=lower_idx)
+    upper_vals = sorted_vals.gather(dim=1, index=upper_idx)
+    q_vals = lower_vals + (upper_vals - lower_vals) * alpha
+    return q_vals.permute(1, 0, 2).contiguous()
+
+
 def sinusoidal_embedding(indices: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
     """Deterministic sinusoidal embedding for arbitrary-sized integer grids."""
     if dim <= 0:

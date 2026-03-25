@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from models.vae_shared import _quantile_over_samples
+from models.vae_shared import _masked_quantile_over_samples, _quantile_over_samples
 
 
 class CrossLayer(nn.Module):
@@ -142,7 +142,12 @@ class InputDistributionEncodingModule(nn.Module):
         probs = torch.linspace(0.0, 1.0, cfg.k_s, dtype=torch.float32)
         self.register_buffer("quantile_probs", probs, persistent=False)
 
-    def forward(self, X: torch.Tensor, patch_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        X: torch.Tensor,
+        patch_idx: torch.Tensor,
+        sample_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if X.ndim != 3:
             raise ValueError(f"X must be rank-3 [B, n, d_in], got {tuple(X.shape)}")
         if patch_idx.ndim != 2:
@@ -152,12 +157,22 @@ class InputDistributionEncodingModule(nn.Module):
         B_idx, p = patch_idx.shape
         if B_idx != B:
             raise ValueError(f"patch_idx batch ({B_idx}) must match X batch ({B})")
+        mask_bool: torch.Tensor | None = None
+        if sample_mask is not None:
+            if sample_mask.ndim != 2:
+                raise ValueError(f"sample_mask must be rank-2 [B, n], got {tuple(sample_mask.shape)}")
+            if tuple(sample_mask.shape) != (B, n):
+                raise ValueError(f"sample_mask shape must be {(B, n)}, got {tuple(sample_mask.shape)}")
+            mask_bool = sample_mask.to(device=X.device, dtype=torch.bool)
 
         idx = patch_idx.to(dtype=torch.long, device=X.device).clamp(min=0, max=max(0, d_in - 1))
         X_I = X.gather(dim=2, index=idx.unsqueeze(1).expand(-1, n, -1))
 
         X_q = X_I.to(torch.float32)
-        q_raw = _quantile_over_samples(X_q, self.quantile_probs.to(X_q.device))
+        if mask_bool is None:
+            q_raw = _quantile_over_samples(X_q, self.quantile_probs.to(X_q.device))
+        else:
+            q_raw = _masked_quantile_over_samples(X_q, self.quantile_probs.to(X_q.device), mask_bool)
         q = q_raw.permute(1, 0, 2).contiguous()
 
         q_first = q[:, 0:1, :]
@@ -169,8 +184,16 @@ class InputDistributionEncodingModule(nn.Module):
         q = torch.where(q_idx == 0, q.new_full((), -1.0), q)
         q = torch.where(q_idx == q.shape[1] - 1, q.new_full((), 1.0), q)
 
-        mu = X_q.mean(dim=1)
-        sigma = X_q.std(dim=1, unbiased=False)
+        if mask_bool is None:
+            mu = X_q.mean(dim=1)
+            sigma = X_q.std(dim=1, unbiased=False)
+            valid_counts = None
+        else:
+            mask_float = mask_bool.to(dtype=X_q.dtype).unsqueeze(-1)
+            valid_counts = mask_float.sum(dim=1).clamp_min(1.0)
+            mu = (X_q * mask_float).sum(dim=1) / valid_counts
+            var = ((X_q - mu.unsqueeze(1)).pow(2) * mask_float).sum(dim=1) / valid_counts
+            sigma = torch.sqrt(var.clamp_min(0.0))
         eps = 1e-6
         mu_log = torch.sign(mu) * torch.log1p(mu.abs())
         sigma_log = torch.log(sigma + eps)
@@ -191,11 +214,18 @@ class InputDistributionEncodingModule(nn.Module):
                     f"but cov_encoder expects {cov_in_features}. "
                     "Set distribution.patch_size_for_cov to match model.patch_size."
                 )
-            X_I_centered = X_I - X_I.mean(dim=1, keepdim=True)
+            if mask_bool is None:
+                X_I_centered = X_I - X_I.mean(dim=1, keepdim=True)
+                cov_denom = X_I.new_full((B, 1, 1), float(max(1, n - 1)))
+            else:
+                assert valid_counts is not None
+                mask_float_cov = mask_bool.to(dtype=X_I.dtype).unsqueeze(-1)
+                X_I_centered = (X_I - mu.unsqueeze(1)) * mask_float_cov
+                cov_denom = (valid_counts - 1.0).clamp_min(1.0).unsqueeze(-1)
             cov = torch.bmm(
                 X_I_centered.transpose(1, 2).to(torch.float32),
                 X_I_centered.to(torch.float32),
-            ) / max(1, n - 1)
+            ) / cov_denom.to(torch.float32)
             tri_idx = torch.triu_indices(p, p, device=cov.device)
             cov_upper = cov[:, tri_idx[0], tri_idx[1]]
             cov_upper = torch.sign(cov_upper) * torch.log1p(cov_upper.abs())
