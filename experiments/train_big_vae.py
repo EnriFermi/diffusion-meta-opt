@@ -242,6 +242,71 @@ def _configure_run_artifacts(cfg: DictConfig) -> dict[str, str]:
     return runtime_configure_per_run_artifacts(cfg, run_label="train_big_vae")
 
 
+def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
+    train_cfg = cfg.get("train", {})
+    model_cfg = cfg.get("model", {})
+    big_cfg = model_cfg.get("big_vae", {})
+    streaming_cfg = cfg.get("streaming", {})
+    collector_cfg = cfg.get("collector", {})
+    batch_source_mixing_cfg = train_cfg.get("batch_source_mixing", {})
+    if batch_source_mixing_cfg is None:
+        batch_source_mixing_cfg = {}
+    if not isinstance(batch_source_mixing_cfg, (dict, DictConfig)):
+        batch_source_mixing_cfg = {}
+    raw_max_source_samples = batch_source_mixing_cfg.get("max_source_samples", 0)
+    if raw_max_source_samples is None:
+        parsed_max_source_samples = 0
+    elif isinstance(raw_max_source_samples, str) and raw_max_source_samples.strip().lower() in {"", "none", "null"}:
+        parsed_max_source_samples = 0
+    else:
+        parsed_max_source_samples = int(raw_max_source_samples)
+
+    tracking_params: dict[str, Any] = {
+        "train.max_steps": int(train_cfg.get("max_steps", 0)),
+        "train.lr": float(train_cfg.get("lr", 0.0)),
+        "train.grad_accum_steps": int(train_cfg.get("grad_accum_steps", 1)),
+        "train.kl_beta": float(train_cfg.get("kl_beta", 0.0)),
+        "train.kl_schedule.enabled": bool(train_cfg.get("kl_schedule", {}).get("enabled", False)),
+        "train.kl_schedule.start_beta": float(train_cfg.get("kl_schedule", {}).get("start_beta", 0.0)),
+        "train.kl_schedule.warmup_steps": int(train_cfg.get("kl_schedule", {}).get("warmup_steps", 0)),
+        "train.kl_schedule.ramp_steps": int(train_cfg.get("kl_schedule", {}).get("ramp_steps", 0)),
+        "train.behavioral_coef": float(train_cfg.get("behavioral_coef", 0.0)),
+        "train.structural_coef": float(train_cfg.get("structural_coef", 0.0)),
+        "train.slice_batch_size": int(train_cfg.get("slice_batch_size", 1)),
+        "train.steps_per_sample": int(train_cfg.get("steps_per_sample", 1)),
+        "train.batch_source_mixing.enabled": bool(batch_source_mixing_cfg.get("enabled", False)),
+        "train.batch_source_mixing.strategy": str(batch_source_mixing_cfg.get("strategy", "round_robin")),
+        "train.batch_source_mixing.uniqueness": str(batch_source_mixing_cfg.get("uniqueness", "none")),
+        "train.batch_source_mixing.max_source_samples": int(parsed_max_source_samples),
+        "model.patch_size": int(model_cfg.get("patch_size", 16)),
+        "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
+        "model.big_vae.disable_distribution_encoder": bool(big_cfg.get("disable_distribution_encoder", False)),
+        "model.big_vae.patch_tokenizer_kind": str(big_cfg.get("patch_tokenizer_kind", "residual")),
+        "model.big_vae.distribution_encoder_conditioning_kind": str(
+            big_cfg.get("distribution_encoder_conditioning_kind", "legacy")
+        ),
+        "streaming.mode": str(streaming_cfg.get("mode", "none")),
+        "collector.mode": str(collector_cfg.get("mode", "auto")),
+        "collector.device": str(collector_cfg.get("device", "")),
+        "collector.jobs_per_selected_model": int(collector_cfg.get("jobs_per_selected_model", 0)),
+        "train.device": str(train_cfg.get("device", "")),
+    }
+    resume_state_cfg = train_cfg.get("resume_state", {})
+    if isinstance(resume_state_cfg, (dict, DictConfig)):
+        tracking_params["train.resume_state.enabled"] = bool(resume_state_cfg.get("enabled", False))
+        tracking_params["train.resume_state.auto_resume"] = bool(resume_state_cfg.get("auto_resume", True))
+        tracking_params["train.resume_state.save_every"] = int(
+            resume_state_cfg.get("save_every", train_cfg.get("checkpoint_every", 0))
+        )
+    clip_by_part_cfg = train_cfg.get("grad_clip_norm_by_part", {})
+    if isinstance(clip_by_part_cfg, (dict, DictConfig)):
+        for group_name in _grad_stat_group_prefixes():
+            if group_name not in clip_by_part_cfg:
+                continue
+            tracking_params[f"train.grad_clip_norm_by_part.{group_name}"] = float(clip_by_part_cfg[group_name])
+    return tracking_params
+
+
 class CometTracker:
     def __init__(self, cfg: DictConfig, logger: logging.Logger, rank: int) -> None:
         self.logger = logger
@@ -278,11 +343,7 @@ class CometTracker:
         log_code = bool(comet_cfg.get("log_code", False))
 
         try:
-            train_cfg = cfg.get("train", {})
-            model_cfg = cfg.get("model", {})
-            big_cfg = model_cfg.get("big_vae", {})
-            streaming_cfg = cfg.get("streaming", {})
-            collector_cfg = cfg.get("collector", {})
+            tracking_params = _build_external_tracking_params(cfg)
             if api_key:
                 exp = Experiment(
                     api_key=api_key,
@@ -308,43 +369,7 @@ class CometTracker:
                 for tag in tags:
                     exp.add_tag(str(tag))
 
-            comet_params: dict[str, Any] = {
-                "train.max_steps": int(train_cfg.get("max_steps", 0)),
-                "train.lr": float(train_cfg.get("lr", 0.0)),
-                "train.grad_accum_steps": int(train_cfg.get("grad_accum_steps", 1)),
-                "train.kl_beta": float(train_cfg.get("kl_beta", 0.0)),
-                "train.kl_schedule.enabled": bool(train_cfg.get("kl_schedule", {}).get("enabled", False)),
-                "train.kl_schedule.start_beta": float(train_cfg.get("kl_schedule", {}).get("start_beta", 0.0)),
-                "train.kl_schedule.warmup_steps": int(train_cfg.get("kl_schedule", {}).get("warmup_steps", 0)),
-                "train.kl_schedule.ramp_steps": int(train_cfg.get("kl_schedule", {}).get("ramp_steps", 0)),
-                "train.behavioral_coef": float(train_cfg.get("behavioral_coef", 0.0)),
-                "train.structural_coef": float(train_cfg.get("structural_coef", 0.0)),
-                "model.patch_size": int(model_cfg.get("patch_size", 16)),
-                "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
-                "model.big_vae.disable_distribution_encoder": bool(big_cfg.get("disable_distribution_encoder", False)),
-                "model.big_vae.patch_tokenizer_kind": str(big_cfg.get("patch_tokenizer_kind", "residual")),
-                "model.big_vae.distribution_encoder_conditioning_kind": str(
-                    big_cfg.get("distribution_encoder_conditioning_kind", "legacy")
-                ),
-                "streaming.mode": str(streaming_cfg.get("mode", "none")),
-                "collector.mode": str(collector_cfg.get("mode", "auto")),
-                "collector.device": str(collector_cfg.get("device", "")),
-                "train.device": str(train_cfg.get("device", "")),
-            }
-            resume_state_cfg = train_cfg.get("resume_state", {})
-            if isinstance(resume_state_cfg, (dict, DictConfig)):
-                comet_params["train.resume_state.enabled"] = bool(resume_state_cfg.get("enabled", False))
-                comet_params["train.resume_state.auto_resume"] = bool(resume_state_cfg.get("auto_resume", True))
-                comet_params["train.resume_state.save_every"] = int(
-                    resume_state_cfg.get("save_every", train_cfg.get("checkpoint_every", 0))
-                )
-            clip_by_part_cfg = train_cfg.get("grad_clip_norm_by_part", {})
-            if isinstance(clip_by_part_cfg, (dict, DictConfig)):
-                for group_name in _grad_stat_group_prefixes():
-                    if group_name not in clip_by_part_cfg:
-                        continue
-                    comet_params[f"train.grad_clip_norm_by_part.{group_name}"] = float(clip_by_part_cfg[group_name])
-            exp.log_parameters(comet_params)
+            exp.log_parameters(tracking_params)
 
             self.experiment = exp
             self.enabled = True
@@ -353,6 +378,14 @@ class CometTracker:
             self.logger.warning("Failed to initialize Comet tracker: %s", exc)
             self.experiment = None
             self.enabled = False
+
+    def log_parameters(self, params: dict[str, Any]) -> None:
+        if self.experiment is None:
+            return
+        try:
+            self.experiment.log_parameters(params)
+        except Exception as exc:
+            self.logger.warning("Comet parameter log failed: %s", exc)
 
     def log_metrics(self, metrics: dict[str, float], step: int) -> None:
         if self.experiment is None:
@@ -367,6 +400,96 @@ class CometTracker:
             return
         try:
             self.experiment.end()
+        except Exception:
+            pass
+
+
+class WandbTracker:
+    def __init__(self, cfg: DictConfig, logger: logging.Logger, rank: int) -> None:
+        self.logger = logger
+        self.rank = rank
+        self.run: Any | None = None
+        self.enabled = False
+
+        telemetry_cfg = cfg.train.get("telemetry", {})
+        wandb_cfg = telemetry_cfg.get("wandb", {})
+        if not bool(wandb_cfg.get("enabled", False)):
+            return
+        if rank != 0:
+            return
+
+        try:
+            import wandb  # type: ignore
+        except Exception as exc:
+            self.logger.warning("W&B is enabled but wandb is unavailable: %s", exc)
+            return
+
+        project_name = str(wandb_cfg.get("project_name", "big_weight_vae")).strip() or "big_weight_vae"
+        entity = str(wandb_cfg.get("entity", "")).strip()
+        run_name = str(wandb_cfg.get("run_name", "")).strip()
+        run_mode = str(wandb_cfg.get("mode", "offline")).strip().lower() or "offline"
+        run_dir = str(wandb_cfg.get("dir", "")).strip()
+        log_code = bool(wandb_cfg.get("log_code", False))
+        if run_mode not in {"online", "offline", "disabled"}:
+            raise ValueError(f"train.telemetry.wandb.mode must be one of {{'online','offline','disabled'}}, got {run_mode!r}")
+
+        tags_raw = wandb_cfg.get("tags", [])
+        tags: list[str] = []
+        if isinstance(tags_raw, (list, tuple, ListConfig)):
+            tags = [str(tag) for tag in tags_raw]
+
+        try:
+            tracking_params = _build_external_tracking_params(cfg)
+            run = wandb.init(
+                project=project_name,
+                entity=entity or None,
+                name=run_name or None,
+                mode=run_mode,
+                dir=run_dir or None,
+                config=tracking_params,
+                tags=tags or None,
+            )
+            if run is None:
+                return
+            if log_code:
+                try:
+                    run.log_code(".")
+                except Exception as exc:
+                    self.logger.warning("W&B code log failed: %s", exc)
+            self.run = run
+            self.enabled = True
+            self.logger.info(
+                "W&B tracking enabled: project=%s entity=%s mode=%s",
+                project_name,
+                entity or "<default>",
+                run_mode,
+            )
+        except Exception as exc:
+            self.logger.warning("Failed to initialize W&B tracker: %s", exc)
+            self.run = None
+            self.enabled = False
+
+    def log_parameters(self, params: dict[str, Any]) -> None:
+        if self.run is None:
+            return
+        try:
+            self.run.config.update(params, allow_val_change=True)
+        except Exception as exc:
+            self.logger.warning("W&B parameter log failed: %s", exc)
+
+    def log_metrics(self, metrics: dict[str, float], step: int) -> None:
+        if self.run is None:
+            return
+        try:
+            self.run.log(metrics, step=int(step))
+        except Exception as exc:
+            self.logger.warning("W&B metrics log failed at step=%s: %s", step, exc)
+
+    def end(self) -> None:
+        if self.run is None:
+            return
+        try:
+            self.run.finish()
         except Exception:
             pass
 
@@ -1399,6 +1522,79 @@ def _round_robin_source_indices(num_sources: int, batch_size: int, start_offset:
     return [int((start + batch_idx) % num_sources) for batch_idx in range(batch_size)]
 
 
+def _compute_batch_source_diversity_stats(
+    source_samples: Sequence[SourceSampleRecord] | None,
+    *,
+    batch_size: int,
+    start_offset: int = 0,
+) -> dict[str, float]:
+    stats: dict[str, float] = {
+        "source_pool_size": 0.0,
+        "source_pool_unique_named_models": 0.0,
+        "source_pool_missing_model_names": 0.0,
+        "batch_sources_used": 0.0,
+        "batch_unique_models": 0.0,
+        "batch_unique_named_models": 0.0,
+        "batch_missing_model_sources": 0.0,
+        "batch_model_entropy": 0.0,
+        "batch_model_perplexity": 0.0,
+    }
+    if not source_samples:
+        return stats
+
+    pool_named_models = {
+        str(record.model_name).strip()
+        for record in source_samples
+        if str(record.model_name).strip()
+    }
+    pool_missing_model_names = sum(
+        1
+        for record in source_samples
+        if not str(record.model_name).strip()
+    )
+    stats["source_pool_size"] = float(len(source_samples))
+    stats["source_pool_unique_named_models"] = float(len(pool_named_models))
+    stats["source_pool_missing_model_names"] = float(pool_missing_model_names)
+
+    assignment = _round_robin_source_indices(
+        num_sources=len(source_samples),
+        batch_size=batch_size,
+        start_offset=start_offset,
+    )
+    source_counts = [0] * len(source_samples)
+    for source_idx in assignment:
+        source_counts[source_idx] += 1
+
+    used_indices = [source_idx for source_idx, count in enumerate(source_counts) if count > 0]
+    batch_named_models: set[str] = set()
+    batch_missing_model_sources = 0
+    effective_model_counts: dict[str, int] = {}
+    for source_idx in used_indices:
+        model_name = str(source_samples[source_idx].model_name).strip()
+        if model_name:
+            batch_named_models.add(model_name)
+            label = model_name
+        else:
+            batch_missing_model_sources += 1
+            label = f"__unknown_source_{source_idx}"
+        effective_model_counts[label] = effective_model_counts.get(label, 0) + int(source_counts[source_idx])
+
+    entropy = 0.0
+    total_items = sum(effective_model_counts.values())
+    if total_items > 0:
+        for count in effective_model_counts.values():
+            prob = float(count) / float(total_items)
+            entropy -= prob * math.log(max(prob, 1e-12))
+
+    stats["batch_sources_used"] = float(len(used_indices))
+    stats["batch_unique_models"] = float(len(effective_model_counts))
+    stats["batch_unique_named_models"] = float(len(batch_named_models))
+    stats["batch_missing_model_sources"] = float(batch_missing_model_sources)
+    stats["batch_model_entropy"] = float(entropy)
+    stats["batch_model_perplexity"] = float(math.exp(entropy)) if total_items > 0 else 0.0
+    return stats
+
+
 def _pad_x_rows_with_mask(x: torch.Tensor, target_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
     if target_rows <= 0:
         raise ValueError(f"target_rows must be > 0, got {target_rows}")
@@ -1840,6 +2036,7 @@ def _run_worker(
     scheduler = None
     scaler = None
     comet_tracker: CometTracker | None = None
+    wandb_tracker: WandbTracker | None = None
 
     failed = False
     try:
@@ -1907,17 +2104,16 @@ def _run_worker(
             optimizer = _build_optimizer(model=model, cfg=cfg, device=device)
             scheduler = _build_scheduler(optimizer=optimizer, cfg=cfg)
             comet_tracker = CometTracker(cfg=cfg, logger=logger, rank=rank)
-            if rank == 0 and comet_tracker is not None and comet_tracker.experiment is not None:
-                try:
-                    comet_tracker.experiment.log_parameters(
-                        {
-                            "model.param_count.total": int(total_params),
-                            "model.param_count.trainable": int(trainable_params),
-                            "model.param_count.frozen": int(frozen_params),
-                        }
-                    )
-                except Exception as exc:
-                    logger.warning("Comet parameter-count log failed: %s", exc)
+            wandb_tracker = WandbTracker(cfg=cfg, logger=logger, rank=rank)
+            param_count_payload = {
+                "model.param_count.total": int(total_params),
+                "model.param_count.trainable": int(trainable_params),
+                "model.param_count.frozen": int(frozen_params),
+            }
+            if comet_tracker is not None and comet_tracker.enabled:
+                comet_tracker.log_parameters(param_count_payload)
+            if wandb_tracker is not None and wandb_tracker.enabled:
+                wandb_tracker.log_parameters(param_count_payload)
 
             stage_num = max(1, int(cfg.train.get("stage", 1)))
             checkpoint_every = max(1, int(cfg.train.get("checkpoint_every", 200)))
@@ -2206,6 +2402,13 @@ def _run_worker(
             struct_scale_window = 0.0
             struct_rec_window = 0.0
             struct_rel_window = 0.0
+            source_diversity_window_unique_models_sum = 0.0
+            source_diversity_window_unique_models_min = math.inf
+            source_diversity_window_unique_models_max = 0.0
+            source_diversity_window_target_coverage_sum = 0.0
+            source_diversity_window_model_perplexity_sum = 0.0
+            source_diversity_window_shortfall_steps = 0
+            source_diversity_latest: dict[str, float] | None = None
             window_steps = 0
             t0 = time.time()
             grad_layer_history: dict[str, list[tuple[int, float]]] = {}
@@ -2229,6 +2432,7 @@ def _run_worker(
             fixed_batch_x: torch.Tensor | None = None
             fixed_batch_W: torch.Tensor | None = None
             fixed_batch_x_mask: torch.Tensor | None = None
+            fixed_batch_diversity_stats: dict[str, float] | None = None
             direction_pre_norm_stats_latest: dict[str, Any] | None = None
             source_mixing_shortfall_logged = False
 
@@ -2343,6 +2547,8 @@ def _run_worker(
                 struct_scale_acc = 0.0
                 struct_rec_acc = 0.0
                 struct_rel_acc = 0.0
+                step_source_diversity_sum: dict[str, float] = {}
+                step_source_diversity_micro_count = 0
                 step_is_finite = True
                 step_invalid_reason: str | None = None
 
@@ -2353,6 +2559,11 @@ def _run_worker(
                         if fixed_batch_x is None or fixed_batch_W is None or fixed_batch_x_mask is None:
                             if not current_source_samples:
                                 raise RuntimeError("fixed training batch capture requires a loaded source sample")
+                            fixed_batch_diversity_stats = _compute_batch_source_diversity_stats(
+                                current_source_samples,
+                                batch_size=slice_batch_size,
+                                start_offset=current_source_round_robin_offset,
+                            )
                             fixed_batch_W, fixed_batch_x, fixed_batch_x_mask = _build_training_batch_from_source_samples(
                                 current_source_samples,
                                 max_T_patches=curriculum_max_T,
@@ -2393,10 +2604,18 @@ def _run_worker(
                                 collector.shutdown()
                                 collector = None
                             dataset_iter = None
+                        if fixed_batch_diversity_stats is None:
+                            raise RuntimeError("fixed training batch requires cached diversity stats")
+                        current_batch_source_diversity = dict(fixed_batch_diversity_stats)
                         W_s, x_s, x_mask_s = fixed_batch_W, fixed_batch_x, fixed_batch_x_mask
                     else:
                         if not current_source_samples:
                             raise RuntimeError("training step requires a loaded source sample")
+                        current_batch_source_diversity = _compute_batch_source_diversity_stats(
+                            current_source_samples,
+                            batch_size=slice_batch_size,
+                            start_offset=current_source_round_robin_offset,
+                        )
                         W_s, x_s, x_mask_s = _build_training_batch_from_source_samples(
                             current_source_samples,
                             max_T_patches=curriculum_max_T,
@@ -2411,6 +2630,18 @@ def _run_worker(
                         current_source_round_robin_offset = (
                             current_source_round_robin_offset + slice_batch_size
                         ) % len(current_source_samples)
+                    current_batch_source_diversity["target_models"] = float(max(1, requested_source_samples_per_refresh))
+                    current_batch_source_diversity["batch_model_target_coverage"] = (
+                        current_batch_source_diversity["batch_unique_models"]
+                        / max(1.0, current_batch_source_diversity["target_models"])
+                    )
+                    current_batch_source_diversity["batch_model_shortfall"] = max(
+                        0.0,
+                        current_batch_source_diversity["target_models"] - current_batch_source_diversity["batch_unique_models"],
+                    )
+                    step_source_diversity_micro_count += 1
+                    for key, value in current_batch_source_diversity.items():
+                        step_source_diversity_sum[key] = step_source_diversity_sum.get(key, 0.0) + float(value)
 
                     no_sync_ctx = contextlib.nullcontext()
                     if is_distributed and not sync_grad:
@@ -2856,6 +3087,29 @@ def _run_worker(
                 struct_scale_window += float(stats[5].item())
                 struct_rec_window += float(stats[6].item())
                 struct_rel_window += float(stats[7].item())
+                if step_source_diversity_micro_count > 0:
+                    step_source_diversity_stats = {
+                        key: float(value) / float(step_source_diversity_micro_count)
+                        for key, value in step_source_diversity_sum.items()
+                    }
+                    source_diversity_latest = step_source_diversity_stats
+                    source_diversity_window_unique_models_sum += float(step_source_diversity_stats.get("batch_unique_models", 0.0))
+                    source_diversity_window_unique_models_min = min(
+                        source_diversity_window_unique_models_min,
+                        float(step_source_diversity_stats.get("batch_unique_models", 0.0)),
+                    )
+                    source_diversity_window_unique_models_max = max(
+                        source_diversity_window_unique_models_max,
+                        float(step_source_diversity_stats.get("batch_unique_models", 0.0)),
+                    )
+                    source_diversity_window_target_coverage_sum += float(
+                        step_source_diversity_stats.get("batch_model_target_coverage", 0.0)
+                    )
+                    source_diversity_window_model_perplexity_sum += float(
+                        step_source_diversity_stats.get("batch_model_perplexity", 0.0)
+                    )
+                    if float(step_source_diversity_stats.get("batch_model_shortfall", 0.0)) > 0.0:
+                        source_diversity_window_shortfall_steps += 1
                 window_steps += 1
 
                 if rank == 0 and global_step % log_every == 0:
@@ -2870,6 +3124,15 @@ def _run_worker(
                     avg_struct_rel = struct_rel_window / max(1, window_steps)
                     lr = float(optimizer.param_groups[0]["lr"])
                     speed = window_steps / dt
+                    diversity_unique_mean = source_diversity_window_unique_models_sum / max(1, window_steps)
+                    diversity_unique_min = (
+                        source_diversity_window_unique_models_min
+                        if source_diversity_window_unique_models_min != math.inf
+                        else 0.0
+                    )
+                    diversity_unique_max = source_diversity_window_unique_models_max
+                    diversity_target_coverage_mean = source_diversity_window_target_coverage_sum / max(1, window_steps)
+                    diversity_model_perplexity_mean = source_diversity_window_model_perplexity_sum / max(1, window_steps)
 
                     cache_metric = dataset.cache_size() if dataset is not None else 0
                     encoder_alpha_values = _get_encoder_conditioning_alpha_values(model)
@@ -2926,6 +3189,25 @@ def _run_worker(
                             float(patch_latent_variance_stats["min"]),
                             float(patch_latent_variance_stats["max"]),
                         )
+                    if source_diversity_latest is not None:
+                        logger.info(
+                            "batch_diversity step=%s target=%.0f pool=%.2f latest_unique_models=%.2f "
+                            "latest_sources_used=%.2f latest_coverage=%.3f latest_perplexity=%.3f "
+                            "window_unique_models=%.2f[min=%.2f max=%.2f] window_coverage=%.3f shortfall_steps=%s/%s",
+                            global_step,
+                            float(source_diversity_latest.get("target_models", 0.0)),
+                            float(source_diversity_latest.get("source_pool_size", 0.0)),
+                            float(source_diversity_latest.get("batch_unique_models", 0.0)),
+                            float(source_diversity_latest.get("batch_sources_used", 0.0)),
+                            float(source_diversity_latest.get("batch_model_target_coverage", 0.0)),
+                            float(source_diversity_latest.get("batch_model_perplexity", 0.0)),
+                            diversity_unique_mean,
+                            diversity_unique_min,
+                            diversity_unique_max,
+                            diversity_target_coverage_mean,
+                            source_diversity_window_shortfall_steps,
+                            window_steps,
+                        )
                     if fixed_training_batch_enabled and direction_pre_norm_stats_latest is not None:
                         logger.info(
                             "direction_pre_norm step=%s mean=%.6f std=%.6f min=%.6f max=%.6f "
@@ -2940,7 +3222,10 @@ def _run_worker(
                             int(direction_pre_norm_stats_latest.get("nan_count", 0)),
                             int(direction_pre_norm_stats_latest.get("inf_count", 0)),
                         )
-                    if comet_tracker is not None and comet_tracker.enabled:
+                    if (
+                        (comet_tracker is not None and comet_tracker.enabled)
+                        or (wandb_tracker is not None and wandb_tracker.enabled)
+                    ):
                         comet_metrics: dict[str, float] = {
                             "train/loss": float(avg_loss),
                             "train/behavioral_loss": float(avg_behavioral),
@@ -3014,6 +3299,61 @@ def _run_worker(
                             comet_metrics["patch_latent_variance/std"] = float(patch_latent_variance_stats["std"])
                             comet_metrics["patch_latent_variance/min"] = float(patch_latent_variance_stats["min"])
                             comet_metrics["patch_latent_variance/max"] = float(patch_latent_variance_stats["max"])
+                        if source_diversity_latest is not None:
+                            comet_metrics["data/source_diversity/target_models"] = float(
+                                source_diversity_latest.get("target_models", 0.0)
+                            )
+                            comet_metrics["data/source_diversity/latest_pool_size"] = float(
+                                source_diversity_latest.get("source_pool_size", 0.0)
+                            )
+                            comet_metrics["data/source_diversity/latest_pool_unique_named_models"] = float(
+                                source_diversity_latest.get("source_pool_unique_named_models", 0.0)
+                            )
+                            comet_metrics["data/source_diversity/latest_pool_missing_model_names"] = float(
+                                source_diversity_latest.get("source_pool_missing_model_names", 0.0)
+                            )
+                            comet_metrics["data/source_diversity/latest_batch_sources_used"] = float(
+                                source_diversity_latest.get("batch_sources_used", 0.0)
+                            )
+                            comet_metrics["data/source_diversity/latest_batch_unique_models"] = float(
+                                source_diversity_latest.get("batch_unique_models", 0.0)
+                            )
+                            comet_metrics["data/source_diversity/latest_batch_unique_named_models"] = float(
+                                source_diversity_latest.get("batch_unique_named_models", 0.0)
+                            )
+                            comet_metrics["data/source_diversity/latest_batch_missing_model_sources"] = float(
+                                source_diversity_latest.get("batch_missing_model_sources", 0.0)
+                            )
+                            comet_metrics["data/source_diversity/latest_batch_model_entropy"] = float(
+                                source_diversity_latest.get("batch_model_entropy", 0.0)
+                            )
+                            comet_metrics["data/source_diversity/latest_batch_model_perplexity"] = float(
+                                source_diversity_latest.get("batch_model_perplexity", 0.0)
+                            )
+                            comet_metrics["data/source_diversity/latest_target_coverage"] = float(
+                                source_diversity_latest.get("batch_model_target_coverage", 0.0)
+                            )
+                            comet_metrics["data/source_diversity/latest_model_shortfall"] = float(
+                                source_diversity_latest.get("batch_model_shortfall", 0.0)
+                            )
+                            comet_metrics["data/source_diversity/window_batch_unique_models_mean"] = float(
+                                diversity_unique_mean
+                            )
+                            comet_metrics["data/source_diversity/window_batch_unique_models_min"] = float(
+                                diversity_unique_min
+                            )
+                            comet_metrics["data/source_diversity/window_batch_unique_models_max"] = float(
+                                diversity_unique_max
+                            )
+                            comet_metrics["data/source_diversity/window_target_coverage_mean"] = float(
+                                diversity_target_coverage_mean
+                            )
+                            comet_metrics["data/source_diversity/window_model_perplexity_mean"] = float(
+                                diversity_model_perplexity_mean
+                            )
+                            comet_metrics["data/source_diversity/window_shortfall_steps"] = float(
+                                source_diversity_window_shortfall_steps
+                            )
                         if partwise_grad_clip_enabled:
                             for group_name in grad_group_prefixes:
                                 comet_metrics[f"grad/{group_name}_global_norm_before_clip"] = float(
@@ -3057,7 +3397,10 @@ def _run_worker(
                             comet_metrics["gpu/max_memory_allocated_mb"] = float(
                                 torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0)
                             )
-                        comet_tracker.log_metrics(comet_metrics, step=global_step)
+                        if comet_tracker is not None and comet_tracker.enabled:
+                            comet_tracker.log_metrics(comet_metrics, step=global_step)
+                        if wandb_tracker is not None and wandb_tracker.enabled:
+                            wandb_tracker.log_metrics(comet_metrics, step=global_step)
                     if collector is not None and (global_step % log_worker_status_every == 0):
                         try:
                             collector_status = _build_collector_status_snapshot(collector)
@@ -3077,6 +3420,12 @@ def _run_worker(
                     struct_scale_window = 0.0
                     struct_rec_window = 0.0
                     struct_rel_window = 0.0
+                    source_diversity_window_unique_models_sum = 0.0
+                    source_diversity_window_unique_models_min = math.inf
+                    source_diversity_window_unique_models_max = 0.0
+                    source_diversity_window_target_coverage_sum = 0.0
+                    source_diversity_window_model_perplexity_sum = 0.0
+                    source_diversity_window_shortfall_steps = 0
                     window_steps = 0
                     t0 = time.time()
 
@@ -3164,6 +3513,8 @@ def _run_worker(
     finally:
         if comet_tracker is not None:
             comet_tracker.end()
+        if wandb_tracker is not None:
+            wandb_tracker.end()
         monitor_send_event(
             monitor_queue,
             {

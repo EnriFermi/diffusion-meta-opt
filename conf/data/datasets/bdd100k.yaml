@@ -16,7 +16,7 @@ hf:
   subset: null
   split: train
   streaming: true
-  stream_via_datasets_server: true
+  stream_via_datasets_server: false
   shuffle_buffer: 10000
   trust_remote_code: false
 

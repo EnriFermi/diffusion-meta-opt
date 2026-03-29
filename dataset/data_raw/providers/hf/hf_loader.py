@@ -57,8 +57,7 @@ def load_hf_dataset(cfg: Any, token: str | None, seed: int):
     if streaming and hasattr(dataset, "shuffle"):
         shuffle_buffer = int(hf_cfg.get("shuffle_buffer", 10_000))
         dataset = dataset.shuffle(seed=seed, buffer_size=shuffle_buffer)
-        if bool(hf_cfg.get("stream_via_datasets_server", False)):
-            dataset = _disable_streaming_image_decode(dataset=dataset, cfg=plain)
+        dataset = _disable_streaming_image_decode(dataset=dataset, cfg=plain)
         dataset = _project_streaming_columns(dataset=dataset, cfg=plain)
 
     return dataset

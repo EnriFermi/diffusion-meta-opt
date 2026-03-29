@@ -18,7 +18,7 @@ hf:
   streaming: true
   shuffle_buffer: 1000
   trust_remote_code: false
-  stream_via_datasets_server: true
+  stream_via_datasets_server: false
 
 schema:
   image_mode: image_field
