@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import time
 from typing import Any
 
 import requests
@@ -25,12 +26,18 @@ class DatasetServerSampler:
         timeout_s: float = 15.0,
         max_retries: int = 3,
         base_url: str = _DEFAULT_BASE_URL,
+        first_rows_cache_ttl_s: float = 300.0,
+        rows_retry_cooldown_s: float = 30.0,
+        rows_unstable_log_interval_s: float = 300.0,
     ) -> None:
         self.repo = str(repo)
         self.split = str(split)
         self.base_url = str(base_url).rstrip("/")
         self.timeout_s = float(timeout_s)
         self.max_retries = int(max_retries)
+        self.first_rows_cache_ttl_s = max(1.0, float(first_rows_cache_ttl_s))
+        self.rows_retry_cooldown_s = max(1.0, float(rows_retry_cooldown_s))
+        self.rows_unstable_log_interval_s = max(1.0, float(rows_unstable_log_interval_s))
 
         self._session = requests.Session()
         if token:
@@ -42,13 +49,17 @@ class DatasetServerSampler:
         rng = random.Random(seed)
         self._cursor = rng.randrange(self.num_examples) if self.num_examples and self.num_examples > 0 else 0
         self._step = _coprime_step(rng=rng, modulus=self.num_examples)
-        self._first_rows_cache = self._load_first_rows_cache()
+        self._first_rows_cache: list[tuple[dict[str, Any], str | int]] = []
+        self._first_rows_cache_loaded_at = 0.0
         self._first_rows_cursor = 0
-        self._force_first_rows = False
+        self._prefer_first_rows_until = 0.0
+        self._last_rows_unstable_log_at = 0.0
+        self._refresh_first_rows_cache(force=True)
 
     def next_record(self) -> tuple[dict[str, Any], str | int]:
-        if self._force_first_rows:
-            cached = self._next_from_first_rows_cache()
+        now = time.monotonic()
+        if now < self._prefer_first_rows_until:
+            cached = self._next_from_first_rows_cache(refresh_if_stale=True)
             if cached is not None:
                 return cached
 
@@ -79,16 +90,19 @@ class DatasetServerSampler:
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
 
-        cached = self._next_from_first_rows_cache()
+        cached = self._next_from_first_rows_cache(force_refresh=True)
         if cached is not None:
-            self._force_first_rows = True
-            LOGGER.warning(
-                "datasets-server /rows is unstable for repo=%s (split=%s, config=%s). "
-                "Falling back to /first-rows cache.",
-                self.repo,
-                self.split,
-                self.config,
-            )
+            self._prefer_first_rows_until = time.monotonic() + self.rows_retry_cooldown_s
+            if (time.monotonic() - self._last_rows_unstable_log_at) >= self.rows_unstable_log_interval_s:
+                LOGGER.warning(
+                    "datasets-server /rows is unstable for repo=%s (split=%s, config=%s). "
+                    "Temporarily falling back to refreshed /first-rows cache for %.1fs.",
+                    self.repo,
+                    self.split,
+                    self.config,
+                    self.rows_retry_cooldown_s,
+                )
+                self._last_rows_unstable_log_at = time.monotonic()
             return cached
 
         if last_error is not None:
@@ -194,7 +208,32 @@ class DatasetServerSampler:
             cache.append((row, sample_id))
         return cache
 
-    def _next_from_first_rows_cache(self) -> tuple[dict[str, Any], str | int] | None:
+    def _refresh_first_rows_cache(self, *, force: bool) -> None:
+        now = time.monotonic()
+        if (
+            (not force)
+            and self._first_rows_cache
+            and (now - self._first_rows_cache_loaded_at) < self.first_rows_cache_ttl_s
+        ):
+            return
+
+        cache = self._load_first_rows_cache()
+        if cache or not self._first_rows_cache:
+            self._first_rows_cache = cache
+            self._first_rows_cursor = 0
+        self._first_rows_cache_loaded_at = now
+
+    def _next_from_first_rows_cache(
+        self,
+        *,
+        refresh_if_stale: bool = False,
+        force_refresh: bool = False,
+    ) -> tuple[dict[str, Any], str | int] | None:
+        if force_refresh:
+            self._refresh_first_rows_cache(force=True)
+        elif refresh_if_stale:
+            self._refresh_first_rows_cache(force=False)
+
         if not self._first_rows_cache:
             return None
         item = self._first_rows_cache[self._first_rows_cursor % len(self._first_rows_cache)]

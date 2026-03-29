@@ -9,6 +9,7 @@ import signal
 import time
 import traceback
 from collections import deque
+from collections import Counter
 from pathlib import Path
 from queue import Empty, Full
 from typing import Any
@@ -596,14 +597,24 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
             attempts = 0
             max_attempts = max(chunk_size * 10, chunk_size + 32)
             chunk_started_at = time.monotonic()
+            materialize_none_reasons: Counter[str] = Counter()
+            materialize_exception_count = 0
+            record_fetch_exception_count = 0
+            record_none_count = 0
 
             while len(records) < chunk_size and not stop_event.is_set():
                 attempts += 1
                 if attempts > max_attempts:
                     logger.warning(
-                        "Stopping chunk fill early after %s attempts (%s records collected)",
+                        "Stopping chunk fill early after %s attempts (%s records collected; "
+                        "record_none=%s; record_fetch_exceptions=%s; materialize_exceptions=%s; "
+                        "materialize_none_reasons=%s)",
                         attempts,
                         len(records),
+                        record_none_count,
+                        record_fetch_exception_count,
+                        materialize_exception_count,
+                        dict(sorted(materialize_none_reasons.items())),
                     )
                     break
 
@@ -628,14 +639,16 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
                         dataset_server_sampler=dataset_server_sampler,
                     )
                 except Exception as exc:  # noqa: BLE001
+                    record_fetch_exception_count += 1
                     logger.warning("Record fetch failed for dataset=%s: %s", dataset_name, exc)
                     time.sleep(max(0.1, idle_sleep_s))
                     continue
                 if record is None:
+                    record_none_count += 1
                     continue
 
                 try:
-                    materialized = _materialize_image(
+                    materialized, materialize_reason = _materialize_image(
                         record=record,
                         sample_id=sample_id,
                         dataset_cfg=dataset_cfg,
@@ -645,6 +658,7 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
                         retries=max_retries,
                     )
                 except Exception as exc:  # noqa: BLE001
+                    materialize_exception_count += 1
                     logger.warning(
                         "Image materialization failed for dataset=%s sample_id=%s: %s",
                         dataset_name,
@@ -653,6 +667,7 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
                     )
                     continue
                 if materialized is None:
+                    materialize_none_reasons[str(materialize_reason or "unknown")] += 1
                     continue
 
                 image_path, item_meta = materialized
@@ -796,7 +811,7 @@ def _materialize_image(
     chunk_id: str,
     timeout: int,
     retries: int,
-) -> tuple[Path, dict[str, Any]] | None:
+) -> tuple[tuple[Path, dict[str, Any]] | None, str]:
     schema = dataset_cfg.get("schema", {})
     mode = str(schema.get("image_mode", "image_field"))
 
@@ -805,7 +820,7 @@ def _materialize_image(
     if mode == "image_field":
         field = _resolve_image_field(record, schema)
         if field is None:
-            return None
+            return None, "missing_image_field"
         image_value = record[field]
         image_path = _materialize_image_field_value(
             image_value=image_value,
@@ -815,10 +830,12 @@ def _materialize_image(
             timeout=timeout,
             retries=retries,
         )
+        if image_path is None:
+            return None, "image_field_decode_or_fetch_failed"
     elif mode == "url_field":
         url = _resolve_url(record, schema)
         if not url:
-            return None
+            return None, "missing_url"
         image_path = fetch_image_to_cache(
             url=url,
             cache=cache,
@@ -827,18 +844,20 @@ def _materialize_image(
             retries=retries,
             chunk_id=chunk_id,
         )
+        if image_path is None:
+            return None, "url_fetch_failed"
     else:
         raise ValueError(f"Unsupported schema.image_mode: {mode}")
 
     if image_path is None:
-        return None
+        return None, "unknown"
 
     item_meta: dict[str, Any] = {}
     for extra_key in schema.get("extra_fields", []):
         if extra_key in record:
             item_meta[extra_key] = _safe_meta_value(record[extra_key])
 
-    return image_path, item_meta
+    return (image_path, item_meta), "ok"
 
 
 def _materialize_image_field_value(
