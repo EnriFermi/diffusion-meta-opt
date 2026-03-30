@@ -20,8 +20,12 @@ collector:
   jobs_per_selected_model: 1
   parallel_inference_workers: 2
   parallel_model_pool_max_loaded_models: 1
-  atomizer_process_enabled: true
+  atomizer_process_enabled: false
   atomizer_queue_max_items: 256
+  in_memory_buffer:
+    capacity_samples: 256
+    fill_target_samples: 128
+    low_watermark_samples: 64
   layer_output_splitting:
     xy_samples_random_slice: 256
 

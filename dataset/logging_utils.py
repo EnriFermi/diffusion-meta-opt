@@ -13,6 +13,12 @@ DEFAULT_LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 LOG_PATH_ENV = "DATA_PIPELINE_LOG_FILE"
 
 
+def _safe_role_name(role: str) -> str:
+    raw = str(role).strip().replace("/", "__").replace(" ", "_")
+    cleaned = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in raw)
+    return cleaned or "unknown"
+
+
 def resolve_log_path(cfg: Any) -> Path:
     """Resolve final log file path from config (with env override for child processes)."""
     env_path = os.environ.get(LOG_PATH_ENV)
@@ -33,7 +39,28 @@ def resolve_log_path(cfg: Any) -> Path:
     return log_dir / file_name
 
 
-def configure_root_logging(cfg: Any, rank: int = 0, force: bool = True) -> Path:
+def resolve_process_log_path(cfg: Any, *, role: str, rank: int | None = None) -> Path:
+    plain = to_plain_dict(cfg)
+    training_artifacts_cfg = plain.get("training_artifacts", {})
+    if not isinstance(training_artifacts_cfg, dict):
+        training_artifacts_cfg = {}
+    logging_cfg = plain.get("logging", {})
+    if not isinstance(logging_cfg, dict):
+        logging_cfg = {}
+
+    logs_dir = training_artifacts_cfg.get("logs_dir", logging_cfg.get("dir", "logs"))
+    role_name = _safe_role_name(role)
+    rank_suffix = f"_rank{int(rank)}" if rank is not None else ""
+    return Path(str(logs_dir)) / f"{role_name}{rank_suffix}.log"
+
+
+def configure_root_logging(
+    cfg: Any,
+    rank: int = 0,
+    force: bool = True,
+    *,
+    log_path_override: str | Path | None = None,
+) -> Path:
     """Configure root logger with dual sink: console + file."""
     plain = to_plain_dict(cfg)
     data_cfg = plain.get("data", {})
@@ -50,7 +77,7 @@ def configure_root_logging(cfg: Any, rank: int = 0, force: bool = True) -> Path:
         level = max(level, logging.WARNING)
 
     fmt = str(logging_cfg.get("format", DEFAULT_LOG_FORMAT))
-    log_path = resolve_log_path(plain)
+    log_path = Path(log_path_override) if log_path_override is not None else resolve_log_path(plain)
 
     ensure_dir(log_path.parent)
     os.environ[LOG_PATH_ENV] = str(log_path)
@@ -65,3 +92,18 @@ def configure_root_logging(cfg: Any, rank: int = 0, force: bool = True) -> Path:
     logging.basicConfig(level=level, handlers=handlers, force=force)
     return log_path
 
+
+def configure_process_logging(
+    cfg: Any,
+    *,
+    role: str,
+    rank: int | None = None,
+    force: bool = True,
+) -> Path:
+    log_path = resolve_process_log_path(cfg, role=role, rank=rank)
+    return configure_root_logging(
+        cfg=cfg,
+        rank=0 if rank is None else int(rank),
+        force=force,
+        log_path_override=log_path,
+    )

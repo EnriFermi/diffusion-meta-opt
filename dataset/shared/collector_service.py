@@ -20,7 +20,7 @@ from typing import Any
 from omegaconf import DictConfig
 
 from dataset.data_raw.core.config import to_plain_dict
-from dataset.logging_utils import configure_root_logging
+from dataset.logging_utils import configure_process_logging
 from dataset.models.model_pool import ModelPool
 from dataset.shared.atomizer import atomize
 from dataset.shared.cache import SharedSampleCache
@@ -1559,7 +1559,14 @@ class CollectorService:
         self._atomizer_stop_event = self._ctx.Event()
         self._atomizer_process = self._ctx.Process(
             target=collector_atomizer_process_main,
-            args=(self.cache, self.atom_cfg, self._atomizer_task_queue, self._atomizer_stop_event, self._status_queue),
+            args=(
+                self.cfg_dict,
+                self.cache,
+                self.atom_cfg,
+                self._atomizer_task_queue,
+                self._atomizer_stop_event,
+                self._status_queue,
+            ),
             daemon=False,
             name="collector_atomizer",
         )
@@ -1961,7 +1968,7 @@ def collector_process_main(
             pass
 
         maybe_redirect_stdio(forensics_cfg_dict, role="collector_process", section="train")
-        log_path = configure_root_logging(cfg=cfg_dict, rank=0, force=True)
+        log_path = configure_process_logging(cfg=cfg_dict, role="collector_process", force=True)
         logger = logging.getLogger("collector_process")
         maybe_enable_core_dumps(forensics_cfg_dict, section="train", logger=logger)
         logger.info("Run log file: %s", log_path)
@@ -2008,13 +2015,16 @@ def collector_process_main(
 
 
 def collector_atomizer_process_main(
+    cfg_dict: dict[str, Any],
     cache: SharedSampleCache,
     atom_cfg: dict[str, Any],
     task_queue: Any,
     stop_event: Any,
     status_queue: Any | None = None,
 ) -> None:
+    log_path = configure_process_logging(cfg=cfg_dict, role="collector_atomizer", force=True)
     logger = logging.getLogger("collector_atomizer")
+    logger.info("Run log file: %s", log_path)
     try:
         try:
             faulthandler.enable(all_threads=True)

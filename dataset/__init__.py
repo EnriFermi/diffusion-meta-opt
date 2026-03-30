@@ -11,14 +11,14 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from dataset.data_raw.providers.hf.auth import init_hf_auth
-from dataset.logging_utils import configure_root_logging
+from dataset.logging_utils import configure_process_logging
 from dataset.models.registry import create_model
 from dataset.shared.collector_service import CollectorService
 from dataset.shared.shared_dataset import SharedModelDataset
 
 
 def setup_logging(cfg: DictConfig, rank: int = 0) -> Path:
-    log_path = configure_root_logging(cfg=cfg, rank=rank, force=True)
+    log_path = configure_process_logging(cfg=cfg, role="train", rank=rank, force=True)
     logging.getLogger("dataset.logging").info("Run log file: %s", log_path)
     return log_path
 

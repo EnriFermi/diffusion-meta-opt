@@ -23,7 +23,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 from dataset import data_pipeline, setup_logging
-from dataset.logging_utils import LOG_PATH_ENV, resolve_log_path
+from dataset.logging_utils import LOG_PATH_ENV, configure_process_logging, resolve_process_log_path
 from models.weight_quantile_vae import (
     BigVAEConfig,
     DistributionConfig,
@@ -4376,6 +4376,7 @@ def main(cfg: DictConfig) -> None:
     run_artifacts = _configure_run_artifacts(cfg)
     maybe_redirect_stdio(cfg, role="train_launcher", section="train")
     maybe_enable_core_dumps(cfg, section="train", logger=None)
+    launcher_log_path = configure_process_logging(cfg=cfg, role="train_launcher", force=True)
     print(
         f"[train_big_vae] run_id={run_artifacts.get('run_id')} artifacts_root={run_artifacts.get('root_dir')}",
         flush=True,
@@ -4393,7 +4394,8 @@ def main(cfg: DictConfig) -> None:
     )
     # Freeze one shared log path before spawning worker processes.
     if not os.environ.get(LOG_PATH_ENV):
-        os.environ[LOG_PATH_ENV] = str(resolve_log_path(cfg))
+        os.environ[LOG_PATH_ENV] = str(resolve_process_log_path(cfg, role="train_launcher"))
+    logging.getLogger("train.launcher").info("Run log file: %s", launcher_log_path)
 
     world_size = _resolve_world_size(cfg)
     print(f"[train_big_vae] resolved world_size={world_size}", flush=True)
