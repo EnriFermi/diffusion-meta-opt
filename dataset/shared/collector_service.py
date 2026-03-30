@@ -721,6 +721,7 @@ class CollectorService:
         self._jobs_total = 0
         self._jobs_by_model: Counter[str] = Counter()
         self._items_emitted = 0
+        self._failed_models: set[str] = set()
 
         self._ctx = mp.get_context("spawn")
         self._stop_event: Any | None = None
@@ -1003,6 +1004,7 @@ class CollectorService:
         if self.parallel_inference_workers > 1:
             assert self._parallel_executor is not None
             in_flight: set[Future[CollectorJobStats]] = set()
+            future_to_prepared: dict[Future[CollectorJobStats], _PreparedCollectorJob] = {}
             while not active_stop_event.is_set():
                 self._ensure_prepared_job_producer_alive()
                 submitted = False
@@ -1014,7 +1016,9 @@ class CollectorService:
                     prepared = self._dequeue_prepared_job(timeout_s=0.2 if not in_flight else 0.05)
                     if prepared is None:
                         break
-                    in_flight.add(self._parallel_executor.submit(self._execute_prepared_parallel_job, prepared))
+                    future = self._parallel_executor.submit(self._execute_prepared_parallel_job, prepared)
+                    in_flight.add(future)
+                    future_to_prepared[future] = prepared
                     submitted = True
 
                 if not in_flight:
@@ -1026,7 +1030,12 @@ class CollectorService:
                 done, pending = wait(in_flight, timeout=0.1, return_when=FIRST_COMPLETED)
                 in_flight = set(pending)
                 for future in done:
-                    stats = future.result()
+                    prepared = future_to_prepared.pop(future, None)
+                    try:
+                        stats = future.result()
+                    except Exception as exc:
+                        self._mark_model_failed(prepared.model_name if prepared is not None else None, exc)
+                        continue
                     self._record_completed_job(stats)
 
                 self._maybe_emit_status_event(event_type="heartbeat")
@@ -1034,7 +1043,12 @@ class CollectorService:
             if in_flight:
                 done, pending = wait(in_flight, timeout=30.0)
                 for future in done:
-                    stats = future.result()
+                    prepared = future_to_prepared.pop(future, None)
+                    try:
+                        stats = future.result()
+                    except Exception as exc:
+                        self._mark_model_failed(prepared.model_name if prepared is not None else None, exc)
+                        continue
                     self._record_completed_job(stats)
                 for future in pending:
                     future.cancel()
@@ -1136,7 +1150,7 @@ class CollectorService:
 
         started = time.time()
 
-        model_name = self._scheduler.next_model()
+        model_name = self._select_next_model_name()
         model_cfg = self.compat_index.get_model_cfg(model_name)
         batch_size = max(1, int(model_cfg.get("batch_size", 1)))
 
@@ -1688,7 +1702,7 @@ class CollectorService:
         assert self._raw_pool is not None
 
         started = time.time()
-        model_name = self._scheduler.next_model()
+        model_name = self._select_next_model_name()
         model_cfg = self.compat_index.get_model_cfg(model_name)
         batch_size = max(1, int(model_cfg.get("batch_size", 1)))
 
@@ -1799,6 +1813,45 @@ class CollectorService:
         self._emit_status_event(event_type="job", job_stats=stats)
         return stats
 
+    def _select_next_model_name(self) -> str:
+        assert self._scheduler is not None
+        all_models = self.compat_index.get_models()
+        if not all_models:
+            raise RuntimeError("collector has no compatible models to schedule")
+        if len(self._failed_models) >= len(all_models):
+            raise RuntimeError(
+                "collector exhausted all compatible models after runtime failures: "
+                f"{sorted(self._failed_models)}"
+            )
+        for _ in range(len(all_models) * 2):
+            model_name = self._scheduler.next_model()
+            if model_name not in self._failed_models:
+                return model_name
+        for model_name in all_models:
+            if model_name not in self._failed_models:
+                return model_name
+        raise RuntimeError(
+            "collector failed to select an active model after runtime failures: "
+            f"{sorted(self._failed_models)}"
+        )
+
+    def _mark_model_failed(self, model_name: str | None, exc: BaseException) -> None:
+        if model_name is None:
+            self.logger.exception("Collector job failed for unknown model", exc_info=exc)
+            return
+        first_failure = model_name not in self._failed_models
+        self._failed_models.add(model_name)
+        if first_failure:
+            self.logger.exception(
+                "Disabling collector model after runtime failure: model=%s error=%s",
+                model_name,
+                exc,
+                exc_info=exc,
+            )
+        else:
+            self.logger.warning("Collector model remains disabled after repeated failure: model=%s error=%s", model_name, exc)
+        self._emit_status_event(event_type="heartbeat", job_stats=None)
+
     def _maybe_emit_status_event(self, event_type: str) -> None:
         now = time.time()
         if now - self._last_status_emit_ts < self.status_emit_interval_s:
@@ -1823,6 +1876,7 @@ class CollectorService:
             "jobs_total": int(self._jobs_total),
             "jobs_by_model": {name: int(value) for name, value in self._jobs_by_model.items()},
             "items_emitted": int(self._items_emitted),
+            "failed_models": sorted(self._failed_models),
             "scheduler": self._scheduler.stats() if self._scheduler else None,
             "sink": self._sink.stats() if self._sink else None,
             "events_dropped": int(self._async_events_dropped),
