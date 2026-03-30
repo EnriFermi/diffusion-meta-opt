@@ -23,7 +23,7 @@ from dataset.data_raw.core.types import ImageSample
 from dataset.data_raw.providers.hf.auth import init_hf_auth
 from dataset.data_raw.providers.hf.datasets_server_sampler import DatasetServerSampler
 from dataset.data_raw.providers.hf.hf_loader import load_hf_dataset
-from dataset.data_raw.providers.hf.url_fetch import fetch_image_to_cache
+from dataset.data_raw.providers.hf.url_fetch import fetch_image_to_cache, fetch_image_to_memory
 from dataset.logging_utils import configure_root_logging
 from training.forensics import emit_fatal_report, maybe_enable_core_dumps, maybe_redirect_stdio
 
@@ -98,7 +98,7 @@ def _build_forensics_cfg(dataset_cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 class HFVirtualDataset(BaseVirtualDataset):
-    """HF-backed virtual dataset with one prefetch process and chunked disk cache."""
+    """HF-backed virtual dataset with one prefetch process and memory/disk transport."""
 
     def __init__(self, cfg: Any, global_data_root: str, seed: int, hf_cfg: Any) -> None:
         super().__init__(cfg=cfg, global_data_root=global_data_root, seed=seed)
@@ -113,9 +113,15 @@ class HFVirtualDataset(BaseVirtualDataset):
         self.meta_path = self.dataset_root / "meta.json"
 
         cache_cfg = self.cfg_dict.get("cache", {})
+        self.transport_mode = str(cache_cfg.get("transport", "memory")).strip().lower()
+        if self.transport_mode not in {"memory", "disk"}:
+            raise ValueError(f"Unsupported cache.transport for dataset '{self.name}': {self.transport_mode}")
         self.num_chunks_kept = int(cache_cfg.get("num_chunks_kept", 2))
-        self.chunk_cache = ChunkCache(self.dataset_root, num_chunks_kept=self.num_chunks_kept)
-        self.chunk_cache.cleanup_incomplete_chunks()
+        self.memory_queue_max_chunks = max(1, int(cache_cfg.get("memory_queue_max_chunks", self.num_chunks_kept)))
+        self.chunk_cache: ChunkCache | None = None
+        if self.transport_mode == "disk":
+            self.chunk_cache = ChunkCache(self.dataset_root, num_chunks_kept=self.num_chunks_kept)
+            self.chunk_cache.cleanup_incomplete_chunks()
 
         worker_cfg = self.cfg_dict.get("worker", {})
         self.get_timeout_s = float(worker_cfg.get("get_timeout_s", 5.0))
@@ -125,6 +131,7 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         self._ctx = mp.get_context("spawn")
         self._events_queue: Any | None = None
+        self._data_queue: Any | None = None
         self._stop_event: Any | None = None
         self._worker: mp.Process | None = None
         self._worker_restarts = 0
@@ -133,6 +140,7 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         self._known_chunks: set[str] = set()
         self._chunk_queue: deque[dict[str, Any]] = deque()
+        self._memory_samples: deque[ImageSample] = deque()
         self._served_samples = 0
         self._status_started_at = float(time.time())
         self._worker_started_at: float | None = None
@@ -143,7 +151,8 @@ class HFVirtualDataset(BaseVirtualDataset):
         self._last_chunk_ready_at: float | None = None
 
         self._init_meta_if_missing()
-        self._load_existing_chunks()
+        if self.chunk_cache is not None:
+            self._load_existing_chunks()
 
     def start(self) -> None:
         self._spawn_worker(force=True)
@@ -156,12 +165,15 @@ class HFVirtualDataset(BaseVirtualDataset):
         # First chunk warmup can be slower (metadata/parquet/network); avoid false empty batches at startup.
         if self._served_samples == 0 and not self._chunk_queue:
             timeout_s = max(timeout_s, self.startup_get_timeout_s)
+        elif self.transport_mode == "memory":
+            timeout_s = min(timeout_s, 0.2)
 
         deadline = time.monotonic() + timeout_s
         batch: list[ImageSample] = []
 
         while len(batch) < batch_size:
             self._drain_worker_events()
+            self._drain_worker_data()
             sample = self._pop_sample()
             if sample is not None:
                 batch.append(sample)
@@ -203,6 +215,13 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         self._worker = None
 
+        if self._data_queue is not None:
+            try:
+                self._data_queue.close()
+            except Exception:
+                pass
+            self._data_queue = None
+
         if self._events_queue is not None:
             try:
                 self._events_queue.close()
@@ -231,9 +250,11 @@ class HFVirtualDataset(BaseVirtualDataset):
         return {
             "dataset": self.name,
             "dataset_root": str(self.dataset_root),
-            "chunks_on_disk": len(self.chunk_cache.list_chunks()),
-            "chunks_loaded": len(self._chunk_queue),
-            "images_on_disk": self.chunk_cache.count_images(),
+            "transport_mode": self.transport_mode,
+            "chunks_on_disk": 0 if self.chunk_cache is None else len(self.chunk_cache.list_chunks()),
+            "chunks_loaded": len(self._chunk_queue) if self.transport_mode == "disk" else 0,
+            "images_on_disk": 0 if self.chunk_cache is None else self.chunk_cache.count_images(),
+            "memory_samples_loaded": len(self._memory_samples),
             "worker_alive": bool(self._worker and self._worker.is_alive()),
             "worker_pid": worker_pid,
             "worker_exitcode": worker_exitcode,
@@ -264,8 +285,17 @@ class HFVirtualDataset(BaseVirtualDataset):
                 self._events_queue.close()
             except Exception:
                 pass
+        if self._data_queue is not None:
+            try:
+                self._data_queue.close()
+            except Exception:
+                pass
 
         self._events_queue = self._ctx.Queue(maxsize=512)
+        if self.transport_mode == "memory":
+            self._data_queue = self._ctx.Queue(maxsize=self.memory_queue_max_chunks)
+        else:
+            self._data_queue = None
         self._stop_event = self._ctx.Event()
 
         worker_payload = {
@@ -277,7 +307,7 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         self._worker = self._ctx.Process(
             target=hf_dataset_prefetch_worker_entry,
-            args=(worker_payload, self._events_queue, self._stop_event),
+            args=(worker_payload, self._events_queue, self._data_queue, self._stop_event),
             daemon=True,
             name=f"{self.name}_prefetch",
         )
@@ -334,10 +364,12 @@ class HFVirtualDataset(BaseVirtualDataset):
                     except Exception:
                         pass
                 self._last_chunk_ready_at = float(time.time())
-                self._register_chunk(str(event["chunk_id"]))
+                if self.transport_mode == "disk":
+                    self._register_chunk(str(event["chunk_id"]))
             elif event_type == "chunk_evicted":
                 self._chunks_evicted_total += 1
-                self._forget_chunk(str(event["chunk_id"]))
+                if self.transport_mode == "disk":
+                    self._forget_chunk(str(event["chunk_id"]))
             elif event_type == "worker_started":
                 timestamp = event.get("timestamp")
                 if timestamp is not None:
@@ -354,7 +386,39 @@ class HFVirtualDataset(BaseVirtualDataset):
             else:
                 self.logger.debug("Worker event: %s", event)
 
+    def _drain_worker_data(self) -> None:
+        if self._data_queue is None:
+            return
+
+        while True:
+            try:
+                chunk_payload = self._data_queue.get_nowait()
+            except Empty:
+                break
+            except Exception:
+                break
+
+            if not isinstance(chunk_payload, list):
+                continue
+
+            for row in chunk_payload:
+                if not isinstance(row, dict):
+                    continue
+                image = row.get("image")
+                if image is None:
+                    continue
+                self._memory_samples.append(
+                    ImageSample(
+                        image=image,
+                        dataset_name=self.name,
+                        sample_id=row.get("sample_id", "unknown"),
+                        meta=row.get("meta", {}) if isinstance(row.get("meta"), dict) else {},
+                    )
+                )
+
     def _register_chunk(self, chunk_id: str) -> None:
+        if self.chunk_cache is None:
+            return
         if chunk_id in self._known_chunks:
             return
 
@@ -386,10 +450,19 @@ class HFVirtualDataset(BaseVirtualDataset):
         self._chunk_queue = deque(state for state in self._chunk_queue if state.get("chunk_id") != chunk_id)
 
     def _load_existing_chunks(self) -> None:
+        if self.chunk_cache is None:
+            return
         for chunk_id in self.chunk_cache.list_chunks():
             self._register_chunk(chunk_id)
 
     def _pop_sample(self) -> ImageSample | None:
+        if self.transport_mode == "memory":
+            if not self._memory_samples:
+                return None
+            sample = self._memory_samples.popleft()
+            self._served_samples += 1
+            return sample
+
         while self._chunk_queue:
             state = self._chunk_queue[0]
             chunk_id = str(state["chunk_id"])
@@ -435,7 +508,8 @@ class HFVirtualDataset(BaseVirtualDataset):
 
     def _consume_chunk(self, chunk_id: str) -> None:
         self._forget_chunk(chunk_id)
-        self.chunk_cache.remove_chunk(chunk_id)
+        if self.chunk_cache is not None:
+            self.chunk_cache.remove_chunk(chunk_id)
 
     def _init_meta_if_missing(self) -> None:
         if self.meta_path.exists():
@@ -474,7 +548,7 @@ class HFVirtualDataset(BaseVirtualDataset):
         write_json_atomic(self.meta_path, payload)
 
 
-def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any, stop_event: Any) -> None:
+def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any, data_queue: Any, stop_event: Any) -> None:
     dataset_cfg = to_plain_dict(worker_payload["dataset_cfg"])
     forensics_cfg = _build_forensics_cfg(dataset_cfg)
     hf_cfg = to_plain_dict({"hf": worker_payload["hf_cfg"]})["hf"]
@@ -496,6 +570,7 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
 
     dataset_root = ensure_dir(Path(global_data_root) / dataset_name)
     cache_cfg = dataset_cfg.get("cache", {})
+    transport_mode = str(cache_cfg.get("transport", "memory")).strip().lower()
     chunk_size = int(cache_cfg.get("chunk_size_images", 1024))
     num_chunks_kept = int(cache_cfg.get("num_chunks_kept", 2))
 
@@ -505,10 +580,12 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
     max_retries = int(worker_cfg.get("max_retries", 2))
     max_chunk_build_seconds = float(worker_cfg.get("max_chunk_build_seconds", 20.0))
 
-    cache = ChunkCache(dataset_root=dataset_root, num_chunks_kept=num_chunks_kept)
-    cleaned = cache.cleanup_incomplete_chunks()
-    if cleaned:
-        logger.info("Removed %s incomplete chunks at worker startup for dataset=%s", len(cleaned), dataset_name)
+    cache: ChunkCache | None = None
+    if transport_mode == "disk":
+        cache = ChunkCache(dataset_root=dataset_root, num_chunks_kept=num_chunks_kept)
+        cleaned = cache.cleanup_incomplete_chunks()
+        if cleaned:
+            logger.info("Removed %s incomplete chunks at worker startup for dataset=%s", len(cleaned), dataset_name)
 
     rng = random.Random(seed + int(time.time()))
 
@@ -583,16 +660,17 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
 
     while not stop_event.is_set():
         try:
-            evicted = cache.evict_old_chunks()
-            for chunk_id in evicted:
-                _emit_event(events_queue, {"type": "chunk_evicted", "chunk_id": chunk_id, "dataset": dataset_name})
+            if cache is not None:
+                evicted = cache.evict_old_chunks()
+                for chunk_id in evicted:
+                    _emit_event(events_queue, {"type": "chunk_evicted", "chunk_id": chunk_id, "dataset": dataset_name})
 
-            chunks_now = cache.list_chunks()
-            if len(chunks_now) >= num_chunks_kept:
-                time.sleep(idle_sleep_s)
-                continue
+                chunks_now = cache.list_chunks()
+                if len(chunks_now) >= num_chunks_kept:
+                    time.sleep(idle_sleep_s)
+                    continue
 
-            chunk_id = cache.start_chunk(_new_chunk_id(rng))
+            chunk_id = _new_chunk_id(rng) if cache is None else cache.start_chunk(_new_chunk_id(rng))
             records: list[dict[str, Any]] = []
             attempts = 0
             max_attempts = max(chunk_size * 10, chunk_size + 32)
@@ -654,6 +732,7 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
                         dataset_cfg=dataset_cfg,
                         cache=cache,
                         chunk_id=chunk_id,
+                        transport_mode=transport_mode,
                         timeout=request_timeout_s,
                         retries=max_retries,
                     )
@@ -670,17 +749,30 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
                     materialize_none_reasons[str(materialize_reason or "unknown")] += 1
                     continue
 
-                image_path, item_meta = materialized
-                records.append(
-                    {
-                        "sample_id": str(sample_id),
-                        "file": Path(image_path).name,
-                        "meta": item_meta,
-                    }
-                )
+                image_payload, item_meta = materialized
+                if transport_mode == "memory":
+                    records.append(
+                        {
+                            "sample_id": str(sample_id),
+                            "image": image_payload,
+                            "meta": item_meta,
+                        }
+                    )
+                else:
+                    image_path = Path(str(image_payload))
+                    records.append(
+                        {
+                            "sample_id": str(sample_id),
+                            "file": image_path.name,
+                            "meta": item_meta,
+                        }
+                    )
 
             if records:
-                cache.finalize_chunk(chunk_id, records)
+                if cache is not None:
+                    cache.finalize_chunk(chunk_id, records)
+                else:
+                    _emit_data_chunk(data_queue, records, stop_event=stop_event)
                 _emit_event(
                     events_queue,
                     {
@@ -692,7 +784,8 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
                     },
                 )
             else:
-                cache.remove_chunk(chunk_id)
+                if cache is not None:
+                    cache.remove_chunk(chunk_id)
                 time.sleep(idle_sleep_s)
         except Exception as exc:
             logger.exception("Worker loop failure for dataset=%s", dataset_name)
@@ -700,7 +793,7 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
             time.sleep(max(1.0, idle_sleep_s))
 
 
-def hf_dataset_prefetch_worker_entry(worker_payload: dict[str, Any], events_queue: Any, stop_event: Any) -> None:
+def hf_dataset_prefetch_worker_entry(worker_payload: dict[str, Any], events_queue: Any, data_queue: Any, stop_event: Any) -> None:
     dataset_cfg = to_plain_dict(worker_payload.get("dataset_cfg", {}))
     dataset_name = str(dataset_cfg.get("name", "unknown_dataset"))
     forensics_cfg = _build_forensics_cfg(dataset_cfg)
@@ -712,7 +805,7 @@ def hf_dataset_prefetch_worker_entry(worker_payload: dict[str, Any], events_queu
     logger = logging.getLogger(f"dataset.worker.{dataset_name}")
     maybe_enable_core_dumps(forensics_cfg, section="train", logger=logger)
     try:
-        hf_dataset_prefetch_worker(worker_payload, events_queue, stop_event)
+        hf_dataset_prefetch_worker(worker_payload, events_queue, data_queue, stop_event)
     except BaseException as exc:
         traceback_text = traceback.format_exc()
         report_path = emit_fatal_report(
@@ -807,49 +900,60 @@ def _materialize_image(
     record: dict[str, Any],
     sample_id: str | int,
     dataset_cfg: dict[str, Any],
-    cache: ChunkCache,
-    chunk_id: str,
+    cache: ChunkCache | None,
+    chunk_id: str | None,
+    transport_mode: str,
     timeout: int,
     retries: int,
-) -> tuple[tuple[Path, dict[str, Any]] | None, str]:
+) -> tuple[tuple[Any, dict[str, Any]] | None, str]:
     schema = dataset_cfg.get("schema", {})
     mode = str(schema.get("image_mode", "image_field"))
 
-    image_path: Path | None = None
+    image_payload: Any | None = None
 
     if mode == "image_field":
         field = _resolve_image_field(record, schema)
         if field is None:
             return None, "missing_image_field"
         image_value = record[field]
-        image_path = _materialize_image_field_value(
+        image_payload = _materialize_image_field_value(
             image_value=image_value,
             sample_id=sample_id,
             cache=cache,
             chunk_id=chunk_id,
+            transport_mode=transport_mode,
             timeout=timeout,
             retries=retries,
         )
-        if image_path is None:
+        if image_payload is None:
             return None, "image_field_decode_or_fetch_failed"
     elif mode == "url_field":
         url = _resolve_url(record, schema)
         if not url:
             return None, "missing_url"
-        image_path = fetch_image_to_cache(
-            url=url,
-            cache=cache,
-            sample_key=sample_id,
-            timeout=timeout,
-            retries=retries,
-            chunk_id=chunk_id,
-        )
-        if image_path is None:
+        if transport_mode == "memory":
+            image_payload = fetch_image_to_memory(
+                url=url,
+                timeout=timeout,
+                retries=retries,
+            )
+        else:
+            if cache is None or chunk_id is None:
+                raise RuntimeError("disk transport requires active ChunkCache and chunk_id")
+            image_payload = fetch_image_to_cache(
+                url=url,
+                cache=cache,
+                sample_key=sample_id,
+                timeout=timeout,
+                retries=retries,
+                chunk_id=chunk_id,
+            )
+        if image_payload is None:
             return None, "url_fetch_failed"
     else:
         raise ValueError(f"Unsupported schema.image_mode: {mode}")
 
-    if image_path is None:
+    if image_payload is None:
         return None, "unknown"
 
     item_meta: dict[str, Any] = {}
@@ -857,27 +961,42 @@ def _materialize_image(
         if extra_key in record:
             item_meta[extra_key] = _safe_meta_value(record[extra_key])
 
-    return (image_path, item_meta), "ok"
+    return (image_payload, item_meta), "ok"
 
 
 def _materialize_image_field_value(
     image_value: Any,
     sample_id: str | int,
-    cache: ChunkCache,
-    chunk_id: str,
+    cache: ChunkCache | None,
+    chunk_id: str | None,
+    transport_mode: str,
     timeout: int,
     retries: int,
-) -> Path | None:
+) -> Any | None:
     # `datasets.Image(decode=False)` may produce dict payloads with `bytes`, `path` or `src`.
     if isinstance(image_value, dict):
         bytes_value = image_value.get("bytes")
         if bytes_value is not None:
             image = decode_to_pil(bytes_value)
-            return cache.save_image(sample_id=sample_id, image=image, chunk_id=chunk_id)
+            return _store_materialized_image(
+                image=image,
+                sample_id=sample_id,
+                cache=cache,
+                chunk_id=chunk_id,
+                transport_mode=transport_mode,
+            )
 
         for key in ("path", "src", "url"):
             url_like = image_value.get(key)
             if isinstance(url_like, str) and url_like.startswith(("http://", "https://")):
+                if transport_mode == "memory":
+                    return fetch_image_to_memory(
+                        url=url_like,
+                        timeout=timeout,
+                        retries=retries,
+                    )
+                if cache is None or chunk_id is None:
+                    raise RuntimeError("disk transport requires active ChunkCache and chunk_id")
                 return fetch_image_to_cache(
                     url=url_like,
                     cache=cache,
@@ -890,9 +1009,23 @@ def _materialize_image_field_value(
         path_value = image_value.get("path")
         if isinstance(path_value, str) and path_value:
             image = decode_to_pil({"path": path_value})
-            return cache.save_image(sample_id=sample_id, image=image, chunk_id=chunk_id)
+            return _store_materialized_image(
+                image=image,
+                sample_id=sample_id,
+                cache=cache,
+                chunk_id=chunk_id,
+                transport_mode=transport_mode,
+            )
 
     if isinstance(image_value, str) and image_value.startswith(("http://", "https://")):
+        if transport_mode == "memory":
+            return fetch_image_to_memory(
+                url=image_value,
+                timeout=timeout,
+                retries=retries,
+            )
+        if cache is None or chunk_id is None:
+            raise RuntimeError("disk transport requires active ChunkCache and chunk_id")
         return fetch_image_to_cache(
             url=image_value,
             cache=cache,
@@ -903,6 +1036,26 @@ def _materialize_image_field_value(
         )
 
     image = decode_to_pil(image_value)
+    return _store_materialized_image(
+        image=image,
+        sample_id=sample_id,
+        cache=cache,
+        chunk_id=chunk_id,
+        transport_mode=transport_mode,
+    )
+
+
+def _store_materialized_image(
+    image: Any,
+    sample_id: str | int,
+    cache: ChunkCache | None,
+    chunk_id: str | None,
+    transport_mode: str,
+) -> Any:
+    if transport_mode == "memory":
+        return image
+    if cache is None or chunk_id is None:
+        raise RuntimeError("disk transport requires active ChunkCache and chunk_id")
     return cache.save_image(sample_id=sample_id, image=image, chunk_id=chunk_id)
 
 
@@ -960,6 +1113,17 @@ def _emit_event(queue_obj: Any, payload: dict[str, Any]) -> None:
         queue_obj.put_nowait(payload)
     except Full:
         pass
+
+
+def _emit_data_chunk(queue_obj: Any, payload: list[dict[str, Any]], *, stop_event: Any) -> None:
+    if queue_obj is None:
+        return
+    while not stop_event.is_set():
+        try:
+            queue_obj.put(payload, timeout=0.5)
+            return
+        except Full:
+            continue
 
 
 def _format_dataset_load_error(dataset_cfg: dict[str, Any], exc: Exception) -> str:

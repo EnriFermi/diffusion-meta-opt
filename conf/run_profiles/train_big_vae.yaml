@@ -18,6 +18,10 @@ defaults:
 collector:
   max_loaded_models: 5
   jobs_per_selected_model: 1
+  parallel_inference_workers: 2
+  parallel_model_pool_max_loaded_models: 1
+  atomizer_process_enabled: true
+  atomizer_queue_max_items: 256
   layer_output_splitting:
     xy_samples_random_slice: 256
 

@@ -6,11 +6,13 @@ import logging
 import multiprocessing as mp
 import os
 import signal
+import threading
 import traceback
 import time
 from abc import ABC, abstractmethod
 from collections import Counter, deque
-from dataclasses import asdict
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from queue import Empty, Full
 from typing import Any
@@ -41,6 +43,16 @@ from dataset.shared.types import CollectorJobStats, SharedSample
 from training.forensics import emit_fatal_report, maybe_enable_core_dumps, maybe_redirect_stdio
 
 _FAULT_HANDLER_FILES: list[Any] = []
+
+
+@dataclass(slots=True)
+class _PreparedCollectorJob:
+    model_name: str
+    pil_batch: list[Any]
+    image_meta: list[Any]
+    dataset_mix: dict[str, int]
+    started_at: float
+    raw_batch_fetch_s: float
 
 
 def _read_text_file(path: Path) -> str | None:
@@ -620,14 +632,29 @@ class CollectorService:
                     "async collector mode requires collector.device != train.device "
                     "(unless collector.allow_async_on_train_device=true)"
                 )
+        if self.parallel_inference_workers > 1 and self.collector_mode != "async":
+            raise ValueError("collector.parallel_inference_workers > 1 is supported only in async collector mode")
+        if self.parallel_inference_workers > 1 and self.streaming_mode != "none":
+            raise ValueError(
+                "collector.parallel_inference_workers > 1 is currently supported only with streaming.mode=none"
+            )
 
         self.model_selection_strategy = str(collector_cfg.get("model_selection_strategy", "round_robin_shuffled"))
         self.jobs_per_selected_model = int(collector_cfg.get("jobs_per_selected_model", 2))
         self.dataset_sampling_strategy = str(collector_cfg.get("dataset_sampling_strategy", "weighted_random"))
         self.max_dataset_fraction_per_batch = float(collector_cfg.get("max_dataset_fraction_per_batch", 0.6))
         self.num_inflight_jobs = max(1, int(collector_cfg.get("num_inflight_jobs", 2)))
+        self.parallel_inference_workers = max(1, int(collector_cfg.get("parallel_inference_workers", 1)))
+        self.parallel_model_pool_max_loaded_models = max(
+            1,
+            int(collector_cfg.get("parallel_model_pool_max_loaded_models", 1)),
+        )
+        self.atomizer_process_enabled = bool(collector_cfg.get("atomizer_process_enabled", False))
+        self.atomizer_queue_max_items = max(8, int(collector_cfg.get("atomizer_queue_max_items", 256)))
         self.status_emit_interval_s = max(0.1, float(collector_cfg.get("status_emit_interval_s", 2.0)))
         self.status_queue_max_items = max(16, int(collector_cfg.get("status_queue_max_items", 2048)))
+        if self.atomizer_process_enabled and self.streaming_mode != "none":
+            raise ValueError("collector.atomizer_process_enabled is currently supported only with streaming.mode=none")
         diagnostics_cfg = collector_cfg.get("diagnostics", {})
         self.emit_resource_snapshot = bool(diagnostics_cfg.get("emit_resource_snapshot", True))
         self.resource_snapshot_max_children = max(0, int(diagnostics_cfg.get("resource_snapshot_max_children", 8)))
@@ -668,6 +695,17 @@ class CollectorService:
         self._scheduler: ModelScheduler | None = None
         self._sink: _SampleSink | None = None
         self._load_report = LoadReportWriter(self.cfg_dict)
+        self._parallel_executor: ThreadPoolExecutor | None = None
+        self._parallel_model_pools: dict[int, ModelPool] = {}
+        self._parallel_model_pools_lock = threading.Lock()
+        self._atomizer_task_queue: Any | None = None
+        self._atomizer_stop_event: Any | None = None
+        self._atomizer_process: mp.Process | None = None
+        self._stats_lock = threading.Lock()
+        self._runtime_device: str | None = None
+        self._runtime_local_only = False
+        self._runtime_release_device_on_unload = True
+        self._runtime_empty_cuda_cache_on_unload = True
 
         self._model_run_id = 0
         self._jobs_total = 0
@@ -680,6 +718,7 @@ class CollectorService:
         self._status_queue: Any | None = status_queue
         self._last_status_emit_ts = 0.0
         self._async_last_status: dict[str, Any] | None = None
+        self._async_last_atomizer_event: dict[str, Any] | None = None
         self._async_recent_jobs: deque[dict[str, Any]] = deque(maxlen=128)
         self._async_events_dropped = 0
         self._cgroup_events_baseline = _read_cgroup_memory_events()
@@ -707,6 +746,17 @@ class CollectorService:
         if self._process is None:
             return
         if self._process.is_alive():
+            if isinstance(self._async_last_atomizer_event, dict):
+                if self._async_last_atomizer_event.get("type") == "atomizer_fatal_exception":
+                    raise RuntimeError(
+                        "Async collector atomizer process exited unexpectedly: "
+                        f"{self._async_last_atomizer_event.get('fatal_error')}"
+                    )
+            if isinstance(self._async_last_status, dict):
+                if bool(self._async_last_status.get("atomizer_process_enabled", False)) and not bool(
+                    self._async_last_status.get("atomizer_process_alive", True)
+                ):
+                    raise RuntimeError("Async collector atomizer process is no longer alive")
             return
 
         exit_code = self._process.exitcode
@@ -934,6 +984,45 @@ class CollectorService:
         if active_stop_event is None:
             active_stop_event = self._ctx.Event()
 
+        if self.parallel_inference_workers > 1:
+            assert self._parallel_executor is not None
+            in_flight: set[Future[CollectorJobStats]] = set()
+            while not active_stop_event.is_set():
+                submitted = False
+                while (
+                    len(in_flight) < self.parallel_inference_workers
+                    and not active_stop_event.is_set()
+                    and self._sink.needs_fill()
+                ):
+                    prepared = self._prepare_parallel_job()
+                    if prepared is None:
+                        break
+                    in_flight.add(self._parallel_executor.submit(self._execute_prepared_parallel_job, prepared))
+                    submitted = True
+
+                if not in_flight:
+                    if not submitted:
+                        time.sleep(0.05)
+                    self._maybe_emit_status_event(event_type="heartbeat")
+                    continue
+
+                done, pending = wait(in_flight, timeout=0.1, return_when=FIRST_COMPLETED)
+                in_flight = set(pending)
+                for future in done:
+                    stats = future.result()
+                    self._record_completed_job(stats)
+
+                self._maybe_emit_status_event(event_type="heartbeat")
+
+            if in_flight:
+                done, pending = wait(in_flight, timeout=30.0)
+                for future in done:
+                    stats = future.result()
+                    self._record_completed_job(stats)
+                for future in pending:
+                    future.cancel()
+            return
+
         while not active_stop_event.is_set():
             if self._sink.needs_fill():
                 for _ in range(self.num_inflight_jobs):
@@ -978,7 +1067,6 @@ class CollectorService:
 
         assert self._scheduler is not None
         assert self._raw_pool is not None
-        assert self._model_pool is not None
         assert self._sink is not None
 
         job_resource_before: dict[str, Any] | None = None
@@ -1035,12 +1123,14 @@ class CollectorService:
         model_cfg = self.compat_index.get_model_cfg(model_name)
         batch_size = max(1, int(model_cfg.get("batch_size", 1)))
 
+        raw_batch_fetch_started = time.time()
         pil_batch, image_meta = self._raw_pool.sample_mixed_batch(
             model_name=model_name,
             batch_size=batch_size,
             dataset_sampling_strategy=self.dataset_sampling_strategy,
             max_dataset_fraction_per_batch=self.max_dataset_fraction_per_batch,
         )
+        raw_batch_fetch_s = time.time() - raw_batch_fetch_started
 
         if not pil_batch:
             duration_s = time.time() - started
@@ -1051,28 +1141,38 @@ class CollectorService:
                 num_samples_emitted=0,
                 dataset_mix={},
                 duration_s=duration_s,
+                raw_batch_fetch_s=raw_batch_fetch_s,
                 **_memory_payload_after(),
             )
 
-        layer_records = self._model_pool.run(model_name=model_name, pil_batch=pil_batch)
+        infer_started = time.time()
+        layer_records = self._get_execution_model_pool().run(model_name=model_name, pil_batch=pil_batch)
+        model_infer_s = time.time() - infer_started
 
-        emitted = 0
+        atomize_started = time.time()
         run_id = self._next_run_id()
-        for record in layer_records:
-            for shared_sample in atomize(
-                layer_record=record,
-                atom_cfg=self.atom_cfg,
+        if self.atomizer_process_enabled:
+            self._enqueue_atomizer_task(
+                layer_records=layer_records,
                 image_meta_list=image_meta,
                 model_run_id=run_id,
-            ):
-                self._sink.emit(shared_sample)
-                emitted += 1
+                model_name=model_name,
+            )
+            emitted = len(layer_records)
+        else:
+            emitted = 0
+            for record in layer_records:
+                for shared_sample in atomize(
+                    layer_record=record,
+                    atom_cfg=self.atom_cfg,
+                    image_meta_list=image_meta,
+                    model_run_id=run_id,
+                ):
+                    self._sink.emit(shared_sample)
+                    emitted += 1
+        atomize_emit_s = time.time() - atomize_started
 
         mix_counter = Counter(item.dataset_name for item in image_meta)
-
-        self._jobs_total += 1
-        self._jobs_by_model[model_name] += 1
-        self._items_emitted += emitted
 
         duration_s = time.time() - started
         stats = CollectorJobStats(
@@ -1082,26 +1182,12 @@ class CollectorService:
             num_samples_emitted=emitted,
             dataset_mix=dict(mix_counter),
             duration_s=duration_s,
+            raw_batch_fetch_s=raw_batch_fetch_s,
+            model_infer_s=model_infer_s,
+            atomize_emit_s=atomize_emit_s,
             **_memory_payload_after(),
         )
-
-        self.logger.info(
-            "collector job model=%s images=%s layers=%s emitted=%s size=%s mode=%s "
-            "rss_after_mb=%s rss_delta_mb=%s hwm_delta_mb=%s child_rss_delta_mb=%s",
-            model_name,
-            stats.num_images,
-            stats.num_layers,
-            emitted,
-            self.cache_size(),
-            self.streaming_mode,
-            _fmt_mb(stats.memory_rss_after_mb),
-            _fmt_mb(stats.memory_rss_delta_mb),
-            _fmt_mb(stats.memory_hwm_delta_mb),
-            _fmt_mb(stats.memory_children_rss_delta_mb),
-        )
-        self._emit_status_event(event_type="job", job_stats=stats)
-
-        return stats
+        return self._record_completed_job(stats)
 
     def cache_size(self) -> int:
         if self.is_async_mode and not self._runtime_ready:
@@ -1141,6 +1227,10 @@ class CollectorService:
             "streaming_mode": self.streaming_mode,
             "collector_device": self.collector_device,
             "train_device": self.train_device,
+            "parallel_inference_workers": int(self.parallel_inference_workers),
+            "parallel_model_pool_max_loaded_models": int(self.parallel_model_pool_max_loaded_models),
+            "atomizer_process_enabled": bool(self.atomizer_process_enabled),
+            "atomizer_process_alive": bool(self._atomizer_process is not None and self._atomizer_process.is_alive()),
             "cache_size": self.cache_size(),
             "jobs_total": self._jobs_total,
             "jobs_by_model": dict(self._jobs_by_model),
@@ -1158,6 +1248,7 @@ class CollectorService:
             payload["async_events_dropped"] = int(self._async_events_dropped)
             payload["async_recent_jobs"] = list(self._async_recent_jobs)
             payload["async_last_status"] = self._async_last_status
+            payload["async_last_atomizer_event"] = self._async_last_atomizer_event
 
             if self._async_last_status is not None:
                 payload["cache_size"] = int(self._async_last_status.get("cache_size", payload["cache_size"]))
@@ -1227,17 +1318,27 @@ class CollectorService:
             runtime_device = self.collector_device
             if runtime_device is None:
                 runtime_device = self.train_device
+            self._runtime_device = runtime_device
+            self._runtime_local_only = bool(collector_cfg.get("runtime_local_only", False))
+            self._runtime_release_device_on_unload = release_device_on_unload
+            self._runtime_empty_cuda_cache_on_unload = empty_cuda_cache_on_unload
 
-            self._model_pool = ModelPool(
-                global_cfg=self.cfg,
-                model_cfgs=model_cfgs,
-                device_override=runtime_device,
-                max_loaded_models=max_loaded,
-                runtime_local_only=bool(collector_cfg.get("runtime_local_only", False)),
-                release_device_on_unload=release_device_on_unload,
-                empty_cuda_cache_on_unload=empty_cuda_cache_on_unload,
-                load_report=self._load_report,
-            )
+            if self.parallel_inference_workers <= 1:
+                self._model_pool = ModelPool(
+                    global_cfg=self.cfg,
+                    model_cfgs=model_cfgs,
+                    device_override=runtime_device,
+                    max_loaded_models=max_loaded,
+                    runtime_local_only=self._runtime_local_only,
+                    release_device_on_unload=release_device_on_unload,
+                    empty_cuda_cache_on_unload=empty_cuda_cache_on_unload,
+                    load_report=self._load_report,
+                )
+            else:
+                self._parallel_executor = ThreadPoolExecutor(
+                    max_workers=self.parallel_inference_workers,
+                    thread_name_prefix="collector_infer",
+                )
 
             data_cfg = self.cfg_dict.get("data") or {}
             seed = int(data_cfg.get("seed", 0))
@@ -1251,6 +1352,8 @@ class CollectorService:
             )
 
             self._sink = self._build_sink()
+            if self.atomizer_process_enabled:
+                self._start_atomizer_process()
             self._runtime_ready = True
             self._load_report.mark_runtime_event("runtime_init_ready")
         except Exception as exc:
@@ -1286,6 +1389,22 @@ class CollectorService:
         )
 
     def _shutdown_runtime_components(self) -> None:
+        if self._atomizer_stop_event is not None:
+            self._atomizer_stop_event.set()
+        if self._atomizer_process is not None:
+            self._atomizer_process.join(timeout=10)
+            if self._atomizer_process.is_alive():
+                self._atomizer_process.terminate()
+                self._atomizer_process.join(timeout=3)
+            self._atomizer_process = None
+        if self._atomizer_task_queue is not None:
+            try:
+                self._atomizer_task_queue.close()
+            except Exception:
+                pass
+            self._atomizer_task_queue = None
+        self._atomizer_stop_event = None
+
         if self._sink is not None:
             try:
                 self._sink.close()
@@ -1293,16 +1412,48 @@ class CollectorService:
                 self.logger.warning("Failed to close collector sink: %s", exc)
             self._sink = None
 
+        if self._parallel_executor is not None:
+            self._parallel_executor.shutdown(wait=True, cancel_futures=False)
+            self._parallel_executor = None
+
         if self._model_pool is not None:
             self._model_pool.unload_all()
             self._model_pool = None
+
+        with self._parallel_model_pools_lock:
+            for pool in self._parallel_model_pools.values():
+                try:
+                    pool.unload_all()
+                except Exception as exc:
+                    self.logger.warning("Failed to unload parallel collector model pool: %s", exc)
+            self._parallel_model_pools.clear()
 
         if self._raw_pool is not None:
             self._raw_pool.shutdown()
             self._raw_pool = None
 
         self._scheduler = None
+        self._runtime_device = None
         self._runtime_ready = False
+
+    def _start_atomizer_process(self) -> None:
+        if self.streaming_mode != "none":
+            raise RuntimeError("atomizer process requires streaming.mode=none")
+        if self.cache is None:
+            raise RuntimeError("atomizer process requires in-memory SharedSampleCache")
+        if self._atomizer_process is not None and self._atomizer_process.is_alive():
+            return
+
+        self._atomizer_task_queue = self._ctx.Queue(maxsize=self.atomizer_queue_max_items)
+        self._atomizer_stop_event = self._ctx.Event()
+        self._atomizer_process = self._ctx.Process(
+            target=collector_atomizer_process_main,
+            args=(self.cache, self.atom_cfg, self._atomizer_task_queue, self._atomizer_stop_event, self._status_queue),
+            daemon=False,
+            name="collector_atomizer",
+        )
+        self._atomizer_process.start()
+        self.logger.info("Started collector atomizer process pid=%s", self._atomizer_process.pid)
 
     def _start_async_process(self) -> None:
         if self._process is not None and self._process.is_alive():
@@ -1324,8 +1475,169 @@ class CollectorService:
         self.logger.info("Started async collector process pid=%s", self._process.pid)
 
     def _next_run_id(self) -> int:
-        self._model_run_id += 1
-        return self._model_run_id
+        with self._stats_lock:
+            self._model_run_id += 1
+            return self._model_run_id
+
+    def _get_execution_model_pool(self) -> ModelPool:
+        if self.parallel_inference_workers <= 1:
+            if self._model_pool is None:
+                raise RuntimeError("collector model pool is not initialized")
+            return self._model_pool
+
+        thread_id = threading.get_ident()
+        with self._parallel_model_pools_lock:
+            pool = self._parallel_model_pools.get(thread_id)
+            if pool is not None:
+                return pool
+            pool = ModelPool(
+                global_cfg=self.cfg,
+                model_cfgs=self.compat_index.get_model_cfgs(),
+                device_override=self._runtime_device,
+                max_loaded_models=self.parallel_model_pool_max_loaded_models,
+                runtime_local_only=self._runtime_local_only,
+                release_device_on_unload=self._runtime_release_device_on_unload,
+                empty_cuda_cache_on_unload=self._runtime_empty_cuda_cache_on_unload,
+                load_report=self._load_report,
+            )
+            self._parallel_model_pools[thread_id] = pool
+            return pool
+
+    def _ensure_atomizer_alive(self) -> None:
+        if not self.atomizer_process_enabled:
+            return
+        if self._atomizer_process is None:
+            raise RuntimeError("collector atomizer process is not initialized")
+        if self._atomizer_process.is_alive():
+            return
+        raise RuntimeError(f"collector atomizer process exited unexpectedly ({_format_process_exit(self._atomizer_process.exitcode)})")
+
+    def _enqueue_atomizer_task(
+        self,
+        *,
+        layer_records: list[Any],
+        image_meta_list: list[Any],
+        model_run_id: int,
+        model_name: str,
+    ) -> None:
+        self._ensure_atomizer_alive()
+        if self._atomizer_task_queue is None:
+            raise RuntimeError("collector atomizer task queue is not initialized")
+
+        payload = {
+            "layer_records": layer_records,
+            "image_meta_list": image_meta_list,
+            "model_run_id": int(model_run_id),
+            "model_name": str(model_name),
+            "timestamp": float(time.time()),
+        }
+        while True:
+            try:
+                self._atomizer_task_queue.put(payload, timeout=0.25)
+                return
+            except Full:
+                self._ensure_atomizer_alive()
+                continue
+
+    def _prepare_parallel_job(self) -> _PreparedCollectorJob | None:
+        assert self._scheduler is not None
+        assert self._raw_pool is not None
+
+        started = time.time()
+        model_name = self._scheduler.next_model()
+        model_cfg = self.compat_index.get_model_cfg(model_name)
+        batch_size = max(1, int(model_cfg.get("batch_size", 1)))
+
+        pil_batch, image_meta = self._raw_pool.sample_mixed_batch(
+            model_name=model_name,
+            batch_size=batch_size,
+            dataset_sampling_strategy=self.dataset_sampling_strategy,
+            max_dataset_fraction_per_batch=self.max_dataset_fraction_per_batch,
+        )
+        raw_batch_fetch_s = time.time() - started
+        if not pil_batch:
+            return None
+
+        dataset_mix = dict(Counter(item.dataset_name for item in image_meta))
+        return _PreparedCollectorJob(
+            model_name=model_name,
+            pil_batch=pil_batch,
+            image_meta=image_meta,
+            dataset_mix=dataset_mix,
+            started_at=started,
+            raw_batch_fetch_s=raw_batch_fetch_s,
+        )
+
+    def _execute_prepared_parallel_job(self, prepared: _PreparedCollectorJob) -> CollectorJobStats:
+        assert self._sink is not None
+
+        model_pool = self._get_execution_model_pool()
+        infer_started = time.time()
+        layer_records = model_pool.run(model_name=prepared.model_name, pil_batch=prepared.pil_batch)
+        model_infer_s = time.time() - infer_started
+
+        atomize_started = time.time()
+        run_id = self._next_run_id()
+        if self.atomizer_process_enabled:
+            self._enqueue_atomizer_task(
+                layer_records=layer_records,
+                image_meta_list=prepared.image_meta,
+                model_run_id=run_id,
+                model_name=prepared.model_name,
+            )
+            emitted = len(layer_records)
+        else:
+            emitted = 0
+            for record in layer_records:
+                for shared_sample in atomize(
+                    layer_record=record,
+                    atom_cfg=self.atom_cfg,
+                    image_meta_list=prepared.image_meta,
+                    model_run_id=run_id,
+                ):
+                    self._sink.emit(shared_sample)
+                    emitted += 1
+        atomize_emit_s = time.time() - atomize_started
+
+        return CollectorJobStats(
+            model_name=prepared.model_name,
+            num_images=len(prepared.pil_batch),
+            num_layers=len(layer_records),
+            num_samples_emitted=emitted,
+            dataset_mix=prepared.dataset_mix,
+            duration_s=time.time() - prepared.started_at,
+            raw_batch_fetch_s=prepared.raw_batch_fetch_s,
+            model_infer_s=model_infer_s,
+            atomize_emit_s=atomize_emit_s,
+        )
+
+    def _record_completed_job(self, stats: CollectorJobStats) -> CollectorJobStats:
+        with self._stats_lock:
+            self._jobs_total += 1
+            self._jobs_by_model[stats.model_name] += 1
+            self._items_emitted += int(stats.num_samples_emitted)
+
+        self.logger.info(
+            "collector job model=%s images=%s layers=%s emitted=%s size=%s mode=%s "
+            "raw_batch_fetch_s=%.3f model_infer_s=%.3f atomize_emit_s=%.3f total_s=%.3f "
+            "rss_after_mb=%s rss_delta_mb=%s hwm_delta_mb=%s child_rss_delta_mb=%s",
+            stats.model_name,
+            stats.num_images,
+            stats.num_layers,
+            stats.num_samples_emitted,
+            self.cache_size(),
+            self.streaming_mode,
+            float(stats.raw_batch_fetch_s),
+            float(stats.model_infer_s),
+            float(stats.atomize_emit_s),
+            float(stats.duration_s),
+            _fmt_mb(stats.memory_rss_after_mb),
+            _fmt_mb(stats.memory_rss_delta_mb),
+            _fmt_mb(stats.memory_hwm_delta_mb),
+            _fmt_mb(stats.memory_children_rss_delta_mb),
+        )
+        self._emit_status_event(event_type="job", job_stats=stats)
+        return stats
 
     def _maybe_emit_status_event(self, event_type: str) -> None:
         now = time.time()
@@ -1340,6 +1652,9 @@ class CollectorService:
             "collector_pid": int(os.getpid()),
             "mode": self.collector_mode,
             "streaming_mode": self.streaming_mode,
+            "parallel_inference_workers": int(self.parallel_inference_workers),
+            "atomizer_process_enabled": bool(self.atomizer_process_enabled),
+            "atomizer_process_alive": bool(self._atomizer_process is not None and self._atomizer_process.is_alive()),
             "cache_size": int(self.cache_size()),
             "jobs_total": int(self._jobs_total),
             "jobs_by_model": {name: int(value) for name, value in self._jobs_by_model.items()},
@@ -1427,6 +1742,11 @@ class CollectorService:
             if not isinstance(payload, dict):
                 continue
 
+            payload_type = str(payload.get("type", ""))
+            if payload_type.startswith("atomizer_"):
+                self._async_last_atomizer_event = payload
+                continue
+
             self._async_last_status = payload
             jobs_total = payload.get("jobs_total")
             if jobs_total is not None:
@@ -1463,6 +1783,9 @@ class CollectorService:
                     "num_samples_emitted": int(job_stats.get("num_samples_emitted", 0)),
                     "dataset_mix": job_stats.get("dataset_mix", {}),
                     "duration_s": float(job_stats.get("duration_s", 0.0)),
+                    "raw_batch_fetch_s": float(job_stats.get("raw_batch_fetch_s", 0.0)),
+                    "model_infer_s": float(job_stats.get("model_infer_s", 0.0)),
+                    "atomize_emit_s": float(job_stats.get("atomize_emit_s", 0.0)),
                     "memory_rss_before_mb": _safe_float(job_stats.get("memory_rss_before_mb")),
                     "memory_rss_after_mb": _safe_float(job_stats.get("memory_rss_after_mb")),
                     "memory_rss_delta_mb": _safe_float(job_stats.get("memory_rss_delta_mb")),
@@ -1553,6 +1876,90 @@ def collector_process_main(
                         "fatal_error": str(exc),
                         "fatal_traceback": traceback_text,
                         "fatal_report_path": report_path,
+                    }
+                )
+            except Exception:
+                pass
+        raise
+
+
+def collector_atomizer_process_main(
+    cache: SharedSampleCache,
+    atom_cfg: dict[str, Any],
+    task_queue: Any,
+    stop_event: Any,
+    status_queue: Any | None = None,
+) -> None:
+    logger = logging.getLogger("collector_atomizer")
+    try:
+        try:
+            faulthandler.enable(all_threads=True)
+        except Exception:
+            pass
+
+        while True:
+            try:
+                if stop_event.is_set():
+                    payload = task_queue.get_nowait()
+                else:
+                    payload = task_queue.get(timeout=0.2)
+            except Empty:
+                if stop_event.is_set():
+                    break
+                continue
+
+            if not isinstance(payload, dict):
+                continue
+
+            layer_records = payload.get("layer_records")
+            image_meta_list = payload.get("image_meta_list")
+            model_run_id = int(payload.get("model_run_id", 0))
+            model_name = str(payload.get("model_name", ""))
+
+            if not isinstance(layer_records, list):
+                continue
+            if not isinstance(image_meta_list, list):
+                image_meta_list = []
+
+            emitted = 0
+            started_at = time.time()
+            for record in layer_records:
+                for shared_sample in atomize(
+                    layer_record=record,
+                    atom_cfg=atom_cfg,
+                    image_meta_list=image_meta_list,
+                    model_run_id=model_run_id,
+                ):
+                    cache.put(shared_sample)
+                    emitted += 1
+
+            if status_queue is not None:
+                try:
+                    status_queue.put_nowait(
+                        {
+                            "type": "atomizer_job",
+                            "timestamp": float(time.time()),
+                            "model_name": model_name,
+                            "model_run_id": model_run_id,
+                            "num_layers": len(layer_records),
+                            "num_samples_emitted": emitted,
+                            "duration_s": float(time.time() - started_at),
+                            "atomizer_pid": int(os.getpid()),
+                        }
+                    )
+                except Exception:
+                    pass
+    except BaseException as exc:
+        logger.exception("Collector atomizer process failed with unhandled exception")
+        if status_queue is not None:
+            try:
+                status_queue.put_nowait(
+                    {
+                        "type": "atomizer_fatal_exception",
+                        "timestamp": float(time.time()),
+                        "atomizer_pid": int(os.getpid()),
+                        "fatal_error": str(exc),
+                        "fatal_traceback": traceback.format_exc(),
                     }
                 )
             except Exception:

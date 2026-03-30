@@ -84,6 +84,11 @@ batch_source_mixing:
   enabled: true
   # Only round_robin is supported for now.
   strategy: round_robin
+  # When enabled, source snapshots stay in the local pool until they run out of
+  # unseen slices, and slice selection consumes disjoint row/column groups
+  # without replacement. In this mode train.steps_per_sample no longer controls
+  # refresh cadence.
+  consume_slices_without_replacement: true
   # none | model
   uniqueness: none
   # 0 -> use full slice_batch_size, i.e. aim for one source snapshot per batch item.
@@ -120,4 +125,13 @@ telemetry:
     experiment_name: ""
     tags: []
     offline_directory: ""
+    log_code: false
+  wandb:
+    enabled: true
+    project_name: big_weight_vae
+    entity: ${oc.env:WANDB_ENTITY,""}
+    run_name: ""
+    tags: []
+    mode: ${oc.env:WANDB_MODE,"offline"}
+    dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/wandb
     log_code: false
