@@ -14,12 +14,24 @@ defaults:
   - _self_
 
 # BigVAE speed tuning for explicit model-diverse batches:
-# keep collector bursts short so the queue contains different models often enough.
+# keep bursts short enough for diversity, but long enough to amortize model loads.
 collector:
   max_loaded_models: 5
   jobs_per_selected_model: 1
-  parallel_inference_workers: 2
-  parallel_model_pool_max_loaded_models: 1
+  # Allow the same raw image sample to be reused by a few distinct models before
+  # it is retired from the dataset chunk cache. This increases model diversity
+  # without scaling raw worker RAM with the number of models.
+  max_distinct_models_per_raw_sample: 2
+  # Safeguard: if a reused raw sample does not get a new distinct model soon
+  # enough, retire it instead of pinning the chunk forever on single-model data.
+  max_pending_reuse_wait_s: 120.0
+  parallel_inference_workers: 4
+  # Keep a small hot set per worker so four concurrent workers do not thrash on
+  # every model switch, but also do not explode VRAM residency unnecessarily.
+  parallel_model_pool_max_loaded_models: 2
+  # train.predownload_models is enabled for big_vae; keep runtime strictly local
+  # so collector does not keep hitting HF Hub metadata endpoints on every reload.
+  runtime_local_only: true
   atomizer_process_enabled: false
   atomizer_queue_max_items: 256
   in_memory_buffer:
@@ -28,6 +40,13 @@ collector:
     low_watermark_samples: 64
   layer_output_splitting:
     xy_samples_random_slice: 256
+
+train:
+  batch_source_mixing:
+    # Force model diversity at the run-profile level as well, so the active run
+    # does not silently fall back to `none` due to an older trainer config.
+    uniqueness: model
+    max_source_samples: 4
 
 hydra:
   job:

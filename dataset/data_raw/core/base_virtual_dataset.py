@@ -29,7 +29,14 @@ class BaseVirtualDataset(ABC):
     def stats(self) -> dict[str, Any]:
         """Return debug stats about cache and worker state."""
 
-    def get_batch_refs(self, batch_size: int) -> list[ImageSampleRef]:
+    def get_batch_refs(
+        self,
+        batch_size: int,
+        *,
+        consumer_id: str | None = None,
+        max_distinct_consumers_per_sample: int | None = None,
+        max_pending_reuse_s: float | None = None,
+    ) -> list[ImageSampleRef]:
         raise NotImplementedError(f"{self.__class__.__name__} does not support lightweight sample refs")
 
     def load_refs(self, refs: list[ImageSampleRef]) -> list[ImageSample]:

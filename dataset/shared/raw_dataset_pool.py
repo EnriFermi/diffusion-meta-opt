@@ -43,6 +43,15 @@ class RawDatasetPool:
         self.seed = int(data_cfg.get("seed", 0))
         self._rng = random.Random(self.seed)
         collector_cfg = self.cfg_dict.get("collector") or {}
+        self.max_distinct_models_per_raw_sample = max(
+            1,
+            int(collector_cfg.get("max_distinct_models_per_raw_sample", 1)),
+        )
+        self.max_pending_reuse_wait_s = (
+            None
+            if collector_cfg.get("max_pending_reuse_wait_s") is None
+            else max(0.0, float(collector_cfg.get("max_pending_reuse_wait_s")))
+        )
         dataset_pool_cfg = collector_cfg.get("dataset_pool") or {}
         self.continue_on_create_failure = bool(dataset_pool_cfg.get("continue_on_create_failure", True))
         self.continue_on_start_failure = bool(dataset_pool_cfg.get("continue_on_start_failure", True))
@@ -245,6 +254,8 @@ class RawDatasetPool:
         self,
         dataset_name: str,
         n: int,
+        *,
+        consumer_id: str | None = None,
     ) -> tuple[list[ImageSampleRef], list[str | int], list[dict[str, Any]]]:
         if n <= 0:
             return [], [], []
@@ -258,7 +269,12 @@ class RawDatasetPool:
             return [], [], []
 
         try:
-            refs = dataset.get_batch_refs(n)
+            refs = dataset.get_batch_refs(
+                n,
+                consumer_id=consumer_id,
+                max_distinct_consumers_per_sample=self.max_distinct_models_per_raw_sample,
+                max_pending_reuse_s=self.max_pending_reuse_wait_s,
+            )
         except NotImplementedError:
             self._mark_runtime_failure(
                 dataset_name,
@@ -427,7 +443,11 @@ class RawDatasetPool:
         for dataset_name, count in counts.items():
             if count <= 0:
                 continue
-            image_refs, source_ids, _ = self.get_image_ref_batch(dataset_name=dataset_name, n=count)
+            image_refs, source_ids, _ = self.get_image_ref_batch(
+                dataset_name=dataset_name,
+                n=count,
+                consumer_id=model_name,
+            )
             for image_ref, source_id in zip(image_refs, source_ids, strict=False):
                 all_refs.append(image_ref)
                 all_meta.append(MixedImageMeta(dataset_name=dataset_name, source_id=source_id))
@@ -444,6 +464,7 @@ class RawDatasetPool:
                 dataset_names=dataset_names,
                 all_refs=all_refs,
                 all_meta=all_meta,
+                consumer_id=model_name,
             )
 
         indices = list(range(len(all_refs)))
@@ -623,13 +644,14 @@ class RawDatasetPool:
         dataset_names: list[str],
         all_refs: list[ImageSampleRef],
         all_meta: list[MixedImageMeta],
+        consumer_id: str | None,
     ) -> None:
         names = dataset_names[:]
         while len(all_refs) < batch_size and names:
             self._rng.shuffle(names)
             progress = False
             for dataset_name in names:
-                image_refs, source_ids, _ = self.get_image_ref_batch(dataset_name=dataset_name, n=1)
+                image_refs, source_ids, _ = self.get_image_ref_batch(dataset_name=dataset_name, n=1, consumer_id=consumer_id)
                 if not image_refs:
                     continue
                 all_refs.append(image_refs[0])
