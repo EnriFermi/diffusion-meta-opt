@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import time
 from pathlib import Path
@@ -28,6 +29,9 @@ class ChunkCache:
 
     def chunk_path(self, chunk_id: str) -> Path:
         return self.chunks_root / chunk_id
+
+    def lease_dir(self, chunk_id: str) -> Path:
+        return self.chunk_path(chunk_id) / ".leases"
 
     def list_chunks(self) -> list[str]:
         chunks = [
@@ -100,6 +104,8 @@ class ChunkCache:
         self._write_index()
 
     def remove_chunk(self, chunk_id: str) -> None:
+        if self.has_active_leases(chunk_id):
+            return
         chunk_dir = self.chunk_path(chunk_id)
         if chunk_dir.exists():
             shutil.rmtree(chunk_dir, ignore_errors=True)
@@ -109,9 +115,12 @@ class ChunkCache:
         evicted: list[str] = []
         chunks = self.list_chunks()
         while len(chunks) > self.num_chunks_kept:
-            oldest = chunks.pop(0)
-            self.remove_chunk(oldest)
-            evicted.append(oldest)
+            evictable = next((chunk_id for chunk_id in chunks if not self.has_active_leases(chunk_id)), None)
+            if evictable is None:
+                break
+            chunks.remove(evictable)
+            self.remove_chunk(evictable)
+            evicted.append(evictable)
         if evicted:
             self._write_index()
         return evicted
@@ -135,3 +144,78 @@ class ChunkCache:
 
     def _iter_chunk_dirs(self) -> list[Path]:
         return [path for path in self.chunks_root.iterdir() if path.is_dir() and path.name.startswith("chunk_")]
+
+    def acquire_lease(self, chunk_id: str, owner_id: str) -> None:
+        lease_dir = ensure_dir(self.lease_dir(chunk_id))
+        self._lease_path(chunk_id, owner_id).touch(exist_ok=True)
+
+    def release_lease(self, chunk_id: str, owner_id: str) -> None:
+        lease_path = self._lease_path(chunk_id, owner_id)
+        try:
+            lease_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        lease_dir = self.lease_dir(chunk_id)
+        try:
+            if lease_dir.exists() and not any(lease_dir.iterdir()):
+                lease_dir.rmdir()
+        except Exception:
+            pass
+
+    def has_active_leases(self, chunk_id: str) -> bool:
+        self._cleanup_stale_leases(chunk_id)
+        lease_dir = self.lease_dir(chunk_id)
+        if not lease_dir.exists():
+            return False
+        try:
+            return any(lease_dir.iterdir())
+        except Exception:
+            return False
+
+    def _lease_path(self, chunk_id: str, owner_id: str) -> Path:
+        safe_owner = slugify(str(owner_id)) or "lease"
+        return self.lease_dir(chunk_id) / f"{safe_owner}.lease"
+
+    def _cleanup_stale_leases(self, chunk_id: str) -> None:
+        lease_dir = self.lease_dir(chunk_id)
+        if not lease_dir.exists():
+            return
+        for path in lease_dir.iterdir():
+            if not path.is_file():
+                continue
+            owner_id = path.stem
+            pid = _parse_owner_pid(owner_id)
+            if pid is None or _pid_is_alive(pid):
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                continue
+        try:
+            if not any(lease_dir.iterdir()):
+                lease_dir.rmdir()
+        except Exception:
+            pass
+
+
+def _parse_owner_pid(owner_id: str) -> int | None:
+    token = str(owner_id).strip()
+    if not token.startswith("pid"):
+        return None
+    pid_text = token[3:].split("_", 1)[0]
+    try:
+        return int(pid_text)
+    except Exception:
+        return None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
+    return True

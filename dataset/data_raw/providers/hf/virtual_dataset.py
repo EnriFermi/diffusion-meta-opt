@@ -19,7 +19,7 @@ from dataset.data_raw.core.chunk_cache import ChunkCache
 from dataset.data_raw.core.config import to_plain_dict
 from dataset.data_raw.core.fs_utils import ensure_dir, read_json, utc_now_iso, write_json_atomic
 from dataset.data_raw.core.image_utils import decode_to_pil, load_image
-from dataset.data_raw.core.types import ImageSample
+from dataset.data_raw.core.types import ImageSample, ImageSampleRef
 from dataset.data_raw.providers.hf.auth import init_hf_auth
 from dataset.data_raw.providers.hf.datasets_server_sampler import DatasetServerSampler
 from dataset.data_raw.providers.hf.hf_loader import load_hf_dataset
@@ -142,6 +142,9 @@ class HFVirtualDataset(BaseVirtualDataset):
         self._known_chunks: set[str] = set()
         self._chunk_queue: deque[dict[str, Any]] = deque()
         self._memory_samples: deque[ImageSample] = deque()
+        self._leased_chunk_ref_counts: Counter[str] = Counter()
+        self._leased_chunk_owner_id = f"pid{os.getpid()}_{self.name}"
+        self._pending_chunk_cleanup: set[str] = set()
         self._served_samples = 0
         self._status_started_at = float(time.time())
         self._worker_started_at: float | None = None
@@ -204,7 +207,101 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         return batch
 
+    def get_batch_refs(self, batch_size: int) -> list[ImageSampleRef]:
+        if batch_size <= 0:
+            return []
+        if self.transport_mode != "disk":
+            raise RuntimeError(f"dataset '{self.name}' does not support disk-backed sample refs in transport={self.transport_mode}")
+
+        timeout_s = self.get_timeout_s
+        if self._served_samples == 0 and not self._chunk_queue:
+            timeout_s = max(timeout_s, self.startup_get_timeout_s)
+
+        deadline = time.monotonic() + timeout_s
+        batch: list[ImageSampleRef] = []
+
+        while len(batch) < batch_size:
+            self._drain_worker_events()
+            sample_ref = self._pop_sample_ref()
+            if sample_ref is not None:
+                batch.append(sample_ref)
+                continue
+
+            self._ensure_worker_alive()
+            if self._worker_permanently_stopped and not self._chunk_queue:
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self.idle_sleep_s)
+
+        if len(batch) < batch_size:
+            if self._last_worker_error:
+                self.logger.warning(
+                    "Requested %s sample refs, returned %s (cache underfilled). Last worker error: %s",
+                    batch_size,
+                    len(batch),
+                    self._last_worker_error,
+                )
+            else:
+                self.logger.warning(
+                    "Requested %s sample refs, returned %s (cache currently underfilled)",
+                    batch_size,
+                    len(batch),
+                )
+        return batch
+
+    def load_refs(self, refs: list[ImageSampleRef]) -> list[ImageSample]:
+        loaded: list[ImageSample] = []
+        for ref in refs:
+            sample = self.load_ref(ref)
+            if sample is not None:
+                loaded.append(sample)
+        return loaded
+
+    def load_ref(self, ref: ImageSampleRef) -> ImageSample | None:
+        if self.transport_mode != "disk":
+            raise RuntimeError(f"dataset '{self.name}' does not support loading refs in transport={self.transport_mode}")
+        if self.chunk_cache is None:
+            raise RuntimeError(f"dataset '{self.name}' is missing ChunkCache for disk-backed refs")
+
+        chunk_id = ref.chunk_id
+        file_name = ref.file_name
+        if not chunk_id or not file_name:
+            return None
+        image_path = self.chunk_cache.chunk_path(str(chunk_id)) / str(file_name)
+        if not image_path.exists():
+            self.logger.warning("Missing leased image for dataset=%s: %s", self.name, image_path)
+            return None
+        try:
+            image = load_image(image_path)
+        except Exception as exc:
+            self.logger.warning("Failed to load leased image %s: %s", image_path, exc)
+            return None
+        return ImageSample(
+            image=image,
+            dataset_name=self.name,
+            sample_id=ref.sample_id,
+            meta=ref.meta if isinstance(ref.meta, dict) else {},
+        )
+
+    def release_refs(self, refs: list[ImageSampleRef]) -> None:
+        if self.transport_mode != "disk":
+            return
+        if self.chunk_cache is None:
+            return
+        for ref in refs:
+            chunk_id = ref.chunk_id
+            if not chunk_id:
+                continue
+            self._release_chunk_lease(str(chunk_id))
+
     def close(self) -> None:
+        if self.chunk_cache is not None:
+            for chunk_id, ref_count in list(self._leased_chunk_ref_counts.items()):
+                if ref_count > 0:
+                    self.chunk_cache.release_lease(str(chunk_id), self._leased_chunk_owner_id)
+            self._leased_chunk_ref_counts.clear()
+            self._pending_chunk_cleanup.clear()
         if self._stop_event is not None:
             self._stop_event.set()
 
@@ -270,6 +367,9 @@ class HFVirtualDataset(BaseVirtualDataset):
             "chunks_loaded": len(self._chunk_queue) if self.transport_mode == "disk" else 0,
             "images_on_disk": 0 if self.chunk_cache is None else self.chunk_cache.count_images(),
             "memory_samples_loaded": len(self._memory_samples),
+            "leased_chunks": int(len(self._leased_chunk_ref_counts)),
+            "leased_refs": int(sum(self._leased_chunk_ref_counts.values())),
+            "pending_chunk_cleanup": int(len(self._pending_chunk_cleanup)),
             "worker_alive": bool(self._worker and self._worker.is_alive()),
             "worker_pid": worker_pid,
             "worker_exitcode": worker_exitcode,
@@ -525,10 +625,81 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         return None
 
+    def _pop_sample_ref(self) -> ImageSampleRef | None:
+        if self.transport_mode != "disk":
+            return None
+
+        while self._chunk_queue:
+            state = self._chunk_queue[0]
+            chunk_id = str(state["chunk_id"])
+            items = state["items"]
+            cursor = int(state["cursor"])
+
+            if cursor >= len(items):
+                self._maybe_finalize_consumed_chunk(chunk_id)
+                continue
+
+            entry = items[cursor]
+            state["cursor"] = cursor + 1
+
+            file_name = entry.get("file")
+            if not file_name:
+                continue
+
+            image_path = self.chunk_cache.chunk_path(chunk_id) / str(file_name)
+            if not image_path.exists():
+                continue
+
+            self._retain_chunk_lease(chunk_id)
+            if state["cursor"] >= len(items):
+                self._maybe_finalize_consumed_chunk(chunk_id)
+
+            sample_id = entry.get("sample_id", "unknown")
+            meta = entry.get("meta", {})
+            self._served_samples += 1
+            return ImageSampleRef(
+                dataset_name=self.name,
+                sample_id=sample_id,
+                meta=meta if isinstance(meta, dict) else {},
+                chunk_id=chunk_id,
+                file_name=str(file_name),
+            )
+        return None
+
     def _consume_chunk(self, chunk_id: str) -> None:
+        self._pending_chunk_cleanup.discard(chunk_id)
         self._forget_chunk(chunk_id)
         if self.chunk_cache is not None:
             self.chunk_cache.remove_chunk(chunk_id)
+
+    def _retain_chunk_lease(self, chunk_id: str) -> None:
+        if self.chunk_cache is None:
+            return
+        if self._leased_chunk_ref_counts.get(chunk_id, 0) <= 0:
+            self.chunk_cache.acquire_lease(chunk_id, self._leased_chunk_owner_id)
+        self._leased_chunk_ref_counts[chunk_id] += 1
+
+    def _release_chunk_lease(self, chunk_id: str) -> None:
+        if self.chunk_cache is None:
+            return
+        current = int(self._leased_chunk_ref_counts.get(chunk_id, 0))
+        if current <= 0:
+            return
+        if current == 1:
+            self._leased_chunk_ref_counts.pop(chunk_id, None)
+            self.chunk_cache.release_lease(chunk_id, self._leased_chunk_owner_id)
+            if chunk_id in self._pending_chunk_cleanup:
+                self._pending_chunk_cleanup.discard(chunk_id)
+                self._consume_chunk(chunk_id)
+            return
+        self._leased_chunk_ref_counts[chunk_id] = current - 1
+
+    def _maybe_finalize_consumed_chunk(self, chunk_id: str) -> None:
+        if int(self._leased_chunk_ref_counts.get(chunk_id, 0)) > 0:
+            self._pending_chunk_cleanup.add(chunk_id)
+            self._forget_chunk(chunk_id)
+            return
+        self._consume_chunk(chunk_id)
 
     def _init_meta_if_missing(self) -> None:
         if self.meta_path.exists():

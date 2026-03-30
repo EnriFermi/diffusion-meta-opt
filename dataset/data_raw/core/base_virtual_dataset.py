@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from dataset.data_raw.core.types import ImageSample
+from dataset.data_raw.core.types import ImageSample, ImageSampleRef
 
 
 class BaseVirtualDataset(ABC):
@@ -28,3 +28,12 @@ class BaseVirtualDataset(ABC):
     @abstractmethod
     def stats(self) -> dict[str, Any]:
         """Return debug stats about cache and worker state."""
+
+    def get_batch_refs(self, batch_size: int) -> list[ImageSampleRef]:
+        raise NotImplementedError(f"{self.__class__.__name__} does not support lightweight sample refs")
+
+    def load_refs(self, refs: list[ImageSampleRef]) -> list[ImageSample]:
+        raise NotImplementedError(f"{self.__class__.__name__} does not support loading sample refs")
+
+    def release_refs(self, refs: list[ImageSampleRef]) -> None:
+        return None

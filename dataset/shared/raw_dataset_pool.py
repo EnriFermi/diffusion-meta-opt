@@ -9,6 +9,7 @@ from typing import Any
 from omegaconf import DictConfig
 
 from dataset.data_raw.core.config import to_plain_dict
+from dataset.data_raw.core.types import ImageSampleRef
 from dataset.data_raw.providers.hf import register_all_adapters
 from dataset.data_raw.providers.hf.auth import (
     gated_datasets_missing_token,
@@ -240,6 +241,58 @@ class RawDatasetPool:
             self._dataset_last_failure.pop(str(dataset_name), None)
         return pil_images, source_ids, metas
 
+    def get_image_ref_batch(
+        self,
+        dataset_name: str,
+        n: int,
+    ) -> tuple[list[ImageSampleRef], list[str | int], list[dict[str, Any]]]:
+        if n <= 0:
+            return [], [], []
+
+        if self._is_dataset_disabled(dataset_name):
+            return [], [], []
+
+        dataset = self.datasets.get(dataset_name)
+        if dataset is None:
+            self._mark_runtime_failure(dataset_name, reason="unknown dataset")
+            return [], [], []
+
+        try:
+            refs = dataset.get_batch_refs(n)
+        except NotImplementedError:
+            self._mark_runtime_failure(
+                dataset_name,
+                reason="get_batch_refs_not_supported",
+            )
+            return [], [], []
+        except Exception as exc:
+            self._mark_runtime_failure(
+                dataset_name,
+                reason=f"get_batch_refs_error: {exc}",
+            )
+            return [], [], []
+
+        if not refs:
+            try:
+                stats = dataset.stats()
+            except Exception as exc:
+                self._mark_runtime_failure(
+                    dataset_name,
+                    reason=f"empty_ref_batch_and_stats_error: {exc}",
+                )
+                return [], [], []
+            if bool(stats.get("worker_permanently_stopped", False)):
+                reason = str(stats.get("worker_last_error") or "worker_permanently_stopped")
+                self._disable_dataset(str(dataset_name), reason=reason)
+                self._ensure_has_active_datasets()
+            return [], [], []
+
+        source_ids = [ref.sample_id for ref in refs]
+        metas = [ref.meta if isinstance(ref.meta, dict) else {} for ref in refs]
+        self._dataset_failure_counts.pop(str(dataset_name), None)
+        self._dataset_last_failure.pop(str(dataset_name), None)
+        return refs, source_ids, metas
+
     def sample_mixed_batch(
         self,
         model_name: str,
@@ -322,6 +375,126 @@ class RawDatasetPool:
         shuffled_meta = [all_meta[i] for i in indices[:batch_size]]
 
         return shuffled_images, shuffled_meta
+
+    def sample_mixed_batch_refs(
+        self,
+        model_name: str,
+        batch_size: int,
+        dataset_sampling_strategy: str,
+        max_dataset_fraction_per_batch: float,
+    ) -> tuple[list[ImageSampleRef], list[MixedImageMeta]]:
+        if batch_size <= 0:
+            return [], []
+
+        dataset_names = self.index.get_datasets_for_model(model_name)
+        if not dataset_names:
+            self.logger.warning("No supporting datasets configured for model '%s'", model_name)
+            return [], []
+
+        raw_dataset_weights = self.index.get_dataset_weights_for_model(model_name)
+        active_pairs = [
+            (str(name), float(weight))
+            for name, weight in zip(dataset_names, raw_dataset_weights, strict=False)
+            if not self._is_dataset_disabled(str(name))
+        ]
+        if not active_pairs:
+            self.logger.warning(
+                "No active datasets left for model '%s' (configured=%s, disabled=%s)",
+                model_name,
+                dataset_names,
+                sorted(self._disabled_datasets),
+            )
+            self._ensure_has_active_datasets()
+            return [], []
+        dataset_names = [name for name, _ in active_pairs]
+        dataset_weights = [weight for _, weight in active_pairs]
+        effective_max_fraction = _normalize_max_dataset_fraction_per_batch(
+            requested=float(max_dataset_fraction_per_batch),
+            num_datasets=len(dataset_names),
+        )
+        counts = _allocate_dataset_counts(
+            dataset_names=dataset_names,
+            dataset_weights=dataset_weights,
+            batch_size=batch_size,
+            dataset_sampling_strategy=dataset_sampling_strategy,
+            max_dataset_fraction=effective_max_fraction,
+            rng=self._rng,
+        )
+
+        all_refs: list[ImageSampleRef] = []
+        all_meta: list[MixedImageMeta] = []
+
+        for dataset_name, count in counts.items():
+            if count <= 0:
+                continue
+            image_refs, source_ids, _ = self.get_image_ref_batch(dataset_name=dataset_name, n=count)
+            for image_ref, source_id in zip(image_refs, source_ids, strict=False):
+                all_refs.append(image_ref)
+                all_meta.append(MixedImageMeta(dataset_name=dataset_name, source_id=source_id))
+
+        if len(all_refs) < batch_size:
+            self.logger.warning(
+                "Mixed ref batch underfilled for model=%s: requested=%s, got=%s",
+                model_name,
+                batch_size,
+                len(all_refs),
+            )
+            self._fill_batch_fallback_refs(
+                batch_size=batch_size,
+                dataset_names=dataset_names,
+                all_refs=all_refs,
+                all_meta=all_meta,
+            )
+
+        indices = list(range(len(all_refs)))
+        self._rng.shuffle(indices)
+
+        shuffled_refs = [all_refs[i] for i in indices[:batch_size]]
+        shuffled_meta = [all_meta[i] for i in indices[:batch_size]]
+        return shuffled_refs, shuffled_meta
+
+    def materialize_image_refs(
+        self,
+        image_refs: list[ImageSampleRef],
+        image_meta: list[MixedImageMeta],
+    ) -> tuple[list[Any], list[MixedImageMeta]]:
+        pil_batch: list[Any] = []
+        filtered_meta: list[MixedImageMeta] = []
+
+        for image_ref, meta in zip(image_refs, image_meta, strict=False):
+            dataset_name = str(image_ref.dataset_name)
+            if self._is_dataset_disabled(dataset_name):
+                continue
+            dataset = self.datasets.get(dataset_name)
+            if dataset is None:
+                self._mark_runtime_failure(dataset_name, reason="unknown dataset during ref materialization")
+                continue
+
+            try:
+                sample = dataset.load_ref(image_ref)
+            except Exception as exc:
+                self._mark_runtime_failure(dataset_name, reason=f"load_ref_error: {exc}")
+                continue
+            if sample is None:
+                continue
+            pil_batch.append(sample.image)
+            filtered_meta.append(meta)
+
+        return pil_batch, filtered_meta
+
+    def release_image_refs(self, image_refs: list[ImageSampleRef]) -> None:
+        refs_by_dataset: dict[str, list[ImageSampleRef]] = {}
+        for ref in image_refs:
+            refs_by_dataset.setdefault(str(ref.dataset_name), []).append(ref)
+
+        for dataset_name, refs in refs_by_dataset.items():
+            dataset = self.datasets.get(dataset_name)
+            if dataset is None:
+                continue
+            try:
+                dataset.release_refs(refs)
+            except Exception as exc:
+                self.logger.warning("Failed to release image refs for dataset '%s': %s", dataset_name, exc)
 
     def stats(self) -> dict[str, Any]:
         payload = {}
@@ -440,6 +613,29 @@ class RawDatasetPool:
                 all_meta.append(MixedImageMeta(dataset_name=dataset_name, source_id=source_ids[0]))
                 progress = True
                 if len(all_images) >= batch_size:
+                    break
+            if not progress:
+                break
+
+    def _fill_batch_fallback_refs(
+        self,
+        batch_size: int,
+        dataset_names: list[str],
+        all_refs: list[ImageSampleRef],
+        all_meta: list[MixedImageMeta],
+    ) -> None:
+        names = dataset_names[:]
+        while len(all_refs) < batch_size and names:
+            self._rng.shuffle(names)
+            progress = False
+            for dataset_name in names:
+                image_refs, source_ids, _ = self.get_image_ref_batch(dataset_name=dataset_name, n=1)
+                if not image_refs:
+                    continue
+                all_refs.append(image_refs[0])
+                all_meta.append(MixedImageMeta(dataset_name=dataset_name, source_id=source_ids[0]))
+                progress = True
+                if len(all_refs) >= batch_size:
                     break
             if not progress:
                 break

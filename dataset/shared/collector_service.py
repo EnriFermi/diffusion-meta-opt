@@ -20,6 +20,7 @@ from typing import Any
 from omegaconf import DictConfig
 
 from dataset.data_raw.core.config import to_plain_dict
+from dataset.data_raw.core.types import ImageSampleRef
 from dataset.logging_utils import configure_process_logging
 from dataset.models.model_pool import ModelPool
 from dataset.shared.atomizer import atomize
@@ -49,7 +50,7 @@ _FAULT_HANDLER_FILES: list[Any] = []
 @dataclass(slots=True)
 class _PreparedCollectorJob:
     model_name: str
-    pil_batch: list[Any]
+    image_refs: list[ImageSampleRef]
     image_meta: list[Any]
     dataset_mix: dict[str, int]
     started_at: float
@@ -1140,7 +1141,7 @@ class CollectorService:
         batch_size = max(1, int(model_cfg.get("batch_size", 1)))
 
         raw_batch_fetch_started = time.time()
-        pil_batch, image_meta = self._raw_pool.sample_mixed_batch(
+        image_refs, image_meta = self._raw_pool.sample_mixed_batch_refs(
             model_name=model_name,
             batch_size=batch_size,
             dataset_sampling_strategy=self.dataset_sampling_strategy,
@@ -1148,7 +1149,7 @@ class CollectorService:
         )
         raw_batch_fetch_s = time.time() - raw_batch_fetch_started
 
-        if not pil_batch:
+        if not image_refs:
             duration_s = time.time() - started
             return CollectorJobStats(
                 model_name=model_name,
@@ -1161,49 +1162,67 @@ class CollectorService:
                 **_memory_payload_after(),
             )
 
-        infer_started = time.time()
-        layer_records = self._get_execution_model_pool().run(model_name=model_name, pil_batch=pil_batch)
-        model_infer_s = time.time() - infer_started
+        pil_batch: list[Any] = []
+        try:
+            pil_batch, image_meta = self._raw_pool.materialize_image_refs(image_refs, image_meta)
+            if not pil_batch:
+                duration_s = time.time() - started
+                return CollectorJobStats(
+                    model_name=model_name,
+                    num_images=0,
+                    num_layers=0,
+                    num_samples_emitted=0,
+                    dataset_mix={},
+                    duration_s=duration_s,
+                    raw_batch_fetch_s=raw_batch_fetch_s,
+                    **_memory_payload_after(),
+                )
 
-        atomize_started = time.time()
-        run_id = self._next_run_id()
-        if self.atomizer_process_enabled:
-            self._enqueue_atomizer_task(
-                layer_records=layer_records,
-                image_meta_list=image_meta,
-                model_run_id=run_id,
-                model_name=model_name,
-            )
-            emitted = len(layer_records)
-        else:
-            emitted = 0
-            for record in layer_records:
-                for shared_sample in atomize(
-                    layer_record=record,
-                    atom_cfg=self.atom_cfg,
+            infer_started = time.time()
+            layer_records = self._get_execution_model_pool().run(model_name=model_name, pil_batch=pil_batch)
+            model_infer_s = time.time() - infer_started
+
+            atomize_started = time.time()
+            run_id = self._next_run_id()
+            if self.atomizer_process_enabled:
+                self._enqueue_atomizer_task(
+                    layer_records=layer_records,
                     image_meta_list=image_meta,
                     model_run_id=run_id,
-                ):
-                    self._sink.emit(shared_sample)
-                    emitted += 1
-        atomize_emit_s = time.time() - atomize_started
+                    model_name=model_name,
+                )
+                emitted = len(layer_records)
+            else:
+                emitted = 0
+                for record in layer_records:
+                    for shared_sample in atomize(
+                        layer_record=record,
+                        atom_cfg=self.atom_cfg,
+                        image_meta_list=image_meta,
+                        model_run_id=run_id,
+                    ):
+                        self._sink.emit(shared_sample)
+                        emitted += 1
+            atomize_emit_s = time.time() - atomize_started
 
-        mix_counter = Counter(item.dataset_name for item in image_meta)
+            mix_counter = Counter(item.dataset_name for item in image_meta)
 
-        duration_s = time.time() - started
-        stats = CollectorJobStats(
-            model_name=model_name,
-            num_images=len(pil_batch),
-            num_layers=len(layer_records),
-            num_samples_emitted=emitted,
-            dataset_mix=dict(mix_counter),
-            duration_s=duration_s,
-            raw_batch_fetch_s=raw_batch_fetch_s,
-            model_infer_s=model_infer_s,
-            atomize_emit_s=atomize_emit_s,
-            **_memory_payload_after(),
-        )
-        return self._record_completed_job(stats)
+            duration_s = time.time() - started
+            stats = CollectorJobStats(
+                model_name=model_name,
+                num_images=len(pil_batch),
+                num_layers=len(layer_records),
+                num_samples_emitted=emitted,
+                dataset_mix=dict(mix_counter),
+                duration_s=duration_s,
+                raw_batch_fetch_s=raw_batch_fetch_s,
+                model_infer_s=model_infer_s,
+                atomize_emit_s=atomize_emit_s,
+                **_memory_payload_after(),
+            )
+            return self._record_completed_job(stats)
+        finally:
+            self._raw_pool.release_image_refs(image_refs)
 
     def cache_size(self) -> int:
         if self.is_async_mode and not self._runtime_ready:
@@ -1673,20 +1692,20 @@ class CollectorService:
         model_cfg = self.compat_index.get_model_cfg(model_name)
         batch_size = max(1, int(model_cfg.get("batch_size", 1)))
 
-        pil_batch, image_meta = self._raw_pool.sample_mixed_batch(
+        image_refs, image_meta = self._raw_pool.sample_mixed_batch_refs(
             model_name=model_name,
             batch_size=batch_size,
             dataset_sampling_strategy=self.dataset_sampling_strategy,
             max_dataset_fraction_per_batch=self.max_dataset_fraction_per_batch,
         )
         raw_batch_fetch_s = time.time() - started
-        if not pil_batch:
+        if not image_refs:
             return None
 
         dataset_mix = dict(Counter(item.dataset_name for item in image_meta))
         return _PreparedCollectorJob(
             model_name=model_name,
-            pil_batch=pil_batch,
+            image_refs=image_refs,
             image_meta=image_meta,
             dataset_mix=dataset_mix,
             started_at=started,
@@ -1697,44 +1716,60 @@ class CollectorService:
         assert self._sink is not None
 
         model_pool = self._get_execution_model_pool()
-        infer_started = time.time()
-        layer_records = model_pool.run(model_name=prepared.model_name, pil_batch=prepared.pil_batch)
-        model_infer_s = time.time() - infer_started
+        pil_batch: list[Any] = []
+        try:
+            pil_batch, image_meta = self._raw_pool.materialize_image_refs(prepared.image_refs, prepared.image_meta)
+            if not pil_batch:
+                return CollectorJobStats(
+                    model_name=prepared.model_name,
+                    num_images=0,
+                    num_layers=0,
+                    num_samples_emitted=0,
+                    dataset_mix=prepared.dataset_mix,
+                    duration_s=time.time() - prepared.started_at,
+                    raw_batch_fetch_s=prepared.raw_batch_fetch_s,
+                )
 
-        atomize_started = time.time()
-        run_id = self._next_run_id()
-        if self.atomizer_process_enabled:
-            self._enqueue_atomizer_task(
-                layer_records=layer_records,
-                image_meta_list=prepared.image_meta,
-                model_run_id=run_id,
-                model_name=prepared.model_name,
-            )
-            emitted = len(layer_records)
-        else:
-            emitted = 0
-            for record in layer_records:
-                for shared_sample in atomize(
-                    layer_record=record,
-                    atom_cfg=self.atom_cfg,
-                    image_meta_list=prepared.image_meta,
+            infer_started = time.time()
+            layer_records = model_pool.run(model_name=prepared.model_name, pil_batch=pil_batch)
+            model_infer_s = time.time() - infer_started
+
+            atomize_started = time.time()
+            run_id = self._next_run_id()
+            if self.atomizer_process_enabled:
+                self._enqueue_atomizer_task(
+                    layer_records=layer_records,
+                    image_meta_list=image_meta,
                     model_run_id=run_id,
-                ):
-                    self._sink.emit(shared_sample)
-                    emitted += 1
-        atomize_emit_s = time.time() - atomize_started
+                    model_name=prepared.model_name,
+                )
+                emitted = len(layer_records)
+            else:
+                emitted = 0
+                for record in layer_records:
+                    for shared_sample in atomize(
+                        layer_record=record,
+                        atom_cfg=self.atom_cfg,
+                        image_meta_list=image_meta,
+                        model_run_id=run_id,
+                    ):
+                        self._sink.emit(shared_sample)
+                        emitted += 1
+            atomize_emit_s = time.time() - atomize_started
 
-        return CollectorJobStats(
-            model_name=prepared.model_name,
-            num_images=len(prepared.pil_batch),
-            num_layers=len(layer_records),
-            num_samples_emitted=emitted,
-            dataset_mix=prepared.dataset_mix,
-            duration_s=time.time() - prepared.started_at,
-            raw_batch_fetch_s=prepared.raw_batch_fetch_s,
-            model_infer_s=model_infer_s,
-            atomize_emit_s=atomize_emit_s,
-        )
+            return CollectorJobStats(
+                model_name=prepared.model_name,
+                num_images=len(pil_batch),
+                num_layers=len(layer_records),
+                num_samples_emitted=emitted,
+                dataset_mix=prepared.dataset_mix,
+                duration_s=time.time() - prepared.started_at,
+                raw_batch_fetch_s=prepared.raw_batch_fetch_s,
+                model_infer_s=model_infer_s,
+                atomize_emit_s=atomize_emit_s,
+            )
+        finally:
+            self._raw_pool.release_image_refs(prepared.image_refs)
 
     def _record_completed_job(self, stats: CollectorJobStats) -> CollectorJobStats:
         with self._stats_lock:
