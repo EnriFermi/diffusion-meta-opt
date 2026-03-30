@@ -1430,13 +1430,16 @@ class CollectorService:
         assert self._prepared_job_queue is not None
         assert self._prepared_job_stop_event is not None
         assert self._sink is not None
+        prepared_job_queue = self._prepared_job_queue
+        stop_event = self._prepared_job_stop_event
+        sink = self._sink
 
         try:
-            while not self._prepared_job_stop_event.is_set():
-                if not self._sink.needs_fill():
+            while not stop_event.is_set():
+                if not sink.needs_fill():
                     time.sleep(0.02)
                     continue
-                if self._prepared_job_queue.full():
+                if prepared_job_queue.full():
                     time.sleep(0.02)
                     continue
 
@@ -1445,9 +1448,9 @@ class CollectorService:
                     time.sleep(0.02)
                     continue
 
-                while not self._prepared_job_stop_event.is_set():
+                while not stop_event.is_set():
                     try:
-                        self._prepared_job_queue.put(prepared, timeout=0.1)
+                        prepared_job_queue.put(prepared, timeout=0.1)
                         break
                     except Full:
                         continue
