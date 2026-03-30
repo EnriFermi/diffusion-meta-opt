@@ -114,7 +114,7 @@ class HFVirtualDataset(BaseVirtualDataset):
         self.meta_path = self.dataset_root / "meta.json"
 
         cache_cfg = self.cfg_dict.get("cache", {})
-        self.transport_mode = str(cache_cfg.get("transport", "memory")).strip().lower()
+        self.transport_mode = str(cache_cfg.get("transport", "disk")).strip().lower()
         if self.transport_mode not in {"memory", "disk"}:
             raise ValueError(f"Unsupported cache.transport for dataset '{self.name}': {self.transport_mode}")
         self.num_chunks_kept = int(cache_cfg.get("num_chunks_kept", 2))
@@ -760,7 +760,7 @@ def hf_dataset_prefetch_worker(worker_payload: dict[str, Any], events_queue: Any
 
     dataset_root = ensure_dir(Path(global_data_root) / dataset_name)
     cache_cfg = dataset_cfg.get("cache", {})
-    transport_mode = str(cache_cfg.get("transport", "memory")).strip().lower()
+    transport_mode = str(cache_cfg.get("transport", "disk")).strip().lower()
     chunk_size = int(cache_cfg.get("chunk_size_images", 1024))
     num_chunks_kept = int(cache_cfg.get("num_chunks_kept", 2))
 
