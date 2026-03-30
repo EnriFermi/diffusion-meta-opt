@@ -85,6 +85,19 @@ class HFEncDecRunner(HFBaseRunner):
                 return self._model(pixel_values=model_inputs["pixel_values"])
             return vision_model(pixel_values=model_inputs["pixel_values"])
 
+        if self.architecture == "trocr":
+            trocr_inputs = {"pixel_values": model_inputs["pixel_values"]}
+            if "pixel_mask" in model_inputs:
+                trocr_inputs["pixel_mask"] = model_inputs["pixel_mask"]
+
+            get_encoder = getattr(self._model, "get_encoder", None)
+            target = get_encoder() if callable(get_encoder) else self._model
+            try:
+                return target(**trocr_inputs)
+            except TypeError:
+                trocr_inputs.pop("pixel_mask", None)
+                return target(**trocr_inputs)
+
         encoder = None
         get_encoder = getattr(self._model, "get_encoder", None)
         if callable(get_encoder):

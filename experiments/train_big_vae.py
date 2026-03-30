@@ -84,6 +84,7 @@ class ConsumedSourceBatch:
     x: torch.Tensor
     x_mask: torch.Tensor
     d_in_mask: torch.Tensor
+    d_out_mask: torch.Tensor
     used_source_indices: tuple[int, ...]
     next_start_offset: int
     source_pool_size: int
@@ -1198,6 +1199,7 @@ def _maybe_dump_fixed_training_batch(
     x_s: torch.Tensor,
     x_mask_s: torch.Tensor | None,
     d_in_mask_s: torch.Tensor | None,
+    d_out_mask_s: torch.Tensor | None,
     cfg: DictConfig,
     logger: logging.Logger,
     global_step: int,
@@ -1232,6 +1234,11 @@ def _maybe_dump_fixed_training_batch(
             if d_in_mask_s is not None
             else None
         ),
+        "fixed_batch_d_out_mask": (
+            d_out_mask_s.detach().to(device="cpu", dtype=torch.bool, copy=True).contiguous()
+            if d_out_mask_s is not None
+            else None
+        ),
         "meta": {
             "capture_step": int(global_step),
             "stage": int(stage),
@@ -1243,6 +1250,7 @@ def _maybe_dump_fixed_training_batch(
             "x_shape": list(x_s.shape),
             "x_mask_shape": list(x_mask_s.shape) if x_mask_s is not None else None,
             "d_in_mask_shape": list(d_in_mask_s.shape) if d_in_mask_s is not None else None,
+            "d_out_mask_shape": list(d_out_mask_s.shape) if d_out_mask_s is not None else None,
             "data_seed": int(cfg.data.get("seed", 42)),
         },
     }
@@ -1758,6 +1766,34 @@ def _pad_d_in_with_mask(
     return torch.cat([x, x_pad], dim=2), torch.cat([W, W_pad], dim=1), d_in_mask
 
 
+def _pad_d_out_with_mask(
+    W: torch.Tensor,
+    target_d_out: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if target_d_out <= 0:
+        raise ValueError(f"target_d_out must be > 0, got {target_d_out}")
+    if W.ndim not in {2, 3}:
+        raise ValueError(f"W must be rank-2 or rank-3, got {tuple(W.shape)}")
+
+    current_d_out = int(W.shape[-1])
+    if current_d_out > int(target_d_out):
+        raise ValueError(f"target_d_out ({target_d_out}) must be >= current_d_out ({current_d_out})")
+
+    mask_shape = (int(target_d_out),) if W.ndim == 2 else (int(W.shape[0]), int(target_d_out))
+    d_out_mask = torch.zeros(mask_shape, device=W.device, dtype=torch.bool)
+    d_out_mask[..., :current_d_out] = True
+    if current_d_out == int(target_d_out):
+        return W, d_out_mask
+
+    pad_d_out = int(target_d_out) - current_d_out
+    if W.ndim == 2:
+        W_pad = torch.zeros((int(W.shape[0]), pad_d_out), device=W.device, dtype=W.dtype)
+        return torch.cat([W, W_pad], dim=1), d_out_mask
+
+    W_pad = torch.zeros((int(W.shape[0]), int(W.shape[1]), pad_d_out), device=W.device, dtype=W.dtype)
+    return torch.cat([W, W_pad], dim=2), d_out_mask
+
+
 def _build_without_replacement_index_groups(
     *,
     num_items: int,
@@ -2097,8 +2133,8 @@ def _build_training_batch_from_source_states(
     ordered_x: list[torch.Tensor] = []
     ordered_x_mask: list[torch.Tensor] = []
     ordered_d_in_mask: list[torch.Tensor] = []
+    ordered_d_out_mask: list[torch.Tensor] = []
     used_source_indices: list[int] = []
-    expected_d_out: int | None = None
     cursor = int(start_offset) % len(source_states)
     stagnant_scans = 0
 
@@ -2123,33 +2159,29 @@ def _build_training_batch_from_source_states(
 
         stagnant_scans = 0
         W_i, x_i = sliced
-        current_d_out = int(W_i.shape[1])
-        if expected_d_out is None:
-            expected_d_out = current_d_out
-        elif current_d_out != expected_d_out:
-            raise ValueError(
-                "without-replacement source consumption requires all selected source samples to slice to the same "
-                f"d_out, got {current_d_out} vs expected {expected_d_out}"
-            )
         raw_slices.append((W_i, x_i))
         used_source_indices.append(cursor)
         cursor = (cursor + 1) % len(source_states)
 
     max_x_rows = max(int(x_i.shape[0]) for _, x_i in raw_slices)
     max_d_in = max(int(W_i.shape[0]) for W_i, _ in raw_slices)
+    max_d_out = max(int(W_i.shape[1]) for W_i, _ in raw_slices)
     for W_i, x_i in raw_slices:
         x_i, x_mask_i = _pad_x_rows_with_mask(x_i, max_x_rows)
         x_i, W_i, d_in_mask_i = _pad_d_in_with_mask(x_i, W_i, max_d_in)
+        W_i, d_out_mask_i = _pad_d_out_with_mask(W_i, max_d_out)
         ordered_W.append(W_i.unsqueeze(0))
         ordered_x.append(x_i.unsqueeze(0))
         ordered_x_mask.append(x_mask_i.unsqueeze(0))
         ordered_d_in_mask.append(d_in_mask_i.unsqueeze(0))
+        ordered_d_out_mask.append(d_out_mask_i.unsqueeze(0))
 
     return ConsumedSourceBatch(
         W=torch.cat(ordered_W, dim=0),
         x=torch.cat(ordered_x, dim=0),
         x_mask=torch.cat(ordered_x_mask, dim=0),
         d_in_mask=torch.cat(ordered_d_in_mask, dim=0),
+        d_out_mask=torch.cat(ordered_d_out_mask, dim=0),
         used_source_indices=tuple(used_source_indices),
         next_start_offset=int(cursor),
         source_pool_size=int(len(source_states)),
@@ -2168,7 +2200,7 @@ def _build_training_batch_from_source_samples(
     patch_size: int,
     batch_size: int,
     start_offset: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not source_samples:
         raise ValueError("source_samples must not be empty")
     if batch_size <= 0:
@@ -2193,8 +2225,8 @@ def _build_training_batch_from_source_samples(
         counts[source_idx] += 1
 
     source_batches: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-    expected_d_out: int | None = None
     max_d_in = 0
+    max_batch_d_out = 0
     for source_idx, count in enumerate(counts):
         if count <= 0:
             continue
@@ -2207,15 +2239,8 @@ def _build_training_batch_from_source_samples(
             patch_size=patch_size,
             batch_size=count,
         )
-        current_d_out = int(W_part.shape[2])
-        if expected_d_out is None:
-            expected_d_out = current_d_out
-        elif current_d_out != expected_d_out:
-            raise ValueError(
-                "round-robin batch mixing requires all selected source samples to slice to the same d_out, got "
-                f"{current_d_out} vs expected {expected_d_out}"
-            )
         max_d_in = max(max_d_in, int(W_part.shape[1]))
+        max_batch_d_out = max(max_batch_d_out, int(W_part.shape[2]))
         x_mask_part = x_mask_src.unsqueeze(0).expand(count, -1)
         source_batches[source_idx] = (W_part, x_part, x_mask_part)
 
@@ -2224,6 +2249,7 @@ def _build_training_batch_from_source_samples(
     ordered_x: list[torch.Tensor] = []
     ordered_x_mask: list[torch.Tensor] = []
     ordered_d_in_mask: list[torch.Tensor] = []
+    ordered_d_out_mask: list[torch.Tensor] = []
     for source_idx in assignment:
         W_part, x_part, x_mask_part = source_batches[source_idx]
         cursor = source_offsets[source_idx]
@@ -2232,10 +2258,12 @@ def _build_training_batch_from_source_samples(
             W_part[cursor: cursor + 1],
             max_d_in,
         )
+        W_i, d_out_mask_i = _pad_d_out_with_mask(W_i, max_batch_d_out)
         ordered_W.append(W_i)
         ordered_x.append(x_i)
         ordered_x_mask.append(x_mask_part[cursor: cursor + 1])
         ordered_d_in_mask.append(d_in_mask_i)
+        ordered_d_out_mask.append(d_out_mask_i)
         source_offsets[source_idx] += 1
 
     return (
@@ -2243,6 +2271,7 @@ def _build_training_batch_from_source_samples(
         torch.cat(ordered_x, dim=0),
         torch.cat(ordered_x_mask, dim=0),
         torch.cat(ordered_d_in_mask, dim=0),
+        torch.cat(ordered_d_out_mask, dim=0),
     )
 
 
@@ -2543,6 +2572,7 @@ def _get_patch_latent_variance_stats(
     X: torch.Tensor,
     x_mask: torch.Tensor | None = None,
     d_in_mask: torch.Tensor | None = None,
+    d_out_mask: torch.Tensor | None = None,
 ) -> dict[str, float] | None:
     target = model.module if isinstance(model, DDP) else model
     compiled_target = getattr(target, "_orig_mod", None)
@@ -2557,7 +2587,7 @@ def _get_patch_latent_variance_stats(
     try:
         target.eval()
         with torch.no_grad():
-            outputs = forward_debug(W, X, x_mask=x_mask, d_in_mask=d_in_mask)
+            outputs = forward_debug(W, X, x_mask=x_mask, d_in_mask=d_in_mask, d_out_mask=d_out_mask)
         if not outputs or not isinstance(outputs[-1], dict):
             return None
         debug_info = outputs[-1]
@@ -3103,6 +3133,7 @@ def _run_worker(
             fixed_batch_W: torch.Tensor | None = None
             fixed_batch_x_mask: torch.Tensor | None = None
             fixed_batch_d_in_mask: torch.Tensor | None = None
+            fixed_batch_d_out_mask: torch.Tensor | None = None
             fixed_batch_diversity_stats: dict[str, float] | None = None
             direction_pre_norm_stats_latest: dict[str, Any] | None = None
             source_mixing_shortfall_logged = False
@@ -3131,6 +3162,7 @@ def _run_worker(
                         or fixed_batch_W is None
                         or fixed_batch_x_mask is None
                         or fixed_batch_d_in_mask is None
+                        or fixed_batch_d_out_mask is None
                     )
                 ):
                     dataset.maybe_collect(step_idx)
@@ -3148,6 +3180,7 @@ def _run_worker(
                                 or fixed_batch_W is None
                                 or fixed_batch_x_mask is None
                                 or fixed_batch_d_in_mask is None
+                                or fixed_batch_d_out_mask is None
                             )
                             and not current_source_states
                         )
@@ -3161,6 +3194,7 @@ def _run_worker(
                                 or fixed_batch_W is None
                                 or fixed_batch_x_mask is None
                                 or fixed_batch_d_in_mask is None
+                                or fixed_batch_d_out_mask is None
                             )
                             and not current_source_samples
                         )
@@ -3303,6 +3337,7 @@ def _run_worker(
                             or fixed_batch_W is None
                             or fixed_batch_x_mask is None
                             or fixed_batch_d_in_mask is None
+                            or fixed_batch_d_out_mask is None
                         ):
                             if consume_slices_without_replacement:
                                 current_source_states = _ensure_source_state_pool_capacity(
@@ -3344,11 +3379,12 @@ def _run_worker(
                                     source_pool_remaining_slices_pre=batch_payload.source_pool_remaining_slices_pre,
                                     source_pool_remaining_slices_post=batch_payload.source_pool_remaining_slices_post,
                                 )
-                                fixed_batch_W, fixed_batch_x, fixed_batch_x_mask, fixed_batch_d_in_mask = (
+                                fixed_batch_W, fixed_batch_x, fixed_batch_x_mask, fixed_batch_d_in_mask, fixed_batch_d_out_mask = (
                                     batch_payload.W,
                                     batch_payload.x,
                                     batch_payload.x_mask,
                                     batch_payload.d_in_mask,
+                                    batch_payload.d_out_mask,
                                 )
                             else:
                                 if not current_source_samples:
@@ -3358,7 +3394,7 @@ def _run_worker(
                                     batch_size=slice_batch_size,
                                     start_offset=current_source_round_robin_offset,
                                 )
-                                fixed_batch_W, fixed_batch_x, fixed_batch_x_mask, fixed_batch_d_in_mask = _build_training_batch_from_source_samples(
+                                fixed_batch_W, fixed_batch_x, fixed_batch_x_mask, fixed_batch_d_in_mask, fixed_batch_d_out_mask = _build_training_batch_from_source_samples(
                                     current_source_samples,
                                     max_T_patches=curriculum_max_T,
                                     max_d_out=curriculum_max_d_out,
@@ -3370,6 +3406,7 @@ def _run_worker(
                             fixed_batch_x = fixed_batch_x.to(device=device, non_blocking=True)
                             fixed_batch_x_mask = fixed_batch_x_mask.to(device=device, non_blocking=True)
                             fixed_batch_d_in_mask = fixed_batch_d_in_mask.to(device=device, non_blocking=True)
+                            fixed_batch_d_out_mask = fixed_batch_d_out_mask.to(device=device, non_blocking=True)
                             current_source_samples = None
                             current_source_states = None
                             current_source_round_robin_offset = 0
@@ -3385,6 +3422,7 @@ def _run_worker(
                                     x_s=fixed_batch_x,
                                     x_mask_s=fixed_batch_x_mask,
                                     d_in_mask_s=fixed_batch_d_in_mask,
+                                    d_out_mask_s=fixed_batch_d_out_mask,
                                     cfg=cfg,
                                     logger=logger,
                                     global_step=global_step,
@@ -3404,11 +3442,12 @@ def _run_worker(
                         if fixed_batch_diversity_stats is None:
                             raise RuntimeError("fixed training batch requires cached diversity stats")
                         current_batch_source_diversity = dict(fixed_batch_diversity_stats)
-                        W_s, x_s, x_mask_s, d_in_mask_s = (
+                        W_s, x_s, x_mask_s, d_in_mask_s, d_out_mask_s = (
                             fixed_batch_W,
                             fixed_batch_x,
                             fixed_batch_x_mask,
                             fixed_batch_d_in_mask,
+                            fixed_batch_d_out_mask,
                         )
                     else:
                         if consume_slices_without_replacement:
@@ -3451,11 +3490,12 @@ def _run_worker(
                                 source_pool_remaining_slices_pre=batch_payload.source_pool_remaining_slices_pre,
                                 source_pool_remaining_slices_post=batch_payload.source_pool_remaining_slices_post,
                             )
-                            W_s, x_s, x_mask_s, d_in_mask_s = (
+                            W_s, x_s, x_mask_s, d_in_mask_s, d_out_mask_s = (
                                 batch_payload.W,
                                 batch_payload.x,
                                 batch_payload.x_mask,
                                 batch_payload.d_in_mask,
+                                batch_payload.d_out_mask,
                             )
                             current_source_states, current_source_round_robin_offset = (
                                 _prune_exhausted_source_states_with_offset(
@@ -3471,7 +3511,7 @@ def _run_worker(
                                 batch_size=slice_batch_size,
                                 start_offset=current_source_round_robin_offset,
                             )
-                            W_s, x_s, x_mask_s, d_in_mask_s = _build_training_batch_from_source_samples(
+                            W_s, x_s, x_mask_s, d_in_mask_s, d_out_mask_s = _build_training_batch_from_source_samples(
                                 current_source_samples,
                                 max_T_patches=curriculum_max_T,
                                 max_d_out=curriculum_max_d_out,
@@ -3486,6 +3526,7 @@ def _run_worker(
                         x_s = x_s.to(device=device, non_blocking=True)
                         x_mask_s = x_mask_s.to(device=device, non_blocking=True)
                         d_in_mask_s = d_in_mask_s.to(device=device, non_blocking=True)
+                        d_out_mask_s = d_out_mask_s.to(device=device, non_blocking=True)
                     current_batch_source_diversity["target_models"] = float(max(1, requested_source_samples_per_refresh))
                     current_batch_source_diversity["batch_model_target_coverage"] = (
                         current_batch_source_diversity["batch_unique_models"]
@@ -3514,16 +3555,24 @@ def _run_worker(
                                     x_s,
                                     x_mask=x_mask_s,
                                     d_in_mask=d_in_mask_s,
+                                    d_out_mask=d_out_mask_s,
                                     return_direction_pre_norms=True,
                                 )
                             else:
-                                W_hat, mu, logvar, pred_dirs = model(W_s, x_s, x_mask=x_mask_s, d_in_mask=d_in_mask_s)
+                                W_hat, mu, logvar, pred_dirs = model(
+                                    W_s,
+                                    x_s,
+                                    x_mask=x_mask_s,
+                                    d_in_mask=d_in_mask_s,
+                                    d_out_mask=d_out_mask_s,
+                                )
                             behavioral_loss = WeightQuantileVAE.operator_recon_loss(
                                 x_s,
                                 W_s,
                                 W_hat,
                                 x_mask=x_mask_s,
                                 d_in_mask=d_in_mask_s,
+                                d_out_mask=d_out_mask_s,
                             )
                             structural_loss, struct_details = WeightQuantileVAE.patch_structure_loss(
                                 W_s, W_hat, patch_size=patch_size_for_slice,
@@ -3535,6 +3584,7 @@ def _run_worker(
                                 huber_delta=struct_huber_delta,
                                 pred_dirs=pred_dirs,
                                 d_in_mask=d_in_mask_s,
+                                d_out_mask=d_out_mask_s,
                             )
                             if use_latent_sampling:
                                 kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
@@ -4008,6 +4058,7 @@ def _run_worker(
                         x_s[:1],
                         x_mask=x_mask_s[:1],
                         d_in_mask=d_in_mask_s[:1],
+                        d_out_mask=d_out_mask_s[:1],
                     )
                     logger.info(
                         "step=%s/%s loss=%.6f behav=%.6f struct=%.6f "
