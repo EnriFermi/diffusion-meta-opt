@@ -21,7 +21,7 @@ collector:
   # Allow the same raw image sample to be reused by a few distinct models before
   # it is retired from the dataset chunk cache. This increases model diversity
   # without scaling raw worker RAM with the number of models.
-  max_distinct_models_per_raw_sample: 2
+  max_distinct_models_per_raw_sample: 3
   # Safeguard: if a reused raw sample does not get a new distinct model soon
   # enough, retire it instead of pinning the chunk forever on single-model data.
   max_pending_reuse_wait_s: 120.0
