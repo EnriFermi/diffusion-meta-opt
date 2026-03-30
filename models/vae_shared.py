@@ -143,6 +143,32 @@ def _apply_rope(x: torch.Tensor, positions: torch.Tensor, max_period: float = 10
     return torch.cat([x_rotated, x_pass], dim=-1)
 
 
+def _key_padding_to_attn_bias(key_mask: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Convert a [B, S] validity mask into an additive attention bias for SDPA.
+
+    `key_mask=True` means a key/value position is valid and may be attended to.
+    """
+    if key_mask.ndim != 2:
+        raise ValueError(f"key_mask must be [B,S], got {tuple(key_mask.shape)}")
+    mask = key_mask.to(dtype=torch.bool)
+    bias = torch.zeros((int(mask.shape[0]), 1, 1, int(mask.shape[1])), device=mask.device, dtype=dtype)
+    neg_inf = torch.full_like(bias, torch.finfo(dtype).min)
+    return torch.where(mask.unsqueeze(1).unsqueeze(1), bias, neg_inf)
+
+
+def _apply_sequence_mask(x: torch.Tensor, token_mask: torch.Tensor | None) -> torch.Tensor:
+    if token_mask is None:
+        return x
+    if x.ndim != 3:
+        raise ValueError(f"x must be [B,S,D] when applying a token mask, got {tuple(x.shape)}")
+    if token_mask.ndim != 2:
+        raise ValueError(f"token_mask must be [B,S], got {tuple(token_mask.shape)}")
+    if tuple(token_mask.shape) != tuple(x.shape[:2]):
+        raise ValueError(f"token_mask shape must match x sample axes, got {tuple(token_mask.shape)} vs {tuple(x.shape[:2])}")
+    return x * token_mask.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
+
+
 def _rope_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -151,6 +177,7 @@ def _rope_attention(
     k_pos: torch.Tensor,
     dropout_p: float,
     training: bool,
+    attn_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     RoPE + scaled dot-product attention.
@@ -167,7 +194,7 @@ def _rope_attention(
         q_rot,
         k_rot,
         v,
-        attn_mask=None,
+        attn_mask=attn_mask,
         dropout_p=attn_dropout,
         is_causal=False,
     )
@@ -244,6 +271,7 @@ def _rope_attention_with_angles(
     k_angles: torch.Tensor,
     dropout_p: float,
     training: bool,
+    attn_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Mixed 2D RoPE + scaled dot-product attention.
@@ -259,7 +287,7 @@ def _rope_attention_with_angles(
         q_rot,
         k_rot,
         v,
-        attn_mask=None,
+        attn_mask=attn_mask,
         dropout_p=attn_dropout,
         is_causal=False,
     )
@@ -468,12 +496,18 @@ class PerceiverResamplerBlock(nn.Module):
         latent_pos: torch.Tensor,
         token_pos: torch.Tensor,
         token_pos2: torch.Tensor | None = None,
+        token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         use_2d = self.use_rope_2d and token_pos2 is not None
         q = self.norm_cross_q(latents)
         kv = self.norm_cross_kv(tokens)
         B, L_lat, _ = q.shape
         L_tok = kv.shape[1]
+        cross_attn_mask = (
+            _key_padding_to_attn_bias(token_mask.to(device=kv.device, dtype=torch.bool), dtype=q.dtype)
+            if token_mask is not None
+            else None
+        )
         q_cross = self.cross_q_proj(q).view(B, L_lat, self.n_heads, self.head_dim).transpose(1, 2)
         k_cross = self.cross_k_proj(kv).view(B, L_tok, self.n_heads, self.head_dim).transpose(1, 2)
         v_cross = self.cross_v_proj(kv).view(B, L_tok, self.n_heads, self.head_dim).transpose(1, 2)
@@ -489,6 +523,7 @@ class PerceiverResamplerBlock(nn.Module):
                 k_angles=k_angles,
                 dropout_p=self.attn_prob_dropout_p,
                 training=self.training,
+                attn_mask=cross_attn_mask,
             )
         else:
             cross_out = _rope_attention(
@@ -499,6 +534,7 @@ class PerceiverResamplerBlock(nn.Module):
                 k_pos=token_pos,
                 dropout_p=self.attn_prob_dropout_p,
                 training=self.training,
+                attn_mask=cross_attn_mask,
             )
         cross_out = cross_out.transpose(1, 2).contiguous().view(B, L_lat, self.d_latent)
         cross_out = self.cross_out_proj(cross_out)
@@ -951,6 +987,8 @@ class CrossAttnBlock(nn.Module):
         kv_pos: torch.Tensor,
         q_pos2: torch.Tensor | None = None,
         kv_pos2: torch.Tensor | None = None,
+        q_mask: torch.Tensor | None = None,
+        kv_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         use_2d = self.use_rope_2d and q_pos2 is not None
         q_attn = self.q_norm(q)
@@ -958,6 +996,11 @@ class CrossAttnBlock(nn.Module):
 
         B, Tq, _ = q_attn.shape
         Tk = kv_attn.shape[1]
+        cross_attn_mask = (
+            _key_padding_to_attn_bias(kv_mask.to(device=kv_attn.device, dtype=torch.bool), dtype=q_attn.dtype)
+            if kv_mask is not None
+            else None
+        )
 
         q_proj = self.q_proj(q_attn).view(B, Tq, self.n_heads, self.head_dim).transpose(1, 2)
         k_proj = self.k_proj(kv_attn).view(B, Tk, self.n_heads, self.head_dim).transpose(1, 2)
@@ -975,6 +1018,7 @@ class CrossAttnBlock(nn.Module):
                 k_angles=k_angles,
                 dropout_p=self.attn_prob_dropout_p,
                 training=self.training,
+                attn_mask=cross_attn_mask,
             )
         else:
             attn_out = _rope_attention(
@@ -985,15 +1029,22 @@ class CrossAttnBlock(nn.Module):
                 k_pos=kv_pos,
                 dropout_p=self.attn_prob_dropout_p,
                 training=self.training,
+                attn_mask=cross_attn_mask,
             )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, Tq, self.d_model)
         attn_out = self.out_proj(attn_out)
 
         q = q + self.attn_out_dropout(attn_out)
+        q = _apply_sequence_mask(q, q_mask)
         q_self = self.self_attn_norm(q)
         self_q = self.self_q_proj(q_self).view(B, Tq, self.n_heads, self.head_dim).transpose(1, 2)
         self_k = self.self_k_proj(q_self).view(B, Tq, self.n_heads, self.head_dim).transpose(1, 2)
         self_v = self.self_v_proj(q_self).view(B, Tq, self.n_heads, self.head_dim).transpose(1, 2)
+        self_attn_mask = (
+            _key_padding_to_attn_bias(q_mask.to(device=q.device, dtype=torch.bool), dtype=q.dtype)
+            if q_mask is not None
+            else None
+        )
 
         if use_2d:
             self_angles = self.rope_2d_self.compute_angles(q_pos, q_pos2)
@@ -1005,6 +1056,7 @@ class CrossAttnBlock(nn.Module):
                 k_angles=self_angles,
                 dropout_p=self.attn_prob_dropout_p,
                 training=self.training,
+                attn_mask=self_attn_mask,
             )
         else:
             self_out = _rope_attention(
@@ -1015,12 +1067,14 @@ class CrossAttnBlock(nn.Module):
                 k_pos=q_pos,
                 dropout_p=self.attn_prob_dropout_p,
                 training=self.training,
+                attn_mask=self_attn_mask,
             )
         self_out = self_out.transpose(1, 2).contiguous().view(B, Tq, self.d_model)
         self_out = self.self_out_proj(self_out)
         q = q + self.self_attn_out_dropout(self_out)
+        q = _apply_sequence_mask(q, q_mask)
         q = q + self.ffn(self.ffn_norm(q))
-        return q
+        return _apply_sequence_mask(q, q_mask)
 
 
 __all__ = [
