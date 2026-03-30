@@ -621,6 +621,13 @@ class CollectorService:
         self.collector_device = resolve_collector_device(self.cfg_dict)
         self.train_device = resolve_train_device(self.cfg_dict)
         allow_async_on_train_device = bool(collector_cfg.get("allow_async_on_train_device", False))
+        self.parallel_inference_workers = max(1, int(collector_cfg.get("parallel_inference_workers", 1)))
+        self.parallel_model_pool_max_loaded_models = max(
+            1,
+            int(collector_cfg.get("parallel_model_pool_max_loaded_models", 1)),
+        )
+        self.atomizer_process_enabled = bool(collector_cfg.get("atomizer_process_enabled", False))
+        self.atomizer_queue_max_items = max(8, int(collector_cfg.get("atomizer_queue_max_items", 256)))
 
         if self.collector_mode == "async":
             if self.collector_device is None:
@@ -644,13 +651,6 @@ class CollectorService:
         self.dataset_sampling_strategy = str(collector_cfg.get("dataset_sampling_strategy", "weighted_random"))
         self.max_dataset_fraction_per_batch = float(collector_cfg.get("max_dataset_fraction_per_batch", 0.6))
         self.num_inflight_jobs = max(1, int(collector_cfg.get("num_inflight_jobs", 2)))
-        self.parallel_inference_workers = max(1, int(collector_cfg.get("parallel_inference_workers", 1)))
-        self.parallel_model_pool_max_loaded_models = max(
-            1,
-            int(collector_cfg.get("parallel_model_pool_max_loaded_models", 1)),
-        )
-        self.atomizer_process_enabled = bool(collector_cfg.get("atomizer_process_enabled", False))
-        self.atomizer_queue_max_items = max(8, int(collector_cfg.get("atomizer_queue_max_items", 256)))
         self.status_emit_interval_s = max(0.1, float(collector_cfg.get("status_emit_interval_s", 2.0)))
         self.status_queue_max_items = max(16, int(collector_cfg.get("status_queue_max_items", 2048)))
         if self.atomizer_process_enabled and self.streaming_mode != "none":
