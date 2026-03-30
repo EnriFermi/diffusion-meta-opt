@@ -10,6 +10,7 @@ import torch
 from PIL import Image
 
 from dataset.models.types import LayerIORecord
+from dataset.shared.types import SharedSample
 
 
 @dataclass(slots=True)
@@ -39,6 +40,16 @@ class SharedLayerRecordRef:
     weight: SharedTensorRef
     inputs: SharedTensorRef
     outputs: SharedTensorRef
+    meta: dict[str, Any]
+
+
+@dataclass(slots=True)
+class SharedSampleRef:
+    model_name: str
+    layer_name: str
+    weight: SharedTensorRef
+    x: SharedTensorRef
+    y: SharedTensorRef
     meta: dict[str, Any]
 
 
@@ -240,3 +251,45 @@ def cleanup_shared_layer_record_refs(record_refs: list[SharedLayerRecordRef]) ->
                 release_shared_buffer(tensor_ref.buffer)
             except Exception:
                 pass
+
+
+def share_shared_sample(sample: SharedSample) -> SharedSampleRef:
+    shared_ref: SharedSampleRef | None = None
+    try:
+        shared_ref = SharedSampleRef(
+            model_name=str(sample.model_name),
+            layer_name=str(sample.layer_name),
+            weight=share_tensor(sample.weight),
+            x=share_tensor(sample.x),
+            y=share_tensor(sample.y),
+            meta=dict(sample.meta),
+        )
+        return shared_ref
+    except Exception:
+        if shared_ref is not None:
+            cleanup_shared_sample_ref(shared_ref)
+        raise
+
+
+def restore_shared_sample(ref: SharedSampleRef, *, release: bool = True) -> SharedSample:
+    try:
+        return SharedSample(
+            model_name=str(ref.model_name),
+            layer_name=str(ref.layer_name),
+            weight=restore_tensor(ref.weight, release=release),
+            x=restore_tensor(ref.x, release=release),
+            y=restore_tensor(ref.y, release=release),
+            meta=dict(ref.meta),
+        )
+    except Exception:
+        if release:
+            cleanup_shared_sample_ref(ref)
+        raise
+
+
+def cleanup_shared_sample_ref(ref: SharedSampleRef) -> None:
+    for tensor_ref in (ref.weight, ref.x, ref.y):
+        try:
+            release_shared_buffer(tensor_ref.buffer)
+        except Exception:
+            pass
