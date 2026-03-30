@@ -34,19 +34,17 @@ class HFDenseRunner(HFBaseRunner):
         raise ValueError(f"Unsupported dense architecture='{self.architecture}' for {self.name}")
 
     def _load_processor(self, token: str | None) -> Any:
-        from transformers import AutoImageProcessor, AutoProcessor
-
         if self.architecture == "grounding_dino" and self.run_mode in {"vision_only", "encoder_only"}:
             # Vision-only path does not need tokenizer/text processor.
             try:
-                return self._from_pretrained(AutoImageProcessor, token=token)
+                return self._load_auto_image_processor_like(token)
             except Exception:
-                return self._from_pretrained(AutoProcessor, token=token)
+                return self._load_auto_processor(token)
 
         try:
-            return self._from_pretrained(AutoProcessor, token=token)
+            return self._load_auto_processor(token)
         except Exception:
-            return self._from_pretrained(AutoImageProcessor, token=token)
+            return self._load_auto_image_processor_like(token)
 
     def prepare_inputs(self, batch_pil: list[Image.Image]) -> dict[str, Any]:
         if self.architecture == "grounding_dino" and self.run_mode == "full":
