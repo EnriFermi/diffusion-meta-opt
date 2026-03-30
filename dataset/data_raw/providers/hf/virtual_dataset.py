@@ -25,6 +25,7 @@ from dataset.data_raw.providers.hf.datasets_server_sampler import DatasetServerS
 from dataset.data_raw.providers.hf.hf_loader import load_hf_dataset
 from dataset.data_raw.providers.hf.url_fetch import fetch_image_to_cache, fetch_image_to_memory
 from dataset.logging_utils import configure_root_logging
+from dataset.shared.shm_transport import cleanup_shared_image_rows, restore_image_rows, share_image_rows
 from training.forensics import emit_fatal_report, maybe_enable_core_dumps, maybe_redirect_stdio
 
 _FAULT_HANDLER_FILES: list[Any] = []
@@ -216,11 +217,7 @@ class HFVirtualDataset(BaseVirtualDataset):
         self._worker = None
 
         if self._data_queue is not None:
-            try:
-                self._data_queue.close()
-            except Exception:
-                pass
-            self._data_queue = None
+            self._close_data_queue()
 
         if self._events_queue is not None:
             try:
@@ -228,6 +225,24 @@ class HFVirtualDataset(BaseVirtualDataset):
             except Exception:
                 pass
             self._events_queue = None
+
+    def _close_data_queue(self) -> None:
+        if self._data_queue is None:
+            return
+        while True:
+            try:
+                payload = self._data_queue.get_nowait()
+            except Empty:
+                break
+            except Exception:
+                break
+            if isinstance(payload, list) and payload and isinstance(payload[0], dict) and "image_ref" in payload[0]:
+                cleanup_shared_image_rows(payload)
+        try:
+            self._data_queue.close()
+        except Exception:
+            pass
+        self._data_queue = None
 
     def stats(self) -> dict[str, Any]:
         self._drain_worker_events()
@@ -286,10 +301,7 @@ class HFVirtualDataset(BaseVirtualDataset):
             except Exception:
                 pass
         if self._data_queue is not None:
-            try:
-                self._data_queue.close()
-            except Exception:
-                pass
+            self._close_data_queue()
 
         self._events_queue = self._ctx.Queue(maxsize=512)
         if self.transport_mode == "memory":
@@ -400,6 +412,13 @@ class HFVirtualDataset(BaseVirtualDataset):
 
             if not isinstance(chunk_payload, list):
                 continue
+
+            if chunk_payload and isinstance(chunk_payload[0], dict) and "image_ref" in chunk_payload[0]:
+                try:
+                    chunk_payload = restore_image_rows(chunk_payload, release=True)
+                except Exception as exc:
+                    self.logger.warning("Failed to restore shared-memory data chunk for dataset=%s: %s", self.name, exc)
+                    continue
 
             for row in chunk_payload:
                 if not isinstance(row, dict):
@@ -1118,12 +1137,19 @@ def _emit_event(queue_obj: Any, payload: dict[str, Any]) -> None:
 def _emit_data_chunk(queue_obj: Any, payload: list[dict[str, Any]], *, stop_event: Any) -> None:
     if queue_obj is None:
         return
-    while not stop_event.is_set():
-        try:
-            queue_obj.put(payload, timeout=0.5)
-            return
-        except Full:
-            continue
+    shared_payload = share_image_rows(payload)
+    enqueued = False
+    try:
+        while not stop_event.is_set():
+            try:
+                queue_obj.put(shared_payload, timeout=0.5)
+                enqueued = True
+                return
+            except Full:
+                continue
+    finally:
+        if not enqueued:
+            cleanup_shared_image_rows(shared_payload)
 
 
 def _format_dataset_load_error(dataset_cfg: dict[str, Any], exc: Exception) -> str:
