@@ -1542,7 +1542,7 @@ def build_optimizer(
     return torch.optim.AdamW(param_groups, **kwargs)
 
 
-def build_scheduler(optimizer: torch.optim.Optimizer, cfg: DictConfig) -> torch.optim.lr_scheduler.LambdaLR:
+def build_scheduler(optimizer: torch.optim.Optimizer, cfg: DictConfig) -> torch.optim.lr_scheduler.LambdaLR | None:
     freeze_decoder_steps = max(0, int(cfg.mini_train.get("freeze_decoder_steps", 0)))
     # Keep decoder LR schedule at its initial warmup point while decoder grads are frozen.
     step_delay_by_group_name = {"mini_decoder": freeze_decoder_steps} if freeze_decoder_steps > 0 else None
@@ -2374,7 +2374,8 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
                     optimizer.step()
                 step_opt_ms = (time.perf_counter() - t_opt) * 1000.0
 
-                scheduler.step()
+                if scheduler is not None:
+                    scheduler.step()
 
                 step_loss = loss_acc / grad_accum_steps
                 step_structural = structural_acc / grad_accum_steps

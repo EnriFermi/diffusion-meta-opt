@@ -1003,7 +1003,8 @@ def _run_mode_variant(
                     direction_pre_norms=direction_pre_norms,
                 )
             optimizer.step()
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
         else:
             row["grad_global_norm"] = math.nan
             row["grad_rms"] = math.nan

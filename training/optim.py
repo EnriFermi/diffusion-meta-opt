@@ -22,6 +22,7 @@ def build_adamw_optimizer(
     eps_key: str = "eps",
 ) -> torch.optim.Optimizer:
     train_cfg = cfg[section]
+    optimizer_name = str(train_cfg.get("optimizer_name", "adamw")).strip().lower()
     lr = float(train_cfg.get(lr_key, default_lr))
     weight_decay = float(train_cfg.get(weight_decay_key, default_weight_decay))
 
@@ -37,7 +38,16 @@ def build_adamw_optimizer(
         "eps": eps,
     }
 
-    params = inspect.signature(torch.optim.AdamW).parameters
+    if optimizer_name == "adamw":
+        optimizer_cls = torch.optim.AdamW
+    elif optimizer_name == "adam":
+        optimizer_cls = torch.optim.Adam
+    else:
+        raise ValueError(
+            f"Unsupported {section}.optimizer_name={optimizer_name!r}. Expected one of: 'adamw', 'adam'"
+        )
+
+    params = inspect.signature(optimizer_cls).parameters
     use_fused = "fused" in params and device.type == "cuda"
     use_foreach = "foreach" in params and not use_fused
 
@@ -46,7 +56,7 @@ def build_adamw_optimizer(
     if "foreach" in params:
         kwargs["foreach"] = use_foreach
 
-    return torch.optim.AdamW(model.parameters(), **kwargs)
+    return optimizer_cls(model.parameters(), **kwargs)
 
 
 def build_cosine_scheduler(
@@ -62,8 +72,15 @@ def build_cosine_scheduler(
     default_min_lr_ratio: float = 0.1,
     step_delay_by_group_name: Mapping[str, int] | None = None,
     group_name_key: str = "group_name",
-) -> torch.optim.lr_scheduler.LambdaLR:
+) -> torch.optim.lr_scheduler.LambdaLR | None:
     section_cfg = cfg[section]
+    scheduler_name = str(section_cfg.get("scheduler_name", "cosine")).strip().lower()
+    if scheduler_name in {"none", "off", "false"}:
+        return None
+    if scheduler_name not in {"cosine", "cosine_decay"}:
+        raise ValueError(
+            f"Unsupported {section}.scheduler_name={scheduler_name!r}. Expected one of: 'cosine', 'none'"
+        )
     max_steps = max(1, int(section_cfg.get(max_steps_key, default_max_steps)))
     warmup_steps = max(0, int(section_cfg.get(warmup_steps_key, default_warmup_steps)))
     min_lr_ratio = float(section_cfg.get(min_lr_ratio_key, default_min_lr_ratio))
