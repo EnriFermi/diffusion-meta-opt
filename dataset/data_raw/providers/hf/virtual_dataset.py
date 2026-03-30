@@ -19,6 +19,12 @@ from dataset.data_raw.core.chunk_cache import ChunkCache
 from dataset.data_raw.core.config import to_plain_dict
 from dataset.data_raw.core.fs_utils import ensure_dir, read_json, utc_now_iso, write_json_atomic
 from dataset.data_raw.core.image_utils import decode_to_pil, load_image
+from dataset.data_raw.core.ref_reuse import (
+    chunk_fully_consumed,
+    retire_stale_reusable_items,
+    resolve_max_distinct_consumers_per_sample,
+    select_reusable_item_index,
+)
 from dataset.data_raw.core.types import ImageSample, ImageSampleRef
 from dataset.data_raw.providers.hf.auth import init_hf_auth
 from dataset.data_raw.providers.hf.datasets_server_sampler import DatasetServerSampler
@@ -119,6 +125,15 @@ class HFVirtualDataset(BaseVirtualDataset):
             raise ValueError(f"Unsupported cache.transport for dataset '{self.name}': {self.transport_mode}")
         self.num_chunks_kept = int(cache_cfg.get("num_chunks_kept", 2))
         self.memory_queue_max_chunks = max(1, int(cache_cfg.get("memory_queue_max_chunks", self.num_chunks_kept)))
+        self.max_distinct_consumers_per_sample = max(
+            1,
+            int(cache_cfg.get("max_distinct_consumers_per_sample", 1)),
+        )
+        self.max_pending_reuse_s = (
+            None
+            if cache_cfg.get("max_pending_reuse_s") is None
+            else max(0.0, float(cache_cfg.get("max_pending_reuse_s")))
+        )
         self.chunk_cache: ChunkCache | None = None
         if self.transport_mode == "disk":
             self.chunk_cache = ChunkCache(self.dataset_root, num_chunks_kept=self.num_chunks_kept)
@@ -153,6 +168,11 @@ class HFVirtualDataset(BaseVirtualDataset):
         self._records_materialized_total = 0
         self._chunk_build_time_total_s = 0.0
         self._last_chunk_ready_at: float | None = None
+        self._compatible_consumers = tuple(
+            str(name).strip()
+            for name in self.cfg_dict.get("models", [])
+            if str(name).strip()
+        )
 
         self._init_meta_if_missing()
         if self.chunk_cache is not None:
@@ -207,11 +227,27 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         return batch
 
-    def get_batch_refs(self, batch_size: int) -> list[ImageSampleRef]:
+    def get_batch_refs(
+        self,
+        batch_size: int,
+        *,
+        consumer_id: str | None = None,
+        max_distinct_consumers_per_sample: int | None = None,
+        max_pending_reuse_s: float | None = None,
+    ) -> list[ImageSampleRef]:
         if batch_size <= 0:
             return []
         if self.transport_mode != "disk":
             raise RuntimeError(f"dataset '{self.name}' does not support disk-backed sample refs in transport={self.transport_mode}")
+
+        effective_max_distinct_consumers = resolve_max_distinct_consumers_per_sample(
+            configured_max=self.max_distinct_consumers_per_sample,
+            requested_max=max_distinct_consumers_per_sample,
+            compatible_consumers=self._compatible_consumers,
+        )
+        effective_max_pending_reuse_s = self.max_pending_reuse_s
+        if max_pending_reuse_s is not None:
+            effective_max_pending_reuse_s = max(0.0, float(max_pending_reuse_s))
 
         timeout_s = self.get_timeout_s
         if self._served_samples == 0 and not self._chunk_queue:
@@ -222,7 +258,11 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         while len(batch) < batch_size:
             self._drain_worker_events()
-            sample_ref = self._pop_sample_ref()
+            sample_ref = self._pop_sample_ref(
+                consumer_id=consumer_id,
+                max_distinct_consumers_per_sample=effective_max_distinct_consumers,
+                max_pending_reuse_s=effective_max_pending_reuse_s,
+            )
             if sample_ref is not None:
                 batch.append(sample_ref)
                 continue
@@ -380,6 +420,8 @@ class HFVirtualDataset(BaseVirtualDataset):
             "chunks_ready_total": int(self._chunks_ready_total),
             "chunks_evicted_total": int(self._chunks_evicted_total),
             "records_materialized": int(self._records_materialized_total),
+            "max_distinct_consumers_per_sample": int(self.max_distinct_consumers_per_sample),
+            "max_pending_reuse_s": self.max_pending_reuse_s,
             "chunk_build_time_total_s": float(self._chunk_build_time_total_s),
             "samples_per_second": float(self._served_samples / total_uptime_s),
             "chunk_ready_rate_per_second": float(self._chunks_ready_total / total_uptime_s),
@@ -560,6 +602,9 @@ class HFVirtualDataset(BaseVirtualDataset):
                 "chunk_id": chunk_id,
                 "items": items,
                 "cursor": 0,
+                "consumer_histories": [set() for _ in items],
+                "first_issued_at": [None for _ in items],
+                "retired_indices": set(),
             }
         )
         self._known_chunks.add(chunk_id)
@@ -625,7 +670,26 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         return None
 
-    def _pop_sample_ref(self) -> ImageSampleRef | None:
+    def _pop_sample_ref(
+        self,
+        *,
+        consumer_id: str | None,
+        max_distinct_consumers_per_sample: int,
+        max_pending_reuse_s: float | None,
+    ) -> ImageSampleRef | None:
+        if self.transport_mode != "disk":
+            return None
+
+        if consumer_id is None or max_distinct_consumers_per_sample <= 1:
+            return self._pop_sample_ref_single_use()
+
+        return self._pop_sample_ref_multi_use(
+            consumer_id=str(consumer_id),
+            max_distinct_consumers_per_sample=max_distinct_consumers_per_sample,
+            max_pending_reuse_s=max_pending_reuse_s,
+        )
+
+    def _pop_sample_ref_single_use(self) -> ImageSampleRef | None:
         if self.transport_mode != "disk":
             return None
 
@@ -664,6 +728,91 @@ class HFVirtualDataset(BaseVirtualDataset):
                 chunk_id=chunk_id,
                 file_name=str(file_name),
             )
+        return None
+
+    def _pop_sample_ref_multi_use(
+        self,
+        *,
+        consumer_id: str,
+        max_distinct_consumers_per_sample: int,
+        max_pending_reuse_s: float | None,
+    ) -> ImageSampleRef | None:
+        if self.transport_mode != "disk":
+            return None
+
+        chunks_to_scan = len(self._chunk_queue)
+        scanned = 0
+        while self._chunk_queue and scanned < chunks_to_scan:
+            state = self._chunk_queue[0]
+            chunk_id = str(state["chunk_id"])
+            items = state["items"]
+            consumer_histories = state["consumer_histories"]
+            first_issued_at = state["first_issued_at"]
+            retired_indices = state["retired_indices"]
+            retire_stale_reusable_items(
+                consumer_histories=consumer_histories,
+                first_issued_at=first_issued_at,
+                retired_indices=retired_indices,
+                now_s=time.time(),
+                max_pending_reuse_s=max_pending_reuse_s,
+                max_distinct_consumers_per_sample=max_distinct_consumers_per_sample,
+            )
+
+            selected_index = select_reusable_item_index(
+                items=items,
+                consumer_histories=consumer_histories,
+                retired_indices=retired_indices,
+                consumer_id=consumer_id,
+                max_distinct_consumers_per_sample=max_distinct_consumers_per_sample,
+                file_exists=lambda file_name: (
+                    self.chunk_cache.chunk_path(chunk_id) / str(file_name)
+                ).exists(),
+            )
+
+            if selected_index is None:
+                if chunk_fully_consumed(
+                    num_items=len(items),
+                    consumer_histories=consumer_histories,
+                    retired_indices=retired_indices,
+                    max_distinct_consumers_per_sample=max_distinct_consumers_per_sample,
+                ):
+                    self._maybe_finalize_consumed_chunk(chunk_id)
+                    chunks_to_scan = len(self._chunk_queue)
+                    continue
+                self._chunk_queue.rotate(-1)
+                scanned += 1
+                continue
+
+            entry = items[selected_index]
+            file_name = entry.get("file")
+            if not file_name:
+                retired_indices.add(selected_index)
+                continue
+
+            if first_issued_at[selected_index] is None:
+                first_issued_at[selected_index] = float(time.time())
+            consumer_histories[selected_index].add(consumer_id)
+            self._retain_chunk_lease(chunk_id)
+
+            if chunk_fully_consumed(
+                num_items=len(items),
+                consumer_histories=consumer_histories,
+                retired_indices=retired_indices,
+                max_distinct_consumers_per_sample=max_distinct_consumers_per_sample,
+            ):
+                self._maybe_finalize_consumed_chunk(chunk_id)
+
+            sample_id = entry.get("sample_id", "unknown")
+            meta = entry.get("meta", {})
+            self._served_samples += 1
+            return ImageSampleRef(
+                dataset_name=self.name,
+                sample_id=sample_id,
+                meta=meta if isinstance(meta, dict) else {},
+                chunk_id=chunk_id,
+                file_name=str(file_name),
+            )
+
         return None
 
     def _consume_chunk(self, chunk_id: str) -> None:
