@@ -13,7 +13,9 @@ from models.vae_shared import (
     CrossAttnBlock,
     MLP,
     PerceiverResamplerBlock,
+    _apply_sequence_mask,
     _decode_direction_and_logscale,
+    _key_padding_to_attn_bias,
     _rope_attention,
     sinusoidal_embedding,
 )
@@ -103,10 +105,15 @@ class LocalOutputSelfAttentionBlock(nn.Module):
         hidden = max(1, int(d_model * ffn_mult))
         self.ffn = MLP(d_model, hidden, d_model, dropout=dropout)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
         B, S, _ = tokens.shape
         h = self.norm_attn(tokens)
         pos = torch.arange(S, device=tokens.device, dtype=torch.float32)
+        attn_mask = (
+            _key_padding_to_attn_bias(token_mask.to(device=tokens.device, dtype=torch.bool), dtype=h.dtype)
+            if token_mask is not None
+            else None
+        )
 
         q_all = self.q_proj(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
         k_all = self.k_proj(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
@@ -121,6 +128,7 @@ class LocalOutputSelfAttentionBlock(nn.Module):
                 k_pos=pos,
                 dropout_p=self.attn_prob_dropout_p,
                 training=self.training,
+                attn_mask=attn_mask,
             )
         else:
             cls_out = _rope_attention(
@@ -131,6 +139,7 @@ class LocalOutputSelfAttentionBlock(nn.Module):
                 k_pos=pos,
                 dropout_p=self.attn_prob_dropout_p,
                 training=self.training,
+                attn_mask=attn_mask,
             )
             patch_out = _rope_attention(
                 q=q_all[:, :, 1:, :],
@@ -145,8 +154,9 @@ class LocalOutputSelfAttentionBlock(nn.Module):
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.d_model)
         tokens = tokens + self.dropout(self.out_proj(attn_out))
+        tokens = _apply_sequence_mask(tokens, token_mask)
         tokens = tokens + self.dropout(self.ffn(self.norm_ffn(tokens)))
-        return tokens
+        return _apply_sequence_mask(tokens, token_mask)
 
 
 class TokenConditioningAdapter(nn.Module):
@@ -267,11 +277,13 @@ class LatentEncoderLayer(nn.Module):
         patch_conditioner: TokenConditioningAdapter | None = None,
         patch_conditioning_ctx: torch.Tensor | None = None,
         patch_conditioning_map_idx: torch.Tensor | None = None,
+        token_valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, d_out, L_local, d_model = tokens_by_output.shape
 
         local_in = tokens_by_output.reshape(B * d_out, L_local, d_model)
-        local_out = self.local_block(local_in)
+        local_mask = token_valid_mask.reshape(B * d_out, L_local) if token_valid_mask is not None else None
+        local_out = self.local_block(local_in, token_mask=local_mask)
         tokens = local_out.reshape(B, d_out, L_local, d_model)
         if patch_conditioner is not None:
             if patch_conditioning_ctx is None or patch_conditioning_map_idx is None:
@@ -282,6 +294,8 @@ class LatentEncoderLayer(nn.Module):
                 y_ctx=patch_conditioning_ctx,
                 map_idx=patch_conditioning_map_idx,
             )
+            if local_mask is not None:
+                patch_tokens = _apply_sequence_mask(patch_tokens, local_mask[:, 1:])
             tokens = torch.cat(
                 [
                     tokens[:, :, :1, :],
@@ -299,6 +313,7 @@ class LatentEncoderLayer(nn.Module):
             kv = tokens.reshape(B, d_out * L_local, d_model)
             token_pos_o = torch.arange(d_out, device=device, dtype=torch.float32).repeat_interleave(L_local)
             token_pos_t = torch.arange(L_local, device=device, dtype=torch.float32).repeat(d_out)
+        kv_mask = None if cross_attend_only_cls or token_valid_mask is None else token_valid_mask.reshape(B, d_out * L_local)
 
         L = latents.shape[1]
         latent_pos = (torch.arange(L, device=device, dtype=torch.float32) + 0.5) / max(float(L), 1.0)
@@ -308,6 +323,7 @@ class LatentEncoderLayer(nn.Module):
             latent_pos=latent_pos,
             token_pos=token_pos_o,
             token_pos2=token_pos_t,
+            token_mask=kv_mask,
         )
         return tokens, latents
 
@@ -561,14 +577,34 @@ class BigWeightVAE(nn.Module):
         lambda_rel: float = 0.1,
         huber_delta: float = 0.1,
         pred_dirs: torch.Tensor | None = None,
+        d_in_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if W.ndim == 2:
             W = W.unsqueeze(0)
             W_hat = W_hat.unsqueeze(0)
+            if d_in_mask is not None:
+                if d_in_mask.ndim != 1:
+                    raise ValueError(f"d_in_mask must be [d_in] for unbatched W, got {tuple(d_in_mask.shape)}")
+                d_in_mask = d_in_mask.unsqueeze(0)
 
         B, d_in, d_out = W.shape
         p = int(patch_size)
-        T = d_in // p
+        if d_in_mask is not None:
+            if d_in_mask.ndim != 2 or tuple(d_in_mask.shape) != (B, d_in):
+                raise ValueError(f"d_in_mask must be {(B, d_in)}, got {tuple(d_in_mask.shape)}")
+            valid_d_in = d_in_mask.to(device=W.device, dtype=torch.long).sum(dim=1)
+            valid_T = torch.div(valid_d_in, p, rounding_mode="floor")
+            T = int(valid_T.max().item()) if valid_T.numel() > 0 else 0
+            patch_mask = (
+                torch.arange(T, device=W.device, dtype=torch.long).view(1, T) < valid_T.view(B, 1)
+                if T > 0
+                else None
+            )
+        else:
+            valid_T = None
+            T = d_in // p
+            patch_mask = None
+
         if T <= 0:
             zero = W.new_zeros(())
             return zero, {"L_dir": zero, "L_scale": zero, "L_rec": zero, "L_rel": zero}
@@ -580,6 +616,11 @@ class BigWeightVAE(nn.Module):
         N = B * d_out
         X = X.reshape(N, T, p)
         X_hat = X_hat.reshape(N, T, p)
+        patch_mask_flat = (
+            patch_mask.unsqueeze(1).expand(B, d_out, T).reshape(N, T).to(device=W.device, dtype=W.dtype)
+            if patch_mask is not None
+            else None
+        )
 
         r = X.norm(dim=-1)
         u = X / (r.unsqueeze(-1) + eps)
@@ -625,10 +666,12 @@ class BigWeightVAE(nn.Module):
             else:
                 u_hat_dir = _ensure_u_hat()
 
-            w = (r + eps) ** gamma
-            w = w / (w.sum(dim=1, keepdim=True) + eps)
             cos = (u_hat_dir * u).sum(dim=-1)
-            L_dir = ((1.0 - cos)).mean(dim=1).mean()
+            dir_loss = 1.0 - cos
+            if patch_mask_flat is None:
+                L_dir = dir_loss.mean(dim=1).mean()
+            else:
+                L_dir = (dir_loss * patch_mask_flat).sum() / patch_mask_flat.sum().clamp_min(1.0)
 
         if use_scale:
             d = _ensure_log_r_hat() - log_r
@@ -638,18 +681,30 @@ class BigWeightVAE(nn.Module):
                 0.5 * d.pow(2),
                 huber_delta * (abs_d - 0.5 * huber_delta),
             )
-            L_scale = huber.mean()
+            if patch_mask_flat is None:
+                L_scale = huber.mean()
+            else:
+                L_scale = (huber * patch_mask_flat).sum() / patch_mask_flat.sum().clamp_min(1.0)
 
         if use_rec:
             rec_num = (X_hat - X).pow(2).sum(dim=-1)
             rec_den = r.pow(2) + eps
-            L_rec = (rec_num / rec_den).mean()
+            rec_loss = rec_num / rec_den
+            if patch_mask_flat is None:
+                L_rec = rec_loss.mean()
+            else:
+                L_rec = (rec_loss * patch_mask_flat).sum() / patch_mask_flat.sum().clamp_min(1.0)
 
         if use_rel:
             current_u_hat = _ensure_u_hat()
             G = torch.bmm(u, u.transpose(1, 2))
             G_hat = torch.bmm(current_u_hat, current_u_hat.transpose(1, 2))
-            L_rel = (G_hat - G).pow(2).mean()
+            rel_sq = (G_hat - G).pow(2)
+            if patch_mask_flat is None:
+                L_rel = rel_sq.mean()
+            else:
+                pair_mask = patch_mask_flat.unsqueeze(1) * patch_mask_flat.unsqueeze(2)
+                L_rel = (rel_sq * pair_mask).sum() / pair_mask.sum().clamp_min(1.0)
 
         total = lambda_dir * L_dir + lambda_scale * L_scale + lambda_rec * L_rec + lambda_rel * L_rel
         details = {
@@ -666,26 +721,44 @@ class BigWeightVAE(nn.Module):
         W: torch.Tensor,
         W_hat: torch.Tensor,
         x_mask: torch.Tensor | None = None,
+        d_in_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        d_in = W.shape[-2]
         pred = X @ W_hat if X.ndim == 2 else torch.matmul(X, W_hat)
         target = X @ W if X.ndim == 2 else torch.matmul(X, W)
-        if x_mask is None:
-            return (F.mse_loss(pred, target) / d_in).sqrt()
-
         if X.ndim == 2:
-            if x_mask.ndim != 1 or int(x_mask.shape[0]) != int(X.shape[0]):
-                raise ValueError(f"x_mask must be [n] for unbatched X, got {tuple(x_mask.shape)}")
-            mask = x_mask.to(device=pred.device, dtype=pred.dtype).unsqueeze(-1)
+            if x_mask is not None:
+                if x_mask.ndim != 1 or int(x_mask.shape[0]) != int(X.shape[0]):
+                    raise ValueError(f"x_mask must be [n] for unbatched X, got {tuple(x_mask.shape)}")
+                sample_mask = x_mask.to(device=pred.device, dtype=pred.dtype).unsqueeze(0)
+            else:
+                sample_mask = torch.ones((1, int(X.shape[0])), device=pred.device, dtype=pred.dtype)
+            if d_in_mask is not None:
+                if d_in_mask.ndim != 1 or int(d_in_mask.shape[0]) != int(W.shape[0]):
+                    raise ValueError(f"d_in_mask must be [d_in] for unbatched W, got {tuple(d_in_mask.shape)}")
+                valid_d_in = d_in_mask.to(device=pred.device, dtype=pred.dtype).sum().view(1).clamp_min(1.0)
+            else:
+                valid_d_in = pred.new_full((1,), float(W.shape[0]))
+            diff_sq = (pred - target).pow(2).unsqueeze(0) * sample_mask.unsqueeze(-1)
         else:
-            if x_mask.ndim != 2 or tuple(x_mask.shape) != tuple(X.shape[:2]):
-                raise ValueError(f"x_mask must be [B,n] for batched X, got {tuple(x_mask.shape)} vs {tuple(X.shape[:2])}")
-            mask = x_mask.to(device=pred.device, dtype=pred.dtype).unsqueeze(-1)
+            if x_mask is not None:
+                if x_mask.ndim != 2 or tuple(x_mask.shape) != tuple(X.shape[:2]):
+                    raise ValueError(f"x_mask must be [B,n] for batched X, got {tuple(x_mask.shape)} vs {tuple(X.shape[:2])}")
+                sample_mask = x_mask.to(device=pred.device, dtype=pred.dtype)
+            else:
+                sample_mask = torch.ones(tuple(X.shape[:2]), device=pred.device, dtype=pred.dtype)
+            if d_in_mask is not None:
+                if d_in_mask.ndim != 2 or tuple(d_in_mask.shape) != (int(W.shape[0]), int(W.shape[1])):
+                    raise ValueError(
+                        f"d_in_mask must be [B,d_in] for batched W, got {tuple(d_in_mask.shape)} vs {(int(W.shape[0]), int(W.shape[1]))}"
+                    )
+                valid_d_in = d_in_mask.to(device=pred.device, dtype=pred.dtype).sum(dim=1).clamp_min(1.0)
+            else:
+                valid_d_in = pred.new_full((int(W.shape[0]),), float(W.shape[1]))
+            diff_sq = (pred - target).pow(2) * sample_mask.unsqueeze(-1)
 
-        diff_sq = (pred - target).pow(2) * mask
-        denom = mask.sum().clamp_min(1.0) * float(pred.shape[-1])
-        mse = diff_sq.sum() / denom
-        return (mse / d_in).sqrt()
+        denom = sample_mask.sum(dim=1).clamp_min(1.0) * float(pred.shape[-1])
+        mse = diff_sq.sum(dim=(1, 2)) / denom
+        return torch.sqrt(mse / valid_d_in).mean()
 
     @staticmethod
     def _channel_norm_over_sequence(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -698,26 +771,57 @@ class BigWeightVAE(nn.Module):
         return (x - mean) * torch.rsqrt(var + float(eps))
 
     @staticmethod
-    def _build_patch_indices(d_in: int, patch_size: int, device: torch.device) -> tuple[torch.Tensor, int, int]:
-        T = (d_in + patch_size - 1) // patch_size
-        d_in_pad = T * patch_size
-        patch_idx_t = torch.arange(d_in_pad, device=device, dtype=torch.long).view(T, patch_size)
-        patch_idx_t = patch_idx_t.clamp(max=max(0, d_in - 1))
-        return patch_idx_t, T, d_in_pad
+    def _validate_d_in_mask(
+        d_in_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        d_in: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if d_in_mask is None:
+            return torch.ones((batch_size, d_in), device=device, dtype=torch.bool)
+        if d_in_mask.ndim != 2:
+            raise ValueError(f"d_in_mask must be rank-2 [B, d_in], got {tuple(d_in_mask.shape)}")
+        if tuple(d_in_mask.shape) != (batch_size, d_in):
+            raise ValueError(f"d_in_mask shape must be {(batch_size, d_in)}, got {tuple(d_in_mask.shape)}")
+        return d_in_mask.to(device=device, dtype=torch.bool)
+
+    @staticmethod
+    def _build_batched_patch_indices(
+        *,
+        d_in_mask: torch.Tensor,
+        patch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        if d_in_mask.ndim != 2:
+            raise ValueError(f"d_in_mask must be [B, d_in], got {tuple(d_in_mask.shape)}")
+        B, d_in = d_in_mask.shape
+        if int(d_in) <= 0:
+            raise ValueError(f"d_in must be > 0, got {d_in}")
+
+        valid_d_in = d_in_mask.to(dtype=torch.long).sum(dim=1).clamp_min(1)
+        T = (int(d_in) + int(patch_size) - 1) // int(patch_size)
+        d_in_pad = T * int(patch_size)
+        base_idx = torch.arange(d_in_pad, device=d_in_mask.device, dtype=torch.long).view(1, T, int(patch_size))
+        patch_idx = base_idx.expand(B, -1, -1).clamp(max=(valid_d_in - 1).view(B, 1, 1))
+
+        patch_grid = torch.arange(T, device=d_in_mask.device, dtype=torch.long).view(1, T)
+        valid_patch_counts = torch.div(valid_d_in + int(patch_size) - 1, int(patch_size), rounding_mode="floor")
+        full_patch_counts = torch.div(valid_d_in, int(patch_size), rounding_mode="floor")
+        patch_mask = patch_grid < valid_patch_counts.view(B, 1)
+        structural_patch_mask = patch_grid < full_patch_counts.view(B, 1)
+        return patch_idx, patch_mask, structural_patch_mask, valid_d_in, T, d_in_pad
 
     def _encode_distribution_context(
         self,
         X: torch.Tensor,
         *,
-        d_in: int,
         x_mask: torch.Tensor | None = None,
-    ) -> tuple[int, int, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        d_in_mask: torch.Tensor | None = None,
+    ) -> tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         if X.ndim != 3:
             raise ValueError(f"X must be rank-3 [B, n, d_in], got {tuple(X.shape)}")
 
         B, n, d_in_x = X.shape
-        if d_in_x != d_in:
-            raise ValueError(f"X last dim ({d_in_x}) must match d_in ({d_in})")
         if x_mask is not None:
             if x_mask.ndim != 2:
                 raise ValueError(f"x_mask must be rank-2 [B, n], got {tuple(x_mask.shape)}")
@@ -726,14 +830,22 @@ class BigWeightVAE(nn.Module):
 
         device = X.device
         p = self.cfg.patch_size
-        patch_idx_t, T, d_in_pad = self._build_patch_indices(d_in=d_in, patch_size=p, device=device)
+        validated_d_in_mask = self._validate_d_in_mask(
+            d_in_mask,
+            batch_size=B,
+            d_in=d_in_x,
+            device=device,
+        )
+        patch_idx_bt, patch_mask, structural_patch_mask, _valid_d_in, T, d_in_pad = self._build_batched_patch_indices(
+            d_in_mask=validated_d_in_mask,
+            patch_size=p,
+        )
         if not self.use_distribution_encoder:
-            return T, d_in_pad, None, None, None
+            return T, d_in_pad, patch_mask, structural_patch_mask, None, None, None
         if self.distribution_encoder is None:
             raise RuntimeError("distribution_encoder is not initialized")
 
-        patch_idx_bt = patch_idx_t.unsqueeze(0).expand(B, -1, -1).contiguous()
-        X_rep = X.unsqueeze(1).expand(B, T, n, d_in).reshape(B * T, n, d_in)
+        X_rep = X.unsqueeze(1).expand(B, T, n, d_in_x).reshape(B * T, n, d_in_x)
         x_mask_rep = (
             x_mask.unsqueeze(1).expand(B, T, n).reshape(B * T, n)
             if x_mask is not None
@@ -747,8 +859,11 @@ class BigWeightVAE(nn.Module):
         d_dist = self.cfg.distribution.d_dist
         dist_var_by_patch = dist_var_flat.view(B, T, p, d_var)
         dist_patch_by_patch = dist_patch_flat.view(B, T, d_dist)
+        patch_mask_float = patch_mask.to(device=device, dtype=dist_var_by_patch.dtype)
+        dist_var_by_patch = dist_var_by_patch * patch_mask_float.unsqueeze(-1).unsqueeze(-1)
+        dist_patch_by_patch = dist_patch_by_patch * patch_mask_float.unsqueeze(-1)
         dist_var_pooled = dist_var_by_patch.mean(dim=2)
-        return T, d_in_pad, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled
+        return T, d_in_pad, patch_mask, structural_patch_mask, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled
 
     def _encode_latent_slots(
         self,
@@ -756,6 +871,7 @@ class BigWeightVAE(nn.Module):
         *,
         T: int,
         d_in_pad: int,
+        patch_mask: torch.Tensor,
         dist_var_by_patch: torch.Tensor | None,
         dist_patch_by_patch: torch.Tensor | None,
         dist_var_pooled: torch.Tensor | None,
@@ -768,6 +884,9 @@ class BigWeightVAE(nn.Module):
         p = self.cfg.patch_size
         d_var = self.cfg.distribution.d_var
         d_dist = self.cfg.distribution.d_dist
+        if patch_mask.ndim != 2 or tuple(patch_mask.shape) != (B, T):
+            raise ValueError(f"patch_mask must be {(B, T)}, got {tuple(patch_mask.shape)}")
+        patch_mask_float = patch_mask.to(device=W.device, dtype=W.dtype)
 
         if self.use_distribution_encoder:
             if dist_var_by_patch is None or dist_patch_by_patch is None or dist_var_pooled is None:
@@ -824,10 +943,19 @@ class BigWeightVAE(nn.Module):
             dist_patch_embed=dist_patch_flat_expanded,
         )
         patch_token_raw = patch_token_raw_flat.view(B, d_out, T, d_patch)
+        patch_token_raw = patch_token_raw * patch_mask_float.unsqueeze(1).unsqueeze(-1)
         patch_tokens = self.patch_token_proj(patch_token_raw)
+        patch_tokens = patch_tokens * patch_mask_float.unsqueeze(1).unsqueeze(-1)
 
         cls_tokens = self.cls_token.view(1, 1, 1, -1).expand(B, d_out, 1, -1)
         tokens_by_output = torch.cat([cls_tokens, patch_tokens], dim=2)
+        token_valid_mask = torch.cat(
+            [
+                torch.ones((B, d_out, 1), device=W.device, dtype=torch.bool),
+                patch_mask.unsqueeze(1).expand(-1, d_out, -1),
+            ],
+            dim=2,
+        )
         if self.use_token_adapter_distribution_encoder_conditioning:
             assert dist_patch_by_patch is not None
             assert self.encoder_conditioning_adapters is not None
@@ -851,6 +979,7 @@ class BigWeightVAE(nn.Module):
                 patch_part = tokens_by_output[:, :, 1:, :]
                 patch_with_dist = torch.cat([patch_part, dist_var_for_inject], dim=-1)
                 patch_part = self.enc_dist_inject_projs[layer_idx](patch_with_dist)
+                patch_part = patch_part * patch_mask_float.unsqueeze(1).unsqueeze(-1)
                 tokens_by_output = torch.cat([cls_part, patch_part], dim=2)
 
                 dist_lat_delta = self.enc_dist_to_latent_heads[layer_idx](dist_var_global)
@@ -867,6 +996,14 @@ class BigWeightVAE(nn.Module):
                 ),
                 patch_conditioning_ctx=dist_patch_ctx_by_output,
                 patch_conditioning_map_idx=patch_map_idx,
+                token_valid_mask=token_valid_mask,
+            )
+            tokens_by_output = torch.cat(
+                [
+                    tokens_by_output[:, :, :1, :],
+                    tokens_by_output[:, :, 1:, :] * patch_mask_float.unsqueeze(1).unsqueeze(-1),
+                ],
+                dim=2,
             )
 
         if return_debug_info:
@@ -979,15 +1116,16 @@ class BigWeightVAE(nn.Module):
         *,
         lat: torch.Tensor,
         encoder_patch_tokens: torch.Tensor | None,
+        patch_mask: torch.Tensor,
         d_out: int,
         T: int,
         debug_decoder_kv_source: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         kv_source = self._normalize_debug_decoder_kv_source(debug_decoder_kv_source)
         if kv_source == "latents":
             kv = lat
             kv_pos = torch.arange(lat.shape[1], device=lat.device, dtype=torch.float32)
-            return kv, kv_pos, kv_pos
+            return kv, kv_pos, kv_pos, None
 
         if encoder_patch_tokens is None:
             raise ValueError("encoder_patch_tokens are required when debug_decoder_kv_source='encoder_patch_tokens'")
@@ -1007,7 +1145,8 @@ class BigWeightVAE(nn.Module):
         t_idx = torch.arange(T, device=device)
         o_grid, t_grid = torch.meshgrid(o_idx, t_idx, indexing="ij")
         kv = encoder_patch_tokens.reshape(encoder_patch_tokens.shape[0], d_out * T, encoder_patch_tokens.shape[-1])
-        return kv, o_grid.flatten().to(dtype=torch.float32), t_grid.flatten().to(dtype=torch.float32)
+        kv_mask = patch_mask.unsqueeze(1).expand(-1, d_out, -1).reshape(encoder_patch_tokens.shape[0], d_out * T)
+        return kv, o_grid.flatten().to(dtype=torch.float32), t_grid.flatten().to(dtype=torch.float32), kv_mask
 
     def _decode_query_tokens_to_output(
         self,
@@ -1019,6 +1158,8 @@ class BigWeightVAE(nn.Module):
         d_out: int,
         d_in_pad: int,
         T: int,
+        patch_mask: torch.Tensor,
+        d_in_mask: torch.Tensor,
         return_direction_pre_norms: bool = False,
         disable_z_shortcut: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1027,10 +1168,17 @@ class BigWeightVAE(nn.Module):
         expected_d_in_pad = T * p
         if d_in_pad != expected_d_in_pad:
             raise ValueError(f"d_in_pad must equal T*patch_size={expected_d_in_pad}, got {d_in_pad}")
+        if patch_mask.ndim != 2 or tuple(patch_mask.shape) != (B, T):
+            raise ValueError(f"patch_mask must be {(B, T)}, got {tuple(patch_mask.shape)}")
+        if d_in_mask.ndim != 2 or tuple(d_in_mask.shape) != (B, d_in):
+            raise ValueError(f"d_in_mask must be {(B, d_in)}, got {tuple(d_in_mask.shape)}")
+        query_mask = patch_mask.unsqueeze(1).expand(-1, d_out, -1).reshape(B, Q)
 
         shortcut_disabled = bool(disable_z_shortcut or self.cfg.big_vae.disable_z_shortcut)
-        q_dir = self.q_tokens_norm(q_tokens)
+        q_tokens = _apply_sequence_mask(q_tokens, query_mask)
+        q_dir = _apply_sequence_mask(self.q_tokens_norm(q_tokens), query_mask)
         u_hat_attn = self.direction_head(q_dir)
+        u_hat_attn = _apply_sequence_mask(u_hat_attn, query_mask)
 
         if shortcut_disabled:
             u_hat_shortcut = torch.zeros_like(u_hat_attn)
@@ -1039,10 +1187,11 @@ class BigWeightVAE(nn.Module):
             z_exp = z_proj.unsqueeze(1).expand(B, Q, -1)
             shortcut_in = torch.cat([z_exp, q_pos_emb], dim=-1)
             u_hat_shortcut = self.z_shortcut(shortcut_in)
+            u_hat_shortcut = _apply_sequence_mask(u_hat_shortcut, query_mask)
 
         u_hat = (u_hat_attn + u_hat_shortcut).reshape(B * Q, p)
         direction_pre_norms = u_hat.norm(dim=-1)
-        s_hat = self.scale_head(q_tokens).reshape(B * Q)
+        s_hat = _apply_sequence_mask(self.scale_head(q_tokens), query_mask).reshape(B * Q)
 
         w_hat_flat = _decode_direction_and_logscale(
             u_hat=u_hat,
@@ -1054,10 +1203,12 @@ class BigWeightVAE(nn.Module):
 
         u_hat_norm = u_hat / (u_hat.norm(dim=-1, keepdim=True) + self.output_eps)
         pred_dirs = u_hat_norm.view(B, d_out, T, p)
+        pred_dirs = pred_dirs * patch_mask.to(device=pred_dirs.device, dtype=pred_dirs.dtype).unsqueeze(1).unsqueeze(-1)
 
         w_hat_patches = w_hat_flat.view(B, d_out, T, p)
         W_hat_pad = w_hat_patches.view(B, d_out, d_in_pad).transpose(1, 2)
         W_hat = W_hat_pad[:, :d_in, :]
+        W_hat = W_hat * d_in_mask.to(device=W_hat.device, dtype=W_hat.dtype).unsqueeze(-1)
 
         outputs = (W_hat, z, pred_dirs)
         if return_direction_pre_norms:
@@ -1073,6 +1224,8 @@ class BigWeightVAE(nn.Module):
         d_out: int,
         d_in_pad: int,
         T: int,
+        patch_mask: torch.Tensor,
+        d_in_mask: torch.Tensor,
         return_direction_pre_norms: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if encoder_patch_tokens.ndim != 4:
@@ -1089,7 +1242,11 @@ class BigWeightVAE(nn.Module):
         B = int(encoder_patch_tokens.shape[0])
         Q = d_out * T
         p = self.cfg.patch_size
-        direct_hidden = encoder_patch_tokens.reshape(B, Q, encoder_patch_tokens.shape[-1])
+        query_mask = patch_mask.unsqueeze(1).expand(-1, d_out, -1).reshape(B, Q)
+        direct_hidden = _apply_sequence_mask(
+            encoder_patch_tokens.reshape(B, Q, encoder_patch_tokens.shape[-1]),
+            query_mask,
+        )
         u_hat = self.debug_encoder_direct_direction_head(direct_hidden).reshape(B * Q, p)
         direction_pre_norms = u_hat.norm(dim=-1)
         s_hat = torch.zeros(B * Q, device=u_hat.device, dtype=u_hat.dtype)
@@ -1104,10 +1261,12 @@ class BigWeightVAE(nn.Module):
 
         u_hat_norm = u_hat / (u_hat.norm(dim=-1, keepdim=True) + self.output_eps)
         pred_dirs = u_hat_norm.view(B, d_out, T, p)
+        pred_dirs = pred_dirs * patch_mask.to(device=pred_dirs.device, dtype=pred_dirs.dtype).unsqueeze(1).unsqueeze(-1)
 
         w_hat_patches = w_hat_flat.view(B, d_out, T, p)
         W_hat_pad = w_hat_patches.view(B, d_out, d_in_pad).transpose(1, 2)
         W_hat = W_hat_pad[:, :d_in, :]
+        W_hat = W_hat * d_in_mask.to(device=W_hat.device, dtype=W_hat.dtype).unsqueeze(-1)
 
         outputs = (W_hat, z, pred_dirs)
         if return_direction_pre_norms:
@@ -1119,6 +1278,8 @@ class BigWeightVAE(nn.Module):
         latent_slots: torch.Tensor,
         *,
         dist_patch_by_patch: torch.Tensor | None,
+        patch_mask: torch.Tensor,
+        d_in_mask: torch.Tensor,
         d_in: int,
         d_out: int,
         d_in_pad: int,
@@ -1152,6 +1313,10 @@ class BigWeightVAE(nn.Module):
                 )
         elif dist_patch_by_patch is not None:
             raise ValueError("dist_patch_by_patch must be None when distribution encoder is disabled")
+        if patch_mask.ndim != 2 or tuple(patch_mask.shape) != (B, T):
+            raise ValueError(f"patch_mask must be {(B, T)}, got {tuple(patch_mask.shape)}")
+        if d_in_mask.ndim != 2 or tuple(d_in_mask.shape) != (B, d_in):
+            raise ValueError(f"d_in_mask must be {(B, d_in)}, got {tuple(d_in_mask.shape)}")
 
         p = self.cfg.patch_size
         expected_d_in_pad = T * p
@@ -1167,11 +1332,14 @@ class BigWeightVAE(nn.Module):
             d_out=d_out,
             T=T,
         )
+        query_mask = patch_mask.unsqueeze(1).expand(-1, d_out, -1).reshape(B, d_out * T)
+        q_tokens_base = _apply_sequence_mask(q_tokens_base, query_mask)
         q_tokens = self._apply_debug_query_hint(
             q_tokens_base,
             encoder_patch_tokens=encoder_patch_tokens,
             debug_query_hint=debug_query_hint,
         )
+        q_tokens = _apply_sequence_mask(q_tokens, query_mask)
 
         #DEBUG
         # debug_direct_from_encoder_tokens = True
@@ -1185,15 +1353,19 @@ class BigWeightVAE(nn.Module):
                 d_out=d_out,
                 d_in_pad=d_in_pad,
                 T=T,
+                patch_mask=patch_mask,
+                d_in_mask=d_in_mask,
                 return_direction_pre_norms=return_direction_pre_norms,
             )
             decoder_kv = None
             kv_pos_o = None
             kv_pos_t = None
+            kv_mask = None
         else:
-            decoder_kv, kv_pos_o, kv_pos_t = self._build_decoder_kv_state(
+            decoder_kv, kv_pos_o, kv_pos_t, kv_mask = self._build_decoder_kv_state(
                 lat=lat,
                 encoder_patch_tokens=encoder_patch_tokens,
+                patch_mask=patch_mask,
                 d_out=d_out,
                 T=T,
                 debug_decoder_kv_source=debug_decoder_kv_source,
@@ -1207,6 +1379,8 @@ class BigWeightVAE(nn.Module):
                     kv_pos=kv_pos_o,
                     q_pos2=q_pos_t,
                     kv_pos2=kv_pos_t,
+                    q_mask=query_mask,
+                    kv_mask=kv_mask,
                 )
             outputs = self._decode_query_tokens_to_output(
                 q_hidden,
@@ -1216,6 +1390,8 @@ class BigWeightVAE(nn.Module):
                 d_out=d_out,
                 d_in_pad=d_in_pad,
                 T=T,
+                patch_mask=patch_mask,
+                d_in_mask=d_in_mask,
                 return_direction_pre_norms=return_direction_pre_norms,
                 disable_z_shortcut=disable_z_shortcut,
             )
@@ -1234,6 +1410,8 @@ class BigWeightVAE(nn.Module):
                 "decoder_kv": decoder_kv,
                 "decoder_kv_pos_o": kv_pos_o,
                 "decoder_kv_pos_t": kv_pos_t,
+                "decoder_query_mask": query_mask,
+                "decoder_kv_mask": kv_mask,
                 "pred_dirs": pred_dirs,
             }
             return outputs + (debug_info,)
@@ -1245,6 +1423,7 @@ class BigWeightVAE(nn.Module):
         X: torch.Tensor,
         *,
         x_mask: torch.Tensor | None = None,
+        d_in_mask: torch.Tensor | None = None,
         return_direction_pre_norms: bool = False,
         disable_z_shortcut: bool = False,
         debug_decoder_kv_source: str = "latents",
@@ -1267,20 +1446,25 @@ class BigWeightVAE(nn.Module):
                 if x_mask.ndim != 1:
                     raise ValueError(f"x_mask must be rank-1 when X is unbatched, got {tuple(x_mask.shape)}")
                 x_mask = x_mask.unsqueeze(0)
+            if d_in_mask is not None:
+                if d_in_mask.ndim != 1:
+                    raise ValueError(f"d_in_mask must be rank-1 when W is unbatched, got {tuple(d_in_mask.shape)}")
+                d_in_mask = d_in_mask.unsqueeze(0)
         B, d_in, d_out = W.shape
         Bx, _, d_in_x = X.shape
         if Bx != B or d_in_x != d_in:
             raise ValueError(f"Shape mismatch: W={tuple(W.shape)}, X={tuple(X.shape)}")
 
-        T, d_in_pad, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled = self._encode_distribution_context(
+        T, d_in_pad, patch_mask, structural_patch_mask, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled = self._encode_distribution_context(
             X,
-            d_in=d_in,
             x_mask=x_mask,
+            d_in_mask=d_in_mask,
         )
         latents, encode_debug = self._encode_latent_slots(
             W,
             T=T,
             d_in_pad=d_in_pad,
+            patch_mask=patch_mask,
             dist_var_by_patch=dist_var_by_patch,
             dist_patch_by_patch=dist_patch_by_patch,
             dist_var_pooled=dist_var_pooled,
@@ -1289,6 +1473,8 @@ class BigWeightVAE(nn.Module):
         decode_outputs = self._decode_from_latent_slots(
             latents,
             dist_patch_by_patch=dist_patch_by_patch,
+            patch_mask=patch_mask,
+            d_in_mask=self._validate_d_in_mask(d_in_mask, batch_size=B, d_in=d_in, device=W.device),
             d_in=d_in,
             d_out=d_out,
             d_in_pad=d_in_pad,
@@ -1309,6 +1495,8 @@ class BigWeightVAE(nn.Module):
         debug_info = {
             "T": int(T),
             "d_in_pad": int(d_in_pad),
+            "patch_mask": patch_mask,
+            "structural_patch_mask": structural_patch_mask,
             "dist_var_by_patch": dist_var_by_patch,
             "dist_patch_by_patch": dist_patch_by_patch,
             "encoder_tokens_by_output": encode_debug["encoder_tokens_by_output"],
@@ -1339,6 +1527,7 @@ class BigWeightVAE(nn.Module):
         X: torch.Tensor,
         *,
         x_mask: torch.Tensor | None = None,
+        d_in_mask: torch.Tensor | None = None,
         return_direction_pre_norms: bool = False,
         disable_z_shortcut: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[
@@ -1367,20 +1556,26 @@ class BigWeightVAE(nn.Module):
                 if x_mask.ndim != 1:
                     raise ValueError(f"x_mask must be rank-1 when X is unbatched, got {tuple(x_mask.shape)}")
                 x_mask = x_mask.unsqueeze(0)
+            if d_in_mask is not None:
+                if d_in_mask.ndim != 1:
+                    raise ValueError(f"d_in_mask must be rank-1 when W is unbatched, got {tuple(d_in_mask.shape)}")
+                d_in_mask = d_in_mask.unsqueeze(0)
         B, d_in, d_out = W.shape
         Bx, _, d_in_x = X.shape
         if Bx != B or d_in_x != d_in:
             raise ValueError(f"Shape mismatch: W={tuple(W.shape)}, X={tuple(X.shape)}")
 
-        T, d_in_pad, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled = self._encode_distribution_context(
+        validated_d_in_mask = self._validate_d_in_mask(d_in_mask, batch_size=B, d_in=d_in, device=W.device)
+        T, d_in_pad, patch_mask, _structural_patch_mask, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled = self._encode_distribution_context(
             X,
-            d_in=d_in,
             x_mask=x_mask,
+            d_in_mask=validated_d_in_mask,
         )
         latents, encode_debug = self._encode_latent_slots(
             W,
             T=T,
             d_in_pad=d_in_pad,
+            patch_mask=patch_mask,
             dist_var_by_patch=dist_var_by_patch,
             dist_patch_by_patch=dist_patch_by_patch,
             dist_var_pooled=dist_var_pooled,
@@ -1389,6 +1584,8 @@ class BigWeightVAE(nn.Module):
         decode_outputs = self._decode_from_latent_slots(
             latents,
             dist_patch_by_patch=dist_patch_by_patch,
+            patch_mask=patch_mask,
+            d_in_mask=validated_d_in_mask,
             d_in=d_in,
             d_out=d_out,
             d_in_pad=d_in_pad,

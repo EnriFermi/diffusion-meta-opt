@@ -40,6 +40,7 @@ class FrozenTarget:
     w_dir: torch.Tensor
     meta: dict[str, Any]
     x_mask_s: torch.Tensor | None = None
+    d_in_mask_s: torch.Tensor | None = None
 
     def to(self, device: torch.device) -> "FrozenTarget":
         return FrozenTarget(
@@ -51,6 +52,7 @@ class FrozenTarget:
             w_dir=self.w_dir.to(device),
             meta=dict(self.meta),
             x_mask_s=self.x_mask_s.to(device) if self.x_mask_s is not None else None,
+            d_in_mask_s=self.d_in_mask_s.to(device) if self.d_in_mask_s is not None else None,
         )
 
     def save(self, path: Path) -> None:
@@ -63,6 +65,7 @@ class FrozenTarget:
             "w_dir": self.w_dir.detach().cpu(),
             "meta": self.meta,
             "x_mask_s": self.x_mask_s.detach().cpu() if self.x_mask_s is not None else None,
+            "d_in_mask_s": self.d_in_mask_s.detach().cpu() if self.d_in_mask_s is not None else None,
         }
         torch.save(payload, path)
 
@@ -78,6 +81,7 @@ class FrozenTarget:
             w_dir=payload["w_dir"],
             meta=dict(payload["meta"]),
             x_mask_s=payload.get("x_mask_s"),
+            d_in_mask_s=payload.get("d_in_mask_s"),
         )
 
 
@@ -820,6 +824,7 @@ def _exact_dir_loss(
         lambda_rec=0.0,
         lambda_rel=0.0,
         pred_dirs=pred_dirs,
+        d_in_mask=frozen.d_in_mask_s,
     )
 
 
@@ -1164,10 +1169,10 @@ def _experiment_4(
 
         frozen = frozen_cpu.to(device)
         with torch.no_grad():
-            T, d_in_pad, _dist_var_by_patch, dist_patch_by_patch, _dist_var_pooled = model._encode_distribution_context(
+            T, d_in_pad, patch_mask, _structural_patch_mask, _dist_var_by_patch, dist_patch_by_patch, _dist_var_pooled = model._encode_distribution_context(
                 frozen.x_s,
-                d_in=int(frozen.meta["d_in"]),
                 x_mask=frozen.x_mask_s,
+                d_in_mask=frozen.d_in_mask_s,
             )
 
         init_slots = model.latent_base.detach().unsqueeze(0).expand(int(frozen.meta["B"]), -1, -1).clone()
@@ -1182,6 +1187,8 @@ def _experiment_4(
             W_hat, z, pred_dirs, direction_pre_norms = model._decode_from_latent_slots(
                 H,
                 dist_patch_by_patch=dist_patch_by_patch,
+                patch_mask=patch_mask,
+                d_in_mask=frozen.d_in_mask_s if frozen.d_in_mask_s is not None else torch.ones_like(frozen.W_s[:, :, 0], dtype=torch.bool),
                 d_in=int(frozen.meta["d_in"]),
                 d_out=int(frozen.meta["d_out"]),
                 d_in_pad=d_in_pad,
@@ -1317,6 +1324,7 @@ def _experiment_5(
                 frozen.W_s,
                 frozen.x_s,
                 x_mask=frozen.x_mask_s,
+                d_in_mask=frozen.d_in_mask_s,
                 return_direction_pre_norms=True,
                 disable_z_shortcut=disable_z_shortcut,
             )

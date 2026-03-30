@@ -14,7 +14,7 @@ from collections import Counter, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from queue import Empty, Full
+from queue import Empty, Full, Queue as ThreadQueue
 from typing import Any
 
 from omegaconf import DictConfig
@@ -33,6 +33,7 @@ from dataset.shared.compatibility_index import (
 from .load_report import LoadReportWriter
 from dataset.shared.model_scheduler import ModelScheduler
 from dataset.shared.raw_dataset_pool import RawDatasetPool
+from dataset.shared.shm_transport import cleanup_shared_layer_record_refs, restore_layer_record_refs, share_layer_record_refs
 from dataset.shared.streaming.factory import (
     build_chunk_reader,
     build_chunk_store,
@@ -626,6 +627,10 @@ class CollectorService:
             1,
             int(collector_cfg.get("parallel_model_pool_max_loaded_models", 1)),
         )
+        self.prepared_job_queue_max_items = max(
+            self.parallel_inference_workers,
+            int(collector_cfg.get("prepared_job_queue_max_items", max(4, self.parallel_inference_workers * 2))),
+        )
         self.atomizer_process_enabled = bool(collector_cfg.get("atomizer_process_enabled", False))
         self.atomizer_queue_max_items = max(8, int(collector_cfg.get("atomizer_queue_max_items", 256)))
 
@@ -698,6 +703,10 @@ class CollectorService:
         self._parallel_executor: ThreadPoolExecutor | None = None
         self._parallel_model_pools: dict[int, ModelPool] = {}
         self._parallel_model_pools_lock = threading.Lock()
+        self._prepared_job_queue: ThreadQueue[_PreparedCollectorJob] | None = None
+        self._prepared_job_stop_event: threading.Event | None = None
+        self._prepared_job_producer_thread: threading.Thread | None = None
+        self._prepared_job_producer_error: dict[str, str] | None = None
         self._atomizer_task_queue: Any | None = None
         self._atomizer_stop_event: Any | None = None
         self._atomizer_process: mp.Process | None = None
@@ -757,6 +766,12 @@ class CollectorService:
                     self._async_last_status.get("atomizer_process_alive", True)
                 ):
                     raise RuntimeError("Async collector atomizer process is no longer alive")
+                if self._async_last_status.get("prepared_job_producer_error"):
+                    producer_error = self._async_last_status.get("prepared_job_producer_error", {})
+                    raise RuntimeError(
+                        "Async collector prepared-job producer failed: "
+                        f"{producer_error.get('error') if isinstance(producer_error, dict) else producer_error}"
+                    )
             return
 
         exit_code = self._process.exitcode
@@ -988,13 +1003,14 @@ class CollectorService:
             assert self._parallel_executor is not None
             in_flight: set[Future[CollectorJobStats]] = set()
             while not active_stop_event.is_set():
+                self._ensure_prepared_job_producer_alive()
                 submitted = False
                 while (
                     len(in_flight) < self.parallel_inference_workers
                     and not active_stop_event.is_set()
                     and self._sink.needs_fill()
                 ):
-                    prepared = self._prepare_parallel_job()
+                    prepared = self._dequeue_prepared_job(timeout_s=0.2 if not in_flight else 0.05)
                     if prepared is None:
                         break
                     in_flight.add(self._parallel_executor.submit(self._execute_prepared_parallel_job, prepared))
@@ -1354,6 +1370,8 @@ class CollectorService:
             self._sink = self._build_sink()
             if self.atomizer_process_enabled:
                 self._start_atomizer_process()
+            if self.parallel_inference_workers > 1:
+                self._start_prepared_job_producer()
             self._runtime_ready = True
             self._load_report.mark_runtime_event("runtime_init_ready")
         except Exception as exc:
@@ -1388,7 +1406,97 @@ class CollectorService:
             stripe_window_chunks=int(stripe_window) if stripe_window is not None else None,
         )
 
+    def _start_prepared_job_producer(self) -> None:
+        if self.parallel_inference_workers <= 1:
+            return
+        if self._sink is None:
+            raise RuntimeError("collector sink must be initialized before starting prepared-job producer")
+        if self._prepared_job_queue is None:
+            self._prepared_job_queue = ThreadQueue(maxsize=self.prepared_job_queue_max_items)
+        if self._prepared_job_stop_event is None:
+            self._prepared_job_stop_event = threading.Event()
+        self._prepared_job_stop_event.clear()
+        self._prepared_job_producer_error = None
+        if self._prepared_job_producer_thread is not None and self._prepared_job_producer_thread.is_alive():
+            return
+        self._prepared_job_producer_thread = threading.Thread(
+            target=self._prepared_job_producer_main,
+            name="collector_prepare",
+            daemon=True,
+        )
+        self._prepared_job_producer_thread.start()
+
+    def _prepared_job_producer_main(self) -> None:
+        assert self._prepared_job_queue is not None
+        assert self._prepared_job_stop_event is not None
+        assert self._sink is not None
+
+        try:
+            while not self._prepared_job_stop_event.is_set():
+                if not self._sink.needs_fill():
+                    time.sleep(0.02)
+                    continue
+                if self._prepared_job_queue.full():
+                    time.sleep(0.02)
+                    continue
+
+                prepared = self._prepare_parallel_job()
+                if prepared is None:
+                    time.sleep(0.02)
+                    continue
+
+                while not self._prepared_job_stop_event.is_set():
+                    try:
+                        self._prepared_job_queue.put(prepared, timeout=0.1)
+                        break
+                    except Full:
+                        continue
+        except BaseException as exc:
+            self._prepared_job_producer_error = {
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            self.logger.exception("Prepared-job producer thread failed")
+
+    def _ensure_prepared_job_producer_alive(self) -> None:
+        if self.parallel_inference_workers <= 1:
+            return
+        if self._prepared_job_producer_error is not None:
+            raise RuntimeError(
+                "collector prepared-job producer thread failed: "
+                f"{self._prepared_job_producer_error.get('error')}"
+            )
+        if self._prepared_job_producer_thread is None or not self._prepared_job_producer_thread.is_alive():
+            raise RuntimeError("collector prepared-job producer thread exited unexpectedly")
+
+    def _dequeue_prepared_job(self, timeout_s: float) -> _PreparedCollectorJob | None:
+        if self._prepared_job_queue is None:
+            return None
+        try:
+            return self._prepared_job_queue.get(timeout=max(0.0, float(timeout_s)))
+        except Empty:
+            return None
+
     def _shutdown_runtime_components(self) -> None:
+        if self._prepared_job_stop_event is not None:
+            self._prepared_job_stop_event.set()
+        if self._prepared_job_producer_thread is not None:
+            self._prepared_job_producer_thread.join(timeout=5)
+            if self._prepared_job_producer_thread.is_alive():
+                self.logger.warning("Prepared-job producer thread did not stop before collector shutdown")
+            self._prepared_job_producer_thread = None
+        self._prepared_job_stop_event = None
+        self._prepared_job_producer_error = None
+        if self._prepared_job_queue is not None:
+            while True:
+                try:
+                    self._prepared_job_queue.get_nowait()
+                except Empty:
+                    break
+                except Exception:
+                    break
+            self._prepared_job_queue = None
+
         if self._atomizer_stop_event is not None:
             self._atomizer_stop_event.set()
         if self._atomizer_process is not None:
@@ -1524,20 +1632,27 @@ class CollectorService:
         if self._atomizer_task_queue is None:
             raise RuntimeError("collector atomizer task queue is not initialized")
 
+        layer_record_refs = share_layer_record_refs(layer_records)
         payload = {
-            "layer_records": layer_records,
+            "layer_record_refs": layer_record_refs,
             "image_meta_list": image_meta_list,
             "model_run_id": int(model_run_id),
             "model_name": str(model_name),
             "timestamp": float(time.time()),
         }
-        while True:
-            try:
-                self._atomizer_task_queue.put(payload, timeout=0.25)
-                return
-            except Full:
-                self._ensure_atomizer_alive()
-                continue
+        enqueued = False
+        try:
+            while True:
+                try:
+                    self._atomizer_task_queue.put(payload, timeout=0.25)
+                    enqueued = True
+                    return
+                except Full:
+                    self._ensure_atomizer_alive()
+                    continue
+        finally:
+            if not enqueued:
+                cleanup_shared_layer_record_refs(layer_record_refs)
 
     def _prepare_parallel_job(self) -> _PreparedCollectorJob | None:
         assert self._scheduler is not None
@@ -1653,6 +1768,10 @@ class CollectorService:
             "mode": self.collector_mode,
             "streaming_mode": self.streaming_mode,
             "parallel_inference_workers": int(self.parallel_inference_workers),
+            "prepared_job_queue_size": int(0 if self._prepared_job_queue is None else self._prepared_job_queue.qsize()),
+            "prepared_job_producer_alive": bool(
+                self._prepared_job_producer_thread is not None and self._prepared_job_producer_thread.is_alive()
+            ),
             "atomizer_process_enabled": bool(self.atomizer_process_enabled),
             "atomizer_process_alive": bool(self._atomizer_process is not None and self._atomizer_process.is_alive()),
             "cache_size": int(self.cache_size()),
@@ -1663,6 +1782,8 @@ class CollectorService:
             "sink": self._sink.stats() if self._sink else None,
             "events_dropped": int(self._async_events_dropped),
         }
+        if self._prepared_job_producer_error is not None:
+            payload["prepared_job_producer_error"] = dict(self._prepared_job_producer_error)
         if self.emit_resource_snapshot:
             payload["resource"] = _collect_process_resource_snapshot(
                 pid=os.getpid(),
@@ -1912,11 +2033,14 @@ def collector_atomizer_process_main(
                 continue
 
             layer_records = payload.get("layer_records")
+            layer_record_refs = payload.get("layer_record_refs")
             image_meta_list = payload.get("image_meta_list")
             model_run_id = int(payload.get("model_run_id", 0))
             model_name = str(payload.get("model_name", ""))
 
-            if not isinstance(layer_records, list):
+            if isinstance(layer_record_refs, list):
+                layer_records = restore_layer_record_refs(layer_record_refs, release=True)
+            elif not isinstance(layer_records, list):
                 continue
             if not isinstance(image_meta_list, list):
                 image_meta_list = []

@@ -83,6 +83,7 @@ class ConsumedSourceBatch:
     W: torch.Tensor
     x: torch.Tensor
     x_mask: torch.Tensor
+    d_in_mask: torch.Tensor
     used_source_indices: tuple[int, ...]
     next_start_offset: int
     source_pool_size: int
@@ -1196,6 +1197,7 @@ def _maybe_dump_fixed_training_batch(
     W_s: torch.Tensor,
     x_s: torch.Tensor,
     x_mask_s: torch.Tensor | None,
+    d_in_mask_s: torch.Tensor | None,
     cfg: DictConfig,
     logger: logging.Logger,
     global_step: int,
@@ -1225,6 +1227,11 @@ def _maybe_dump_fixed_training_batch(
             if x_mask_s is not None
             else None
         ),
+        "fixed_batch_d_in_mask": (
+            d_in_mask_s.detach().to(device="cpu", dtype=torch.bool, copy=True).contiguous()
+            if d_in_mask_s is not None
+            else None
+        ),
         "meta": {
             "capture_step": int(global_step),
             "stage": int(stage),
@@ -1235,6 +1242,7 @@ def _maybe_dump_fixed_training_batch(
             "W_shape": list(W_s.shape),
             "x_shape": list(x_s.shape),
             "x_mask_shape": list(x_mask_s.shape) if x_mask_s is not None else None,
+            "d_in_mask_shape": list(d_in_mask_s.shape) if d_in_mask_s is not None else None,
             "data_seed": int(cfg.data.get("seed", 42)),
         },
     }
@@ -1659,6 +1667,40 @@ def _pad_x_rows_with_mask(x: torch.Tensor, target_rows: int) -> tuple[torch.Tens
     return torch.cat([x, x_pad], dim=0), torch.cat([valid_mask, mask_pad], dim=0)
 
 
+def _pad_d_in_with_mask(
+    x: torch.Tensor,
+    W: torch.Tensor,
+    target_d_in: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if target_d_in <= 0:
+        raise ValueError(f"target_d_in must be > 0, got {target_d_in}")
+    if x.ndim not in {2, 3}:
+        raise ValueError(f"x must be rank-2 or rank-3, got {tuple(x.shape)}")
+    if W.ndim not in {2, 3}:
+        raise ValueError(f"W must be rank-2 or rank-3, got {tuple(W.shape)}")
+    current_d_in = int(W.shape[-2])
+    if int(x.shape[-1]) != current_d_in:
+        raise ValueError(f"x last dim ({int(x.shape[-1])}) must match W d_in ({current_d_in})")
+    if current_d_in > int(target_d_in):
+        raise ValueError(f"target_d_in ({target_d_in}) must be >= current_d_in ({current_d_in})")
+
+    mask_shape = (int(target_d_in),) if W.ndim == 2 else (int(W.shape[0]), int(target_d_in))
+    d_in_mask = torch.zeros(mask_shape, device=W.device, dtype=torch.bool)
+    d_in_mask[..., :current_d_in] = True
+    if current_d_in == int(target_d_in):
+        return x, W, d_in_mask
+
+    pad_d_in = int(target_d_in) - current_d_in
+    if x.ndim == 2:
+        x_pad = torch.zeros((int(x.shape[0]), pad_d_in), device=x.device, dtype=x.dtype)
+        W_pad = torch.zeros((pad_d_in, int(W.shape[1])), device=W.device, dtype=W.dtype)
+        return torch.cat([x, x_pad], dim=1), torch.cat([W, W_pad], dim=0), d_in_mask
+
+    x_pad = torch.zeros((int(x.shape[0]), int(x.shape[1]), pad_d_in), device=x.device, dtype=x.dtype)
+    W_pad = torch.zeros((int(W.shape[0]), pad_d_in, int(W.shape[2])), device=W.device, dtype=W.dtype)
+    return torch.cat([x, x_pad], dim=2), torch.cat([W, W_pad], dim=1), d_in_mask
+
+
 def _build_without_replacement_index_groups(
     *,
     num_items: int,
@@ -1726,6 +1768,90 @@ def _remaining_source_state_slices(state: SourceSliceState) -> int:
     if not capacities:
         return 0 if state.single_unsliced_consumed else 1
     return max(0, min(capacities))
+
+
+def _source_state_slice_shape(state: SourceSliceState) -> tuple[int, int]:
+    if state.row_patch_groups is not None:
+        if len(state.row_patch_groups) <= 0:
+            raise ValueError("row_patch_groups must be non-empty when present")
+        d_in = int(state.row_patch_groups[0].numel()) * int(state.patch_size)
+    else:
+        d_in = int(state.source.W.shape[0])
+
+    if state.col_groups is not None:
+        if len(state.col_groups) <= 0:
+            raise ValueError("col_groups must be non-empty when present")
+        d_out = int(state.col_groups[0].numel())
+    else:
+        d_out = int(state.source.W.shape[1])
+
+    return d_in, d_out
+
+
+def _source_state_shape_capacities(
+    source_states: Sequence[SourceSliceState] | None,
+) -> dict[tuple[int, int], int]:
+    capacities: dict[tuple[int, int], int] = {}
+    if not source_states:
+        return capacities
+
+    for state in source_states:
+        remaining = _remaining_source_state_slices(state)
+        if remaining <= 0:
+            continue
+        shape = _source_state_slice_shape(state)
+        capacities[shape] = capacities.get(shape, 0) + int(remaining)
+    return capacities
+
+
+def _max_source_state_shape_capacity(source_states: Sequence[SourceSliceState] | None) -> int:
+    capacities = _source_state_shape_capacities(source_states)
+    if not capacities:
+        return 0
+    return max(int(value) for value in capacities.values())
+
+
+def _dominant_source_state_shape(
+    source_states: Sequence[SourceSliceState] | None,
+    *,
+    start_offset: int = 0,
+) -> tuple[int, int] | None:
+    capacities = _source_state_shape_capacities(source_states)
+    if not capacities:
+        return None
+
+    if not source_states:
+        return next(iter(capacities.keys()))
+
+    best_shape: tuple[int, int] | None = None
+    best_capacity = -1
+    normalized_offset = int(start_offset) % len(source_states)
+    for step in range(len(source_states)):
+        state = source_states[(normalized_offset + step) % len(source_states)]
+        if _remaining_source_state_slices(state) <= 0:
+            continue
+        shape = _source_state_slice_shape(state)
+        capacity = int(capacities.get(shape, 0))
+        if capacity > best_capacity:
+            best_shape = shape
+            best_capacity = capacity
+    if best_shape is not None:
+        return best_shape
+    return next(iter(capacities.keys()))
+
+
+def _prune_source_states_to_shape(
+    source_states: Sequence[SourceSliceState] | None,
+    *,
+    target_shape: tuple[int, int],
+) -> list[SourceSliceState]:
+    if not source_states:
+        return []
+    return [
+        state
+        for state in source_states
+        if _remaining_source_state_slices(state) > 0 and _source_state_slice_shape(state) == target_shape
+    ]
 
 
 def _source_states_total_remaining_slices(source_states: Sequence[SourceSliceState] | None) -> int:
@@ -1908,19 +2034,26 @@ def _build_training_batch_from_source_states(
         for state in source_states
         if not str(state.source.model_name).strip()
     )
-    max_x_rows = max(int(state.source.x.shape[0]) for state in source_states)
 
+    raw_slices: list[tuple[torch.Tensor, torch.Tensor]] = []
     ordered_W: list[torch.Tensor] = []
     ordered_x: list[torch.Tensor] = []
     ordered_x_mask: list[torch.Tensor] = []
+    ordered_d_in_mask: list[torch.Tensor] = []
     used_source_indices: list[int] = []
-    expected_w_shape: tuple[int, int] | None = None
-    expected_x_shape: tuple[int, int] | None = None
+    expected_d_out: int | None = None
     cursor = int(start_offset) % len(source_states)
     stagnant_scans = 0
 
-    while len(ordered_W) < batch_size:
+    while len(raw_slices) < batch_size:
         state = source_states[cursor]
+        if _remaining_source_state_slices(state) <= 0:
+            stagnant_scans += 1
+            if stagnant_scans >= len(source_states):
+                raise RuntimeError("source pool stalled while assembling a batch without replacement despite precomputed capacity")
+            cursor = (cursor + 1) % len(source_states)
+            continue
+
         sliced = _consume_slice_from_source_state(state)
         if sliced is None:
             stagnant_scans += 1
@@ -1933,27 +2066,33 @@ def _build_training_batch_from_source_states(
 
         stagnant_scans = 0
         W_i, x_i = sliced
-        x_i, x_mask_i = _pad_x_rows_with_mask(x_i, max_x_rows)
-        w_shape = (int(W_i.shape[0]), int(W_i.shape[1]))
-        x_shape = (int(x_i.shape[0]), int(x_i.shape[1]))
-        if expected_w_shape is None:
-            expected_w_shape = w_shape
-            expected_x_shape = x_shape
-        elif w_shape != expected_w_shape or x_shape != expected_x_shape:
+        current_d_out = int(W_i.shape[1])
+        if expected_d_out is None:
+            expected_d_out = current_d_out
+        elif current_d_out != expected_d_out:
             raise ValueError(
                 "without-replacement source consumption requires all selected source samples to slice to the same "
-                f"shape, got W={w_shape}/x={x_shape} vs expected W={expected_w_shape}/x={expected_x_shape}"
+                f"d_out, got {current_d_out} vs expected {expected_d_out}"
             )
+        raw_slices.append((W_i, x_i))
+        used_source_indices.append(cursor)
+        cursor = (cursor + 1) % len(source_states)
+
+    max_x_rows = max(int(x_i.shape[0]) for _, x_i in raw_slices)
+    max_d_in = max(int(W_i.shape[0]) for W_i, _ in raw_slices)
+    for W_i, x_i in raw_slices:
+        x_i, x_mask_i = _pad_x_rows_with_mask(x_i, max_x_rows)
+        x_i, W_i, d_in_mask_i = _pad_d_in_with_mask(x_i, W_i, max_d_in)
         ordered_W.append(W_i.unsqueeze(0))
         ordered_x.append(x_i.unsqueeze(0))
         ordered_x_mask.append(x_mask_i.unsqueeze(0))
-        used_source_indices.append(cursor)
-        cursor = (cursor + 1) % len(source_states)
+        ordered_d_in_mask.append(d_in_mask_i.unsqueeze(0))
 
     return ConsumedSourceBatch(
         W=torch.cat(ordered_W, dim=0),
         x=torch.cat(ordered_x, dim=0),
         x_mask=torch.cat(ordered_x_mask, dim=0),
+        d_in_mask=torch.cat(ordered_d_in_mask, dim=0),
         used_source_indices=tuple(used_source_indices),
         next_start_offset=int(cursor),
         source_pool_size=int(len(source_states)),
@@ -1972,7 +2111,7 @@ def _build_training_batch_from_source_samples(
     patch_size: int,
     batch_size: int,
     start_offset: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not source_samples:
         raise ValueError("source_samples must not be empty")
     if batch_size <= 0:
@@ -1997,8 +2136,8 @@ def _build_training_batch_from_source_samples(
         counts[source_idx] += 1
 
     source_batches: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-    expected_w_shape: tuple[int, int] | None = None
-    expected_x_shape: tuple[int, int] | None = None
+    expected_d_out: int | None = None
+    max_d_in = 0
     for source_idx, count in enumerate(counts):
         if count <= 0:
             continue
@@ -2011,16 +2150,15 @@ def _build_training_batch_from_source_samples(
             patch_size=patch_size,
             batch_size=count,
         )
-        w_shape = (int(W_part.shape[1]), int(W_part.shape[2]))
-        x_shape = (int(x_part.shape[1]), int(x_part.shape[2]))
-        if expected_w_shape is None:
-            expected_w_shape = w_shape
-            expected_x_shape = x_shape
-        elif w_shape != expected_w_shape or x_shape != expected_x_shape:
+        current_d_out = int(W_part.shape[2])
+        if expected_d_out is None:
+            expected_d_out = current_d_out
+        elif current_d_out != expected_d_out:
             raise ValueError(
-                "round-robin batch mixing requires all selected source samples to slice to the same shape, got "
-                f"W={w_shape}/x={x_shape} vs expected W={expected_w_shape}/x={expected_x_shape}"
+                "round-robin batch mixing requires all selected source samples to slice to the same d_out, got "
+                f"{current_d_out} vs expected {expected_d_out}"
             )
+        max_d_in = max(max_d_in, int(W_part.shape[1]))
         x_mask_part = x_mask_src.unsqueeze(0).expand(count, -1)
         source_batches[source_idx] = (W_part, x_part, x_mask_part)
 
@@ -2028,18 +2166,26 @@ def _build_training_batch_from_source_samples(
     ordered_W: list[torch.Tensor] = []
     ordered_x: list[torch.Tensor] = []
     ordered_x_mask: list[torch.Tensor] = []
+    ordered_d_in_mask: list[torch.Tensor] = []
     for source_idx in assignment:
         W_part, x_part, x_mask_part = source_batches[source_idx]
         cursor = source_offsets[source_idx]
-        ordered_W.append(W_part[cursor: cursor + 1])
-        ordered_x.append(x_part[cursor: cursor + 1])
+        x_i, W_i, d_in_mask_i = _pad_d_in_with_mask(
+            x_part[cursor: cursor + 1],
+            W_part[cursor: cursor + 1],
+            max_d_in,
+        )
+        ordered_W.append(W_i)
+        ordered_x.append(x_i)
         ordered_x_mask.append(x_mask_part[cursor: cursor + 1])
+        ordered_d_in_mask.append(d_in_mask_i)
         source_offsets[source_idx] += 1
 
     return (
         torch.cat(ordered_W, dim=0),
         torch.cat(ordered_x, dim=0),
         torch.cat(ordered_x_mask, dim=0),
+        torch.cat(ordered_d_in_mask, dim=0),
     )
 
 
@@ -2339,6 +2485,7 @@ def _get_patch_latent_variance_stats(
     W: torch.Tensor,
     X: torch.Tensor,
     x_mask: torch.Tensor | None = None,
+    d_in_mask: torch.Tensor | None = None,
 ) -> dict[str, float] | None:
     target = model.module if isinstance(model, DDP) else model
     compiled_target = getattr(target, "_orig_mod", None)
@@ -2353,7 +2500,7 @@ def _get_patch_latent_variance_stats(
     try:
         target.eval()
         with torch.no_grad():
-            outputs = forward_debug(W, X, x_mask=x_mask)
+            outputs = forward_debug(W, X, x_mask=x_mask, d_in_mask=d_in_mask)
         if not outputs or not isinstance(outputs[-1], dict):
             return None
         debug_info = outputs[-1]
@@ -2894,6 +3041,7 @@ def _run_worker(
             fixed_batch_x: torch.Tensor | None = None
             fixed_batch_W: torch.Tensor | None = None
             fixed_batch_x_mask: torch.Tensor | None = None
+            fixed_batch_d_in_mask: torch.Tensor | None = None
             fixed_batch_diversity_stats: dict[str, float] | None = None
             direction_pre_norm_stats_latest: dict[str, Any] | None = None
             source_mixing_shortfall_logged = False
@@ -2921,6 +3069,7 @@ def _run_worker(
                         or fixed_batch_x is None
                         or fixed_batch_W is None
                         or fixed_batch_x_mask is None
+                        or fixed_batch_d_in_mask is None
                     )
                 ):
                     dataset.maybe_collect(step_idx)
@@ -2933,7 +3082,12 @@ def _run_worker(
                     )
                     if fixed_training_batch_enabled:
                         should_refresh_source_sample = (
-                            (fixed_batch_x is None or fixed_batch_W is None or fixed_batch_x_mask is None)
+                            (
+                                fixed_batch_x is None
+                                or fixed_batch_W is None
+                                or fixed_batch_x_mask is None
+                                or fixed_batch_d_in_mask is None
+                            )
                             and not current_source_states
                         )
                     else:
@@ -2941,7 +3095,12 @@ def _run_worker(
                 else:
                     if fixed_training_batch_enabled:
                         should_refresh_source_sample = (
-                            (fixed_batch_x is None or fixed_batch_W is None or fixed_batch_x_mask is None)
+                            (
+                                fixed_batch_x is None
+                                or fixed_batch_W is None
+                                or fixed_batch_x_mask is None
+                                or fixed_batch_d_in_mask is None
+                            )
                             and not current_source_samples
                         )
                     else:
@@ -3078,7 +3237,12 @@ def _run_worker(
                     sync_grad = micro_idx == grad_accum_steps - 1
 
                     if fixed_training_batch_enabled:
-                        if fixed_batch_x is None or fixed_batch_W is None or fixed_batch_x_mask is None:
+                        if (
+                            fixed_batch_x is None
+                            or fixed_batch_W is None
+                            or fixed_batch_x_mask is None
+                            or fixed_batch_d_in_mask is None
+                        ):
                             if consume_slices_without_replacement:
                                 current_source_states = _ensure_source_state_pool_capacity(
                                     current_source_states=current_source_states,
@@ -3119,10 +3283,11 @@ def _run_worker(
                                     source_pool_remaining_slices_pre=batch_payload.source_pool_remaining_slices_pre,
                                     source_pool_remaining_slices_post=batch_payload.source_pool_remaining_slices_post,
                                 )
-                                fixed_batch_W, fixed_batch_x, fixed_batch_x_mask = (
+                                fixed_batch_W, fixed_batch_x, fixed_batch_x_mask, fixed_batch_d_in_mask = (
                                     batch_payload.W,
                                     batch_payload.x,
                                     batch_payload.x_mask,
+                                    batch_payload.d_in_mask,
                                 )
                             else:
                                 if not current_source_samples:
@@ -3132,7 +3297,7 @@ def _run_worker(
                                     batch_size=slice_batch_size,
                                     start_offset=current_source_round_robin_offset,
                                 )
-                                fixed_batch_W, fixed_batch_x, fixed_batch_x_mask = _build_training_batch_from_source_samples(
+                                fixed_batch_W, fixed_batch_x, fixed_batch_x_mask, fixed_batch_d_in_mask = _build_training_batch_from_source_samples(
                                     current_source_samples,
                                     max_T_patches=curriculum_max_T,
                                     max_d_out=curriculum_max_d_out,
@@ -3143,6 +3308,7 @@ def _run_worker(
                             fixed_batch_W = fixed_batch_W.to(device=device, non_blocking=True)
                             fixed_batch_x = fixed_batch_x.to(device=device, non_blocking=True)
                             fixed_batch_x_mask = fixed_batch_x_mask.to(device=device, non_blocking=True)
+                            fixed_batch_d_in_mask = fixed_batch_d_in_mask.to(device=device, non_blocking=True)
                             current_source_samples = None
                             current_source_states = None
                             current_source_round_robin_offset = 0
@@ -3157,6 +3323,7 @@ def _run_worker(
                                     W_s=fixed_batch_W,
                                     x_s=fixed_batch_x,
                                     x_mask_s=fixed_batch_x_mask,
+                                    d_in_mask_s=fixed_batch_d_in_mask,
                                     cfg=cfg,
                                     logger=logger,
                                     global_step=global_step,
@@ -3176,7 +3343,12 @@ def _run_worker(
                         if fixed_batch_diversity_stats is None:
                             raise RuntimeError("fixed training batch requires cached diversity stats")
                         current_batch_source_diversity = dict(fixed_batch_diversity_stats)
-                        W_s, x_s, x_mask_s = fixed_batch_W, fixed_batch_x, fixed_batch_x_mask
+                        W_s, x_s, x_mask_s, d_in_mask_s = (
+                            fixed_batch_W,
+                            fixed_batch_x,
+                            fixed_batch_x_mask,
+                            fixed_batch_d_in_mask,
+                        )
                     else:
                         if consume_slices_without_replacement:
                             current_source_states = _ensure_source_state_pool_capacity(
@@ -3218,7 +3390,12 @@ def _run_worker(
                                 source_pool_remaining_slices_pre=batch_payload.source_pool_remaining_slices_pre,
                                 source_pool_remaining_slices_post=batch_payload.source_pool_remaining_slices_post,
                             )
-                            W_s, x_s, x_mask_s = batch_payload.W, batch_payload.x, batch_payload.x_mask
+                            W_s, x_s, x_mask_s, d_in_mask_s = (
+                                batch_payload.W,
+                                batch_payload.x,
+                                batch_payload.x_mask,
+                                batch_payload.d_in_mask,
+                            )
                             current_source_states, current_source_round_robin_offset = (
                                 _prune_exhausted_source_states_with_offset(
                                     current_source_states,
@@ -3233,7 +3410,7 @@ def _run_worker(
                                 batch_size=slice_batch_size,
                                 start_offset=current_source_round_robin_offset,
                             )
-                            W_s, x_s, x_mask_s = _build_training_batch_from_source_samples(
+                            W_s, x_s, x_mask_s, d_in_mask_s = _build_training_batch_from_source_samples(
                                 current_source_samples,
                                 max_T_patches=curriculum_max_T,
                                 max_d_out=curriculum_max_d_out,
@@ -3247,6 +3424,7 @@ def _run_worker(
                         W_s = W_s.to(device=device, non_blocking=True)
                         x_s = x_s.to(device=device, non_blocking=True)
                         x_mask_s = x_mask_s.to(device=device, non_blocking=True)
+                        d_in_mask_s = d_in_mask_s.to(device=device, non_blocking=True)
                     current_batch_source_diversity["target_models"] = float(max(1, requested_source_samples_per_refresh))
                     current_batch_source_diversity["batch_model_target_coverage"] = (
                         current_batch_source_diversity["batch_unique_models"]
@@ -3274,11 +3452,18 @@ def _run_worker(
                                     W_s,
                                     x_s,
                                     x_mask=x_mask_s,
+                                    d_in_mask=d_in_mask_s,
                                     return_direction_pre_norms=True,
                                 )
                             else:
-                                W_hat, mu, logvar, pred_dirs = model(W_s, x_s, x_mask=x_mask_s)
-                            behavioral_loss = WeightQuantileVAE.operator_recon_loss(x_s, W_s, W_hat, x_mask=x_mask_s)
+                                W_hat, mu, logvar, pred_dirs = model(W_s, x_s, x_mask=x_mask_s, d_in_mask=d_in_mask_s)
+                            behavioral_loss = WeightQuantileVAE.operator_recon_loss(
+                                x_s,
+                                W_s,
+                                W_hat,
+                                x_mask=x_mask_s,
+                                d_in_mask=d_in_mask_s,
+                            )
                             structural_loss, struct_details = WeightQuantileVAE.patch_structure_loss(
                                 W_s, W_hat, patch_size=patch_size_for_slice,
                                 gamma=struct_gamma,
@@ -3288,6 +3473,7 @@ def _run_worker(
                                 lambda_rel=struct_lambda_rel,
                                 huber_delta=struct_huber_delta,
                                 pred_dirs=pred_dirs,
+                                d_in_mask=d_in_mask_s,
                             )
                             if use_latent_sampling:
                                 kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
@@ -3759,6 +3945,7 @@ def _run_worker(
                         W_s[:1],
                         x_s[:1],
                         x_mask=x_mask_s[:1],
+                        d_in_mask=d_in_mask_s[:1],
                     )
                     logger.info(
                         "step=%s/%s loss=%.6f behav=%.6f struct=%.6f "
