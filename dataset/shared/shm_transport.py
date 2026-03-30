@@ -78,6 +78,20 @@ def _create_shared_buffer(raw_bytes: bytes) -> SharedBufferRef:
         shm.close()
 
 
+def _create_shared_ndarray_copy(array: np.ndarray) -> SharedBufferRef:
+    contiguous = np.ascontiguousarray(array)
+    actual_size = int(contiguous.nbytes)
+    shm = shared_memory.SharedMemory(create=True, size=max(1, actual_size))
+    try:
+        if actual_size > 0:
+            shm_array = np.ndarray(shape=contiguous.shape, dtype=contiguous.dtype, buffer=shm.buf)
+            np.copyto(shm_array, contiguous, casting="no")
+        return SharedBufferRef(name=str(shm.name), size_bytes=actual_size)
+    finally:
+        _best_effort_unregister_shared_memory(_resource_tracker_name(shm))
+        shm.close()
+
+
 def release_shared_buffer(ref: SharedBufferRef) -> None:
     shm = shared_memory.SharedMemory(name=str(ref.name))
     try:
@@ -92,9 +106,9 @@ def release_shared_buffer(ref: SharedBufferRef) -> None:
 def share_image(image: Image.Image) -> SharedImageRef:
     materialized = image.copy()
     materialized.load()
-    raw_bytes = materialized.tobytes()
+    image_array = np.asarray(materialized)
     return SharedImageRef(
-        buffer=_create_shared_buffer(raw_bytes),
+        buffer=_create_shared_ndarray_copy(image_array),
         mode=str(materialized.mode),
         size=(int(materialized.size[0]), int(materialized.size[1])),
     )
@@ -172,7 +186,7 @@ def share_tensor(tensor: torch.Tensor) -> SharedTensorRef:
     cpu_tensor = tensor.detach().to(device="cpu").contiguous()
     array = cpu_tensor.numpy()
     return SharedTensorRef(
-        buffer=_create_shared_buffer(array.tobytes(order="C")),
+        buffer=_create_shared_ndarray_copy(array),
         shape=tuple(int(dim) for dim in array.shape),
         dtype=str(array.dtype.str),
     )
