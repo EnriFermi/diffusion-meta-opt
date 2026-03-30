@@ -67,3 +67,27 @@ def fetch_image_to_cache(
             time.sleep(0.25 * (attempt + 1))
 
     return None
+
+
+def fetch_image_to_memory(
+    url: str,
+    timeout: int = 10,
+    retries: int = 2,
+) -> Image.Image | None:
+    """Download URL image and return decoded RGB PIL.Image."""
+    if _should_skip_url(url):
+        return None
+
+    for attempt in range(retries + 1):
+        try:
+            response = requests.get(url, timeout=timeout, headers=REQUEST_HEADERS)
+            response.raise_for_status()
+            return Image.open(io.BytesIO(response.content)).convert("RGB")
+        except Exception as exc:
+            if attempt >= retries:
+                _remember_failed_url(url)
+                LOGGER.warning("URL fetch failed for %s after %s attempts: %s", url, retries + 1, exc)
+                return None
+            time.sleep(0.25 * (attempt + 1))
+
+    return None

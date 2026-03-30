@@ -36,6 +36,9 @@ class CollectorJobStats:
     num_samples_emitted: int
     dataset_mix: dict[str, int] = field(default_factory=dict)
     duration_s: float = 0.0
+    raw_batch_fetch_s: float = 0.0
+    model_infer_s: float = 0.0
+    atomize_emit_s: float = 0.0
     memory_rss_before_mb: float | None = None
     memory_rss_after_mb: float | None = None
     memory_rss_delta_mb: float | None = None
