@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import logging
 from abc import abstractmethod
 from pathlib import Path
@@ -258,6 +259,38 @@ class HFBaseRunner(BaseVirtualModel):
                     return loader_cls.from_pretrained(self.hf_repo, **load_kwargs)
 
         return loader_cls.from_pretrained(self.hf_repo, **load_kwargs)
+
+    def _get_transformers_attr(self, name: str, *, required: bool = False) -> Any | None:
+        transformers_module = importlib.import_module("transformers")
+        attr = getattr(transformers_module, name, None)
+        if attr is None and required:
+            raise ImportError(f"transformers.{name} is unavailable in the installed transformers package")
+        return attr
+
+    def _load_auto_processor(self, token: str | None) -> Any:
+        auto_processor_cls = self._get_transformers_attr("AutoProcessor", required=True)
+        return self._from_pretrained(auto_processor_cls, token=token)
+
+    def _load_auto_image_processor_like(self, token: str | None) -> Any:
+        last_exc: Exception | None = None
+        tried_any = False
+        for class_name in ("AutoImageProcessor", "AutoFeatureExtractor"):
+            loader_cls = self._get_transformers_attr(class_name, required=False)
+            if loader_cls is None:
+                continue
+            tried_any = True
+            try:
+                return self._from_pretrained(loader_cls, token=token)
+            except Exception as exc:
+                last_exc = exc
+
+        if last_exc is not None:
+            raise last_exc
+        if not tried_any:
+            raise ImportError(
+                "Neither transformers.AutoImageProcessor nor transformers.AutoFeatureExtractor is available"
+            )
+        raise RuntimeError("Failed to load an image processor for an unknown reason")
 
     def _prepare_processor_payload(self, **kwargs: Any) -> dict[str, Any]:
         if self._processor is None:

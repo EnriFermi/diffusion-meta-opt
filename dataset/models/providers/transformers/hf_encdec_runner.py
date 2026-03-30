@@ -30,16 +30,14 @@ class HFEncDecRunner(HFBaseRunner):
         raise ValueError(f"Unsupported encoder-decoder architecture='{self.architecture}' for {self.name}")
 
     def _load_processor(self, token: str | None) -> Any:
-        from transformers import AutoImageProcessor, AutoProcessor
-
         if self.architecture == "trocr" and self.run_mode in {"vision_only", "vision_encoder_only", "encoder_only"}:
             # TrOCR encoder-only path is image-only; avoid tokenizer-driven processor calls.
             try:
-                return self._from_pretrained(AutoImageProcessor, token=token)
+                return self._load_auto_image_processor_like(token)
             except Exception:
-                return self._from_pretrained(AutoProcessor, token=token)
+                return self._load_auto_processor(token)
 
-        return self._from_pretrained(AutoProcessor, token=token)
+        return self._load_auto_processor(token)
 
     def prepare_inputs(self, batch_pil: list[Image.Image]) -> dict[str, Any]:
         payload = self._prepare_processor_payload(images=batch_pil)
