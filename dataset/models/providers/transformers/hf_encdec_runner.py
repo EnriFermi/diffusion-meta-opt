@@ -25,7 +25,19 @@ class HFEncDecRunner(HFBaseRunner):
             return self._from_pretrained(BlipForConditionalGeneration, token=token)
 
         if self.architecture in {"vision_encoder_decoder", "donut", "trocr"}:
-            return self._from_pretrained(VisionEncoderDecoderModel, token=token)
+            model = self._from_pretrained(VisionEncoderDecoderModel, token=token)
+            if self.architecture == "trocr" and self.run_mode in {"vision_only", "vision_encoder_only", "encoder_only"}:
+                get_encoder = getattr(model, "get_encoder", None)
+                encoder = get_encoder() if callable(get_encoder) else None
+                if encoder is None:
+                    encoder = getattr(model, "encoder", None)
+                if encoder is not None:
+                    return encoder
+                self.logger.warning(
+                    "Model '%s' did not expose a standalone encoder in encoder_only mode; falling back to full model",
+                    self.name,
+                )
+            return model
 
         raise ValueError(f"Unsupported encoder-decoder architecture='{self.architecture}' for {self.name}")
 
