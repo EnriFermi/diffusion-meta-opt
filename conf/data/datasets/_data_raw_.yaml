@@ -88,7 +88,7 @@ cache:
   root_subdir: datasets/${name}
 
   # memory | disk. memory убирает hot path через disk между dataset worker и collector.
-  transport: memory
+  transport: disk
 
   # Сколько изображений в одном логическом чанке.
   chunk_size_images: 256
