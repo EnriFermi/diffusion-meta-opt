@@ -62,6 +62,7 @@ class HFBaseRunner(BaseVirtualModel):
 
         self._loaded = False
         self._num_runs = 0
+        self._force_disable_low_cpu_mem_usage = False
 
     def load(self) -> None:
         if self._loaded:
@@ -79,6 +80,12 @@ class HFBaseRunner(BaseVirtualModel):
 
         self._processor = self._load_processor(token)
         self._model = self._load_model(token)
+        if self._model_has_meta_tensors(self._model):
+            self.logger.warning(
+                "Model '%s' loaded with meta tensors; retrying with low_cpu_mem_usage=False",
+                self.name,
+            )
+            self._model = self._reload_model_without_meta_tensors(token)
         self._model.eval()
 
         if self.run_dtype != torch.float32:
@@ -239,6 +246,34 @@ class HFBaseRunner(BaseVirtualModel):
             state["output_shape_list"] = []
             state["num_calls"] = 0
 
+    @staticmethod
+    def _model_has_meta_tensors(model: Any) -> bool:
+        try:
+            for parameter in model.parameters():
+                if getattr(parameter, "is_meta", False):
+                    return True
+            for buffer in model.buffers():
+                if getattr(buffer, "is_meta", False):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _reload_model_without_meta_tensors(self, token: str | None) -> Any:
+        self._model = None
+        previous_flag = self._force_disable_low_cpu_mem_usage
+        self._force_disable_low_cpu_mem_usage = True
+        try:
+            reloaded_model = self._load_model(token)
+        finally:
+            self._force_disable_low_cpu_mem_usage = previous_flag
+
+        if self._model_has_meta_tensors(reloaded_model):
+            raise RuntimeError(
+                f"HF model '{self.name}' still contains meta tensors after retry with low_cpu_mem_usage=False"
+            )
+        return reloaded_model
+
     def _from_pretrained(self, loader_cls: Any, token: str | None, **kwargs: Any) -> Any:
         load_kwargs: dict[str, Any] = {
             "cache_dir": str(self.cache_dir),
@@ -248,16 +283,39 @@ class HFBaseRunner(BaseVirtualModel):
         if self.revision:
             load_kwargs["revision"] = self.revision
         load_kwargs.update(kwargs)
+        if self._force_disable_low_cpu_mem_usage and "low_cpu_mem_usage" not in load_kwargs:
+            load_kwargs["low_cpu_mem_usage"] = False
 
-        if token:
-            try:
-                return loader_cls.from_pretrained(self.hf_repo, token=token, **load_kwargs)
-            except TypeError:
+        candidate_load_kwargs: list[dict[str, Any]] = [dict(load_kwargs)]
+        if "low_cpu_mem_usage" in load_kwargs:
+            stripped_load_kwargs = dict(load_kwargs)
+            stripped_load_kwargs.pop("low_cpu_mem_usage", None)
+            candidate_load_kwargs.append(stripped_load_kwargs)
+
+        last_type_error: TypeError | None = None
+        for current_load_kwargs in candidate_load_kwargs:
+            if token:
                 try:
-                    return loader_cls.from_pretrained(self.hf_repo, use_auth_token=token, **load_kwargs)
+                    return loader_cls.from_pretrained(self.hf_repo, token=token, **current_load_kwargs)
                 except TypeError:
-                    return loader_cls.from_pretrained(self.hf_repo, **load_kwargs)
+                    try:
+                        return loader_cls.from_pretrained(self.hf_repo, use_auth_token=token, **current_load_kwargs)
+                    except TypeError as exc:
+                        last_type_error = exc
+                        try:
+                            return loader_cls.from_pretrained(self.hf_repo, **current_load_kwargs)
+                        except TypeError as exc2:
+                            last_type_error = exc2
+                            continue
+            else:
+                try:
+                    return loader_cls.from_pretrained(self.hf_repo, **current_load_kwargs)
+                except TypeError as exc:
+                    last_type_error = exc
+                    continue
 
+        if last_type_error is not None:
+            raise last_type_error
         return loader_cls.from_pretrained(self.hf_repo, **load_kwargs)
 
     def _get_transformers_attr(self, name: str, *, required: bool = False) -> Any | None:
