@@ -30,6 +30,7 @@ from dataset.shared.shared_dataset import SharedModelDataset
 from dataset.shared.streaming.backends.local_disk import LocalDiskChunkStore
 from dataset.shared.streaming.factory import build_chunk_store, resolve_streaming_cfg
 from dataset.shared.types import SharedSample
+from dataset.logging_utils import configure_process_logging
 from training.optim import build_cosine_scheduler
 from training.mini_patch_training_model import MiniPatchTrainingModel, build_distribution_config, build_mini_vae_config
 from training.runtime import (
@@ -56,11 +57,7 @@ except Exception:
 # Logging / telemetry helpers
 # ---------------------------
 def setup_logging(cfg: DictConfig, rank: int = 0) -> None:
-    level_name = str(cfg.data.get("log_level", "INFO")).upper()
-    level = getattr(logging, level_name, logging.INFO)
-    if rank != 0:
-        level = max(level, logging.WARNING)
-    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    configure_process_logging(cfg=cfg, role="train_mini", rank=rank, force=True)
 
 
 def get_logger(name: str, rank: int) -> logging.Logger:

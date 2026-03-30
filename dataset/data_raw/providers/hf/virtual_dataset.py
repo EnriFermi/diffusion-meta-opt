@@ -24,7 +24,7 @@ from dataset.data_raw.providers.hf.auth import init_hf_auth
 from dataset.data_raw.providers.hf.datasets_server_sampler import DatasetServerSampler
 from dataset.data_raw.providers.hf.hf_loader import load_hf_dataset
 from dataset.data_raw.providers.hf.url_fetch import fetch_image_to_cache, fetch_image_to_memory
-from dataset.logging_utils import configure_root_logging
+from dataset.logging_utils import configure_process_logging
 from dataset.shared.shm_transport import cleanup_shared_image_rows, restore_image_rows, share_image_rows
 from training.forensics import emit_fatal_report, maybe_enable_core_dumps, maybe_redirect_stdio
 
@@ -1168,5 +1168,7 @@ def _configure_logging(dataset_cfg: dict[str, Any]) -> Path:
     runtime_cfg = {
         "data": {"log_level": str(dataset_cfg.get("log_level", "INFO"))},
         "logging": dataset_cfg.get("runtime_logging", {}),
+        "training_artifacts": dataset_cfg.get("training_artifacts", {}),
     }
-    return configure_root_logging(cfg=runtime_cfg, rank=0, force=True)
+    dataset_name = str(dataset_cfg.get("name", "unknown_dataset"))
+    return configure_process_logging(cfg=runtime_cfg, role=f"dataset_worker_{dataset_name}", force=True)
