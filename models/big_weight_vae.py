@@ -668,10 +668,11 @@ class BigWeightVAE(nn.Module):
 
             cos = (u_hat_dir * u).sum(dim=-1)
             dir_loss = 1.0 - cos
-            if patch_mask_flat is None:
-                L_dir = dir_loss.mean(dim=1).mean()
-            else:
-                L_dir = (dir_loss * patch_mask_flat).sum() / patch_mask_flat.sum().clamp_min(1.0)
+            dir_weight = (r + eps).pow(float(gamma))
+            if patch_mask_flat is not None:
+                dir_weight = dir_weight * patch_mask_flat
+            dir_weight = dir_weight / dir_weight.sum(dim=1, keepdim=True).clamp_min(1.0)
+            L_dir = (dir_loss * dir_weight).sum(dim=1).mean()
 
         if use_scale:
             d = _ensure_log_r_hat() - log_r
@@ -815,6 +816,7 @@ class BigWeightVAE(nn.Module):
         self,
         X: torch.Tensor,
         *,
+        d_in: int | None = None,
         x_mask: torch.Tensor | None = None,
         d_in_mask: torch.Tensor | None = None,
     ) -> tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
@@ -822,6 +824,9 @@ class BigWeightVAE(nn.Module):
             raise ValueError(f"X must be rank-3 [B, n, d_in], got {tuple(X.shape)}")
 
         B, n, d_in_x = X.shape
+        legacy_return_shape = d_in is not None
+        if d_in is not None and int(d_in) != int(d_in_x):
+            raise ValueError(f"d_in must match X.shape[-1], got d_in={d_in} vs X.shape[-1]={d_in_x}")
         if x_mask is not None:
             if x_mask.ndim != 2:
                 raise ValueError(f"x_mask must be rank-2 [B, n], got {tuple(x_mask.shape)}")
@@ -841,6 +846,8 @@ class BigWeightVAE(nn.Module):
             patch_size=p,
         )
         if not self.use_distribution_encoder:
+            if legacy_return_shape:
+                return T, d_in_pad, None, None, None
             return T, d_in_pad, patch_mask, structural_patch_mask, None, None, None
         if self.distribution_encoder is None:
             raise RuntimeError("distribution_encoder is not initialized")
@@ -863,6 +870,8 @@ class BigWeightVAE(nn.Module):
         dist_var_by_patch = dist_var_by_patch * patch_mask_float.unsqueeze(-1).unsqueeze(-1)
         dist_patch_by_patch = dist_patch_by_patch * patch_mask_float.unsqueeze(-1)
         dist_var_pooled = dist_var_by_patch.mean(dim=2)
+        if legacy_return_shape:
+            return T, d_in_pad, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled
         return T, d_in_pad, patch_mask, structural_patch_mask, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled
 
     def _encode_latent_slots(
@@ -929,7 +938,8 @@ class BigWeightVAE(nn.Module):
             dist_patch_flat_expanded = dist_patch_expanded.reshape(B * d_out * T, d_dist)
             dist_var_flat_expanded: torch.Tensor | None = dist_var_expanded.reshape(B * d_out * T, p, d_var)
             dist_var_for_inject = dist_var_pooled.unsqueeze(1).expand(-1, d_out, -1, -1)
-            dist_var_global = dist_var_pooled.mean(dim=1)
+            valid_patch_counts = patch_mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
+            dist_var_global = (dist_var_pooled * patch_mask_float.unsqueeze(-1)).sum(dim=1) / valid_patch_counts
         else:
             dist_patch_flat_expanded = w_flat.new_zeros((B * d_out * T, 0))
             dist_var_flat_expanded = None

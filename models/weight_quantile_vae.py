@@ -28,6 +28,7 @@ from models.mini_patch_vae import (
 from models.patch_tokenizers import MixerPatchTokenizer, ResidualPatchTokenizer
 from models.simple_big_weight_vae import SimpleDirectBigWeightVAE, build_weight_quantile_vae
 from models.vae_shared import CrossAttnBlock, MLP, PerceiverResamplerBlock, RoPeMixed2D, sinusoidal_embedding
+from models.vae_shared import _decode_direction_and_logscale
 
 __all__ = [
     "BigVAEConfig",
@@ -63,6 +64,7 @@ __all__ = [
     "build_weight_quantile_vae",
     "sinusoidal_embedding",
     "smoke_test_big_weight_vae",
+    "_decode_direction_and_logscale",
 ]
 
 

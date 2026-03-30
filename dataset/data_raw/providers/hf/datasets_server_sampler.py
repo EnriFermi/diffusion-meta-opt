@@ -89,6 +89,7 @@ class DatasetServerSampler:
                 return row, sample_id
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
+                break
 
         cached = self._next_from_first_rows_cache(force_refresh=True)
         if cached is not None:

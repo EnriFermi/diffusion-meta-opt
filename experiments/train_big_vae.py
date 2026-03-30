@@ -225,7 +225,7 @@ def _build_optimizer(
     )
 
 
-def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: DictConfig) -> torch.optim.lr_scheduler.LambdaLR:
+def _build_scheduler(optimizer: torch.optim.Optimizer, cfg: DictConfig) -> torch.optim.lr_scheduler.LambdaLR | None:
     return build_cosine_scheduler(
         optimizer=optimizer,
         cfg=cfg,
@@ -1251,6 +1251,47 @@ def _maybe_dump_fixed_training_batch(
     return dump_path
 
 
+def _load_frozen_training_batch_dump(
+    dump_path: str | Path,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    path = Path(dump_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Frozen training batch dump not found: {path}")
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise TypeError(f"Frozen training batch dump must contain a dict payload, got {type(payload)!r}: {path}")
+
+    W_s = payload.get("fixed_batch_W", payload.get("W_s"))
+    x_s = payload.get("fixed_batch_x", payload.get("x_s"))
+    if not torch.is_tensor(W_s) or not torch.is_tensor(x_s):
+        raise KeyError(
+            f"Frozen training batch dump must contain tensor keys 'fixed_batch_W'/'fixed_batch_x' or 'W_s'/'x_s': {path}"
+        )
+
+    W_s = W_s.detach().to(device=device, dtype=torch.float32, copy=True).contiguous()
+    x_s = x_s.detach().to(device=device, dtype=torch.float32, copy=True).contiguous()
+    if W_s.ndim != 3 or x_s.ndim != 3:
+        raise ValueError(
+            "Frozen training batch tensors must be rank-3 batched tensors, got "
+            f"W={tuple(W_s.shape)} x={tuple(x_s.shape)} from {path}"
+        )
+    if int(W_s.shape[0]) != int(x_s.shape[0]) or int(W_s.shape[1]) != int(x_s.shape[2]):
+        raise ValueError(
+            "Frozen training batch tensor shapes are inconsistent, got "
+            f"W={tuple(W_s.shape)} x={tuple(x_s.shape)} from {path}"
+        )
+
+    raw_meta = payload.get("meta", {})
+    meta = dict(raw_meta) if isinstance(raw_meta, dict) else {"raw_meta": raw_meta}
+    meta.setdefault("loaded_W_shape", list(W_s.shape))
+    meta.setdefault("loaded_x_shape", list(x_s.shape))
+    meta.setdefault("dump_path", str(path))
+    return W_s, x_s, meta
+
+
 def _source_sample_record_to_device(record: SourceSampleRecord, device: torch.device) -> SourceSampleRecord:
     return SourceSampleRecord(
         x=record.x.to(device=device, non_blocking=True),
@@ -1489,9 +1530,12 @@ def _fetch_source_samples(
 
     selected: list[SourceSampleRecord] = []
     fallback_sample: SourceSampleRecord | None = None
+    fallback_shape_compatible_sample: SourceSampleRecord | None = None
     uniqueness_keys: set[str] = set(existing_uniqueness_keys or ())
     attempts = 0
     max_attempts = max(int(num_samples) * 8, int(num_samples))
+    if min_d_in > 0 or min_d_out > 0:
+        max_attempts = max(max_attempts, 128)
 
     def _is_shape_compatible(record: SourceSampleRecord) -> bool:
         if min_d_in > 0 and int(record.W.shape[0]) < int(min_d_in):
@@ -1534,6 +1578,8 @@ def _fetch_source_samples(
 
         if fallback_sample is None:
             fallback_sample = record
+        if fallback_shape_compatible_sample is None and _is_shape_compatible(record):
+            fallback_shape_compatible_sample = record
 
         if _try_select(record):
             continue
@@ -1543,9 +1589,20 @@ def _fetch_source_samples(
             deferred_samples.append(record)
 
     if not selected:
-        if fallback_sample is None:
+        if fallback_shape_compatible_sample is not None:
+            selected.append(fallback_shape_compatible_sample)
+        elif fallback_sample is None:
             raise RuntimeError("failed to fetch any source samples")
-        selected.append(fallback_sample)
+        elif min_d_in <= 0 and min_d_out <= 0:
+            selected.append(fallback_sample)
+        else:
+            logger.warning(
+                "Failed to fetch shape-compatible source samples after %s attempts; min_d_in=%s min_d_out=%s",
+                attempts,
+                min_d_in,
+                min_d_out,
+            )
+            return []
 
     return selected
 
@@ -2847,8 +2904,12 @@ def _run_worker(
                 requested_source_samples_per_refresh = 1
             batch_source_mixing_active = batch_source_mixing_enabled and requested_source_samples_per_refresh > 1
             max_active_source_pool_size = max(slice_batch_size, requested_source_samples_per_refresh)
-            min_mixed_source_d_in = int(curriculum_max_T * patch_size_for_slice) if batch_source_mixing_active else 0
-            min_mixed_source_d_out = int(curriculum_max_d_out) if batch_source_mixing_active else 0
+            min_mixed_source_d_in = int(patch_size_for_slice) if batch_source_mixing_active else 0
+            min_mixed_source_d_out = (
+                1
+                if batch_source_mixing_active and consume_slices_without_replacement
+                else (int(curriculum_max_d_out) if batch_source_mixing_active else 0)
+            )
             deferred_source_cache_size = max(16, int(requested_source_samples_per_refresh) * 8)
             if batch_source_mixing_uniqueness != "none" and use_broadcast:
                 raise ValueError(
@@ -3854,7 +3915,8 @@ def _run_worker(
                 else:
                     optimizer.step()
 
-                scheduler.step()
+                if scheduler is not None:
+                    scheduler.step()
 
                 step_loss = loss_acc / grad_accum_steps
                 step_behavioral = behavioral_acc / grad_accum_steps

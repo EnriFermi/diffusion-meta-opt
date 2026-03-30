@@ -471,6 +471,8 @@ class HFVirtualDataset(BaseVirtualDataset):
 
     def _ensure_worker_alive(self) -> None:
         if self._worker is None:
+            if self._data_queue is not None and self._events_queue is None and self.transport_mode == "memory":
+                return
             self._spawn_worker(force=True)
             return
 
