@@ -283,8 +283,10 @@ def configure_per_run_artifacts(
         logs_dir = root_dir / "logs"
         reports_dir = root_dir / "reports"
         crashes_dir = root_dir / "crashes"
-        mini_ckpt_dir = root_dir / "checkpoints" / "mini_patch_vae"
-        big_ckpt_dir = root_dir / "checkpoints" / "weight_quantile_vae"
+        default_mini_ckpt_dir = root_dir / "checkpoints" / "mini_patch_vae"
+        default_big_ckpt_dir = root_dir / "checkpoints" / "weight_quantile_vae"
+        mini_ckpt_dir = Path(str(ta.get("mini_vae_checkpoint_dir", default_mini_ckpt_dir)))
+        big_ckpt_dir = Path(str(ta.get("big_vae_checkpoint_dir", default_big_ckpt_dir)))
 
         ta["base_root_dir"] = str(base_root)
         ta["separate_run_dirs"] = bool(separate_run_dirs)
