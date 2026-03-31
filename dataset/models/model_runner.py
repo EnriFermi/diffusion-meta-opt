@@ -137,12 +137,12 @@ def merge_layer_records(records: list[LayerIORecord]) -> list[LayerIORecord]:
     merged: list[LayerIORecord] = []
     for state in grouped.values():
         if state["inputs"]:
-            merged_inputs = torch.cat(state["inputs"], dim=0)
+            merged_inputs = _merge_row_chunks(state["inputs"])
         else:
             merged_inputs = torch.empty((0, 0), dtype=torch.float32)
 
         if state["outputs"]:
-            merged_outputs = torch.cat(state["outputs"], dim=0)
+            merged_outputs = _merge_row_chunks(state["outputs"])
         else:
             merged_outputs = torch.empty((0, 0), dtype=torch.float32)
 
@@ -166,3 +166,26 @@ def merge_layer_records(records: list[LayerIORecord]) -> list[LayerIORecord]:
 
 def _chunked(values: list[Any], chunk_size: int) -> list[list[Any]]:
     return [values[i : i + chunk_size] for i in range(0, len(values), chunk_size)]
+
+
+def _merge_row_chunks(chunks: list[torch.Tensor]) -> torch.Tensor:
+    if not chunks:
+        return torch.empty((0, 0), dtype=torch.float32)
+    if len(chunks) == 1:
+        return chunks[0]
+
+    first = chunks[0]
+    tail_shape = tuple(first.shape[1:])
+    dtype = first.dtype
+    device = first.device
+    if any(tuple(chunk.shape[1:]) != tail_shape or chunk.dtype != dtype or chunk.device != device for chunk in chunks[1:]):
+        return torch.cat(chunks, dim=0)
+
+    total_rows = sum(int(chunk.shape[0]) for chunk in chunks)
+    merged = torch.empty((total_rows, *tail_shape), dtype=dtype, device=device)
+    cursor = 0
+    for chunk in chunks:
+        rows = int(chunk.shape[0])
+        merged[cursor : cursor + rows].copy_(chunk)
+        cursor += rows
+    return merged

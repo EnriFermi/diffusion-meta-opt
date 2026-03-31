@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gzip
-import io
 import time
 from pathlib import Path
 from typing import Any
@@ -36,18 +35,15 @@ def save_chunk(path: str | Path, samples: list[SharedSample], meta: dict[str, An
         "meta": metadata,
     }
 
-    binary = io.BytesIO()
-    torch.save(payload, binary)
-    raw_bytes = binary.getvalue()
-
     normalized = str(compression or "none").lower()
     if normalized == "none":
-        target.write_bytes(raw_bytes)
+        with target.open("wb") as handle:
+            torch.save(payload, handle)
         return
 
     if normalized == "gzip":
         with gzip.open(target, "wb") as handle:
-            handle.write(raw_bytes)
+            torch.save(payload, handle)
         return
 
     raise ValueError(f"Unsupported chunk compression='{compression}'")
@@ -55,12 +51,11 @@ def save_chunk(path: str | Path, samples: list[SharedSample], meta: dict[str, An
 
 def load_chunk(path: str | Path) -> tuple[list[SharedSample], dict[str, Any]]:
     source = Path(path)
-    raw = source.read_bytes()
-
     if source.suffix == ".gz":
-        raw = gzip.decompress(raw)
-
-    payload = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False)
+        with gzip.open(source, "rb") as handle:
+            payload = torch.load(handle, map_location="cpu", weights_only=False)
+    else:
+        payload = torch.load(source, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise TypeError(f"Chunk payload must be dict, got {type(payload)}")
 

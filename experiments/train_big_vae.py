@@ -2514,7 +2514,7 @@ def _load_training_state_from_checkpoint(
 
     step = int(ckpt.get("step", 0) or 0)
     stage = ckpt.get("stage", "?")
-    logger.info("Training state loaded successfully (step=%s stage=%s)", step, stage)
+    logger.info("Training state loaded successfully (path=%s step=%s stage=%s)", path, step, stage)
     return step
 
 
@@ -2824,7 +2824,12 @@ def _run_worker(
             resumed_training_step = 0
             resume_state_path: Path | None = None
             if resume_state_enabled and resume_state_auto_resume:
+                logger.info("Auto-resume probe: dir=%s", resume_state_dir)
                 resume_state_path = _find_latest_resume_state_checkpoint(resume_state_dir)
+                if resume_state_path is not None:
+                    logger.info("Auto-resume candidate found: %s", resume_state_path)
+                else:
+                    logger.info("Auto-resume candidate not found in %s; starting from scratch", resume_state_dir)
             if resume_state_path is not None:
                 resumed_training_step = _load_training_state_from_checkpoint(
                     model=model,
@@ -2835,7 +2840,13 @@ def _run_worker(
                     logger=logger,
                 )
             elif resume_checkpoint:
+                logger.info(
+                    "Resume-state unavailable; loading model weights only from resume_checkpoint=%s",
+                    resume_checkpoint,
+                )
                 _load_model_weights_from_checkpoint(model, resume_checkpoint, logger)
+            else:
+                logger.info("No resume source configured or found; starting training from step=0")
             cudagraph_step_begin = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
             use_cudagraph_step_begin = (
                 bool(cfg.train.get("compile", False))

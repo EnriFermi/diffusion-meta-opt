@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import random
 import signal
+import threading
 import time
 import traceback
 from collections import deque
@@ -160,6 +161,7 @@ class HFVirtualDataset(BaseVirtualDataset):
         self._leased_chunk_ref_counts: Counter[str] = Counter()
         self._leased_chunk_owner_id = f"pid{os.getpid()}_{self.name}"
         self._pending_chunk_cleanup: set[str] = set()
+        self._state_lock = threading.RLock()
         self._served_samples = 0
         self._status_started_at = float(time.time())
         self._worker_started_at: float | None = None
@@ -187,7 +189,9 @@ class HFVirtualDataset(BaseVirtualDataset):
 
         timeout_s = self.get_timeout_s
         # First chunk warmup can be slower (metadata/parquet/network); avoid false empty batches at startup.
-        if self._served_samples == 0 and not self._chunk_queue:
+        with self._state_lock:
+            startup_underfilled = self._served_samples == 0 and not self._chunk_queue
+        if startup_underfilled:
             timeout_s = max(timeout_s, self.startup_get_timeout_s)
         elif self.transport_mode == "memory":
             timeout_s = min(timeout_s, 0.2)
@@ -204,7 +208,9 @@ class HFVirtualDataset(BaseVirtualDataset):
                 continue
 
             self._ensure_worker_alive()
-            if self._worker_permanently_stopped and not self._chunk_queue:
+            with self._state_lock:
+                no_chunks_loaded = not self._chunk_queue
+            if self._worker_permanently_stopped and no_chunks_loaded:
                 break
             if time.monotonic() >= deadline:
                 break
@@ -250,7 +256,9 @@ class HFVirtualDataset(BaseVirtualDataset):
             effective_max_pending_reuse_s = max(0.0, float(max_pending_reuse_s))
 
         timeout_s = self.get_timeout_s
-        if self._served_samples == 0 and not self._chunk_queue:
+        with self._state_lock:
+            startup_underfilled = self._served_samples == 0 and not self._chunk_queue
+        if startup_underfilled:
             timeout_s = max(timeout_s, self.startup_get_timeout_s)
 
         deadline = time.monotonic() + timeout_s
@@ -268,7 +276,9 @@ class HFVirtualDataset(BaseVirtualDataset):
                 continue
 
             self._ensure_worker_alive()
-            if self._worker_permanently_stopped and not self._chunk_queue:
+            with self._state_lock:
+                no_chunks_loaded = not self._chunk_queue
+            if self._worker_permanently_stopped and no_chunks_loaded:
                 break
             if time.monotonic() >= deadline:
                 break
@@ -329,19 +339,21 @@ class HFVirtualDataset(BaseVirtualDataset):
             return
         if self.chunk_cache is None:
             return
-        for ref in refs:
-            chunk_id = ref.chunk_id
-            if not chunk_id:
-                continue
-            self._release_chunk_lease(str(chunk_id))
+        with self._state_lock:
+            for ref in refs:
+                chunk_id = ref.chunk_id
+                if not chunk_id:
+                    continue
+                self._release_chunk_lease(str(chunk_id))
 
     def close(self) -> None:
-        if self.chunk_cache is not None:
-            for chunk_id, ref_count in list(self._leased_chunk_ref_counts.items()):
-                if ref_count > 0:
-                    self.chunk_cache.release_lease(str(chunk_id), self._leased_chunk_owner_id)
-            self._leased_chunk_ref_counts.clear()
-            self._pending_chunk_cleanup.clear()
+        with self._state_lock:
+            if self.chunk_cache is not None:
+                for chunk_id, ref_count in list(self._leased_chunk_ref_counts.items()):
+                    if ref_count > 0:
+                        self.chunk_cache.release_lease(str(chunk_id), self._leased_chunk_owner_id)
+                self._leased_chunk_ref_counts.clear()
+                self._pending_chunk_cleanup.clear()
         if self._stop_event is not None:
             self._stop_event.set()
 
@@ -399,35 +411,49 @@ class HFVirtualDataset(BaseVirtualDataset):
             except Exception:
                 worker_exitcode = None
 
+        with self._state_lock:
+            chunks_loaded = len(self._chunk_queue) if self.transport_mode == "disk" else 0
+            memory_samples_loaded = len(self._memory_samples)
+            leased_chunks = int(len(self._leased_chunk_ref_counts))
+            leased_refs = int(sum(self._leased_chunk_ref_counts.values()))
+            pending_chunk_cleanup = int(len(self._pending_chunk_cleanup))
+            samples_served = int(self._served_samples)
+            chunks_ready_total = int(self._chunks_ready_total)
+            chunks_evicted_total = int(self._chunks_evicted_total)
+            records_materialized_total = int(self._records_materialized_total)
+            chunk_build_time_total_s = float(self._chunk_build_time_total_s)
+            worker_started_at = self._worker_started_at
+            last_chunk_ready_at = self._last_chunk_ready_at
+
         return {
             "dataset": self.name,
             "dataset_root": str(self.dataset_root),
             "transport_mode": self.transport_mode,
             "chunks_on_disk": 0 if self.chunk_cache is None else len(self.chunk_cache.list_chunks()),
-            "chunks_loaded": len(self._chunk_queue) if self.transport_mode == "disk" else 0,
+            "chunks_loaded": chunks_loaded,
             "images_on_disk": 0 if self.chunk_cache is None else self.chunk_cache.count_images(),
-            "memory_samples_loaded": len(self._memory_samples),
-            "leased_chunks": int(len(self._leased_chunk_ref_counts)),
-            "leased_refs": int(sum(self._leased_chunk_ref_counts.values())),
-            "pending_chunk_cleanup": int(len(self._pending_chunk_cleanup)),
+            "memory_samples_loaded": memory_samples_loaded,
+            "leased_chunks": leased_chunks,
+            "leased_refs": leased_refs,
+            "pending_chunk_cleanup": pending_chunk_cleanup,
             "worker_alive": bool(self._worker and self._worker.is_alive()),
             "worker_pid": worker_pid,
             "worker_exitcode": worker_exitcode,
             "worker_restarts": self._worker_restarts,
             "worker_permanently_stopped": bool(self._worker_permanently_stopped),
             "worker_last_error": self._last_worker_error,
-            "samples_served": self._served_samples,
-            "chunks_ready_total": int(self._chunks_ready_total),
-            "chunks_evicted_total": int(self._chunks_evicted_total),
-            "records_materialized": int(self._records_materialized_total),
+            "samples_served": samples_served,
+            "chunks_ready_total": chunks_ready_total,
+            "chunks_evicted_total": chunks_evicted_total,
+            "records_materialized": records_materialized_total,
             "max_distinct_consumers_per_sample": int(self.max_distinct_consumers_per_sample),
             "max_pending_reuse_s": self.max_pending_reuse_s,
-            "chunk_build_time_total_s": float(self._chunk_build_time_total_s),
-            "samples_per_second": float(self._served_samples / total_uptime_s),
-            "chunk_ready_rate_per_second": float(self._chunks_ready_total / total_uptime_s),
-            "avg_chunk_build_seconds": float(self._chunk_build_time_total_s / max(1, int(self._chunks_ready_total))),
-            "worker_uptime_s": float(0.0 if self._worker_started_at is None else max(0.0, now - self._worker_started_at)),
-            "last_chunk_ready_at": self._last_chunk_ready_at,
+            "chunk_build_time_total_s": chunk_build_time_total_s,
+            "samples_per_second": float(samples_served / total_uptime_s),
+            "chunk_ready_rate_per_second": float(chunks_ready_total / total_uptime_s),
+            "avg_chunk_build_seconds": float(chunk_build_time_total_s / max(1, chunks_ready_total)),
+            "worker_uptime_s": float(0.0 if worker_started_at is None else max(0.0, now - worker_started_at)),
+            "last_chunk_ready_at": last_chunk_ready_at,
         }
 
     def _spawn_worker(self, force: bool) -> None:
@@ -498,49 +524,50 @@ class HFVirtualDataset(BaseVirtualDataset):
         if self._events_queue is None:
             return
 
-        while True:
-            try:
-                event = self._events_queue.get_nowait()
-            except Empty:
-                break
+        with self._state_lock:
+            while True:
+                try:
+                    event = self._events_queue.get_nowait()
+                except Empty:
+                    break
 
-            event_type = event.get("type")
-            if event_type == "chunk_ready":
-                self._chunks_ready_total += 1
-                records_count = event.get("records_count")
-                if records_count is not None:
-                    try:
-                        self._records_materialized_total += max(0, int(records_count))
-                    except Exception:
-                        pass
-                build_seconds = event.get("build_seconds")
-                if build_seconds is not None:
-                    try:
-                        self._chunk_build_time_total_s += max(0.0, float(build_seconds))
-                    except Exception:
-                        pass
-                self._last_chunk_ready_at = float(time.time())
-                if self.transport_mode == "disk":
-                    self._register_chunk(str(event["chunk_id"]))
-            elif event_type == "chunk_evicted":
-                self._chunks_evicted_total += 1
-                if self.transport_mode == "disk":
-                    self._forget_chunk(str(event["chunk_id"]))
-            elif event_type == "worker_started":
-                timestamp = event.get("timestamp")
-                if timestamp is not None:
-                    try:
-                        self._worker_started_at = float(timestamp)
-                    except Exception:
+                event_type = event.get("type")
+                if event_type == "chunk_ready":
+                    self._chunks_ready_total += 1
+                    records_count = event.get("records_count")
+                    if records_count is not None:
+                        try:
+                            self._records_materialized_total += max(0, int(records_count))
+                        except Exception:
+                            pass
+                    build_seconds = event.get("build_seconds")
+                    if build_seconds is not None:
+                        try:
+                            self._chunk_build_time_total_s += max(0.0, float(build_seconds))
+                        except Exception:
+                            pass
+                    self._last_chunk_ready_at = float(time.time())
+                    if self.transport_mode == "disk":
+                        self._register_chunk(str(event["chunk_id"]))
+                elif event_type == "chunk_evicted":
+                    self._chunks_evicted_total += 1
+                    if self.transport_mode == "disk":
+                        self._forget_chunk(str(event["chunk_id"]))
+                elif event_type == "worker_started":
+                    timestamp = event.get("timestamp")
+                    if timestamp is not None:
+                        try:
+                            self._worker_started_at = float(timestamp)
+                        except Exception:
+                            self._worker_started_at = float(time.time())
+                    else:
                         self._worker_started_at = float(time.time())
+                elif event_type == "error":
+                    message = str(event.get("message", "unknown worker error"))
+                    self._last_worker_error = message
+                    self.logger.error("Worker error: %s", message)
                 else:
-                    self._worker_started_at = float(time.time())
-            elif event_type == "error":
-                message = str(event.get("message", "unknown worker error"))
-                self._last_worker_error = message
-                self.logger.error("Worker error: %s", message)
-            else:
-                self.logger.debug("Worker event: %s", event)
+                    self.logger.debug("Worker event: %s", event)
 
     def _drain_worker_data(self) -> None:
         if self._data_queue is None:
@@ -564,56 +591,59 @@ class HFVirtualDataset(BaseVirtualDataset):
                     self.logger.warning("Failed to restore shared-memory data chunk for dataset=%s: %s", self.name, exc)
                     continue
 
-            for row in chunk_payload:
-                if not isinstance(row, dict):
-                    continue
-                image = row.get("image")
-                if image is None:
-                    continue
-                self._memory_samples.append(
-                    ImageSample(
-                        image=image,
-                        dataset_name=self.name,
-                        sample_id=row.get("sample_id", "unknown"),
-                        meta=row.get("meta", {}) if isinstance(row.get("meta"), dict) else {},
+            with self._state_lock:
+                for row in chunk_payload:
+                    if not isinstance(row, dict):
+                        continue
+                    image = row.get("image")
+                    if image is None:
+                        continue
+                    self._memory_samples.append(
+                        ImageSample(
+                            image=image,
+                            dataset_name=self.name,
+                            sample_id=row.get("sample_id", "unknown"),
+                            meta=row.get("meta", {}) if isinstance(row.get("meta"), dict) else {},
+                        )
                     )
-                )
 
     def _register_chunk(self, chunk_id: str) -> None:
-        if self.chunk_cache is None:
-            return
-        if chunk_id in self._known_chunks:
-            return
+        with self._state_lock:
+            if self.chunk_cache is None:
+                return
+            if chunk_id in self._known_chunks:
+                return
 
-        try:
-            manifest = self.chunk_cache.load_chunk(chunk_id)
-        except FileNotFoundError:
-            # Stale chunk event: chunk may have been evicted before we processed event.
-            self.logger.debug("Skipping stale chunk event for missing chunk: %s", chunk_id)
-            return
-        except Exception as exc:
-            self.logger.warning("Cannot load chunk %s: %s", chunk_id, exc)
-            return
+            try:
+                manifest = self.chunk_cache.load_chunk(chunk_id)
+            except FileNotFoundError:
+                # Stale chunk event: chunk may have been evicted before we processed event.
+                self.logger.debug("Skipping stale chunk event for missing chunk: %s", chunk_id)
+                return
+            except Exception as exc:
+                self.logger.warning("Cannot load chunk %s: %s", chunk_id, exc)
+                return
 
-        items = manifest.get("items", [])
-        if not items:
-            return
+            items = manifest.get("items", [])
+            if not items:
+                return
 
-        self._chunk_queue.append(
-            {
-                "chunk_id": chunk_id,
-                "items": items,
-                "cursor": 0,
-                "consumer_histories": [set() for _ in items],
-                "first_issued_at": [None for _ in items],
-                "retired_indices": set(),
-            }
-        )
-        self._known_chunks.add(chunk_id)
+            self._chunk_queue.append(
+                {
+                    "chunk_id": chunk_id,
+                    "items": items,
+                    "cursor": 0,
+                    "consumer_histories": [set() for _ in items],
+                    "first_issued_at": [None for _ in items],
+                    "retired_indices": set(),
+                }
+            )
+            self._known_chunks.add(chunk_id)
 
     def _forget_chunk(self, chunk_id: str) -> None:
-        self._known_chunks.discard(chunk_id)
-        self._chunk_queue = deque(state for state in self._chunk_queue if state.get("chunk_id") != chunk_id)
+        with self._state_lock:
+            self._known_chunks.discard(chunk_id)
+            self._chunk_queue = deque(state for state in self._chunk_queue if state.get("chunk_id") != chunk_id)
 
     def _load_existing_chunks(self) -> None:
         if self.chunk_cache is None:
@@ -622,53 +652,54 @@ class HFVirtualDataset(BaseVirtualDataset):
             self._register_chunk(chunk_id)
 
     def _pop_sample(self) -> ImageSample | None:
-        if self.transport_mode == "memory":
-            if not self._memory_samples:
-                return None
-            sample = self._memory_samples.popleft()
-            self._served_samples += 1
-            return sample
+        with self._state_lock:
+            if self.transport_mode == "memory":
+                if not self._memory_samples:
+                    return None
+                sample = self._memory_samples.popleft()
+                self._served_samples += 1
+                return sample
 
-        while self._chunk_queue:
-            state = self._chunk_queue[0]
-            chunk_id = str(state["chunk_id"])
-            items = state["items"]
-            cursor = int(state["cursor"])
+            while self._chunk_queue:
+                state = self._chunk_queue[0]
+                chunk_id = str(state["chunk_id"])
+                items = state["items"]
+                cursor = int(state["cursor"])
 
-            if cursor >= len(items):
-                self._consume_chunk(chunk_id)
-                continue
+                if cursor >= len(items):
+                    self._consume_chunk(chunk_id)
+                    continue
 
-            entry = items[cursor]
-            state["cursor"] = cursor + 1
+                entry = items[cursor]
+                state["cursor"] = cursor + 1
 
-            file_name = entry.get("file")
-            if not file_name:
-                continue
+                file_name = entry.get("file")
+                if not file_name:
+                    continue
 
-            image_path = self.chunk_cache.chunk_path(chunk_id) / str(file_name)
-            if not image_path.exists():
-                continue
+                image_path = self.chunk_cache.chunk_path(chunk_id) / str(file_name)
+                if not image_path.exists():
+                    continue
 
-            try:
-                image = load_image(image_path)
-            except Exception as exc:
-                self.logger.warning("Failed to load image %s: %s", image_path, exc)
-                continue
+                try:
+                    image = load_image(image_path)
+                except Exception as exc:
+                    self.logger.warning("Failed to load image %s: %s", image_path, exc)
+                    continue
 
-            if state["cursor"] >= len(items):
-                self._consume_chunk(chunk_id)
+                if state["cursor"] >= len(items):
+                    self._consume_chunk(chunk_id)
 
-            sample_id = entry.get("sample_id", "unknown")
-            meta = entry.get("meta", {})
+                sample_id = entry.get("sample_id", "unknown")
+                meta = entry.get("meta", {})
 
-            self._served_samples += 1
-            return ImageSample(
-                image=image,
-                dataset_name=self.name,
-                sample_id=sample_id,
-                meta=meta if isinstance(meta, dict) else {},
-            )
+                self._served_samples += 1
+                return ImageSample(
+                    image=image,
+                    dataset_name=self.name,
+                    sample_id=sample_id,
+                    meta=meta if isinstance(meta, dict) else {},
+                )
 
         return None
 
@@ -695,41 +726,42 @@ class HFVirtualDataset(BaseVirtualDataset):
         if self.transport_mode != "disk":
             return None
 
-        while self._chunk_queue:
-            state = self._chunk_queue[0]
-            chunk_id = str(state["chunk_id"])
-            items = state["items"]
-            cursor = int(state["cursor"])
+        with self._state_lock:
+            while self._chunk_queue:
+                state = self._chunk_queue[0]
+                chunk_id = str(state["chunk_id"])
+                items = state["items"]
+                cursor = int(state["cursor"])
 
-            if cursor >= len(items):
-                self._maybe_finalize_consumed_chunk(chunk_id)
-                continue
+                if cursor >= len(items):
+                    self._maybe_finalize_consumed_chunk(chunk_id)
+                    continue
 
-            entry = items[cursor]
-            state["cursor"] = cursor + 1
+                entry = items[cursor]
+                state["cursor"] = cursor + 1
 
-            file_name = entry.get("file")
-            if not file_name:
-                continue
+                file_name = entry.get("file")
+                if not file_name:
+                    continue
 
-            image_path = self.chunk_cache.chunk_path(chunk_id) / str(file_name)
-            if not image_path.exists():
-                continue
+                image_path = self.chunk_cache.chunk_path(chunk_id) / str(file_name)
+                if not image_path.exists():
+                    continue
 
-            self._retain_chunk_lease(chunk_id)
-            if state["cursor"] >= len(items):
-                self._maybe_finalize_consumed_chunk(chunk_id)
+                self._retain_chunk_lease(chunk_id)
+                if state["cursor"] >= len(items):
+                    self._maybe_finalize_consumed_chunk(chunk_id)
 
-            sample_id = entry.get("sample_id", "unknown")
-            meta = entry.get("meta", {})
-            self._served_samples += 1
-            return ImageSampleRef(
-                dataset_name=self.name,
-                sample_id=sample_id,
-                meta=meta if isinstance(meta, dict) else {},
-                chunk_id=chunk_id,
-                file_name=str(file_name),
-            )
+                sample_id = entry.get("sample_id", "unknown")
+                meta = entry.get("meta", {})
+                self._served_samples += 1
+                return ImageSampleRef(
+                    dataset_name=self.name,
+                    sample_id=sample_id,
+                    meta=meta if isinstance(meta, dict) else {},
+                    chunk_id=chunk_id,
+                    file_name=str(file_name),
+                )
         return None
 
     def _pop_sample_ref_multi_use(
@@ -742,36 +774,61 @@ class HFVirtualDataset(BaseVirtualDataset):
         if self.transport_mode != "disk":
             return None
 
-        chunks_to_scan = len(self._chunk_queue)
-        scanned = 0
-        while self._chunk_queue and scanned < chunks_to_scan:
-            state = self._chunk_queue[0]
-            chunk_id = str(state["chunk_id"])
-            items = state["items"]
-            consumer_histories = state["consumer_histories"]
-            first_issued_at = state["first_issued_at"]
-            retired_indices = state["retired_indices"]
-            retire_stale_reusable_items(
-                consumer_histories=consumer_histories,
-                first_issued_at=first_issued_at,
-                retired_indices=retired_indices,
-                now_s=time.time(),
-                max_pending_reuse_s=max_pending_reuse_s,
-                max_distinct_consumers_per_sample=max_distinct_consumers_per_sample,
-            )
+        with self._state_lock:
+            chunks_to_scan = len(self._chunk_queue)
+            scanned = 0
+            while self._chunk_queue and scanned < chunks_to_scan:
+                state = self._chunk_queue[0]
+                chunk_id = str(state["chunk_id"])
+                items = state["items"]
+                consumer_histories = state["consumer_histories"]
+                first_issued_at = state["first_issued_at"]
+                retired_indices = state["retired_indices"]
+                retire_stale_reusable_items(
+                    consumer_histories=consumer_histories,
+                    first_issued_at=first_issued_at,
+                    retired_indices=retired_indices,
+                    now_s=time.time(),
+                    max_pending_reuse_s=max_pending_reuse_s,
+                    max_distinct_consumers_per_sample=max_distinct_consumers_per_sample,
+                )
 
-            selected_index = select_reusable_item_index(
-                items=items,
-                consumer_histories=consumer_histories,
-                retired_indices=retired_indices,
-                consumer_id=consumer_id,
-                max_distinct_consumers_per_sample=max_distinct_consumers_per_sample,
-                file_exists=lambda file_name: (
-                    self.chunk_cache.chunk_path(chunk_id) / str(file_name)
-                ).exists(),
-            )
+                selected_index = select_reusable_item_index(
+                    items=items,
+                    consumer_histories=consumer_histories,
+                    retired_indices=retired_indices,
+                    consumer_id=consumer_id,
+                    max_distinct_consumers_per_sample=max_distinct_consumers_per_sample,
+                    file_exists=lambda file_name: (
+                        self.chunk_cache.chunk_path(chunk_id) / str(file_name)
+                    ).exists(),
+                )
 
-            if selected_index is None:
+                if selected_index is None:
+                    if chunk_fully_consumed(
+                        num_items=len(items),
+                        consumer_histories=consumer_histories,
+                        retired_indices=retired_indices,
+                        max_distinct_consumers_per_sample=max_distinct_consumers_per_sample,
+                    ):
+                        self._maybe_finalize_consumed_chunk(chunk_id)
+                        chunks_to_scan = len(self._chunk_queue)
+                        continue
+                    self._chunk_queue.rotate(-1)
+                    scanned += 1
+                    continue
+
+                entry = items[selected_index]
+                file_name = entry.get("file")
+                if not file_name:
+                    retired_indices.add(selected_index)
+                    continue
+
+                if first_issued_at[selected_index] is None:
+                    first_issued_at[selected_index] = float(time.time())
+                consumer_histories[selected_index].add(consumer_id)
+                self._retain_chunk_lease(chunk_id)
+
                 if chunk_fully_consumed(
                     num_items=len(items),
                     consumer_histories=consumer_histories,
@@ -779,78 +836,58 @@ class HFVirtualDataset(BaseVirtualDataset):
                     max_distinct_consumers_per_sample=max_distinct_consumers_per_sample,
                 ):
                     self._maybe_finalize_consumed_chunk(chunk_id)
-                    chunks_to_scan = len(self._chunk_queue)
-                    continue
-                self._chunk_queue.rotate(-1)
-                scanned += 1
-                continue
 
-            entry = items[selected_index]
-            file_name = entry.get("file")
-            if not file_name:
-                retired_indices.add(selected_index)
-                continue
-
-            if first_issued_at[selected_index] is None:
-                first_issued_at[selected_index] = float(time.time())
-            consumer_histories[selected_index].add(consumer_id)
-            self._retain_chunk_lease(chunk_id)
-
-            if chunk_fully_consumed(
-                num_items=len(items),
-                consumer_histories=consumer_histories,
-                retired_indices=retired_indices,
-                max_distinct_consumers_per_sample=max_distinct_consumers_per_sample,
-            ):
-                self._maybe_finalize_consumed_chunk(chunk_id)
-
-            sample_id = entry.get("sample_id", "unknown")
-            meta = entry.get("meta", {})
-            self._served_samples += 1
-            return ImageSampleRef(
-                dataset_name=self.name,
-                sample_id=sample_id,
-                meta=meta if isinstance(meta, dict) else {},
-                chunk_id=chunk_id,
-                file_name=str(file_name),
-            )
+                sample_id = entry.get("sample_id", "unknown")
+                meta = entry.get("meta", {})
+                self._served_samples += 1
+                return ImageSampleRef(
+                    dataset_name=self.name,
+                    sample_id=sample_id,
+                    meta=meta if isinstance(meta, dict) else {},
+                    chunk_id=chunk_id,
+                    file_name=str(file_name),
+                )
 
         return None
 
     def _consume_chunk(self, chunk_id: str) -> None:
-        self._pending_chunk_cleanup.discard(chunk_id)
-        self._forget_chunk(chunk_id)
-        if self.chunk_cache is not None:
-            self.chunk_cache.remove_chunk(chunk_id)
+        with self._state_lock:
+            self._pending_chunk_cleanup.discard(chunk_id)
+            self._forget_chunk(chunk_id)
+            if self.chunk_cache is not None:
+                self.chunk_cache.remove_chunk(chunk_id)
 
     def _retain_chunk_lease(self, chunk_id: str) -> None:
-        if self.chunk_cache is None:
-            return
-        if self._leased_chunk_ref_counts.get(chunk_id, 0) <= 0:
-            self.chunk_cache.acquire_lease(chunk_id, self._leased_chunk_owner_id)
-        self._leased_chunk_ref_counts[chunk_id] += 1
+        with self._state_lock:
+            if self.chunk_cache is None:
+                return
+            if self._leased_chunk_ref_counts.get(chunk_id, 0) <= 0:
+                self.chunk_cache.acquire_lease(chunk_id, self._leased_chunk_owner_id)
+            self._leased_chunk_ref_counts[chunk_id] += 1
 
     def _release_chunk_lease(self, chunk_id: str) -> None:
-        if self.chunk_cache is None:
-            return
-        current = int(self._leased_chunk_ref_counts.get(chunk_id, 0))
-        if current <= 0:
-            return
-        if current == 1:
-            self._leased_chunk_ref_counts.pop(chunk_id, None)
-            self.chunk_cache.release_lease(chunk_id, self._leased_chunk_owner_id)
-            if chunk_id in self._pending_chunk_cleanup:
-                self._pending_chunk_cleanup.discard(chunk_id)
-                self._consume_chunk(chunk_id)
-            return
-        self._leased_chunk_ref_counts[chunk_id] = current - 1
+        with self._state_lock:
+            if self.chunk_cache is None:
+                return
+            current = int(self._leased_chunk_ref_counts.get(chunk_id, 0))
+            if current <= 0:
+                return
+            if current == 1:
+                self._leased_chunk_ref_counts.pop(chunk_id, None)
+                self.chunk_cache.release_lease(chunk_id, self._leased_chunk_owner_id)
+                if chunk_id in self._pending_chunk_cleanup:
+                    self._pending_chunk_cleanup.discard(chunk_id)
+                    self._consume_chunk(chunk_id)
+                return
+            self._leased_chunk_ref_counts[chunk_id] = current - 1
 
     def _maybe_finalize_consumed_chunk(self, chunk_id: str) -> None:
-        if int(self._leased_chunk_ref_counts.get(chunk_id, 0)) > 0:
-            self._pending_chunk_cleanup.add(chunk_id)
-            self._forget_chunk(chunk_id)
-            return
-        self._consume_chunk(chunk_id)
+        with self._state_lock:
+            if int(self._leased_chunk_ref_counts.get(chunk_id, 0)) > 0:
+                self._pending_chunk_cleanup.add(chunk_id)
+                self._forget_chunk(chunk_id)
+                return
+            self._consume_chunk(chunk_id)
 
     def _init_meta_if_missing(self) -> None:
         if self.meta_path.exists():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -31,10 +32,18 @@ class LocalDiskChunkStore(ChunkStore):
 
         staging_path = self.staging_dir / filename
         ready_path = self.ready_dir / filename
+        staging_tmp_path = staging_path.with_name(f"{staging_path.name}.tmp")
 
-        shutil.copy2(source, staging_path)
+        try:
+            staging_tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            os.link(source, staging_tmp_path)
+        except Exception:
+            shutil.copy2(source, staging_tmp_path)
         ready_path.parent.mkdir(parents=True, exist_ok=True)
-        staging_path.replace(ready_path)
+        staging_tmp_path.replace(ready_path)
 
         created_at = float(meta.get("created_at", time.time()))
         size_bytes = ready_path.stat().st_size
@@ -54,27 +63,23 @@ class LocalDiskChunkStore(ChunkStore):
         )
 
     def list_ready(self, limit: int | None = None) -> list[ChunkRef]:
-        files_with_meta: list[tuple[float, str, Path]] = []
-        for path in self.ready_dir.iterdir():
-            if not _is_ready_chunk_file(path):
+        files_with_meta: list[tuple[float, str, Path, int]] = []
+        for entry in os.scandir(self.ready_dir):
+            name = entry.name
+            if not _is_ready_chunk_entry(entry):
                 continue
             try:
-                stat = path.stat()
+                stat = entry.stat()
             except FileNotFoundError:
-                # Concurrent rename/remove while scanning.
                 continue
-            files_with_meta.append((float(stat.st_mtime), path.name, path))
+            files_with_meta.append((float(stat.st_mtime), name, Path(entry.path), int(stat.st_size)))
 
         files_with_meta.sort(key=lambda item: (item[0], item[1]))
         if limit is not None:
             files_with_meta = files_with_meta[: max(0, int(limit))]
 
         refs: list[ChunkRef] = []
-        for mtime, _, path in files_with_meta:
-            try:
-                size_bytes = int(path.stat().st_size)
-            except FileNotFoundError:
-                continue
+        for mtime, _, path, size_bytes in files_with_meta:
             refs.append(
                 ChunkRef(
                     chunk_id=_chunk_id_from_filename(path.name),
@@ -92,7 +97,14 @@ class LocalDiskChunkStore(ChunkStore):
         target.parent.mkdir(parents=True, exist_ok=True)
 
         tmp_path = target.with_suffix(target.suffix + ".tmp")
-        shutil.copy2(source, tmp_path)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            os.link(source, tmp_path)
+        except Exception:
+            shutil.copy2(source, tmp_path)
         tmp_path.replace(target)
         return target
 
@@ -109,8 +121,8 @@ class LocalDiskChunkStore(ChunkStore):
 
     def count_ready(self) -> int:
         count = 0
-        for path in self.ready_dir.iterdir():
-            if _is_ready_chunk_file(path):
+        for entry in os.scandir(self.ready_dir):
+            if _is_ready_chunk_entry(entry):
                 count += 1
         return count
 
@@ -204,6 +216,21 @@ def _is_ready_chunk_file(path: Path) -> bool:
         return False
 
     name = path.name
+    if name.endswith(".tmp"):
+        return False
+    if name.endswith(".meta.json"):
+        return False
+    return name.endswith(".pt") or name.endswith(".pt.gz")
+
+
+def _is_ready_chunk_entry(entry: os.DirEntry[str]) -> bool:
+    try:
+        if not entry.is_file():
+            return False
+    except FileNotFoundError:
+        return False
+
+    name = entry.name
     if name.endswith(".tmp"):
         return False
     if name.endswith(".meta.json"):

@@ -1016,6 +1016,9 @@ class CollectorService:
                     prepared = self._dequeue_prepared_job(timeout_s=0.2 if not in_flight else 0.05)
                     if prepared is None:
                         break
+                    if self._is_model_failed(prepared.model_name):
+                        self._discard_prepared_job(prepared)
+                        continue
                     future = self._parallel_executor.submit(self._execute_prepared_parallel_job, prepared)
                     in_flight.add(future)
                     future_to_prepared[future] = prepared
@@ -1051,7 +1054,9 @@ class CollectorService:
                         continue
                     self._record_completed_job(stats)
                 for future in pending:
-                    future.cancel()
+                    prepared = future_to_prepared.pop(future, None)
+                    if future.cancel() and prepared is not None:
+                        self._discard_prepared_job(prepared)
             return
 
         while not active_stop_event.is_set():
@@ -1480,6 +1485,9 @@ class CollectorService:
                 if prepared is None:
                     time.sleep(0.02)
                     continue
+                if self._is_model_failed(prepared.model_name):
+                    self._discard_prepared_job(prepared)
+                    continue
 
                 while not stop_event.is_set():
                     try:
@@ -1513,6 +1521,22 @@ class CollectorService:
         except Empty:
             return None
 
+    def _discard_prepared_job(self, prepared: _PreparedCollectorJob) -> None:
+        if self._raw_pool is None:
+            return
+        try:
+            self._raw_pool.release_image_refs(prepared.image_refs)
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to release discarded prepared job refs for model '%s': %s",
+                prepared.model_name,
+                exc,
+            )
+
+    def _is_model_failed(self, model_name: str) -> bool:
+        with self._stats_lock:
+            return str(model_name) in self._failed_models
+
     def _shutdown_runtime_components(self) -> None:
         if self._prepared_job_stop_event is not None:
             self._prepared_job_stop_event.set()
@@ -1526,11 +1550,13 @@ class CollectorService:
         if self._prepared_job_queue is not None:
             while True:
                 try:
-                    self._prepared_job_queue.get_nowait()
+                    prepared = self._prepared_job_queue.get_nowait()
                 except Empty:
                     break
                 except Exception:
                     break
+                if isinstance(prepared, _PreparedCollectorJob):
+                    self._discard_prepared_job(prepared)
             self._prepared_job_queue = None
 
         if self._atomizer_stop_event is not None:
@@ -1818,29 +1844,33 @@ class CollectorService:
         all_models = self.compat_index.get_models()
         if not all_models:
             raise RuntimeError("collector has no compatible models to schedule")
-        if len(self._failed_models) >= len(all_models):
+        with self._stats_lock:
+            failed_models = set(self._failed_models)
+        if len(failed_models) >= len(all_models):
             raise RuntimeError(
                 "collector exhausted all compatible models after runtime failures: "
-                f"{sorted(self._failed_models)}"
+                f"{sorted(failed_models)}"
             )
         for _ in range(len(all_models) * 2):
             model_name = self._scheduler.next_model()
-            if model_name not in self._failed_models:
+            if model_name not in failed_models:
                 return model_name
         for model_name in all_models:
-            if model_name not in self._failed_models:
+            if model_name not in failed_models:
                 return model_name
         raise RuntimeError(
             "collector failed to select an active model after runtime failures: "
-            f"{sorted(self._failed_models)}"
+            f"{sorted(failed_models)}"
         )
 
     def _mark_model_failed(self, model_name: str | None, exc: BaseException) -> None:
         if model_name is None:
             self.logger.exception("Collector job failed for unknown model", exc_info=exc)
             return
-        first_failure = model_name not in self._failed_models
-        self._failed_models.add(model_name)
+        with self._stats_lock:
+            first_failure = model_name not in self._failed_models
+            self._failed_models.add(model_name)
+        self._purge_failed_model_from_pools(model_name)
         if first_failure:
             self.logger.exception(
                 "Disabling collector model after runtime failure: model=%s error=%s",
@@ -1852,6 +1882,13 @@ class CollectorService:
             self.logger.warning("Collector model remains disabled after repeated failure: model=%s error=%s", model_name, exc)
         self._emit_status_event(event_type="heartbeat", job_stats=None)
 
+    def _purge_failed_model_from_pools(self, model_name: str) -> None:
+        if self._model_pool is not None:
+            self._model_pool.unload_model(model_name)
+        with self._parallel_model_pools_lock:
+            for pool in self._parallel_model_pools.values():
+                pool.unload_model(model_name)
+
     def _maybe_emit_status_event(self, event_type: str) -> None:
         now = time.time()
         if now - self._last_status_emit_ts < self.status_emit_interval_s:
@@ -1859,6 +1896,11 @@ class CollectorService:
         self._emit_status_event(event_type=event_type, job_stats=None)
 
     def _emit_status_event(self, event_type: str, job_stats: CollectorJobStats | None) -> None:
+        with self._stats_lock:
+            jobs_total = int(self._jobs_total)
+            jobs_by_model = {name: int(value) for name, value in self._jobs_by_model.items()}
+            items_emitted = int(self._items_emitted)
+            failed_models = sorted(self._failed_models)
         payload: dict[str, Any] = {
             "type": str(event_type),
             "timestamp": float(time.time()),
@@ -1873,10 +1915,10 @@ class CollectorService:
             "atomizer_process_enabled": bool(self.atomizer_process_enabled),
             "atomizer_process_alive": bool(self._atomizer_process is not None and self._atomizer_process.is_alive()),
             "cache_size": int(self.cache_size()),
-            "jobs_total": int(self._jobs_total),
-            "jobs_by_model": {name: int(value) for name, value in self._jobs_by_model.items()},
-            "items_emitted": int(self._items_emitted),
-            "failed_models": sorted(self._failed_models),
+            "jobs_total": jobs_total,
+            "jobs_by_model": jobs_by_model,
+            "items_emitted": items_emitted,
+            "failed_models": failed_models,
             "scheduler": self._scheduler.stats() if self._scheduler else None,
             "sink": self._sink.stats() if self._sink else None,
             "events_dropped": int(self._async_events_dropped),
