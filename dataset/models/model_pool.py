@@ -90,6 +90,15 @@ class ModelPool:
             except Exception:
                 continue
 
+    def unload_model(self, model_name: str) -> None:
+        model = self._loaded_models.pop(str(model_name), None)
+        if model is None:
+            return
+        try:
+            model.unload()
+        except Exception as exc:
+            self.logger.warning("Failed to unload model '%s': %s", model_name, exc)
+
     def stats(self) -> dict[str, Any]:
         return {
             "device_override": self.device_override,

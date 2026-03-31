@@ -75,7 +75,7 @@ class ChunkReader:
             if deadline is not None and time.monotonic() >= deadline:
                 raise Empty("Timed out waiting for streaming chunk")
 
-            time.sleep(0.1)
+            time.sleep(0.02)
 
     def try_next_sample(self) -> SharedSample | None:
         if self._active_chunk is None or self._active_index >= len(self._active_samples):
@@ -156,17 +156,19 @@ class ChunkReader:
             self._rng.shuffle(self._active_order)
 
     def _prefetch_once(self) -> None:
-        while len(self._pending_chunks) < self.prefetch_max_chunks:
-            refs = self.store.list_ready(limit=self.prefetch_max_chunks * 4)
-            refs = [ref for ref in refs if self._eligible_ref(ref)]
+        slots_needed = self.prefetch_max_chunks - len(self._pending_chunks)
+        if slots_needed <= 0:
+            return
 
-            if not refs:
-                return
+        refs = self.store.list_ready(limit=max(self.prefetch_max_chunks * 4, slots_needed))
+        refs = [ref for ref in refs if self._eligible_ref(ref)]
+        if not refs:
+            return
 
-            if self.randomize_chunk_order:
-                ref = self._rng.choice(refs)
-            else:
-                ref = refs[0]
+        if self.randomize_chunk_order:
+            self._rng.shuffle(refs)
+
+        for ref in refs[:slots_needed]:
             self._known_chunk_ids.add(ref.chunk_id)
 
             target = self.cache_dir / _chunk_filename(ref)
