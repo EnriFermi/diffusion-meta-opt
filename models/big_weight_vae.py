@@ -187,7 +187,7 @@ class TokenConditioningAdapter(nn.Module):
         self.gate_c = nn.Linear(d_model, gate_dim)
         self.gate_out = nn.Linear(gate_dim, d_model)
 
-        self.alpha = nn.Parameter(torch.zeros(1))
+        self.alpha = nn.Parameter(torch.full((1,), 1e-3))
         self.conditioning_dropout = nn.Dropout(dropout)
 
         nn.init.zeros_(self.mix_out.weight)

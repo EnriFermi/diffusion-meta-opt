@@ -40,7 +40,7 @@ class AlignedConditionedPatchBlock(nn.Module):
         self.cond_fc1 = nn.Linear(d_rank, d_hidden)
         self.cond_fc2 = nn.Linear(d_hidden, d_model)
         self.gate_fc = nn.Linear(d_rank, d_model)
-        self.alpha = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.alpha = nn.Parameter(torch.full((1, 1, d_model), 1e-3))
 
         nn.init.zeros_(self.cond_fc2.weight)
         nn.init.zeros_(self.cond_fc2.bias)
