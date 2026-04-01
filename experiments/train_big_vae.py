@@ -543,6 +543,27 @@ def _strip_ddp_prefix(name: str) -> str:
     return out
 
 
+def _unwrap_model_for_state_io(model: torch.nn.Module) -> torch.nn.Module:
+    target = model.module if isinstance(model, DDP) else model
+    compiled_target = getattr(target, "_orig_mod", None)
+    if isinstance(compiled_target, torch.nn.Module):
+        target = compiled_target
+    return target
+
+
+def _normalize_model_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for raw_key, value in state_dict.items():
+        key = _strip_ddp_prefix(str(raw_key))
+        existing = normalized.get(key)
+        if existing is not None and existing is not value:
+            raise ValueError(
+                f"State dict key collision after normalization: raw_key={raw_key!r} normalized_key={key!r}"
+            )
+        normalized[key] = value
+    return normalized
+
+
 def _layer_key_from_param_name(name: str) -> str:
     parts = name.split(".")
     if not parts:
@@ -1140,7 +1161,7 @@ def _save_checkpoint(
     checkpoint_dir = base_dir / f"stage_{stage}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    model_to_save = model.module if isinstance(model, DDP) else model
+    model_to_save = _unwrap_model_for_state_io(model)
     payload = {
         "step": step_idx,
         "stage": stage,
@@ -1167,7 +1188,7 @@ def _save_resume_state_checkpoint(
     stage: int,
     state_dir: Path,
 ) -> None:
-    model_to_save = model.module if isinstance(model, DDP) else model
+    model_to_save = _unwrap_model_for_state_io(model)
     payload = {
         "step": step_idx,
         "stage": stage,
@@ -2470,8 +2491,8 @@ def _load_model_weights_from_checkpoint(
 ) -> None:
     logger.info("Loading model weights from checkpoint: %s", path)
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    state_dict = ckpt["model_state"]
-    target = model.module if isinstance(model, DDP) else model
+    state_dict = _normalize_model_state_dict_keys(ckpt["model_state"])
+    target = _unwrap_model_for_state_io(model)
     target.load_state_dict(state_dict, strict=True)
     logger.info("Model weights loaded successfully (step=%s)", ckpt.get("step", "?"))
 
@@ -2499,8 +2520,9 @@ def _load_training_state_from_checkpoint(
 ) -> int:
     logger.info("Loading training state from checkpoint: %s", path)
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    target = model.module if isinstance(model, DDP) else model
-    target.load_state_dict(ckpt["model_state"], strict=True)
+    target = _unwrap_model_for_state_io(model)
+    state_dict = _normalize_model_state_dict_keys(ckpt["model_state"])
+    target.load_state_dict(state_dict, strict=True)
 
     optimizer_state = ckpt.get("optimizer_state")
     if optimizer_state is not None:
