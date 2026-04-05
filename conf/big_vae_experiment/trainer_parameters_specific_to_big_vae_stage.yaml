@@ -4,7 +4,7 @@ distributed: false
 num_gpus: 1
 
 amp: true
-tf32:  
+tf32: true
 cudnn_benchmark: true
 compile: true
 compile_mode: reduce-overhead
@@ -23,9 +23,9 @@ kl_schedule:
   warmup_steps: 100000
   ramp_steps: 200000
 weight_decay: 0.01
-lr: 1e-6
+lr: 1e-4
 
-behavioral_coef: 100.0
+behavioral_coef: 0.0
 structural_coef: 1.0
 contrastive_coef: 0.0
 struct_loss:
@@ -50,16 +50,10 @@ resume_state:
   save_every: ${train.checkpoint_every}
   dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/resume_state
   load_model_state: true
-  load_optimizer_state: true
-  load_scheduler_state: true
-  load_scaler_state: true
-  load_step: true
-  # To keep current weights but restart optimization from scratch:
-  # load_model_state: true
-  # load_optimizer_state: false
-  # load_scheduler_state: false
-  # load_scaler_state: false
-  # load_step: false
+  load_optimizer_state: false
+  load_scheduler_state: false
+  load_scaler_state: false
+  load_step: false
 
 stage: 1
 stage_base_T_patches: 16
@@ -84,7 +78,7 @@ fixed_training_batch:
 # Cap rows in x to reduce rare heavy samples that can stall steps.
 max_x_rows: 512
 steps_per_sample: 1
-slice_batch_size: 64
+slice_batch_size: 256
 # Optional mixed-source batch mode for big_vae.
 # Default path builds the whole batch from one source snapshot and reslices it.
 # When enabled, train loop pulls several ready snapshots, keeps only those that
