@@ -36,6 +36,7 @@ from training.mini_patch_training_model import MiniPatchTrainingModel, build_dis
 from training.runtime import (
     autocast_context as runtime_autocast_context,
     configure_per_run_artifacts as runtime_configure_per_run_artifacts,
+    create_grad_scaler as runtime_create_grad_scaler,
     find_free_port as runtime_find_free_port,
     get_rank_logger,
     maybe_compile_model as runtime_maybe_compile_model,
@@ -1755,7 +1756,10 @@ def run_worker(rank: int, world_size: int, cfg_dict: dict[str, Any], master_addr
             scheduler = build_scheduler(optimizer=optimizer, cfg=cfg)
 
             amp_enabled, amp_dtype = resolve_amp(cfg=cfg, device=device)
-            scaler = GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
+            scaler = runtime_create_grad_scaler(
+                device=device,
+                enabled=(amp_enabled and amp_dtype == torch.float16),
+            )
 
             telemetry_cfg = cfg.mini_train.get("telemetry", {})
             local_telemetry_cfg = telemetry_cfg.get("local", {})

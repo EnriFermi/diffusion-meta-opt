@@ -18,7 +18,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
-from torch.cuda.amp import GradScaler
+try:
+    from torch.amp import GradScaler
+except Exception:  # pragma: no cover - compatibility for older PyTorch
+    from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 
@@ -46,6 +49,7 @@ from training.forensics import (
 from training.runtime import (
     autocast_context as runtime_autocast_context,
     configure_per_run_artifacts as runtime_configure_per_run_artifacts,
+    create_grad_scaler as runtime_create_grad_scaler,
     find_free_port as runtime_find_free_port,
     get_rank_logger,
     maybe_compile_model,
@@ -208,6 +212,20 @@ def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
 
 
 def _maybe_compile(model: torch.nn.Module, cfg: DictConfig, logger: logging.Logger) -> torch.nn.Module:
+    train_cfg = cfg.train
+    compile_dynamic = bool(train_cfg.get("compile_dynamic", True))
+    slice_batch_size = max(1, int(train_cfg.get("slice_batch_size", 1)))
+    max_safe_slice_batch_size = int(train_cfg.get("compile_dynamic_max_safe_slice_batch_size", 128))
+    if compile_dynamic and max_safe_slice_batch_size > 0 and slice_batch_size > max_safe_slice_batch_size:
+        logger.warning(
+            "Disabling train.compile_dynamic at runtime because train.slice_batch_size=%s exceeds "
+            "train.compile_dynamic_max_safe_slice_batch_size=%s; large BigVAE batches can hit "
+            "torch.compile backward CantSplit / Inductor failures in dynamic mode",
+            slice_batch_size,
+            max_safe_slice_batch_size,
+        )
+        with open_dict(cfg):
+            cfg.train.compile_dynamic = False
     return maybe_compile_model(model, cfg, logger, section="train", label="model")
 
 
@@ -324,6 +342,7 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
             collector_cfg.get("parallel_model_pool_max_loaded_models", 1)
         ),
         "train.device": str(train_cfg.get("device", "")),
+        "train.compile_stable_batch_shapes": bool(train_cfg.get("compile_stable_batch_shapes", False)),
     }
     resume_state_cfg = train_cfg.get("resume_state", {})
     if isinstance(resume_state_cfg, (dict, DictConfig)):
@@ -2136,6 +2155,9 @@ def _build_training_batch_from_source_states(
     *,
     batch_size: int,
     start_offset: int = 0,
+    target_x_rows: int | None = None,
+    target_d_in: int | None = None,
+    target_d_out: int | None = None,
 ) -> ConsumedSourceBatch:
     if not source_states:
         raise ValueError("source_states must not be empty")
@@ -2200,6 +2222,12 @@ def _build_training_batch_from_source_states(
     max_x_rows = max(int(x_i.shape[0]) for _, x_i in raw_slices)
     max_d_in = max(int(W_i.shape[0]) for W_i, _ in raw_slices)
     max_d_out = max(int(W_i.shape[1]) for W_i, _ in raw_slices)
+    if target_x_rows is not None:
+        max_x_rows = int(target_x_rows)
+    if target_d_in is not None:
+        max_d_in = int(target_d_in)
+    if target_d_out is not None:
+        max_d_out = int(target_d_out)
     for W_i, x_i in raw_slices:
         x_i, x_mask_i = _pad_x_rows_with_mask(x_i, max_x_rows)
         x_i, W_i, d_in_mask_i = _pad_d_in_with_mask(x_i, W_i, max_d_in)
@@ -2234,6 +2262,9 @@ def _build_training_batch_from_source_samples(
     patch_size: int,
     batch_size: int,
     start_offset: int = 0,
+    target_x_rows: int | None = None,
+    target_d_in: int | None = None,
+    target_d_out: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not source_samples:
         raise ValueError("source_samples must not be empty")
@@ -2241,6 +2272,8 @@ def _build_training_batch_from_source_samples(
         raise ValueError(f"batch_size must be > 0, got {batch_size}")
 
     max_x_rows = max(int(record.x.shape[0]) for record in source_samples)
+    if target_x_rows is not None:
+        max_x_rows = int(target_x_rows)
     normalized_sources = [
         (
             *_pad_x_rows_with_mask(record.x, max_x_rows),
@@ -2277,6 +2310,11 @@ def _build_training_batch_from_source_samples(
         max_batch_d_out = max(max_batch_d_out, int(W_part.shape[2]))
         x_mask_part = x_mask_src.unsqueeze(0).expand(count, -1)
         source_batches[source_idx] = (W_part, x_part, x_mask_part)
+
+    if target_d_in is not None:
+        max_d_in = int(target_d_in)
+    if target_d_out is not None:
+        max_batch_d_out = int(target_d_out)
 
     source_offsets = [0] * len(normalized_sources)
     ordered_W: list[torch.Tensor] = []
@@ -2418,6 +2456,22 @@ def _compute_curriculum_slice_sizes(cfg: DictConfig) -> tuple[int, int]:
     max_T = base_T * (scale ** (stage - 1))
     max_d_out = base_d_out * (scale ** (stage - 1))
     return max_T, max_d_out
+
+
+def _stable_batch_shape_targets(
+    *,
+    cfg: DictConfig,
+    patch_size: int,
+    max_T_patches: int,
+    max_d_out: int,
+    max_x_rows: int,
+) -> tuple[int | None, int | None, int | None]:
+    if not bool(cfg.train.get("compile_stable_batch_shapes", False)):
+        return None, None, None
+    target_x_rows = int(max_x_rows) if int(max_x_rows) > 0 else None
+    target_d_in = int(patch_size) * int(max_T_patches)
+    target_d_out = int(max_d_out)
+    return target_x_rows, target_d_in, target_d_out
 
 
 def _slice_sample(
@@ -2882,7 +2936,10 @@ def _run_worker(
             resume_state_dir = Path(str(resume_state_cfg.get("dir", str(default_resume_state_dir))))
 
             amp_enabled, amp_dtype = _resolve_amp(cfg=cfg, device=device)
-            scaler = GradScaler(enabled=(amp_enabled and amp_dtype == torch.float16))
+            scaler = runtime_create_grad_scaler(
+                device=device,
+                enabled=(amp_enabled and amp_dtype == torch.float16),
+            )
             resume_checkpoint = str(cfg.train.get("resume_checkpoint", "")).strip()
             resumed_training_step = 0
             resume_state_path: Path | None = None
@@ -2978,6 +3035,13 @@ def _run_worker(
             patch_size_for_slice = int(cfg.model.get("patch_size", 16))
             curriculum_max_T, curriculum_max_d_out = _compute_curriculum_slice_sizes(cfg)
             slice_batch_size = max(1, int(cfg.train.get("slice_batch_size", 1)))
+            stable_batch_target_x_rows, stable_batch_target_d_in, stable_batch_target_d_out = _stable_batch_shape_targets(
+                cfg=cfg,
+                patch_size=patch_size_for_slice,
+                max_T_patches=curriculum_max_T,
+                max_d_out=curriculum_max_d_out,
+                max_x_rows=max_x_rows,
+            )
             batch_source_mixing_cfg = cfg.train.get("batch_source_mixing", {})
             if batch_source_mixing_cfg is None:
                 batch_source_mixing_cfg = {}
@@ -3030,6 +3094,17 @@ def _run_worker(
                     "Curriculum slicing: stage=%s max_T_patches=%s max_d_out=%s patch_size=%s slice_batch_size=%s",
                     stage_num, curriculum_max_T, curriculum_max_d_out, patch_size_for_slice, slice_batch_size,
                 )
+                if (
+                    stable_batch_target_x_rows is not None
+                    or stable_batch_target_d_in is not None
+                    or stable_batch_target_d_out is not None
+                ):
+                    logger.info(
+                        "Compile-stable batch shapes enabled: target_x_rows=%s target_d_in=%s target_d_out=%s",
+                        stable_batch_target_x_rows,
+                        stable_batch_target_d_in,
+                        stable_batch_target_d_out,
+                    )
                 if batch_source_mixing_enabled:
                     logger.info(
                         "Batch source mixing: enabled=%s strategy=%s requested_source_samples=%s "
@@ -3468,6 +3543,9 @@ def _run_worker(
                                     current_source_states,
                                     batch_size=slice_batch_size,
                                     start_offset=current_source_round_robin_offset,
+                                    target_x_rows=stable_batch_target_x_rows,
+                                    target_d_in=stable_batch_target_d_in,
+                                    target_d_out=stable_batch_target_d_out,
                                 )
                                 fixed_batch_diversity_stats = _compute_consumed_batch_source_diversity_stats(
                                     current_source_states,
@@ -3497,6 +3575,9 @@ def _run_worker(
                                     patch_size=patch_size_for_slice,
                                     batch_size=slice_batch_size,
                                     start_offset=current_source_round_robin_offset,
+                                    target_x_rows=stable_batch_target_x_rows,
+                                    target_d_in=stable_batch_target_d_in,
+                                    target_d_out=stable_batch_target_d_out,
                                 )
                             fixed_batch_W = fixed_batch_W.to(device=device, non_blocking=True)
                             fixed_batch_x = fixed_batch_x.to(device=device, non_blocking=True)
@@ -3579,6 +3660,9 @@ def _run_worker(
                                 current_source_states,
                                 batch_size=slice_batch_size,
                                 start_offset=current_source_round_robin_offset,
+                                target_x_rows=stable_batch_target_x_rows,
+                                target_d_in=stable_batch_target_d_in,
+                                target_d_out=stable_batch_target_d_out,
                             )
                             current_batch_source_diversity = _compute_consumed_batch_source_diversity_stats(
                                 current_source_states,
@@ -3614,6 +3698,9 @@ def _run_worker(
                                 patch_size=patch_size_for_slice,
                                 batch_size=slice_batch_size,
                                 start_offset=current_source_round_robin_offset,
+                                target_x_rows=stable_batch_target_x_rows,
+                                target_d_in=stable_batch_target_d_in,
+                                target_d_out=stable_batch_target_d_out,
                             )
                             current_source_round_robin_offset = (
                                 current_source_round_robin_offset + slice_batch_size

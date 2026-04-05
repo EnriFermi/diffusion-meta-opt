@@ -8,7 +8,11 @@ tf32: true
 cudnn_benchmark: true
 compile: true
 compile_mode: reduce-overhead
-compile_dynamic: true
+compile_dynamic: false
+compile_stable_batch_shapes: true
+# When explicitly re-enabled, large slice batches can hit Inductor backward
+# CantSplit failures in dynamic mode. Keep a runtime safety cutoff.
+compile_dynamic_max_safe_slice_batch_size: 128
 # Keep torch.compile while avoiding inductor CUDAGraph output-buffer reuse issues.
 compile_disable_cudagraphs: true
 # Pull model artifacts up front to reduce collector cold-start stalls.

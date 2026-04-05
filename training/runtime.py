@@ -9,6 +9,7 @@ import random
 import socket
 import uuid
 from pathlib import Path
+from typing import Any
 
 import torch
 from omegaconf import DictConfig, open_dict
@@ -210,6 +211,17 @@ def maybe_compile_model(
             section,
         )
     return torch.compile(model, **compile_kwargs)
+
+
+def create_grad_scaler(*, device: torch.device, enabled: bool) -> Any:
+    try:
+        from torch.amp import GradScaler as TorchGradScaler
+
+        return TorchGradScaler(device.type, enabled=enabled)
+    except Exception:
+        from torch.cuda.amp import GradScaler as CudaGradScaler
+
+        return CudaGradScaler(enabled=enabled)
 
 
 def resolve_amp(cfg: DictConfig, device: torch.device, *, section: str, amp_key: str = "amp") -> tuple[bool, torch.dtype | None]:
