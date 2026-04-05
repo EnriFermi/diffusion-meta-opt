@@ -4,7 +4,7 @@ distributed: false
 num_gpus: 1
 
 amp: true
-tf32: true
+tf32:  
 cudnn_benchmark: true
 compile: true
 compile_mode: reduce-overhead
@@ -21,16 +21,16 @@ kl_schedule:
   enabled: true
   start_beta: 0.0
   warmup_steps: 100000
-  ramp_steps: 100000
+  ramp_steps: 200000
 weight_decay: 0.01
 lr: 1e-6
 
-behavioral_coef: 1.0
+behavioral_coef: 100.0
 structural_coef: 1.0
 contrastive_coef: 0.0
 struct_loss:
   gamma: 0.5
-  lambda_scale: 1.0
+  lambda_scale: 5.0
   lambda_rec: 0.0
   lambda_dir: 1.0
   lambda_rel: 0.0
@@ -73,7 +73,7 @@ fixed_training_batch:
 # Cap rows in x to reduce rare heavy samples that can stall steps.
 max_x_rows: 512
 steps_per_sample: 1
-slice_batch_size: 32
+slice_batch_size: 64
 # Optional mixed-source batch mode for big_vae.
 # Default path builds the whole batch from one source snapshot and reslices it.
 # When enabled, train loop pulls several ready snapshots, keeps only those that
@@ -93,7 +93,7 @@ batch_source_mixing:
   uniqueness: none
   # 0 -> use full slice_batch_size, i.e. aim for one source snapshot per batch item.
   # Positive value -> cap the number of distinct source snapshots per refresh.
-  max_source_samples: 3
+  max_source_samples: 4
 resume_checkpoint: ""
 
 forensics:
