@@ -49,6 +49,17 @@ resume_state:
   auto_resume: true
   save_every: ${train.checkpoint_every}
   dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/resume_state
+  load_model_state: true
+  load_optimizer_state: true
+  load_scheduler_state: true
+  load_scaler_state: true
+  load_step: true
+  # To keep current weights but restart optimization from scratch:
+  # load_model_state: true
+  # load_optimizer_state: false
+  # load_scheduler_state: false
+  # load_scaler_state: false
+  # load_step: false
 
 stage: 1
 stage_base_T_patches: 16

@@ -332,6 +332,19 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         tracking_params["train.resume_state.save_every"] = int(
             resume_state_cfg.get("save_every", train_cfg.get("checkpoint_every", 0))
         )
+        tracking_params["train.resume_state.load_model_state"] = bool(
+            resume_state_cfg.get("load_model_state", True)
+        )
+        tracking_params["train.resume_state.load_optimizer_state"] = bool(
+            resume_state_cfg.get("load_optimizer_state", True)
+        )
+        tracking_params["train.resume_state.load_scheduler_state"] = bool(
+            resume_state_cfg.get("load_scheduler_state", True)
+        )
+        tracking_params["train.resume_state.load_scaler_state"] = bool(
+            resume_state_cfg.get("load_scaler_state", True)
+        )
+        tracking_params["train.resume_state.load_step"] = bool(resume_state_cfg.get("load_step", True))
     clip_by_part_cfg = train_cfg.get("grad_clip_norm_by_part", {})
     if isinstance(clip_by_part_cfg, (dict, DictConfig)):
         for group_name in _grad_stat_group_prefixes():
@@ -2509,6 +2522,16 @@ def _find_latest_resume_state_checkpoint(state_dir: Path) -> Path | None:
     return None
 
 
+def _resume_state_load_policy(resume_state_cfg: dict[str, Any] | DictConfig) -> dict[str, bool]:
+    return {
+        "load_model_state": bool(resume_state_cfg.get("load_model_state", True)),
+        "load_optimizer_state": bool(resume_state_cfg.get("load_optimizer_state", True)),
+        "load_scheduler_state": bool(resume_state_cfg.get("load_scheduler_state", True)),
+        "load_scaler_state": bool(resume_state_cfg.get("load_scaler_state", True)),
+        "load_step": bool(resume_state_cfg.get("load_step", True)),
+    }
+
+
 def _load_training_state_from_checkpoint(
     *,
     model: torch.nn.Module,
@@ -2517,26 +2540,43 @@ def _load_training_state_from_checkpoint(
     scaler: GradScaler,
     path: Path,
     logger: logging.Logger,
+    load_model_state: bool = True,
+    load_optimizer_state: bool = True,
+    load_scheduler_state: bool = True,
+    load_scaler_state: bool = True,
+    load_step: bool = True,
 ) -> int:
     logger.info("Loading training state from checkpoint: %s", path)
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    target = _unwrap_model_for_state_io(model)
-    state_dict = _normalize_model_state_dict_keys(ckpt["model_state"])
-    target.load_state_dict(state_dict, strict=True)
+    if load_model_state:
+        target = _unwrap_model_for_state_io(model)
+        state_dict = _normalize_model_state_dict_keys(ckpt["model_state"])
+        target.load_state_dict(state_dict, strict=True)
 
     optimizer_state = ckpt.get("optimizer_state")
-    if optimizer_state is not None:
+    if load_optimizer_state and optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
     scheduler_state = ckpt.get("scheduler_state")
-    if scheduler_state is not None:
+    if load_scheduler_state and scheduler_state is not None:
         scheduler.load_state_dict(scheduler_state)
     scaler_state = ckpt.get("scaler_state")
-    if scaler_state is not None:
+    if load_scaler_state and scaler_state is not None:
         scaler.load_state_dict(scaler_state)
 
-    step = int(ckpt.get("step", 0) or 0)
+    step = int(ckpt.get("step", 0) or 0) if load_step else 0
     stage = ckpt.get("stage", "?")
-    logger.info("Training state loaded successfully (path=%s step=%s stage=%s)", path, step, stage)
+    logger.info(
+        "Training state loaded successfully (path=%s step=%s stage=%s load_model_state=%s "
+        "load_optimizer_state=%s load_scheduler_state=%s load_scaler_state=%s load_step=%s)",
+        path,
+        step,
+        stage,
+        load_model_state,
+        load_optimizer_state,
+        load_scheduler_state,
+        load_scaler_state,
+        load_step,
+    )
     return step
 
 
@@ -2833,6 +2873,7 @@ def _run_worker(
             resume_state_enabled = bool(resume_state_cfg.get("enabled", False))
             resume_state_auto_resume = bool(resume_state_cfg.get("auto_resume", True))
             resume_state_save_every = max(1, int(resume_state_cfg.get("save_every", checkpoint_every)))
+            resume_state_load_policy = _resume_state_load_policy(resume_state_cfg)
             default_resume_state_dir = (
                 Path(str(cfg.train.get("checkpoint_dir", "./checkpoints/weight_quantile_vae")))
                 / f"stage_{stage_num}"
@@ -2860,6 +2901,11 @@ def _run_worker(
                     scaler=scaler,
                     path=resume_state_path,
                     logger=logger,
+                    load_model_state=resume_state_load_policy["load_model_state"],
+                    load_optimizer_state=resume_state_load_policy["load_optimizer_state"],
+                    load_scheduler_state=resume_state_load_policy["load_scheduler_state"],
+                    load_scaler_state=resume_state_load_policy["load_scaler_state"],
+                    load_step=resume_state_load_policy["load_step"],
                 )
             elif resume_checkpoint:
                 logger.info(
@@ -3073,11 +3119,28 @@ def _run_worker(
                 logger.info("Steps per sample: %s", steps_per_sample)
                 if resume_state_enabled:
                     logger.info(
-                        "Resume-state checkpointing: dir=%s save_every=%s auto_resume=%s",
+                        "Resume-state checkpointing: dir=%s save_every=%s auto_resume=%s "
+                        "load_model_state=%s load_optimizer_state=%s load_scheduler_state=%s "
+                        "load_scaler_state=%s load_step=%s",
                         resume_state_dir,
                         resume_state_save_every,
                         resume_state_auto_resume,
+                        resume_state_load_policy["load_model_state"],
+                        resume_state_load_policy["load_optimizer_state"],
+                        resume_state_load_policy["load_scheduler_state"],
+                        resume_state_load_policy["load_scaler_state"],
+                        resume_state_load_policy["load_step"],
                     )
+                    if (
+                        resume_state_load_policy["load_step"]
+                        != resume_state_load_policy["load_scheduler_state"]
+                    ):
+                        logger.warning(
+                            "Resume-state config mismatch: load_step=%s but load_scheduler_state=%s. "
+                            "This can desync logged global_step from LR schedule state.",
+                            resume_state_load_policy["load_step"],
+                            resume_state_load_policy["load_scheduler_state"],
+                        )
                 if kl_schedule_enabled:
                     logger.info(
                         "BigVAE latent mode: %s (use_latent_sampling=%s, kl_beta_target=%s, "
