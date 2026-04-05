@@ -26,6 +26,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 from dataset import data_pipeline, setup_logging
+from dataset.big_vae_offline import offline_big_vae_data_pipeline
 from dataset.logging_utils import LOG_PATH_ENV, configure_process_logging, resolve_process_log_path
 from models.weight_quantile_vae import (
     BigVAEConfig,
@@ -326,6 +327,9 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         "train.batch_source_mixing.consume_slices_without_replacement": bool(
             batch_source_mixing_cfg.get("consume_slices_without_replacement", False)
         ),
+        "train.offline_dataset.enabled": bool(train_cfg.get("offline_dataset", {}).get("enabled", False)),
+        "train.offline_dataset.root_dir": str(train_cfg.get("offline_dataset", {}).get("root_dir", "")),
+        "train.offline_dataset.shard_by_rank": bool(train_cfg.get("offline_dataset", {}).get("shard_by_rank", True)),
         "model.patch_size": int(model_cfg.get("patch_size", 16)),
         "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
         "model.big_vae.disable_distribution_encoder": bool(big_cfg.get("disable_distribution_encoder", False)),
@@ -2790,15 +2794,33 @@ def _run_worker(
     if not isinstance(fixed_batch_cfg, (dict, DictConfig)):
         raise TypeError("train.fixed_training_batch must be a mapping")
     fixed_training_batch_enabled = bool(fixed_batch_cfg.get("enabled", False))
+    offline_dataset_cfg = cfg.train.get("offline_dataset", {})
+    if offline_dataset_cfg is None:
+        offline_dataset_cfg = {}
+    if not isinstance(offline_dataset_cfg, (dict, DictConfig)):
+        raise TypeError("train.offline_dataset must be a mapping")
+    offline_dataset_enabled = bool(offline_dataset_cfg.get("enabled", False))
+    offline_dataset_root = str(offline_dataset_cfg.get("root_dir", "") or "").strip()
+    offline_dataset_shard_by_rank = bool(offline_dataset_cfg.get("shard_by_rank", True))
     if synthetic_x_std <= 0.0:
         raise ValueError(f"train.synthetic_layer_source.x_std must be > 0, got {synthetic_x_std}")
     if synthetic_w_std <= 0.0:
         raise ValueError(f"train.synthetic_layer_source.w_std must be > 0, got {synthetic_w_std}")
+    if offline_dataset_enabled and not offline_dataset_root:
+        raise ValueError("train.offline_dataset.root_dir must be set when train.offline_dataset.enabled=true")
+    if offline_dataset_enabled and synthetic_layer_enabled:
+        raise ValueError(
+            "train.offline_dataset.enabled=true is incompatible with train.synthetic_layer_source.enabled=true"
+        )
     if synthetic_layer_enabled:
         dataset_sharding = False
         use_broadcast = False
+    elif offline_dataset_enabled:
+        streaming_mode = "offline_big_vae"
+        dataset_sharding = bool(cfg.train.get("use_dataset_sharding", True)) and is_distributed and offline_dataset_shard_by_rank
+        use_broadcast = is_distributed and not dataset_sharding
 
-    if dataset_sharding:
+    if dataset_sharding and not offline_dataset_enabled:
         cfg.streaming.distributed.enabled = True
         cfg.streaming.distributed.rank_env = "RANK"
         cfg.streaming.distributed.world_size_env = "WORLD_SIZE"
@@ -2819,6 +2841,13 @@ def _run_worker(
         streaming_mode,
         dataset_sharding,
     )
+    if offline_dataset_enabled:
+        logger.info(
+            "Offline BigVAE dataset enabled: root=%s shard_by_rank=%s use_broadcast=%s",
+            offline_dataset_root,
+            offline_dataset_shard_by_rank,
+            use_broadcast,
+        )
     if synthetic_layer_enabled:
         logger.info(
             "Synthetic layer source enabled: collectors disabled, x~N(0,%.4f), W~N(0,%.4f), n_rows=%s d_in=%s d_out=%s",
@@ -2848,29 +2877,43 @@ def _run_worker(
 
         with contextlib.ExitStack() as stack:
             if not synthetic_layer_enabled:
-                if rank == 0:
-                    dataset, collector = stack.enter_context(
-                        data_pipeline(
-                            cfg,
-                            logger=logger,
-                            emit_run_report=True,
-                            rank=rank,
+                if offline_dataset_enabled:
+                    if rank == 0 or dataset_sharding:
+                        offline_rank = rank if dataset_sharding else 0
+                        offline_world_size = world_size if dataset_sharding else 1
+                        dataset, collector = stack.enter_context(
+                            offline_big_vae_data_pipeline(
+                                cfg,
+                                logger=logger,
+                                rank=offline_rank,
+                                world_size=offline_world_size,
+                            )
                         )
-                    )
-                    dataset_iter = iter(dataset)
-                elif dataset_sharding:
-                    # Consumer-only wrapper over shared chunk stream.
-                    dataset, collector = stack.enter_context(
-                        data_pipeline(
-                            cfg,
-                            start_collector=False,
-                            predownload_models=False,
-                            logger=logger,
-                            emit_run_report=False,
-                            rank=rank,
+                        dataset_iter = iter(dataset)
+                else:
+                    if rank == 0:
+                        dataset, collector = stack.enter_context(
+                            data_pipeline(
+                                cfg,
+                                logger=logger,
+                                emit_run_report=True,
+                                rank=rank,
+                            )
                         )
-                    )
-                    dataset_iter = iter(dataset)
+                        dataset_iter = iter(dataset)
+                    elif dataset_sharding:
+                        # Consumer-only wrapper over shared chunk stream.
+                        dataset, collector = stack.enter_context(
+                            data_pipeline(
+                                cfg,
+                                start_collector=False,
+                                predownload_models=False,
+                                logger=logger,
+                                emit_run_report=False,
+                                rank=rank,
+                            )
+                        )
+                        dataset_iter = iter(dataset)
 
             model_cfg = _build_model_cfg(cfg)
             model = build_weight_quantile_vae(model_cfg).to(device)

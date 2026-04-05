@@ -109,6 +109,28 @@ batch_source_mixing:
   # 0 -> use full slice_batch_size, i.e. aim for one source snapshot per batch item.
   # Positive value -> cap the number of distinct source snapshots per refresh.
   max_source_samples: 4
+offline_dataset:
+  enabled: false
+  root_dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/offline_dataset
+  # When distributed, true -> each rank consumes its own chunk shard.
+  # false -> only rank0 reads the offline dataset and other ranks receive tensors via broadcast.
+  shard_by_rank: true
+  shuffle_chunks: true
+  shuffle_records_within_chunk: true
+  repeat: true
+  weight_cache_size: 64
+  builder:
+    # Set one of target_size_gb / target_size_bytes when running the offline builder.
+    target_size_gb: 0
+    target_size_bytes: 0
+    overwrite_existing: false
+    # Each x-chunk stores records that all reference deduplicated weights in weights/.
+    x_chunk_size_records: 128
+    # Optional diversity guard: 0 disables the cap.
+    max_samples_per_source: 0
+    # Optional hard stop for debug/smoke runs. 0 disables the cap.
+    max_seen_samples: 0
+    log_every_seen_samples: 1000
 resume_checkpoint: ""
 
 forensics:
