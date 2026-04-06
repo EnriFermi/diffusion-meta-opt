@@ -147,6 +147,7 @@ class BigVAEOfflineDatasetWriter:
         max_x_rows: int,
         x_chunk_size_records: int,
         max_samples_per_source: int,
+        enforce_stage_compatibility: bool,
         overwrite_existing: bool,
         seed: int,
         logger: logging.Logger | None = None,
@@ -161,8 +162,9 @@ class BigVAEOfflineDatasetWriter:
         self.max_T_patches = max(1, int(max_T_patches))
         self.max_d_out = max(1, int(max_d_out))
         self.max_x_rows = max(0, int(max_x_rows))
-        self.min_d_in = self.patch_size * self.max_T_patches
-        self.min_d_out = self.max_d_out
+        self.enforce_stage_compatibility = bool(enforce_stage_compatibility)
+        self.min_d_in = self.patch_size * self.max_T_patches if self.enforce_stage_compatibility else 0
+        self.min_d_out = self.max_d_out if self.enforce_stage_compatibility else 0
         self.x_chunk_size_records = max(1, int(x_chunk_size_records))
         self.max_samples_per_source = max(0, int(max_samples_per_source))
         self.logger = logger or logging.getLogger(self.__class__.__name__)
@@ -232,7 +234,9 @@ class BigVAEOfflineDatasetWriter:
             meta["offline_builder_selected_row_count"] = int(keep.numel())
             meta["offline_builder_selected_row_indices_preview"] = [int(idx) for idx in keep[:32].tolist()]
 
-        if int(W_cpu.shape[0]) < int(self.min_d_in) or int(W_cpu.shape[1]) < int(self.min_d_out):
+        if self.enforce_stage_compatibility and (
+            int(W_cpu.shape[0]) < int(self.min_d_in) or int(W_cpu.shape[1]) < int(self.min_d_out)
+        ):
             self._skipped_incompatible += 1
             return "incompatible"
 
@@ -294,6 +298,7 @@ class BigVAEOfflineDatasetWriter:
             "target_size_bytes": int(self.target_size_bytes),
             "written_size_bytes": int(self._total_file_bytes),
             "written_size_gb": float(self._total_file_bytes) / (1024.0 ** 3),
+            "enforce_stage_compatibility": bool(self.enforce_stage_compatibility),
             "pending_records": int(len(self._chunk_buffer)),
             "pending_x_bytes_estimate": int(self._pending_x_bytes_estimate),
             "top_source_key": top_source_key,
@@ -441,6 +446,7 @@ class BigVAEOfflineDatasetWriter:
                 "max_T_patches": int(self.max_T_patches),
                 "max_d_out": int(self.max_d_out),
                 "max_x_rows": int(self.max_x_rows),
+                "enforce_stage_compatibility": bool(self.enforce_stage_compatibility),
                 "min_d_in": int(self.min_d_in),
                 "min_d_out": int(self.min_d_out),
             },
@@ -698,6 +704,7 @@ def build_big_vae_offline_dataset(
         max_x_rows=max_x_rows,
         x_chunk_size_records=int(builder_cfg.get("x_chunk_size_records", 128)),
         max_samples_per_source=int(builder_cfg.get("max_samples_per_source", 0)),
+        enforce_stage_compatibility=bool(builder_cfg.get("enforce_stage_compatibility", False)),
         overwrite_existing=bool(builder_cfg.get("overwrite_existing", False)),
         seed=int(cfg.data.get("seed", 42)),
         logger=logger_local,
@@ -723,7 +730,7 @@ def build_big_vae_offline_dataset(
             if int(stats["seen_samples"]) % log_every_seen == 0:
                 logger_local.info(
                     "Offline BigVAE build progress: seen=%s accepted=%s size_gb=%.2f/%s unique_sources=%s "
-                    "skipped_invalid=%s skipped_incompatible=%s skipped_source_cap=%s",
+                    "skipped_invalid=%s skipped_incompatible=%s skipped_source_cap=%s stage_filter=%s",
                     int(stats["seen_samples"]),
                     int(stats["accepted_records"]),
                     float(stats["written_size_gb"]),
@@ -732,6 +739,7 @@ def build_big_vae_offline_dataset(
                     int(stats["skipped_invalid"]),
                     int(stats["skipped_incompatible"]),
                     int(stats["skipped_source_cap"]),
+                    bool(stats["enforce_stage_compatibility"]),
                 )
     finally:
         summary = writer.close()

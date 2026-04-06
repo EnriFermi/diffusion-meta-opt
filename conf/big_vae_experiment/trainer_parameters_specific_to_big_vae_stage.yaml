@@ -124,6 +124,9 @@ offline_dataset:
     target_size_gb: 0
     target_size_bytes: 0
     overwrite_existing: false
+    # false -> keep all valid source shapes and let train_big_vae slice them later.
+    # true -> pre-filter to samples that already satisfy the current stage minima.
+    enforce_stage_compatibility: false
     # Each x-chunk stores records that all reference deduplicated weights in weights/.
     x_chunk_size_records: 128
     # Optional diversity guard: 0 disables the cap.
