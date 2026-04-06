@@ -115,14 +115,11 @@ offline_dataset:
   weight_cache_size: 64
   builder:
     # Set one of target_size_gb / target_size_bytes when running the offline builder.
-    target_size_gb: 0
+    target_size_gb: 300
     target_size_bytes: 0
     overwrite_existing: false
-    # Each x-chunk stores records that all reference deduplicated weights in weights/.
     x_chunk_size_records: 128
-    # Optional diversity guard: 0 disables the cap.
-    max_samples_per_source: 0
-    # Optional hard stop for debug/smoke runs. 0 disables the cap.
+    max_samples_per_source: 512
     max_seen_samples: 0
     log_every_seen_samples: 1000
 resume_checkpoint: ""
