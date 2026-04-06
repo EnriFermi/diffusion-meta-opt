@@ -63,13 +63,15 @@ def main(cfg: DictConfig) -> None:
     logger.info("Starting BigVAE offline dataset build")
     logger.info("Run log file: %s", log_path)
     logger.info(
-        "Build target: root=%s target_size_gb=%.2f patch_size=%s max_T_patches=%s max_d_out=%s max_x_rows=%s",
+        "Build target: root=%s target_size_gb=%.2f patch_size=%s max_T_patches=%s max_d_out=%s max_x_rows=%s "
+        "enforce_stage_compatibility=%s",
         str(offline_cfg.get("root_dir", "")),
         float(target_size_bytes) / (1024.0 ** 3),
         patch_size,
         max_T_patches,
         max_d_out,
         max_x_rows,
+        bool(builder_cfg.get("enforce_stage_compatibility", False)),
     )
     logger.debug("Resolved config:\n%s", OmegaConf.to_yaml(cfg, resolve=True))
 
