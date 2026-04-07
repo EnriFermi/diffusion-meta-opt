@@ -104,7 +104,7 @@ batch_source_mixing:
   # Positive value -> cap the number of distinct source snapshots per refresh.
   max_source_samples: 4
 offline_dataset:
-  enabled: false
+  enabled: true
   root_dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/offline_dataset
   # When distributed, true -> each rank consumes its own chunk shard.
   # false -> only rank0 reads the offline dataset and other ranks receive tensors via broadcast.
