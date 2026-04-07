@@ -113,6 +113,10 @@ offline_dataset:
   shuffle_records_within_chunk: true
   repeat: true
   weight_cache_size: 64
+  analysis:
+    output_dir: ${train.offline_dataset.root_dir}/analysis
+    topk: 20
+    per_model_topk: 10
   builder:
     # Set one of target_size_gb / target_size_bytes when running the offline builder.
     target_size_gb: 300
