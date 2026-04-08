@@ -113,6 +113,16 @@ offline_dataset:
   shuffle_records_within_chunk: true
   repeat: true
   weight_cache_size: 64
+  sampling:
+    # random -> plain shuffled chunk/record traversal
+    # balanced -> use each record once per epoch, but reorder epoch traversal to
+    # improve short-window diversity across selected metadata groups while keeping
+    # chunk-local access reasonably coherent
+    mode: random
+    group_keys: [dataset, model, layer_type, depth]
+    window_size_records: 2048
+    max_records_per_chunk_round: 8
+    x_chunk_cache_size: 4
   analysis:
     output_dir: ${train.offline_dataset.root_dir}/analysis
     topk: 20

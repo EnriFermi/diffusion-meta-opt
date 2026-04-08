@@ -5,9 +5,10 @@ import hashlib
 import json
 import logging
 import random
+import re
 import shutil
 import time
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -17,7 +18,25 @@ from omegaconf import DictConfig, OmegaConf
 from dataset.shared.types import SharedSample
 
 
-OFFLINE_BIG_VAE_FORMAT_VERSION = 1
+OFFLINE_BIG_VAE_FORMAT_VERSION = 2
+
+_DEPTH_PATTERNS = (
+    re.compile(r"(?:^|\.)(?:layers|layer|blocks|block|h|resblocks|encoder_layers|decoder_layers)\.(\d+)(?:\.|$)"),
+    re.compile(r"(?:^|\.)(?:encoder|decoder)\.(?:layers|layer|blocks|block)\.(\d+)(?:\.|$)"),
+)
+
+_BALANCED_SAMPLING_GROUP_KEY_ALIASES = {
+    "dataset": "dataset",
+    "model": "model",
+    "layer_type": "layer_type",
+    "depth": "depth",
+    "shape": "shape",
+    "source": "source",
+    "layer": "layer",
+    "d_in_bucket": "d_in_bucket",
+    "d_out_bucket": "d_out_bucket",
+    "num_params_bucket": "num_params_bucket",
+}
 
 
 def resolve_big_vae_curriculum_targets(cfg: DictConfig) -> tuple[int, int, int, int]:
@@ -111,6 +130,65 @@ def _sample_dataset_names(meta: dict[str, Any] | None) -> list[str]:
     return sorted(dataset_names)
 
 
+def _primary_dataset_name(meta: dict[str, Any] | None) -> str:
+    dataset_names = _sample_dataset_names(meta)
+    return dataset_names[0] if dataset_names else "<unknown_dataset>"
+
+
+def infer_layer_type(layer_name: str) -> str:
+    name = str(layer_name).lower()
+
+    if any(token in name for token in ("query", "q_proj", ".q.", "self.q", "attn.q", ".qkv")):
+        return "attn_query"
+    if any(token in name for token in ("key", "k_proj", ".k.", "self.k", "attn.k")):
+        return "attn_key"
+    if any(token in name for token in ("value", "v_proj", ".v.", "self.v", "attn.v")):
+        return "attn_value"
+    if any(token in name for token in ("out_proj", "output.dense", "attention.output", "attn.proj")):
+        return "attn_output"
+    if "attn" in name or "attention" in name:
+        return "attn_other"
+
+    if any(token in name for token in ("intermediate", "fc1", "mlp.fc1", "gate_proj", "up_proj")):
+        return "ffn_up"
+    if any(token in name for token in ("output.dense", "fc2", "mlp.fc2", "down_proj")):
+        return "ffn_down"
+
+    if "pooler" in name:
+        return "pooler"
+    if any(token in name for token in ("embed", "embedding")):
+        return "embedding"
+    if "conv" in name:
+        return "conv"
+    if any(token in name for token in ("lm_head", "classifier", "score", "head")):
+        return "head"
+    return "other_linear"
+
+
+def infer_layer_depth(layer_name: str) -> int | None:
+    name = str(layer_name).strip()
+    if not name:
+        return None
+    for pattern in _DEPTH_PATTERNS:
+        match = pattern.search(name)
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
+def _shape_key(d_in: int, d_out: int) -> str:
+    return f"{int(d_in)}x{int(d_out)}"
+
+
+def _pow2_bucket(value: int) -> str:
+    value = int(value)
+    if value <= 0:
+        return "0"
+    lower = 1 << max(0, int(value).bit_length() - 1)
+    upper = max(lower, (lower << 1) - 1)
+    return f"{lower}-{upper}"
+
+
 def _source_key(model_name: str, layer_name: str) -> str:
     payload = f"{str(model_name).strip()}\n{str(layer_name).strip()}".encode("utf-8")
     return hashlib.sha1(payload).hexdigest()
@@ -120,11 +198,96 @@ def _weight_path(weights_dir: Path, source_key: str) -> Path:
     return weights_dir / source_key[:2] / f"{source_key}.pt"
 
 
+def _chunk_index_path(chunk_index_dir: Path, chunk_id: str) -> Path:
+    return chunk_index_dir / f"{str(chunk_id).strip()}.json"
+
+
+def _normalize_sampling_group_keys(value: Any) -> tuple[str, ...]:
+    if value is None:
+        raw_items: list[str] = []
+    elif isinstance(value, str):
+        raw_items = [item.strip() for item in value.split(",")]
+    elif isinstance(value, Sequence):
+        raw_items = [str(item).strip() for item in value]
+    else:
+        raise TypeError("offline_dataset.sampling.group_keys must be a string or sequence of strings")
+
+    normalized: list[str] = []
+    for item in raw_items:
+        if not item:
+            continue
+        key = _BALANCED_SAMPLING_GROUP_KEY_ALIASES.get(item.strip().lower())
+        if key is None:
+            valid = ", ".join(sorted(_BALANCED_SAMPLING_GROUP_KEY_ALIASES))
+            raise ValueError(f"Unsupported offline_dataset.sampling.group_keys item {item!r}; valid keys: {valid}")
+        if key not in normalized:
+            normalized.append(key)
+
+    if not normalized:
+        return ("dataset", "model", "layer_type", "depth")
+    return tuple(normalized)
+
+
+def _normalize_offline_sampling_mode(value: Any) -> str:
+    normalized = str(value or "random").strip().lower()
+    aliases = {
+        "random": "random",
+        "shuffle": "random",
+        "shuffled": "random",
+        "balanced": "balanced",
+    }
+    resolved = aliases.get(normalized, normalized)
+    if resolved not in {"random", "balanced"}:
+        raise ValueError(f"Unsupported offline_dataset.sampling.mode: {value!r}")
+    return resolved
+
+
+def _chunk_record_index_entry(
+    record: dict[str, Any],
+    *,
+    record_idx: int,
+    source_weight_shape: Sequence[int] | None,
+) -> dict[str, Any]:
+    source_key = str(record.get("source_key", "") or "")
+    model_name = str(record.get("model_name", "") or "").strip() or "<unknown_model>"
+    layer_name = str(record.get("layer_name", "") or "").strip() or "<unknown_layer>"
+    meta = dict(record.get("meta", {}) or {})
+    dataset_names = _sample_dataset_names(meta)
+    primary_dataset = dataset_names[0] if dataset_names else "<unknown_dataset>"
+
+    d_in = int(source_weight_shape[0]) if source_weight_shape is not None and len(source_weight_shape) >= 1 else 0
+    d_out = int(source_weight_shape[1]) if source_weight_shape is not None and len(source_weight_shape) >= 2 else 0
+    depth = infer_layer_depth(layer_name)
+    return {
+        "record_idx": int(record_idx),
+        "source_key": source_key,
+        "model_name": model_name,
+        "layer_name": layer_name,
+        "primary_dataset": primary_dataset,
+        "dataset_names": dataset_names,
+        "layer_type": infer_layer_type(layer_name),
+        "layer_depth": int(depth) if depth is not None else None,
+        "depth_label": str(depth) if depth is not None else "unknown",
+        "weight_shape": [d_in, d_out],
+        "shape": _shape_key(d_in=d_in, d_out=d_out),
+        "d_in_bucket": _pow2_bucket(d_in),
+        "d_out_bucket": _pow2_bucket(d_out),
+        "num_params_bucket": _pow2_bucket(d_in * d_out),
+    }
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     tmp_path.replace(path)
+
+
+def _load_json_payload(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"Expected JSON object in {path}, got {type(payload)}")
+    return payload
 
 
 def _directory_size_bytes(root_dir: Path) -> int:
@@ -172,6 +335,7 @@ class BigVAEOfflineDatasetWriter:
 
         self.weights_dir = self.root_dir / "weights"
         self.x_chunks_dir = self.root_dir / "x_chunks"
+        self.chunk_index_dir = self.root_dir / "chunk_index"
         self.manifest_path = self.root_dir / "manifest.json"
         self.sources_index_path = self.root_dir / "sources.json"
         self._rng = torch.Generator(device="cpu")
@@ -325,6 +489,7 @@ class BigVAEOfflineDatasetWriter:
                 shutil.rmtree(self.root_dir)
         self.weights_dir.mkdir(parents=True, exist_ok=True)
         self.x_chunks_dir.mkdir(parents=True, exist_ok=True)
+        self.chunk_index_dir.mkdir(parents=True, exist_ok=True)
 
     def _write_weight_if_needed(
         self,
@@ -387,6 +552,7 @@ class BigVAEOfflineDatasetWriter:
         chunk_id = f"x_chunk_{self._chunk_index:08d}"
         self._chunk_index += 1
         chunk_path = self.x_chunks_dir / f"{chunk_id}.pt"
+        chunk_index_path = _chunk_index_path(self.chunk_index_dir, chunk_id)
         chunk_meta = {
             "chunk_id": chunk_id,
             "created_at": float(time.time()),
@@ -404,7 +570,42 @@ class BigVAEOfflineDatasetWriter:
             chunk_path,
         )
         self._total_file_bytes += int(chunk_path.stat().st_size)
+        _atomic_write_json(
+            chunk_index_path,
+            self._build_chunk_index_payload(
+                chunk_id=chunk_id,
+                chunk_path=chunk_path,
+                records=records,
+            ),
+        )
         self._write_sidecars()
+
+    def _build_chunk_index_payload(
+        self,
+        *,
+        chunk_id: str,
+        chunk_path: Path,
+        records: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        index_records = []
+        for record_idx, record in enumerate(records):
+            source_key = str(record.get("source_key", "") or "")
+            source_meta = self._source_index.get(source_key, {})
+            weight_shape = source_meta.get("weight_shape", [0, 0]) if isinstance(source_meta, dict) else [0, 0]
+            index_records.append(
+                _chunk_record_index_entry(
+                    record,
+                    record_idx=record_idx,
+                    source_weight_shape=weight_shape,
+                )
+            )
+        return {
+            "format_version": OFFLINE_BIG_VAE_FORMAT_VERSION,
+            "chunk_id": chunk_id,
+            "chunk_path": str(chunk_path.relative_to(self.root_dir)),
+            "num_records": int(len(index_records)),
+            "records": index_records,
+        }
 
     def _build_sources_payload(self) -> dict[str, Any]:
         sources = []
@@ -453,6 +654,7 @@ class BigVAEOfflineDatasetWriter:
             "layout": {
                 "weights_dir": str(self.weights_dir.relative_to(self.root_dir)),
                 "x_chunks_dir": str(self.x_chunks_dir.relative_to(self.root_dir)),
+                "chunk_index_dir": str(self.chunk_index_dir.relative_to(self.root_dir)),
                 "sources_index": str(self.sources_index_path.relative_to(self.root_dir)),
             },
             "config_snapshot": self.config_snapshot,
@@ -476,6 +678,11 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
         shard_world_size: int = 1,
         shard_by_chunk: bool = True,
         weight_cache_size: int = 64,
+        sampling_mode: str = "random",
+        sampling_group_keys: Sequence[str] | str | None = None,
+        sampling_window_size: int = 2048,
+        sampling_max_records_per_chunk_round: int = 8,
+        x_chunk_cache_size: int = 4,
     ) -> None:
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -483,6 +690,7 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
         self.sources_index_path = self.root_dir / "sources.json"
         self.weights_dir = self.root_dir / "weights"
         self.x_chunks_dir = self.root_dir / "x_chunks"
+        self.chunk_index_dir = self.root_dir / "chunk_index"
         self.shuffle_chunks = bool(shuffle_chunks)
         self.shuffle_records_within_chunk = bool(shuffle_records_within_chunk)
         self.repeat = bool(repeat)
@@ -491,55 +699,36 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
         self.shard_world_size = max(1, int(shard_world_size))
         self.shard_by_chunk = bool(shard_by_chunk)
         self.weight_cache_size = max(1, int(weight_cache_size))
+        self.sampling_mode = _normalize_offline_sampling_mode(sampling_mode)
+        self.sampling_group_keys = _normalize_sampling_group_keys(sampling_group_keys)
+        self.sampling_window_size = max(1, int(sampling_window_size))
+        self.sampling_max_records_per_chunk_round = max(1, int(sampling_max_records_per_chunk_round))
+        self.x_chunk_cache_size = max(1, int(x_chunk_cache_size))
         self.logger = logging.getLogger(self.__class__.__name__)
 
         self._weight_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._x_chunk_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
         self._active_iter: Iterator[SharedSample] | None = None
         self._manifest = self._load_manifest()
         self._sources_index = self._load_sources_index()
         self._chunk_paths = sorted(self.x_chunks_dir.glob("*.pt"))
         if not self._chunk_paths:
             raise FileNotFoundError(f"No offline BigVAE x chunks found under {self.x_chunks_dir}")
+        self._effective_chunk_indices = self._resolve_effective_chunk_indices()
+        self._chunk_index_payloads: list[dict[str, Any]] | None = None
+        self._balanced_group_to_refs: dict[tuple[str, ...], list[tuple[int, int]]] | None = None
+        if self.sampling_mode == "balanced":
+            self._chunk_index_payloads = self._load_chunk_index_payloads()
+            self._balanced_group_to_refs = self._build_balanced_group_index(self._chunk_index_payloads)
 
     def __iter__(self) -> Iterator[SharedSample]:
         epoch = 0
         while True:
             rng = random.Random(self.seed + epoch)
-            chunk_paths = list(self._chunk_paths)
-            if self.shuffle_chunks and len(chunk_paths) > 1:
-                rng.shuffle(chunk_paths)
-            if self.shard_by_chunk and self.shard_world_size > 1:
-                chunk_paths = chunk_paths[self.shard_rank :: self.shard_world_size]
-                if not chunk_paths:
-                    raise RuntimeError(
-                        "Offline BigVAE dataset shard is empty. "
-                        f"rank={self.shard_rank} world_size={self.shard_world_size} chunk_count={len(self._chunk_paths)}"
-                    )
-
-            for chunk_path in chunk_paths:
-                payload = torch.load(chunk_path, map_location="cpu", weights_only=False)
-                records = payload.get("records", [])
-                if not isinstance(records, list):
-                    raise TypeError(f"Offline BigVAE chunk {chunk_path} has invalid records payload")
-                order = list(range(len(records)))
-                if self.shuffle_records_within_chunk and len(order) > 1:
-                    rng.shuffle(order)
-                for idx in order:
-                    record = records[idx]
-                    source_key = str(record.get("source_key", ""))
-                    x = record.get("x")
-                    if not torch.is_tensor(x):
-                        raise TypeError(f"Offline BigVAE record in {chunk_path} is missing tensor 'x'")
-                    x_cpu = _prepare_cpu_sample_tensor(x)
-                    weight = self._load_weight(source_key)
-                    yield SharedSample(
-                        model_name=str(record.get("model_name", "")),
-                        layer_name=str(record.get("layer_name", "")),
-                        weight=weight,
-                        x=x_cpu,
-                        y=torch.empty((int(x_cpu.shape[0]), 0), dtype=torch.float32),
-                        meta=dict(record.get("meta", {}) or {}),
-                    )
+            if self.sampling_mode == "balanced":
+                yield from self._iter_balanced_epoch(rng)
+            else:
+                yield from self._iter_random_epoch(rng)
 
             if not self.repeat:
                 return
@@ -569,16 +758,23 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
             "num_chunks": int(len(self._chunk_paths)),
             "chunk_head": [path.name for path in self._chunk_paths[:preview_int]],
             "weight_cache_size": int(len(self._weight_cache)),
+            "x_chunk_cache_size": int(len(self._x_chunk_cache)),
             "shard_rank": int(self.shard_rank),
             "shard_world_size": int(self.shard_world_size),
             "shard_by_chunk": bool(self.shard_by_chunk),
+            "sampling_mode": self.sampling_mode,
+            "sampling_group_keys": list(self.sampling_group_keys),
         }
 
     def summary(self) -> dict[str, Any]:
-        return dict(self._manifest)
+        payload = dict(self._manifest)
+        payload["sampling_mode"] = self.sampling_mode
+        payload["sampling_group_keys"] = list(self.sampling_group_keys)
+        return payload
 
     def close(self) -> None:
         self._weight_cache.clear()
+        self._x_chunk_cache.clear()
         self._active_iter = None
 
     def _load_manifest(self) -> dict[str, Any]:
@@ -605,6 +801,237 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
                 continue
             result[source_key] = dict(item)
         return result
+
+    def _resolve_effective_chunk_indices(self) -> list[int]:
+        if self.shard_by_chunk and self.shard_world_size > 1:
+            chunk_indices = list(range(len(self._chunk_paths)))[self.shard_rank :: self.shard_world_size]
+            if not chunk_indices:
+                raise RuntimeError(
+                    "Offline BigVAE dataset shard is empty. "
+                    f"rank={self.shard_rank} world_size={self.shard_world_size} chunk_count={len(self._chunk_paths)}"
+                )
+            return chunk_indices
+        return list(range(len(self._chunk_paths)))
+
+    def _iter_random_epoch(self, rng: random.Random) -> Iterator[SharedSample]:
+        chunk_indices = list(self._effective_chunk_indices)
+        if self.shuffle_chunks and len(chunk_indices) > 1:
+            rng.shuffle(chunk_indices)
+
+        for chunk_idx in chunk_indices:
+            payload = self._load_x_chunk(chunk_idx)
+            records = payload.get("records", [])
+            if not isinstance(records, list):
+                raise TypeError(f"Offline BigVAE chunk {self._chunk_paths[chunk_idx]} has invalid records payload")
+            order = list(range(len(records)))
+            if self.shuffle_records_within_chunk and len(order) > 1:
+                rng.shuffle(order)
+            for record_idx in order:
+                yield self._shared_sample_from_record_ref(chunk_idx=chunk_idx, record_idx=record_idx)
+
+    def _iter_balanced_epoch(self, rng: random.Random) -> Iterator[SharedSample]:
+        if self._balanced_group_to_refs is None:
+            raise RuntimeError("balanced sampling requested but group index is not initialized")
+        for chunk_idx, record_idx in self._build_balanced_epoch_record_refs(rng):
+            yield self._shared_sample_from_record_ref(chunk_idx=chunk_idx, record_idx=record_idx)
+
+    def _build_balanced_epoch_record_refs(self, rng: random.Random) -> Iterator[tuple[int, int]]:
+        if self._balanced_group_to_refs is None:
+            return
+
+        group_to_pending: dict[tuple[str, ...], list[tuple[int, int]]] = {}
+        for group_key, refs in self._balanced_group_to_refs.items():
+            pending = list(refs)
+            rng.shuffle(pending)
+            if pending:
+                group_to_pending[group_key] = pending
+
+        active_groups = list(group_to_pending.keys())
+        rng.shuffle(active_groups)
+        cursor = 0
+        while active_groups:
+            active_group_count = len(active_groups)
+            window: list[tuple[int, int]] = []
+            while active_groups and len(window) < self.sampling_window_size:
+                if cursor >= len(active_groups):
+                    cursor = 0
+                    if len(active_groups) > 1:
+                        rng.shuffle(active_groups)
+                group_key = active_groups[cursor]
+                pending = group_to_pending[group_key]
+                window.append(pending.pop())
+                if pending:
+                    cursor = (cursor + 1) % len(active_groups)
+                else:
+                    active_groups.pop(cursor)
+                    del group_to_pending[group_key]
+                    if active_groups:
+                        cursor %= len(active_groups)
+                    else:
+                        cursor = 0
+            preserve_prefix = min(active_group_count, len(window))
+            for ref in window[:preserve_prefix]:
+                yield ref
+            yield from self._reorder_record_window_for_chunk_locality(window[preserve_prefix:])
+
+    def _reorder_record_window_for_chunk_locality(self, window: Sequence[tuple[int, int]]) -> Iterator[tuple[int, int]]:
+        if not window:
+            return
+        per_chunk: OrderedDict[int, deque[tuple[int, int]]] = OrderedDict()
+        for ref in window:
+            per_chunk.setdefault(int(ref[0]), deque()).append(ref)
+
+        active_chunk_indices = list(per_chunk.keys())
+        while active_chunk_indices:
+            next_active_chunk_indices: list[int] = []
+            for chunk_idx in active_chunk_indices:
+                queue = per_chunk[chunk_idx]
+                take_n = min(self.sampling_max_records_per_chunk_round, len(queue))
+                for _ in range(take_n):
+                    yield queue.popleft()
+                if queue:
+                    next_active_chunk_indices.append(chunk_idx)
+            active_chunk_indices = next_active_chunk_indices
+
+    def _build_balanced_group_index(
+        self,
+        chunk_index_payloads: Sequence[dict[str, Any]],
+    ) -> dict[tuple[str, ...], list[tuple[int, int]]]:
+        group_to_refs: dict[tuple[str, ...], list[tuple[int, int]]] = {}
+        for chunk_idx, payload in enumerate(chunk_index_payloads):
+            records = payload.get("records", [])
+            if not isinstance(records, list):
+                continue
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                record_idx = int(record.get("record_idx", 0))
+                group_key = self._balanced_group_key_for_record(record)
+                group_to_refs.setdefault(group_key, []).append((int(self._effective_chunk_indices[chunk_idx]), record_idx))
+        return group_to_refs
+
+    def _balanced_group_key_for_record(self, record: dict[str, Any]) -> tuple[str, ...]:
+        components: list[str] = []
+        for key in self.sampling_group_keys:
+            if key == "dataset":
+                components.append(str(record.get("primary_dataset", "<unknown_dataset>")))
+            elif key == "model":
+                components.append(str(record.get("model_name", "<unknown_model>")))
+            elif key == "layer_type":
+                components.append(str(record.get("layer_type", "other_linear")))
+            elif key == "depth":
+                components.append(str(record.get("depth_label", "unknown")))
+            elif key == "shape":
+                components.append(str(record.get("shape", "0x0")))
+            elif key == "source":
+                components.append(str(record.get("source_key", "")))
+            elif key == "layer":
+                components.append(str(record.get("layer_name", "<unknown_layer>")))
+            elif key == "d_in_bucket":
+                components.append(str(record.get("d_in_bucket", "0")))
+            elif key == "d_out_bucket":
+                components.append(str(record.get("d_out_bucket", "0")))
+            elif key == "num_params_bucket":
+                components.append(str(record.get("num_params_bucket", "0")))
+            else:
+                raise ValueError(f"Unsupported balanced group key: {key!r}")
+        return tuple(components)
+
+    def _load_chunk_index_payloads(self) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        for chunk_idx in self._effective_chunk_indices:
+            payloads.append(self._load_chunk_index_payload(chunk_idx))
+        return payloads
+
+    def _load_chunk_index_payload(self, chunk_idx: int) -> dict[str, Any]:
+        chunk_path = self._chunk_paths[chunk_idx]
+        chunk_id = chunk_path.stem
+        index_path = _chunk_index_path(self.chunk_index_dir, chunk_id)
+        if index_path.exists():
+            payload = _load_json_payload(index_path)
+            records = payload.get("records", [])
+            if isinstance(records, list):
+                return payload
+            raise TypeError(f"Offline BigVAE chunk index has invalid records payload: {index_path}")
+
+        self.logger.warning(
+            "Offline BigVAE chunk index missing for %s; generating it by scanning the chunk once",
+            chunk_path,
+        )
+        chunk_payload = self._load_x_chunk(chunk_idx)
+        records = chunk_payload.get("records", [])
+        if not isinstance(records, list):
+            raise TypeError(f"Offline BigVAE chunk {chunk_path} has invalid records payload")
+        payload = self._build_chunk_index_payload_from_loaded_chunk(
+            chunk_id=chunk_id,
+            chunk_path=chunk_path,
+            records=records,
+        )
+        _atomic_write_json(index_path, payload)
+        return payload
+
+    def _build_chunk_index_payload_from_loaded_chunk(
+        self,
+        *,
+        chunk_id: str,
+        chunk_path: Path,
+        records: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        index_records = []
+        for record_idx, record in enumerate(records):
+            source_key = str(record.get("source_key", "") or "")
+            source_meta = self._sources_index.get(source_key, {})
+            weight_shape = source_meta.get("weight_shape", [0, 0]) if isinstance(source_meta, dict) else [0, 0]
+            index_records.append(
+                _chunk_record_index_entry(
+                    record,
+                    record_idx=record_idx,
+                    source_weight_shape=weight_shape,
+                )
+            )
+        return {
+            "format_version": OFFLINE_BIG_VAE_FORMAT_VERSION,
+            "chunk_id": chunk_id,
+            "chunk_path": str(chunk_path.relative_to(self.root_dir)),
+            "num_records": int(len(index_records)),
+            "records": index_records,
+        }
+
+    def _load_x_chunk(self, chunk_idx: int) -> dict[str, Any]:
+        if chunk_idx in self._x_chunk_cache:
+            payload = self._x_chunk_cache.pop(chunk_idx)
+            self._x_chunk_cache[chunk_idx] = payload
+            return payload
+
+        chunk_path = self._chunk_paths[chunk_idx]
+        payload = torch.load(chunk_path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise TypeError(f"Offline BigVAE chunk payload must be a dict, got {type(payload)!r}: {chunk_path}")
+        self._x_chunk_cache[chunk_idx] = payload
+        while len(self._x_chunk_cache) > self.x_chunk_cache_size:
+            self._x_chunk_cache.popitem(last=False)
+        return payload
+
+    def _shared_sample_from_record_ref(self, *, chunk_idx: int, record_idx: int) -> SharedSample:
+        payload = self._load_x_chunk(chunk_idx)
+        records = payload.get("records", [])
+        if not isinstance(records, list):
+            raise TypeError(f"Offline BigVAE chunk {self._chunk_paths[chunk_idx]} has invalid records payload")
+        record = records[record_idx]
+        source_key = str(record.get("source_key", ""))
+        x = record.get("x")
+        if not torch.is_tensor(x):
+            raise TypeError(f"Offline BigVAE record in {self._chunk_paths[chunk_idx]} is missing tensor 'x'")
+        x_cpu = _prepare_cpu_sample_tensor(x)
+        weight = self._load_weight(source_key)
+        return SharedSample(
+            model_name=str(record.get("model_name", "")),
+            layer_name=str(record.get("layer_name", "")),
+            weight=weight,
+            x=x_cpu,
+            y=torch.empty((int(x_cpu.shape[0]), 0), dtype=torch.float32),
+            meta=dict(record.get("meta", {}) or {}),
+        )
 
     def _load_weight(self, source_key: str) -> torch.Tensor:
         if source_key in self._weight_cache:
@@ -639,6 +1066,11 @@ def offline_big_vae_data_pipeline(
         offline_cfg = {}
     if not isinstance(offline_cfg, (dict, DictConfig)):
         raise TypeError("train.offline_dataset must be a mapping")
+    sampling_cfg = offline_cfg.get("sampling", {})
+    if sampling_cfg is None:
+        sampling_cfg = {}
+    if not isinstance(sampling_cfg, (dict, DictConfig)):
+        raise TypeError("train.offline_dataset.sampling must be a mapping")
 
     root_dir = str(offline_cfg.get("root_dir", "") or "").strip()
     if not root_dir:
@@ -654,15 +1086,23 @@ def offline_big_vae_data_pipeline(
         shard_world_size=max(1, int(world_size)),
         shard_by_chunk=bool(offline_cfg.get("shard_by_rank", True)),
         weight_cache_size=int(offline_cfg.get("weight_cache_size", 64)),
+        sampling_mode=str(sampling_cfg.get("mode", "random")),
+        sampling_group_keys=sampling_cfg.get("group_keys", ("dataset", "model", "layer_type", "depth")),
+        sampling_window_size=int(sampling_cfg.get("window_size_records", 2048)),
+        sampling_max_records_per_chunk_round=int(sampling_cfg.get("max_records_per_chunk_round", 8)),
+        x_chunk_cache_size=int(sampling_cfg.get("x_chunk_cache_size", 4)),
     )
     logger_local = logger or logging.getLogger("dataset.big_vae_offline")
     summary = dataset.summary()
     logger_local.info(
-        "Offline BigVAE dataset ready: root=%s accepted_records=%s unique_sources=%s actual_size_gb=%.2f",
+        "Offline BigVAE dataset ready: root=%s accepted_records=%s unique_sources=%s actual_size_gb=%.2f "
+        "sampling_mode=%s sampling_group_keys=%s",
         summary.get("root_dir", str(dataset.root_dir)),
         int(summary.get("accepted_records", 0)),
         int(summary.get("unique_sources", 0)),
         float(summary.get("actual_size_gb", 0.0)),
+        str(summary.get("sampling_mode", "random")),
+        list(summary.get("sampling_group_keys", [])),
     )
     try:
         yield dataset, None
