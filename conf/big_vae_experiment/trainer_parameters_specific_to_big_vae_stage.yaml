@@ -117,7 +117,10 @@ batch_source_mixing:
   max_source_samples: 4
 offline_dataset:
   enabled: false
-  root_dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/offline_dataset
+  # Full dataset root may also be overridden with BIG_VAE_OFFLINE_DATASET_DIR.
+  # Keep this separate from checkpoint_dir when running multiple trainings on
+  # the same prebuilt offline dataset.
+  root_dir: ${oc.env:BIG_VAE_OFFLINE_DATASET_DIR,${training_artifacts.big_vae_offline_dataset_base_dir}/stage_${train.stage}/offline_dataset}
   # When distributed, true -> each rank consumes its own chunk shard.
   # false -> only rank0 reads the offline dataset and other ranks receive tensors via broadcast.
   shard_by_rank: true
