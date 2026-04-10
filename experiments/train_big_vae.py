@@ -299,6 +299,11 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         batch_source_mixing_cfg = {}
     if not isinstance(batch_source_mixing_cfg, (dict, DictConfig)):
         batch_source_mixing_cfg = {}
+    behavioral_loss_cfg = train_cfg.get("behavioral_loss", {})
+    if behavioral_loss_cfg is None:
+        behavioral_loss_cfg = {}
+    if not isinstance(behavioral_loss_cfg, (dict, DictConfig)):
+        behavioral_loss_cfg = {}
     raw_max_source_samples = batch_source_mixing_cfg.get("max_source_samples", 0)
     if raw_max_source_samples is None:
         parsed_max_source_samples = 0
@@ -318,6 +323,9 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         "train.kl_schedule.ramp_steps": int(train_cfg.get("kl_schedule", {}).get("ramp_steps", 0)),
         "train.behavioral_coef": float(train_cfg.get("behavioral_coef", 0.0)),
         "train.structural_coef": float(train_cfg.get("structural_coef", 0.0)),
+        "train.behavioral_loss.lambda_operator": float(behavioral_loss_cfg.get("lambda_operator", 1.0)),
+        "train.behavioral_loss.lambda_dir": float(behavioral_loss_cfg.get("lambda_dir", 0.0)),
+        "train.behavioral_loss.lambda_scale": float(behavioral_loss_cfg.get("lambda_scale", 0.0)),
         "train.slice_batch_size": int(train_cfg.get("slice_batch_size", 1)),
         "train.steps_per_sample": int(train_cfg.get("steps_per_sample", 1)),
         "train.batch_source_mixing.enabled": bool(batch_source_mixing_cfg.get("enabled", False)),
@@ -3043,6 +3051,16 @@ def _run_worker(
             use_latent_sampling = bool(cfg_holder.cfg.big_vae.use_latent_sampling)
             behavioral_coef = float(cfg.train.get("behavioral_coef", 1.0))
             structural_coef = float(cfg.train.get("structural_coef", 0.5))
+            behavioral_loss_cfg = cfg.train.get("behavioral_loss", {})
+            if behavioral_loss_cfg is None:
+                behavioral_loss_cfg = {}
+            if not isinstance(behavioral_loss_cfg, (dict, DictConfig)):
+                raise TypeError("train.behavioral_loss must be a mapping when provided")
+            behavioral_lambda_operator = float(behavioral_loss_cfg.get("lambda_operator", 1.0))
+            behavioral_lambda_dir = float(behavioral_loss_cfg.get("lambda_dir", 0.0))
+            behavioral_lambda_scale = float(behavioral_loss_cfg.get("lambda_scale", 0.0))
+            behavioral_gamma = float(behavioral_loss_cfg.get("gamma", 0.5))
+            behavioral_huber_delta = float(behavioral_loss_cfg.get("huber_delta", 0.1))
             struct_loss_cfg = cfg.train.get("struct_loss", {})
             if struct_loss_cfg is None:
                 struct_loss_cfg = {}
@@ -3309,6 +3327,9 @@ def _run_worker(
 
             loss_window = 0.0
             behavioral_window = 0.0
+            behavioral_operator_window = 0.0
+            behavioral_dir_window = 0.0
+            behavioral_scale_window = 0.0
             structural_window = 0.0
             kl_window = 0.0
             struct_dir_window = 0.0
@@ -3531,6 +3552,9 @@ def _run_worker(
 
                 loss_acc = 0.0
                 behavioral_acc = 0.0
+                behavioral_operator_acc = 0.0
+                behavioral_dir_acc = 0.0
+                behavioral_scale_acc = 0.0
                 structural_acc = 0.0
                 kl_acc = 0.0
                 struct_dir_acc = 0.0
@@ -3792,13 +3816,31 @@ def _run_worker(
                                     d_in_mask=d_in_mask_s,
                                     d_out_mask=d_out_mask_s,
                                 )
-                            behavioral_loss = WeightQuantileVAE.operator_recon_loss(
+                            behavioral_operator_loss = WeightQuantileVAE.operator_recon_loss(
                                 x_s,
                                 W_s,
                                 W_hat,
                                 x_mask=x_mask_s,
                                 d_in_mask=d_in_mask_s,
                                 d_out_mask=d_out_mask_s,
+                            )
+                            if behavioral_lambda_dir != 0.0 or behavioral_lambda_scale != 0.0:
+                                behavioral_dir_loss, behavioral_scale_loss = WeightQuantileVAE.operator_direction_scale_loss(
+                                    x_s,
+                                    W_s,
+                                    W_hat,
+                                    x_mask=x_mask_s,
+                                    d_out_mask=d_out_mask_s,
+                                    gamma=behavioral_gamma,
+                                    huber_delta=behavioral_huber_delta,
+                                )
+                            else:
+                                behavioral_dir_loss = behavioral_operator_loss.new_zeros(())
+                                behavioral_scale_loss = behavioral_operator_loss.new_zeros(())
+                            behavioral_loss = (
+                                behavioral_lambda_operator * behavioral_operator_loss
+                                + behavioral_lambda_dir * behavioral_dir_loss
+                                + behavioral_lambda_scale * behavioral_scale_loss
                             )
                             structural_loss, struct_details = WeightQuantileVAE.patch_structure_loss(
                                 W_s, W_hat, patch_size=patch_size_for_slice,
@@ -3836,11 +3878,14 @@ def _run_worker(
                                 "rank": int(rank),
                                 "fixed_training_batch": bool(fixed_training_batch_enabled),
                                 "synthetic_layer_source": bool(synthetic_layer_enabled),
-                                "loss": {
-                                    "total": _scalar_debug_value(total_loss),
-                                    "behavioral": _scalar_debug_value(behavioral_loss),
-                                    "structural": _scalar_debug_value(structural_loss),
-                                    "kl": _scalar_debug_value(kl_loss),
+                                    "loss": {
+                                        "total": _scalar_debug_value(total_loss),
+                                        "behavioral": _scalar_debug_value(behavioral_loss),
+                                        "behavioral_operator": _scalar_debug_value(behavioral_operator_loss),
+                                        "behavioral_dir": _scalar_debug_value(behavioral_dir_loss),
+                                        "behavioral_scale": _scalar_debug_value(behavioral_scale_loss),
+                                        "structural": _scalar_debug_value(structural_loss),
+                                        "kl": _scalar_debug_value(kl_loss),
                                     "kl_beta": float(current_kl_beta),
                                     "struct_dir": _scalar_debug_value(struct_details["L_dir"]),
                                     "struct_scale": _scalar_debug_value(struct_details["L_scale"]),
@@ -3916,6 +3961,9 @@ def _run_worker(
 
                     loss_acc += float(total_loss.detach().item())
                     behavioral_acc += float(behavioral_loss.detach().item())
+                    behavioral_operator_acc += float(behavioral_operator_loss.detach().item())
+                    behavioral_dir_acc += float(behavioral_dir_loss.detach().item())
+                    behavioral_scale_acc += float(behavioral_scale_loss.detach().item())
                     structural_acc += float(structural_loss.detach().item())
                     kl_acc += float(kl_loss.detach().item())
                     struct_dir_acc += float(struct_details["L_dir"].detach().item())
@@ -4196,6 +4244,9 @@ def _run_worker(
 
                 step_loss = loss_acc / grad_accum_steps
                 step_behavioral = behavioral_acc / grad_accum_steps
+                step_behavioral_operator = behavioral_operator_acc / grad_accum_steps
+                step_behavioral_dir = behavioral_dir_acc / grad_accum_steps
+                step_behavioral_scale = behavioral_scale_acc / grad_accum_steps
                 step_structural = structural_acc / grad_accum_steps
                 step_kl = kl_acc / grad_accum_steps
                 step_struct_dir = struct_dir_acc / grad_accum_steps
@@ -4207,6 +4258,9 @@ def _run_worker(
                     [
                         step_loss,
                         step_behavioral,
+                        step_behavioral_operator,
+                        step_behavioral_dir,
+                        step_behavioral_scale,
                         step_structural,
                         step_kl,
                         step_struct_dir,
@@ -4222,12 +4276,15 @@ def _run_worker(
 
                 loss_window += float(stats[0].item())
                 behavioral_window += float(stats[1].item())
-                structural_window += float(stats[2].item())
-                kl_window += float(stats[3].item())
-                struct_dir_window += float(stats[4].item())
-                struct_scale_window += float(stats[5].item())
-                struct_rec_window += float(stats[6].item())
-                struct_rel_window += float(stats[7].item())
+                behavioral_operator_window += float(stats[2].item())
+                behavioral_dir_window += float(stats[3].item())
+                behavioral_scale_window += float(stats[4].item())
+                structural_window += float(stats[5].item())
+                kl_window += float(stats[6].item())
+                struct_dir_window += float(stats[7].item())
+                struct_scale_window += float(stats[8].item())
+                struct_rec_window += float(stats[9].item())
+                struct_rel_window += float(stats[10].item())
                 if step_source_diversity_micro_count > 0:
                     step_source_diversity_stats = {
                         key: float(value) / float(step_source_diversity_micro_count)
@@ -4257,6 +4314,9 @@ def _run_worker(
                     dt = max(1e-6, time.time() - t0)
                     avg_loss = loss_window / max(1, window_steps)
                     avg_behavioral = behavioral_window / max(1, window_steps)
+                    avg_behavioral_operator = behavioral_operator_window / max(1, window_steps)
+                    avg_behavioral_dir = behavioral_dir_window / max(1, window_steps)
+                    avg_behavioral_scale = behavioral_scale_window / max(1, window_steps)
                     avg_structural = structural_window / max(1, window_steps)
                     avg_kl = kl_window / max(1, window_steps)
                     avg_struct_dir = struct_dir_window / max(1, window_steps)
@@ -4288,6 +4348,7 @@ def _run_worker(
                     )
                     logger.info(
                         "step=%s/%s loss=%.6f behav=%.6f struct=%.6f "
+                        "b_op=%.6f b_dir=%.6f b_scl=%.6f "
                         "s_dir=%.6f s_scl=%.6f s_rec=%.6f s_rel=%.6f "
                         "kl=%.6f kl_beta=%.6f lr=%.6e steps/s=%.2f cache=%s",
                         global_step,
@@ -4295,6 +4356,9 @@ def _run_worker(
                         avg_loss,
                         avg_behavioral,
                         avg_structural,
+                        avg_behavioral_operator,
+                        avg_behavioral_dir,
+                        avg_behavioral_scale,
                         avg_struct_dir,
                         avg_struct_scale,
                         avg_struct_rec,
@@ -4375,6 +4439,9 @@ def _run_worker(
                         comet_metrics: dict[str, float] = {
                             "train/loss": float(avg_loss),
                             "train/behavioral_loss": float(avg_behavioral),
+                            "train/behavioral_operator": float(avg_behavioral_operator),
+                            "train/behavioral_dir": float(avg_behavioral_dir),
+                            "train/behavioral_scale": float(avg_behavioral_scale),
                             "train/structural_loss": float(avg_structural),
                             "train/kl_loss": float(avg_kl),
                             "train/struct_dir": float(avg_struct_dir),
@@ -4566,6 +4633,9 @@ def _run_worker(
 
                     loss_window = 0.0
                     behavioral_window = 0.0
+                    behavioral_operator_window = 0.0
+                    behavioral_dir_window = 0.0
+                    behavioral_scale_window = 0.0
                     structural_window = 0.0
                     kl_window = 0.0
                     struct_dir_window = 0.0
