@@ -32,6 +32,12 @@ lr: 1e-4
 behavioral_coef: 0.0
 structural_coef: 1.0
 contrastive_coef: 0.0
+behavioral_loss:
+  lambda_operator: 1.0
+  lambda_dir: 0.0
+  lambda_scale: 0.0
+  gamma: 0.5
+  huber_delta: 0.1
 struct_loss:
   gamma: 0.5
   lambda_scale: 5.0

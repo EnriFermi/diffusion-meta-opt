@@ -802,6 +802,92 @@ class BigWeightVAE(nn.Module):
         return torch.sqrt(mse / valid_d_in).mean()
 
     @staticmethod
+    def operator_direction_scale_loss(
+        X: torch.Tensor,
+        W: torch.Tensor,
+        W_hat: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
+        d_out_mask: torch.Tensor | None = None,
+        eps: float = 1e-8,
+        gamma: float = 0.5,
+        huber_delta: float = 0.1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        squeeze_batch = False
+        if X.ndim == 2:
+            if W.ndim != 2 or W_hat.ndim != 2:
+                raise ValueError(
+                    "unbatched operator_direction_scale_loss expects X=[n,d_in], W=[d_in,d_out], "
+                    f"W_hat=[d_in,d_out], got X={tuple(X.shape)} W={tuple(W.shape)} W_hat={tuple(W_hat.shape)}"
+                )
+            X = X.unsqueeze(0)
+            W = W.unsqueeze(0)
+            W_hat = W_hat.unsqueeze(0)
+            squeeze_batch = True
+            if x_mask is not None:
+                if x_mask.ndim != 1:
+                    raise ValueError(f"x_mask must be [n] for unbatched X, got {tuple(x_mask.shape)}")
+                x_mask = x_mask.unsqueeze(0)
+            if d_out_mask is not None:
+                if d_out_mask.ndim != 1:
+                    raise ValueError(f"d_out_mask must be [d_out] for unbatched W, got {tuple(d_out_mask.shape)}")
+                d_out_mask = d_out_mask.unsqueeze(0)
+
+        if X.ndim != 3 or W.ndim != 3 or W_hat.ndim != 3:
+            raise ValueError(
+                "operator_direction_scale_loss expects batched tensors X=[B,n,d_in], W=[B,d_in,d_out], "
+                f"W_hat=[B,d_in,d_out], got X={tuple(X.shape)} W={tuple(W.shape)} W_hat={tuple(W_hat.shape)}"
+            )
+        if tuple(W.shape) != tuple(W_hat.shape):
+            raise ValueError(f"W and W_hat shapes must match, got {tuple(W.shape)} vs {tuple(W_hat.shape)}")
+        if int(X.shape[0]) != int(W.shape[0]) or int(X.shape[2]) != int(W.shape[1]):
+            raise ValueError(
+                "X/W shapes are inconsistent, expected X=[B,n,d_in] and W=[B,d_in,d_out], "
+                f"got X={tuple(X.shape)} W={tuple(W.shape)}"
+            )
+
+        B, n, _ = X.shape
+        d_out = int(W.shape[2])
+        pred = torch.matmul(X, W_hat)
+        target = torch.matmul(X, W)
+
+        if x_mask is not None:
+            if x_mask.ndim != 2 or tuple(x_mask.shape) != (B, n):
+                prefix = "unbatched " if squeeze_batch else ""
+                raise ValueError(f"{prefix}x_mask must be {(B, n)}, got {tuple(x_mask.shape)}")
+            sample_mask = x_mask.to(device=pred.device, dtype=pred.dtype)
+        else:
+            sample_mask = torch.ones((B, n), device=pred.device, dtype=pred.dtype)
+
+        if d_out_mask is not None:
+            if d_out_mask.ndim != 2 or tuple(d_out_mask.shape) != (B, d_out):
+                prefix = "unbatched " if squeeze_batch else ""
+                raise ValueError(f"{prefix}d_out_mask must be {(B, d_out)}, got {tuple(d_out_mask.shape)}")
+            output_mask = d_out_mask.to(device=pred.device, dtype=pred.dtype).unsqueeze(1)
+            pred = pred * output_mask
+            target = target * output_mask
+
+        pred_norm = pred.norm(dim=-1)
+        target_norm = target.norm(dim=-1)
+        active = target_norm > float(eps)
+        row_weight = sample_mask * active.to(device=pred.device, dtype=pred.dtype)
+
+        dot = (pred * target).sum(dim=-1)
+        cos = dot / (pred_norm * target_norm).clamp_min(float(eps))
+        dir_loss = 1.0 - cos.clamp(min=-1.0, max=1.0)
+        dir_weight = row_weight * (target_norm + float(eps)).pow(float(gamma))
+        L_dir = (dir_loss * dir_weight).sum() / dir_weight.sum().clamp_min(1.0)
+
+        d = torch.log(pred_norm + float(eps)) - torch.log(target_norm + float(eps))
+        abs_d = d.abs()
+        huber = torch.where(
+            abs_d <= huber_delta,
+            0.5 * d.pow(2),
+            huber_delta * (abs_d - 0.5 * huber_delta),
+        )
+        L_scale = (huber * row_weight).sum() / row_weight.sum().clamp_min(1.0)
+        return L_dir, L_scale
+
+    @staticmethod
     def _channel_norm_over_sequence(x: torch.Tensor, eps: float) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError(f"expected [B,T,C], got {tuple(x.shape)}")
