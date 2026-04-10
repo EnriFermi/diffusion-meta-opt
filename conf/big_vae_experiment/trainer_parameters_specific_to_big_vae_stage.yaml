@@ -1,6 +1,7 @@
 max_steps: 5000000
 grad_accum_steps: 1
 distributed: false
+# device: "cuda:0"
 num_gpus: 1
 
 amp: true
@@ -29,7 +30,7 @@ kl_schedule:
 weight_decay: 0.01
 lr: 1e-4
 
-behavioral_coef: 0.0
+behavioral_coef: 100.0
 structural_coef: 1.0
 contrastive_coef: 0.0
 behavioral_loss:
