@@ -14,4 +14,7 @@ training_artifacts:
   crashes_dir: ${training_artifacts.root_dir}/crashes
   mini_vae_checkpoint_dir: ${training_artifacts.base_root_dir}/checkpoints/mini_patch_vae
   big_vae_checkpoint_dir: ${training_artifacts.base_root_dir}/checkpoints/weight_quantile_vae
+  # Base directory for reusable BigVAE offline datasets. Defaults to the legacy
+  # checkpoint-coupled location; override this to share one dataset across runs.
+  big_vae_offline_dataset_base_dir: ${training_artifacts.big_vae_checkpoint_dir}
   mini_encoder_latest_checkpoint: ${training_artifacts.mini_vae_checkpoint_dir}/mini_encoder_latest.pt
