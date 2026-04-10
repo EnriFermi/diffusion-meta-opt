@@ -82,7 +82,7 @@ fixed_training_batch:
 # Cap rows in x to reduce rare heavy samples that can stall steps.
 max_x_rows: 512
 steps_per_sample: 1
-slice_batch_size: 256
+slice_batch_size: 300
 # Optional mixed-source batch mode for big_vae.
 # Default path builds the whole batch from one source snapshot and reslices it.
 # When enabled, train loop pulls several ready snapshots, keeps only those that
@@ -102,7 +102,7 @@ batch_source_mixing:
   uniqueness: none
   # 0 -> use full slice_batch_size, i.e. aim for one source snapshot per batch item.
   # Positive value -> cap the number of distinct source snapshots per refresh.
-  max_source_samples: 4
+  max_source_samples: 8
 offline_dataset:
   enabled: true
   root_dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/offline_dataset
@@ -118,11 +118,11 @@ offline_dataset:
     # balanced -> use each record once per epoch, but reorder epoch traversal to
     # improve short-window diversity across selected metadata groups while keeping
     # chunk-local access reasonably coherent
-    mode: random
+    mode: balanced
     group_keys: [dataset, model, layer_type, depth]
     window_size_records: 2048
-    max_records_per_chunk_round: 8
-    x_chunk_cache_size: 4
+    max_records_per_chunk_round: 16
+    x_chunk_cache_size: 16
   analysis:
     output_dir: ${train.offline_dataset.root_dir}/analysis
     topk: 20
