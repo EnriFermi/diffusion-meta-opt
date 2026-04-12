@@ -16,7 +16,7 @@ defaults:
 # BigVAE speed tuning for explicit model-diverse batches:
 # keep bursts short enough for diversity, but long enough to amortize model loads.
 collector:
-  max_loaded_models: 5
+  max_loaded_models: 8
   jobs_per_selected_model: 1
   # Allow the same raw image sample to be reused by a few distinct models before
   # it is retired from the dataset chunk cache. This increases model diversity
@@ -25,7 +25,7 @@ collector:
   # Safeguard: if a reused raw sample does not get a new distinct model soon
   # enough, retire it instead of pinning the chunk forever on single-model data.
   max_pending_reuse_wait_s: 120.0
-  parallel_inference_workers: 4
+  parallel_inference_workers: 6
   # Keep a small hot set per worker so four concurrent workers do not thrash on
   # every model switch, but also do not explode VRAM residency unnecessarily.
   parallel_model_pool_max_loaded_models: 2
@@ -35,9 +35,9 @@ collector:
   atomizer_process_enabled: false
   atomizer_queue_max_items: 256
   in_memory_buffer:
-    capacity_samples: 256
-    fill_target_samples: 128
-    low_watermark_samples: 64
+    capacity_samples: 1024
+    fill_target_samples: 512
+    low_watermark_samples: 128
   layer_output_splitting:
     xy_samples_random_slice: 256
 
