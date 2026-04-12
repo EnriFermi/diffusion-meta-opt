@@ -4,10 +4,12 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import shutil
 import time
+import uuid
 from collections import Counter, OrderedDict, deque
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -278,9 +280,15 @@ def _chunk_record_index_entry(
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    tmp_path.replace(path)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _load_json_payload(path: Path) -> dict[str, Any]:
