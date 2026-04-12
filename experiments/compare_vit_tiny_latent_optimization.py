@@ -75,6 +75,7 @@ class ExperimentConfig:
     big_vae_checkpoint: str = ""
     big_vae_latent_init: str = "base"
     big_vae_latent_noise_std: float = 0.0
+    big_vae_decode: str = "weights"
     big_vae_init_fit_steps: int = 0
     big_vae_init_fit_lr: float = 1e-2
     big_vae_init_fit_log_every: int = 10
@@ -241,11 +242,15 @@ class BigVAELatentTensorStore(nn.Module):
         big_vae: BigWeightVAE,
         latent_init: str,
         latent_noise_std: float,
+        decode_policy: str,
     ) -> None:
         super().__init__()
         init_mode = str(latent_init).strip().lower()
         if init_mode not in {"base", "random"}:
             raise ValueError(f"big_vae_latent_init must be 'base' or 'random', got {latent_init!r}")
+        policy = str(decode_policy).strip().lower()
+        if policy not in {"weights", "all"}:
+            raise ValueError(f"big_vae_decode must be 'weights' or 'all', got {decode_policy!r}")
 
         self.big_vae = big_vae
         self.big_vae.eval()
@@ -253,8 +258,12 @@ class BigVAELatentTensorStore(nn.Module):
             param.requires_grad_(False)
 
         self._name_to_key: dict[str, str] = {}
+        self._key_to_name: dict[str, str] = {}
         self._specs: dict[str, TensorMatrixSpec] = {}
+        self._groups: dict[tuple[int, int, int], list[str]] = {}
+        self._direct_name_to_key: dict[str, str] = {}
         self.latent_slots = nn.ParameterDict()
+        self.direct_tensors = nn.ModuleDict()
         self.patch_size = int(self.big_vae.cfg.patch_size)
         self.use_distribution_encoder = bool(getattr(self.big_vae, "use_distribution_encoder", False))
         self.d_dist = int(self.big_vae.cfg.distribution.d_dist)
@@ -262,11 +271,18 @@ class BigVAELatentTensorStore(nn.Module):
         base_latents = self.big_vae.latent_base.detach().clone()
         for idx, (name, initial) in enumerate(initial_tensors.items()):
             key = f"p{idx:04d}"
+            if not self._should_decode_with_big_vae(name=name, tensor=initial, policy=policy):
+                self._direct_name_to_key[name] = key
+                self.direct_tensors[key] = DirectTensor(initial)
+                continue
+
             spec = make_tensor_matrix_spec(initial)
             d_in, d_out = spec.matrix_shape
             T = int(math.ceil(float(d_in) / float(self.patch_size)))
             self._name_to_key[name] = key
+            self._key_to_name[key] = name
             self._specs[key] = spec
+            self._groups.setdefault((d_in, d_out, T), []).append(key)
 
             if init_mode == "base":
                 latent = base_latents.clone()
@@ -282,7 +298,31 @@ class BigVAELatentTensorStore(nn.Module):
             if self.use_distribution_encoder:
                 self.register_buffer(f"{key}_dist_patch", torch.zeros(1, T, self.d_dist), persistent=False)
 
+    @staticmethod
+    def _should_decode_with_big_vae(*, name: str, tensor: torch.Tensor, policy: str) -> bool:
+        if policy == "all":
+            return True
+        # BigVAE was trained on layer weight matrices. Keep non-kernel params
+        # direct; decoding pos_embed/bias/LayerNorm tensors is both expensive and
+        # not representative of the target weight-manifold question.
+        return tensor.ndim >= 2 and str(name).endswith(".weight")
+
+    def decode_group_count(self) -> int:
+        return int(len(self._groups))
+
     def decoded_numel(self) -> int:
+        total = 0
+        for spec in self._specs.values():
+            numel = 1
+            for dim in spec.original_shape:
+                numel *= int(dim)
+            total += int(numel)
+        for module in self.direct_tensors.values():
+            if isinstance(module, DirectTensor):
+                total += int(module.value.numel())
+        return int(total)
+
+    def big_vae_decoded_numel(self) -> int:
         total = 0
         for spec in self._specs.values():
             numel = 1
@@ -320,7 +360,46 @@ class BigVAELatentTensorStore(nn.Module):
         )[0]
         return decoded.squeeze(0)
 
+    def decode_all_matrices(self) -> dict[str, torch.Tensor]:
+        result: dict[str, torch.Tensor] = {}
+        for (d_in, d_out, T), keys in self._groups.items():
+            latents = torch.stack([self.latent_slots[key] for key in keys], dim=0)
+            batch = int(latents.shape[0])
+            d_in_pad = int(T) * self.patch_size
+            device = latents.device
+            patch_mask = torch.ones(batch, int(T), device=device, dtype=torch.bool)
+            d_in_mask = torch.ones(batch, int(d_in), device=device, dtype=torch.bool)
+            d_out_mask = torch.ones(batch, int(d_out), device=device, dtype=torch.bool)
+            dist_patch = (
+                torch.zeros(batch, int(T), self.d_dist, device=device, dtype=latents.dtype)
+                if self.use_distribution_encoder
+                else None
+            )
+            decoded = self.big_vae._decode_from_latent_slots(
+                latents,
+                dist_patch_by_patch=dist_patch,
+                patch_mask=patch_mask,
+                d_in_mask=d_in_mask,
+                d_out_mask=d_out_mask,
+                d_in=int(d_in),
+                d_out=int(d_out),
+                d_in_pad=d_in_pad,
+                T=int(T),
+            )[0]
+            for item_idx, key in enumerate(keys):
+                result[self._key_to_name[key]] = decoded[item_idx]
+        return result
+
+    def decode_all_tensors(self) -> dict[str, torch.Tensor]:
+        return {
+            name: matrix_to_tensor(matrix, self._specs[self._name_to_key[name]])
+            for name, matrix in self.decode_all_matrices().items()
+        }
+
     def tensor(self, name: str) -> torch.Tensor:
+        direct_key = self._direct_name_to_key.get(name)
+        if direct_key is not None:
+            return self.direct_tensors[direct_key]()
         key = self._name_to_key[name]
         return matrix_to_tensor(self.decoded_matrix(name), self._specs[key])
 
@@ -338,6 +417,7 @@ class FunctionalViTTiny(nn.Module):
         big_vae: BigWeightVAE | None = None,
         big_vae_latent_init: str = "base",
         big_vae_latent_noise_std: float = 0.0,
+        big_vae_decode: str = "weights",
     ) -> None:
         super().__init__()
         self.cfg = vit_cfg
@@ -349,6 +429,7 @@ class FunctionalViTTiny(nn.Module):
                 big_vae=big_vae,
                 latent_init=big_vae_latent_init,
                 latent_noise_std=big_vae_latent_noise_std,
+                decode_policy=big_vae_decode,
             )
         else:
             store_mode = "latent" if parameter_mode == "lowrank_latent" else parameter_mode
@@ -359,11 +440,24 @@ class FunctionalViTTiny(nn.Module):
                 latent_delta_scale=latent_delta_scale,
                 latent_factor_init_std=latent_factor_init_std,
             )
+        self._decoded_tensor_cache: dict[str, torch.Tensor] | None = None
 
     def w(self, name: str) -> torch.Tensor:
+        if self._decoded_tensor_cache is not None and name in self._decoded_tensor_cache:
+            return self._decoded_tensor_cache[name]
         return self.store.tensor(name)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if isinstance(self.store, BigVAELatentTensorStore):
+            self._decoded_tensor_cache = self.store.decode_all_tensors()
+        else:
+            self._decoded_tensor_cache = None
+        try:
+            return self._forward_with_cached_weights(images)
+        finally:
+            self._decoded_tensor_cache = None
+
+    def _forward_with_cached_weights(self, images: torch.Tensor) -> torch.Tensor:
         cfg = self.cfg
         x = F.conv2d(
             images,
@@ -675,8 +769,9 @@ def fit_big_vae_latents_to_initial_weights(
     for step_idx in range(1, int(steps) + 1):
         optimizer.zero_grad(set_to_none=True)
         loss = None
+        decoded_matrices = store.decode_all_matrices()
         for name, target_matrix in target_matrices.items():
-            decoded = store.decoded_matrix(name)
+            decoded = decoded_matrices[name]
             term = F.mse_loss(decoded, target_matrix, reduction="sum")
             loss = term if loss is None else loss + term
         assert loss is not None
@@ -716,6 +811,7 @@ def train_setup(
         big_vae=big_vae_decoder,
         big_vae_latent_init=str(cfg.big_vae_latent_init),
         big_vae_latent_noise_std=float(cfg.big_vae_latent_noise_std),
+        big_vae_decode=str(cfg.big_vae_decode),
     ).to(device)
     if bool(cfg.compile):
         model = torch.compile(model)
@@ -746,8 +842,12 @@ def train_setup(
 
     trainable_params = count_trainable_parameters(model)
     decoded_params = int(getattr(model, "store", getattr(model, "_orig_mod", model).store).decoded_numel())
+    store = getattr(model, "store", getattr(model, "_orig_mod", model).store)
+    decode_groups = store.decode_group_count() if isinstance(store, BigVAELatentTensorStore) else 0
+    big_vae_decoded_params = store.big_vae_decoded_numel() if isinstance(store, BigVAELatentTensorStore) else 0
     print(
         f"[{setup}] trainable_params={trainable_params} decoded_params={decoded_params} "
+        f"bigvae_decoded_params={big_vae_decoded_params} decode_groups={decode_groups} "
         f"lr={lr:g} weight_decay={weight_decay:g}",
         flush=True,
     )
@@ -867,6 +967,8 @@ def train_setup(
         "weight_decay": float(weight_decay),
         "big_vae_checkpoint": str(cfg.big_vae_checkpoint) if setup == "bigvae_latent" else "",
         "big_vae_init_fit_steps": int(cfg.big_vae_init_fit_steps) if setup == "bigvae_latent" else 0,
+        "decode_groups": int(decode_groups),
+        "big_vae_decoded_params": int(big_vae_decoded_params),
     }
     write_json(output_dir / f"{setup}_summary.json", summary)
     return summary
@@ -959,6 +1061,7 @@ def parse_args() -> tuple[ExperimentConfig, ViTTinyConfig]:
     parser.add_argument("--big-vae-checkpoint", default=default_exp.big_vae_checkpoint)
     parser.add_argument("--big-vae-latent-init", choices=("base", "random"), default=default_exp.big_vae_latent_init)
     parser.add_argument("--big-vae-latent-noise-std", type=float, default=default_exp.big_vae_latent_noise_std)
+    parser.add_argument("--big-vae-decode", choices=("weights", "all"), default=default_exp.big_vae_decode)
     parser.add_argument("--big-vae-init-fit-steps", type=int, default=default_exp.big_vae_init_fit_steps)
     parser.add_argument("--big-vae-init-fit-lr", type=float, default=default_exp.big_vae_init_fit_lr)
     parser.add_argument("--big-vae-init-fit-log-every", type=int, default=default_exp.big_vae_init_fit_log_every)
@@ -1007,6 +1110,7 @@ def parse_args() -> tuple[ExperimentConfig, ViTTinyConfig]:
         big_vae_checkpoint=str(args.big_vae_checkpoint),
         big_vae_latent_init=str(args.big_vae_latent_init),
         big_vae_latent_noise_std=float(args.big_vae_latent_noise_std),
+        big_vae_decode=str(args.big_vae_decode),
         big_vae_init_fit_steps=int(args.big_vae_init_fit_steps),
         big_vae_init_fit_lr=float(args.big_vae_init_fit_lr),
         big_vae_init_fit_log_every=int(args.big_vae_init_fit_log_every),
