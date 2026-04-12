@@ -73,7 +73,7 @@ class ExperimentConfig:
     latent_delta_scale: float = 1.0
     latent_factor_init_std: float = 0.02
     big_vae_checkpoint: str = ""
-    big_vae_latent_init: str = "base"
+    big_vae_latent_init: str = "random"
     big_vae_latent_noise_std: float = 0.0
     big_vae_decode: str = "weights"
     big_vae_init_fit_steps: int = 0
@@ -264,6 +264,7 @@ class BigVAELatentTensorStore(nn.Module):
         self._direct_name_to_key: dict[str, str] = {}
         self.latent_slots = nn.ParameterDict()
         self.direct_tensors = nn.ModuleDict()
+        self.latent_init_mode = init_mode
         self.patch_size = int(self.big_vae.cfg.patch_size)
         self.use_distribution_encoder = bool(getattr(self.big_vae, "use_distribution_encoder", False))
         self.d_dist = int(self.big_vae.cfg.distribution.d_dist)
@@ -330,6 +331,19 @@ class BigVAELatentTensorStore(nn.Module):
                 numel *= int(dim)
             total += int(numel)
         return int(total)
+
+    def latent_init_diversity(self) -> dict[str, float]:
+        if not self.latent_slots:
+            return {"count": 0.0, "across_layer_std_mean": 0.0, "max_pair_delta": 0.0}
+        stacked = torch.stack([param.detach().float().cpu() for param in self.latent_slots.values()], dim=0)
+        if int(stacked.shape[0]) <= 1:
+            return {"count": float(stacked.shape[0]), "across_layer_std_mean": 0.0, "max_pair_delta": 0.0}
+        centered = stacked - stacked.mean(dim=0, keepdim=True)
+        return {
+            "count": float(stacked.shape[0]),
+            "across_layer_std_mean": float(stacked.std(dim=0, unbiased=False).mean().item()),
+            "max_pair_delta": float(centered.abs().max().item()),
+        }
 
     def target_matrix(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         key = self._name_to_key[name]
@@ -415,7 +429,7 @@ class FunctionalViTTiny(nn.Module):
         latent_delta_scale: float = 1.0,
         latent_factor_init_std: float = 0.02,
         big_vae: BigWeightVAE | None = None,
-        big_vae_latent_init: str = "base",
+        big_vae_latent_init: str = "random",
         big_vae_latent_noise_std: float = 0.0,
         big_vae_decode: str = "weights",
     ) -> None:
@@ -592,8 +606,6 @@ def count_trainable_parameters(model: nn.Module) -> int:
 
 def normalize_setup_name(setup: str) -> str:
     value = str(setup).strip().lower()
-    if value == "latent":
-        return "bigvae_latent"
     return value
 
 
@@ -851,6 +863,15 @@ def train_setup(
         f"lr={lr:g} weight_decay={weight_decay:g}",
         flush=True,
     )
+    if isinstance(store, BigVAELatentTensorStore):
+        diversity = store.latent_init_diversity()
+        print(
+            f"[{setup}] latent_init={store.latent_init_mode} "
+            f"latent_tensors={int(diversity['count'])} "
+            f"across_layer_std_mean={diversity['across_layer_std_mean']:.6g} "
+            f"max_pair_delta={diversity['max_pair_delta']:.6g}",
+            flush=True,
+        )
 
     global_step = 0
     train_loss_window = 0.0
@@ -1028,7 +1049,7 @@ def parse_args() -> tuple[ExperimentConfig, ViTTinyConfig]:
     parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=default_exp.download)
     parser.add_argument(
         "--setup",
-        choices=("direct", "latent", "bigvae_latent", "lowrank_latent", "both"),
+        choices=("direct", "bigvae_latent", "lowrank_latent", "both"),
         default=default_exp.setup,
     )
     parser.add_argument("--device", default=default_exp.device)
