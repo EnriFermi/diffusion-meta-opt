@@ -160,16 +160,22 @@ class TensorMatrixSpec:
 
 
 @dataclass(slots=True)
-class BigVAETileSpec:
+class BigVAETileSegment:
     tensor_name: str
     tensor_key: str
+    tile_row_start: int
     row_start: int
     row_len: int
     col_start: int
     col_len: int
+
+
+@dataclass(slots=True)
+class BigVAEDecodeTileSpec:
     d_in: int
     d_out: int
     T: int
+    segments: list[BigVAETileSegment]
 
 
 def make_tensor_matrix_spec(tensor: torch.Tensor, *, output_first_dim: bool = False) -> TensorMatrixSpec:
@@ -285,7 +291,7 @@ class BigVAELatentTensorStore(nn.Module):
         self._name_to_key: dict[str, str] = {}
         self._key_to_name: dict[str, str] = {}
         self._specs: dict[str, TensorMatrixSpec] = {}
-        self._tile_specs: dict[str, BigVAETileSpec] = {}
+        self._tile_specs: dict[str, BigVAEDecodeTileSpec] = {}
         self._tensor_key_to_tile_keys: dict[str, list[str]] = {}
         self._groups: dict[tuple[int, int, int], list[str]] = {}
         self._direct_name_to_key: dict[str, str] = {}
@@ -317,33 +323,58 @@ class BigVAELatentTensorStore(nn.Module):
             self._specs[tensor_key] = spec
             self._tensor_key_to_tile_keys[tensor_key] = []
 
-            for row_block, row_start in enumerate(range(0, int(rows), int(self.tile_d_in))):
-                row_len = min(int(self.tile_d_in), int(rows) - int(row_start))
-                for col_block, col_start in enumerate(range(0, int(cols), int(self.tile_d_out))):
-                    col_len = min(int(self.tile_d_out), int(cols) - int(col_start))
-                    tile_key = f"{tensor_key}_r{row_block:04d}_c{col_block:04d}"
-                    self._tile_specs[tile_key] = BigVAETileSpec(
-                        tensor_name=name,
-                        tensor_key=tensor_key,
-                        row_start=int(row_start),
-                        row_len=int(row_len),
-                        col_start=int(col_start),
-                        col_len=int(col_len),
-                        d_in=int(self.tile_d_in),
-                        d_out=int(self.tile_d_out),
-                        T=int(self.tile_T_patches),
-                    )
-                    self._tensor_key_to_tile_keys[tensor_key].append(tile_key)
-                    group_key = (int(self.tile_d_in), int(self.tile_d_out), int(self.tile_T_patches))
-                    self._groups.setdefault(group_key, []).append(tile_key)
+            pending_segments: list[BigVAETileSegment] = []
+            tile_index = 0
 
-                    if init_mode == "base":
-                        latent = base_latents.clone()
-                    else:
-                        latent = torch.randn_like(base_latents) * 0.02
-                    if float(latent_noise_std) > 0.0:
-                        latent = latent + torch.randn_like(latent) * float(latent_noise_std)
-                    self.latent_slots[tile_key] = nn.Parameter(latent)
+            def flush_tile() -> None:
+                nonlocal pending_segments, tile_index
+                if not pending_segments:
+                    return
+                tile_key = f"{tensor_key}_t{tile_index:04d}"
+                tile_index += 1
+                self._tile_specs[tile_key] = BigVAEDecodeTileSpec(
+                    d_in=int(self.tile_d_in),
+                    d_out=int(self.tile_d_out),
+                    T=int(self.tile_T_patches),
+                    segments=list(pending_segments),
+                )
+                self._tensor_key_to_tile_keys[tensor_key].append(tile_key)
+                group_key = (int(self.tile_d_in), int(self.tile_d_out), int(self.tile_T_patches))
+                self._groups.setdefault(group_key, []).append(tile_key)
+
+                if init_mode == "base":
+                    latent = base_latents.clone()
+                else:
+                    latent = torch.randn_like(base_latents) * 0.02
+                if float(latent_noise_std) > 0.0:
+                    latent = latent + torch.randn_like(latent) * float(latent_noise_std)
+                self.latent_slots[tile_key] = nn.Parameter(latent)
+                pending_segments = []
+
+            current_tile_rows = 0
+            for col_start in range(0, int(cols), int(self.tile_d_out)):
+                col_len = min(int(self.tile_d_out), int(cols) - int(col_start))
+                for row_start in range(0, int(rows), int(self.patch_size)):
+                    row_len = min(int(self.patch_size), int(rows) - int(row_start))
+                    if current_tile_rows > 0 and current_tile_rows + int(row_len) > int(self.tile_d_in):
+                        flush_tile()
+                        current_tile_rows = 0
+                    pending_segments.append(
+                        BigVAETileSegment(
+                            tensor_name=name,
+                            tensor_key=tensor_key,
+                            tile_row_start=int(current_tile_rows),
+                            row_start=int(row_start),
+                            row_len=int(row_len),
+                            col_start=int(col_start),
+                            col_len=int(col_len),
+                        )
+                    )
+                    current_tile_rows += int(row_len)
+                    if current_tile_rows >= int(self.tile_d_in):
+                        flush_tile()
+                        current_tile_rows = 0
+            flush_tile()
 
     @staticmethod
     def _should_decode_with_big_vae(*, name: str, tensor: torch.Tensor, policy: str) -> bool:
@@ -433,10 +464,16 @@ class BigVAELatentTensorStore(nn.Module):
             d_out_mask = torch.zeros(batch, int(d_out), device=device, dtype=torch.bool)
             for item_idx, key in enumerate(keys):
                 tile = self._tile_specs[key]
-                valid_patches = int(math.ceil(float(tile.row_len) / float(self.patch_size)))
+                used_rows = 0
+                used_cols = 0
+                for segment in tile.segments:
+                    segment_row_end = int(segment.tile_row_start) + int(segment.row_len)
+                    d_in_mask[item_idx, int(segment.tile_row_start) : segment_row_end] = True
+                    used_rows = max(used_rows, segment_row_end)
+                    used_cols = max(used_cols, int(segment.col_len))
+                valid_patches = int(math.ceil(float(used_rows) / float(self.patch_size)))
                 patch_mask[item_idx, :valid_patches] = True
-                d_in_mask[item_idx, : int(tile.row_len)] = True
-                d_out_mask[item_idx, : int(tile.col_len)] = True
+                d_out_mask[item_idx, :used_cols] = True
             dist_patch = (
                 torch.zeros(batch, int(T), self.d_dist, device=device, dtype=latents.dtype)
                 if self.use_distribution_encoder
@@ -455,10 +492,13 @@ class BigVAELatentTensorStore(nn.Module):
             )[0]
             for item_idx, key in enumerate(keys):
                 tile = self._tile_specs[key]
-                result[tile.tensor_name][
-                    int(tile.row_start) : int(tile.row_start) + int(tile.row_len),
-                    int(tile.col_start) : int(tile.col_start) + int(tile.col_len),
-                ] = decoded[item_idx, : int(tile.row_len), : int(tile.col_len)]
+                for segment in tile.segments:
+                    tile_row_start = int(segment.tile_row_start)
+                    tile_row_end = tile_row_start + int(segment.row_len)
+                    result[segment.tensor_name][
+                        int(segment.row_start) : int(segment.row_start) + int(segment.row_len),
+                        int(segment.col_start) : int(segment.col_start) + int(segment.col_len),
+                    ] = decoded[item_idx, tile_row_start:tile_row_end, : int(segment.col_len)]
         return result
 
     def decode_all_tensors(self) -> dict[str, torch.Tensor]:
