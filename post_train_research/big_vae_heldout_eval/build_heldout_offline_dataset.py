@@ -26,6 +26,7 @@ from common import (
     primary_dataset_name,
     promote_run_profile_to_root,
     resolved_cfg_snapshot,
+    sanitize_programmatic_hydra_logging,
     sample_pair,
     write_csv,
     write_json,
@@ -206,6 +207,7 @@ def _load_base_config() -> DictConfig:
 def main() -> None:
     cfg = _load_base_config()
     promote_run_profile_to_root(cfg)
+    sanitize_programmatic_hydra_logging(cfg, role="build_big_vae_heldout_offline_dataset")
     root_dir = env_path(
         "HELDOUT_ROOT",
         "post_train_research/big_vae_heldout_eval/artifacts/offline_dataset",
