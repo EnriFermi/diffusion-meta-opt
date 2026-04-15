@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import os
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,6 +97,19 @@ def promote_run_profile_to_root(cfg: DictConfig) -> None:
                 continue
             if section in run_profiles_cfg:
                 cfg[section] = run_profiles_cfg[section]
+
+
+def sanitize_programmatic_hydra_logging(cfg: DictConfig, *, role: str) -> None:
+    """Remove `${hydra:...}` logging interpolations when scripts use compose()."""
+    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    with open_dict(cfg):
+        if "logging" not in cfg or cfg.logging is None:
+            cfg.logging = {}
+        project_name = str(cfg.logging.get("project_name", "diffusion_meta_opt"))
+        log_dir = str(cfg.logging.get("dir", "logs"))
+        file_name = f"{project_name}_{role}_{timestamp}.log"
+        cfg.logging.file_name = file_name
+        cfg.logging.file_path = str(Path(log_dir) / file_name)
 
 
 def apply_heldout_data_profile(cfg: DictConfig) -> None:

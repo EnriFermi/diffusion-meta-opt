@@ -23,6 +23,7 @@ from common import (
     finite_metrics,
     primary_dataset_name,
     promote_run_profile_to_root,
+    sanitize_programmatic_hydra_logging,
     tensor_to_float,
     write_csv,
     write_json,
@@ -417,6 +418,7 @@ def _load_base_config() -> DictConfig:
 def main() -> None:
     cfg = _load_base_config()
     promote_run_profile_to_root(cfg)
+    sanitize_programmatic_hydra_logging(cfg, role="evaluate_big_vae_heldout")
     raw_checkpoint = str(os.environ.get("BIG_VAE_CHECKPOINT", "")).strip()
     if not raw_checkpoint:
         raise ValueError("Set BIG_VAE_CHECKPOINT=/path/to/big_vae_checkpoint.pt")
