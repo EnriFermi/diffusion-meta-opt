@@ -137,6 +137,64 @@ def apply_heldout_data_profile(cfg: DictConfig) -> None:
         }
 
 
+def apply_heldout_collector_defaults_from_env(cfg: DictConfig) -> None:
+    """Use conservative collector residency for offline held-out builds.
+
+    The BigVAE train profile uses multiple inference workers and multiple hot
+    models per worker. That is useful for training throughput, but for the
+    held-out offline builder it can resident several large vision models on one
+    collector GPU and OOM before all pairs are covered.
+    """
+    with open_dict(cfg):
+        if "collector" not in cfg or cfg.collector is None:
+            cfg.collector = {}
+        collector = cfg.collector
+        collector.parallel_inference_workers = env_int("HELDOUT_COLLECTOR_PARALLEL_INFERENCE_WORKERS", 1)
+        collector.parallel_model_pool_max_loaded_models = env_int(
+            "HELDOUT_COLLECTOR_PARALLEL_MODEL_POOL_MAX_LOADED_MODELS",
+            1,
+        )
+        collector.max_loaded_models = env_int("HELDOUT_COLLECTOR_MAX_LOADED_MODELS", 1)
+        collector.num_inflight_jobs = env_int("HELDOUT_COLLECTOR_NUM_INFLIGHT_JOBS", 1)
+        collector.jobs_per_selected_model = env_int("HELDOUT_COLLECTOR_JOBS_PER_SELECTED_MODEL", 1)
+        collector.pin_gpu = env_bool("HELDOUT_COLLECTOR_PIN_GPU", False)
+        collector.release_device_on_unload = env_bool("HELDOUT_COLLECTOR_RELEASE_DEVICE_ON_UNLOAD", True)
+        collector.empty_cuda_cache_on_unload = env_bool("HELDOUT_COLLECTOR_EMPTY_CUDA_CACHE_ON_UNLOAD", True)
+        collector.runtime_local_only = env_bool("HELDOUT_COLLECTOR_RUNTIME_LOCAL_ONLY", True)
+        if "in_memory_buffer" not in collector or collector.in_memory_buffer is None:
+            collector.in_memory_buffer = {}
+        collector.in_memory_buffer.capacity_samples = env_int("HELDOUT_COLLECTOR_IN_MEMORY_CAPACITY_SAMPLES", 1024)
+        collector.in_memory_buffer.fill_target_samples = env_int("HELDOUT_COLLECTOR_IN_MEMORY_FILL_TARGET_SAMPLES", 1)
+        collector.in_memory_buffer.low_watermark_samples = env_int("HELDOUT_COLLECTOR_IN_MEMORY_LOW_WATERMARK_SAMPLES", 1)
+
+
+def _configured_hf_token(cfg: DictConfig) -> str:
+    hf_cfg = cfg.get("hf", {})
+    token_value = hf_cfg.get("token") if isinstance(hf_cfg, (dict, DictConfig)) else None
+    token = str(token_value or os.environ.get("HF_TOKEN") or os.environ.get("HF_HUB_TOKEN") or "").strip()
+    if token.upper() in {"", "NULL", "NONE"}:
+        return ""
+    if token in {"YOUR_HF_TOKEN_HERE", "<YOUR_HF_TOKEN_HERE>", "${oc.env:HF_TOKEN,\"\"}"}:
+        return ""
+    return token
+
+
+def validate_heldout_preflight(cfg: DictConfig) -> None:
+    if not env_bool("HELDOUT_REQUIRE_GATED_DATASET_TOKEN", True):
+        return
+    enabled_datasets = {str(name) for name in cfg.data.get("enabled_datasets", [])}
+    if "bigearthnet" not in enabled_datasets:
+        return
+    if _configured_hf_token(cfg):
+        return
+    raise RuntimeError(
+        "Held-out build includes gated dataset 'bigearthnet', but HF token is empty. "
+        "Set HF_TOKEN/hf.token with accepted BigEarthNet access, or remove bigearthnet "
+        "from HELDOUT_DATASET_MODELS before building. To bypass this fail-fast check for "
+        "partial/debug runs, set HELDOUT_REQUIRE_GATED_DATASET_TOKEN=false."
+    )
+
+
 def apply_offline_dataset_defaults(cfg: DictConfig, *, root_dir: str | Path) -> None:
     with open_dict(cfg):
         cfg.train.offline_dataset.enabled = True

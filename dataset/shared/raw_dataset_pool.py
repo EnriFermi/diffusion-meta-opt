@@ -4,7 +4,7 @@ import logging
 import random
 import traceback
 from collections import Counter
-from typing import Any
+from typing import Any, Collection
 
 from omegaconf import DictConfig
 
@@ -315,6 +315,7 @@ class RawDatasetPool:
         batch_size: int,
         dataset_sampling_strategy: str,
         max_dataset_fraction_per_batch: float,
+        allowed_dataset_names: Collection[str] | None = None,
     ) -> tuple[list[Any], list[MixedImageMeta]]:
         if batch_size <= 0:
             return [], []
@@ -325,10 +326,12 @@ class RawDatasetPool:
             return [], []
 
         raw_dataset_weights = self.index.get_dataset_weights_for_model(model_name)
+        allowed = {str(name) for name in allowed_dataset_names} if allowed_dataset_names is not None else None
         active_pairs = [
             (str(name), float(weight))
             for name, weight in zip(dataset_names, raw_dataset_weights, strict=False)
             if not self._is_dataset_disabled(str(name))
+            and (allowed is None or str(name) in allowed)
         ]
         if not active_pairs:
             self.logger.warning(
@@ -398,6 +401,7 @@ class RawDatasetPool:
         batch_size: int,
         dataset_sampling_strategy: str,
         max_dataset_fraction_per_batch: float,
+        allowed_dataset_names: Collection[str] | None = None,
     ) -> tuple[list[ImageSampleRef], list[MixedImageMeta]]:
         if batch_size <= 0:
             return [], []
@@ -408,10 +412,12 @@ class RawDatasetPool:
             return [], []
 
         raw_dataset_weights = self.index.get_dataset_weights_for_model(model_name)
+        allowed = {str(name) for name in allowed_dataset_names} if allowed_dataset_names is not None else None
         active_pairs = [
             (str(name), float(weight))
             for name, weight in zip(dataset_names, raw_dataset_weights, strict=False)
             if not self._is_dataset_disabled(str(name))
+            and (allowed is None or str(name) in allowed)
         ]
         if not active_pairs:
             self.logger.warning(

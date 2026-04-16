@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from common import (
     HELDOUT_DATASET_MODELS,
+    apply_heldout_collector_defaults_from_env,
     apply_heldout_log_dir,
     allowed_pairs,
     apply_builder_defaults_from_env,
@@ -32,6 +33,7 @@ from common import (
     resolved_cfg_snapshot,
     sanitize_programmatic_hydra_logging,
     sample_pair,
+    validate_heldout_preflight,
     write_csv,
     write_json,
 )
@@ -162,6 +164,21 @@ def _should_accept_pair_in_size_mode(
     return int(pair_counts.get(pair, 0)) <= min_count + int(balance_slack)
 
 
+def _active_pairs_for_counts(
+    pair_counts: Counter[tuple[str, str]],
+    expected_pairs: list[tuple[str, str]],
+    *,
+    records_per_pair: int,
+) -> list[tuple[str, str]]:
+    if records_per_pair <= 0:
+        return list(expected_pairs)
+    return [
+        pair
+        for pair in expected_pairs
+        if int(pair_counts.get(pair, 0)) < int(records_per_pair)
+    ]
+
+
 def _build_balanced_heldout_dataset(
     cfg: DictConfig,
     *,
@@ -205,11 +222,33 @@ def _build_balanced_heldout_dataset(
     dataset_counts: Counter[str] = Counter()
     model_counts: Counter[str] = Counter()
     status_counts: Counter[str] = Counter()
+    last_active_pairs: tuple[tuple[str, str], ...] | None = None
 
     def pair_targets_reached() -> bool:
         if records_per_pair <= 0:
             return False
         return all(int(pair_counts.get(pair, 0)) >= records_per_pair for pair in expected_pairs)
+
+    def update_collector_active_pairs() -> None:
+        nonlocal last_active_pairs
+        if collector is None or not hasattr(collector, "set_active_pairs"):
+            return
+        active_pairs = tuple(
+            _active_pairs_for_counts(
+                pair_counts,
+                expected_pairs,
+                records_per_pair=records_per_pair,
+            )
+        )
+        if active_pairs == last_active_pairs:
+            return
+        collector.set_active_pairs(list(active_pairs))
+        last_active_pairs = active_pairs
+        logger.info(
+            "Updated held-out active collector pairs: active=%s total=%s",
+            len(active_pairs),
+            len(expected_pairs),
+        )
 
     def wait_context() -> dict[str, Any]:
         writer_stats = writer.stats()
@@ -229,6 +268,7 @@ def _build_balanced_heldout_dataset(
         }
 
     try:
+        update_collector_active_pairs()
         while True:
             if records_per_pair > 0 and pair_targets_reached():
                 logger.info("Held-out build reached records_per_pair=%s for all pairs", records_per_pair)
@@ -275,6 +315,8 @@ def _build_balanced_heldout_dataset(
                 pair_counts[pair] += 1
                 dataset_counts[dataset_name] += 1
                 model_counts[model_name] += 1
+                if records_per_pair > 0 and int(pair_counts[pair]) >= records_per_pair:
+                    update_collector_active_pairs()
 
             if seen_total % log_every_seen == 0:
                 writer_stats = writer.stats()
@@ -346,8 +388,10 @@ def main() -> None:
     )
     log_dir = apply_heldout_log_dir(cfg, root_dir=root_dir)
     apply_heldout_data_profile(cfg)
+    apply_heldout_collector_defaults_from_env(cfg)
     apply_offline_dataset_defaults(cfg, root_dir=root_dir)
     apply_builder_defaults_from_env(cfg, root_dir=root_dir)
+    validate_heldout_preflight(cfg)
 
     log_path = configure_process_logging(cfg=cfg, role="build_big_vae_heldout_offline_dataset", rank=0, force=True)
     logger = LOGGER

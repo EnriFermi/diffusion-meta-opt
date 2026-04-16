@@ -14,7 +14,7 @@ hf:
   split: train
   streaming: true
   shuffle_buffer: 1000
-  trust_remote_code: false
+  trust_remote_code: true
 
 schema:
   image_mode: image_field
@@ -36,4 +36,4 @@ worker:
   max_retries: 2
   max_worker_restarts: 5
 
-licensing_note: "Use according to RVL-CDIP / HF dataset card terms."
+licensing_note: "Uses custom RVL-CDIP dataset script; keep trust_remote_code=true after reviewing the HF repo."
