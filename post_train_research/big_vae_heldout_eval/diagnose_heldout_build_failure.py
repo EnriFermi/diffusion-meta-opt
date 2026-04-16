@@ -23,6 +23,26 @@ WAIT_RE = re.compile(r"Waiting for held-out sample: waited_s=(?P<waited>[0-9.]+)
 MODEL_FAILURE_RE = re.compile(
     r"Disabling collector model after runtime failure: model=(?P<model>\S+) error=(?P<error>.*)"
 )
+HELDOUT_EXPECTED_MODELS = {
+    "clip_vit_l14",
+    "detr_resnet50",
+    "donut_rvlcdip",
+    "segformer_b5_cityscapes",
+    "siglip_so400m_p14_384",
+    "trocr_large_printed",
+    "vit_base_p16_224",
+    "vit_large_p16_224",
+}
+HELDOUT_EXPECTED_DATASETS = {
+    "bigearthnet",
+    "chexpert",
+    "flickr30k",
+    "food101",
+    "openimages_v7",
+    "pascal_voc_2012",
+    "rvl_cdip",
+    "sun397",
+}
 
 
 def _env_path(name: str, default: str | Path) -> Path:
@@ -148,6 +168,18 @@ def _parse_log(log_path: Path) -> dict[str, Any]:
     return payload
 
 
+def _is_heldout_load_summary(summary: dict[str, Any]) -> bool:
+    path = str(summary.get("path", ""))
+    if "heldout" in path:
+        return True
+    expected = summary.get("expected", {})
+    if not isinstance(expected, dict):
+        return False
+    models = set(str(item) for item in expected.get("models", []) or [])
+    datasets = set(str(item) for item in expected.get("datasets", []) or [])
+    return HELDOUT_EXPECTED_MODELS.issubset(models) and HELDOUT_EXPECTED_DATASETS.issubset(datasets)
+
+
 def _collect_load_reports(report_dirs: list[Path], limit_events: int = 80) -> dict[str, Any]:
     summary_paths: list[Path] = []
     event_paths: list[Path] = []
@@ -174,6 +206,7 @@ def _collect_load_reports(report_dirs: list[Path], limit_events: int = 80) -> di
                 "pending": payload.get("pending", {}),
             }
         )
+    heldout_summaries = [summary for summary in summaries if _is_heldout_load_summary(summary)]
 
     events: list[dict[str, Any]] = []
     interesting_events = {
@@ -187,6 +220,8 @@ def _collect_load_reports(report_dirs: list[Path], limit_events: int = 80) -> di
         "expected",
     }
     for path in sorted(set(event_paths), key=lambda p: p.stat().st_mtime, reverse=True):
+        if "heldout" not in str(path):
+            continue
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except Exception as exc:
@@ -208,8 +243,67 @@ def _collect_load_reports(report_dirs: list[Path], limit_events: int = 80) -> di
         "report_dirs": [str(path) for path in _dedupe_paths(report_dirs)],
         "summary_count": len(summary_paths),
         "event_file_count": len(event_paths),
-        "summaries": summaries[:12],
+        "summaries": heldout_summaries[:12],
+        "ignored_non_heldout_summary_count": max(0, len(summaries) - len(heldout_summaries)),
         "events_tail": events[-max(1, int(limit_events)) :],
+    }
+
+
+def _collect_process_logs(log_dirs: list[Path], limit_files: int = 16, tail_lines: int = 160) -> dict[str, Any]:
+    patterns = [
+        "collector_process*.log",
+        "*collector_process*.stdout.log",
+        "*collector_process*.stderr.log",
+        "*collector_process*_fault*.log",
+        "dataset_worker_rvl_cdip*.log",
+        "*dataset_worker_rvl_cdip*.stdout.log",
+        "*dataset_worker_rvl_cdip*.stderr.log",
+    ]
+    candidates: list[Path] = []
+    for log_dir in _dedupe_paths(log_dirs):
+        if not log_dir.exists():
+            continue
+        for pattern in patterns:
+            candidates.extend(log_dir.rglob(pattern))
+    unique = sorted(set(candidates), key=lambda p: p.stat().st_mtime, reverse=True)
+
+    files: list[dict[str, Any]] = []
+    for path in unique[: max(1, int(limit_files))]:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception as exc:
+            files.append({"path": str(path), "error": f"read_failed: {exc}"})
+            continue
+        interesting = [
+            line
+            for line in lines
+            if (
+                "Disabling collector model" in line
+                or "Collector model remains disabled" in line
+                or "Traceback" in line
+                or "RuntimeError" in line
+                or "Exception" in line
+                or "ERROR" in line
+                or "WARNING" in line
+                or "CUDA" in line
+                or "out of memory" in line.lower()
+                or "trust_remote_code" in line
+                or "rvl_cdip" in line
+            )
+        ]
+        files.append(
+            {
+                "path": str(path),
+                "mtime": path.stat().st_mtime,
+                "line_count": len(lines),
+                "interesting_tail": interesting[-max(1, int(tail_lines)) :],
+                "tail": lines[-min(len(lines), max(1, int(tail_lines))) :],
+            }
+        )
+    return {
+        "log_dirs": [str(path) for path in _dedupe_paths(log_dirs)],
+        "matched_file_count": len(unique),
+        "files": files,
     }
 
 
@@ -328,6 +422,43 @@ def _summarize_crash_report(path: Path) -> dict[str, Any]:
     }
 
 
+def _extract_model_failures_from_process_logs(process_logs: dict[str, Any]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    if not isinstance(process_logs, dict):
+        return out
+    for file_payload in process_logs.get("files", []) or []:
+        if not isinstance(file_payload, dict):
+            continue
+        path = str(file_payload.get("path", ""))
+        for line in file_payload.get("interesting_tail", []) or []:
+            if not isinstance(line, str):
+                continue
+            match = MODEL_FAILURE_RE.search(line)
+            if match is None:
+                continue
+            model = str(match.group("model")).strip()
+            if model:
+                out.setdefault(model, []).append(f"{path}: {line}")
+    return out
+
+
+def _extract_dataset_mentions_from_process_logs(process_logs: dict[str, Any]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    if not isinstance(process_logs, dict):
+        return out
+    for file_payload in process_logs.get("files", []) or []:
+        if not isinstance(file_payload, dict):
+            continue
+        path = str(file_payload.get("path", ""))
+        for line in file_payload.get("interesting_tail", []) or []:
+            if not isinstance(line, str):
+                continue
+            for dataset in HELDOUT_EXPECTED_DATASETS:
+                if dataset in line:
+                    out.setdefault(dataset, []).append(f"{path}: {line}")
+    return out
+
+
 def _build_failure_attribution(report: dict[str, Any]) -> dict[str, Any]:
     models: dict[str, dict[str, Any]] = {}
     datasets: dict[str, dict[str, Any]] = {}
@@ -373,6 +504,12 @@ def _build_failure_attribution(report: dict[str, Any]) -> dict[str, Any]:
             if isinstance(failed_datasets, dict):
                 for dataset, payload in failed_datasets.items():
                     datasets.setdefault(str(dataset), {})["load_report_failure"] = payload
+
+    process_logs = report.get("process_logs", {})
+    for model, lines in _extract_model_failures_from_process_logs(process_logs).items():
+        models.setdefault(str(model), {})["process_log_failures"] = lines[-5:]
+    for dataset, lines in _extract_dataset_mentions_from_process_logs(process_logs).items():
+        datasets.setdefault(str(dataset), {})["process_log_mentions"] = lines[-5:]
 
     worker_status = report.get("worker_status", {})
     if isinstance(worker_status, dict):
@@ -473,6 +610,7 @@ def main() -> None:
         },
         "log": _parse_log(log_path) if log_path is not None else {"exists": False, "reason": "no log found"},
         "load_reports": _collect_load_reports(reports_dirs),
+        "process_logs": _collect_process_logs(log_dirs),
         "collector_crash_report": _summarize_crash_report(crash_report),
         "worker_status": _summarize_worker_status(worker_status_dir),
         "recent_fatal_reports": [
@@ -487,6 +625,7 @@ def main() -> None:
     _print_section("Failure Attribution", report["failure_attribution"])
     _print_section("Log Summary", report["log"])
     _print_section("Load Reports", report["load_reports"])
+    _print_section("Process Logs", report["process_logs"])
     _print_section("Collector Crash Report", report["collector_crash_report"])
     _print_section("Worker Status", report["worker_status"])
     _print_section("Recent Fatal Reports", report["recent_fatal_reports"])
