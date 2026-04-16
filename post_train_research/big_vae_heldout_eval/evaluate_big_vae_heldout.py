@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from common import (
     GroupedMetrics,
+    coverage_report,
     env_bool,
     env_int,
     env_path,
@@ -391,6 +392,12 @@ def _evaluate_dataset(
             record_fh.close()
 
     payload = grouped.payload()
+    payload["coverage"] = coverage_report(
+        observed_datasets=grouped.by_dataset.keys(),
+        observed_models=grouped.by_model.keys(),
+        observed_pairs=grouped.by_pair.keys(),
+        skipped=skipped,
+    )
     payload["run"] = {
         "records_seen": int(records_seen),
         "records_evaluated": int(records_evaluated),
@@ -473,13 +480,24 @@ def main() -> None:
     payload["offline_dataset"] = dataset.summary()
 
     write_json(output_dir / "metrics_summary.json", payload)
+    write_json(output_dir / "coverage.json", payload["coverage"])
     write_json(output_dir / "metrics_global.json", payload["global"])
     write_json(output_dir / "metrics_macro.json", payload["macro"])
     write_csv(output_dir / "metrics_by_model.csv", payload["by_model"])
     write_csv(output_dir / "metrics_by_dataset.csv", payload["by_dataset"])
     write_csv(output_dir / "metrics_by_dataset_model_pair.csv", payload["by_dataset_model_pair"])
     write_csv(output_dir / "metrics_by_layer.csv", payload["by_layer"])
-    LOGGER.info("Held-out eval complete: output_dir=%s global=%s macro=%s", output_dir, payload["global"], payload["macro"])
+    LOGGER.info(
+        "Held-out eval complete: output_dir=%s coverage_ok=%s global=%s macro=%s",
+        output_dir,
+        bool(payload["coverage"].get("ok", False)),
+        payload["global"],
+        payload["macro"],
+    )
+    if not bool(payload["coverage"].get("ok", False)):
+        LOGGER.error("Held-out coverage check failed: %s", payload["coverage"])
+        if env_bool("EVAL_REQUIRE_FULL_COVERAGE", env_int("EVAL_MAX_RECORDS", 0) <= 0):
+            raise RuntimeError(f"Held-out coverage check failed; see {output_dir / 'coverage.json'}")
 
 
 if __name__ == "__main__":
