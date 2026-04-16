@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
@@ -15,12 +16,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from common import (
     HELDOUT_DATASET_MODELS,
+    apply_heldout_log_dir,
     allowed_pairs,
     apply_builder_defaults_from_env,
     apply_heldout_data_profile,
     apply_offline_dataset_defaults,
     counter_to_rows,
     env_bool,
+    env_float,
     env_int,
     env_path,
     coverage_report,
@@ -44,14 +47,106 @@ from dataset.logging_utils import configure_process_logging
 LOGGER = logging.getLogger("build_big_vae_heldout_offline_dataset")
 
 
-def _dataset_iterator_with_collection(dataset: Any, collector: Any) -> Iterator[Any]:
-    dataset_iter = iter(dataset)
-    seen = 0
+def _compact_collector_snapshot(dataset: Any, collector: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if dataset is not None and hasattr(dataset, "debug_snapshot"):
+        try:
+            payload["dataset"] = dataset.debug_snapshot(preview=3)
+        except Exception as exc:
+            payload["dataset_error"] = repr(exc)
+    if collector is not None and hasattr(collector, "stats"):
+        try:
+            stats = collector.stats()
+            payload["collector"] = {
+                "mode": stats.get("mode"),
+                "streaming_mode": stats.get("streaming_mode"),
+                "async_process_alive": stats.get("async_process_alive"),
+                "cache_size": stats.get("cache_size"),
+                "jobs_total": stats.get("jobs_total"),
+                "items_emitted": stats.get("items_emitted"),
+                "jobs_by_model": stats.get("jobs_by_model"),
+                "sink": stats.get("sink"),
+                "scheduler": stats.get("scheduler"),
+            }
+        except Exception as exc:
+            payload["collector_error"] = repr(exc)
+    return payload
+
+
+def _format_missing_pairs(
+    pair_counts: Counter[tuple[str, str]],
+    expected_pairs: list[tuple[str, str]],
+    *,
+    records_per_pair: int,
+    limit: int = 12,
+) -> list[str]:
+    if records_per_pair <= 0:
+        return []
+    missing = [
+        (f"{dataset_name}::{model_name}", int(pair_counts.get((dataset_name, model_name), 0)))
+        for dataset_name, model_name in expected_pairs
+        if int(pair_counts.get((dataset_name, model_name), 0)) < records_per_pair
+    ]
+    missing.sort(key=lambda item: (item[1], item[0]))
+    return [f"{label}:{count}/{records_per_pair}" for label, count in missing[: max(1, int(limit))]]
+
+
+def _next_sample_with_collection(
+    dataset: Any,
+    collector: Any,
+    *,
+    seen_total: int,
+    logger: logging.Logger,
+    wait_context: Any,
+) -> Any:
+    if not hasattr(dataset, "try_next_sample"):
+        dataset_iter = iter(dataset)
+        if collector is not None and not bool(getattr(collector, "is_async_mode", False)):
+            dataset.maybe_collect(seen_total)
+        return next(dataset_iter)
+
+    timeout_s = max(0.0, env_float("HELDOUT_SAMPLE_WAIT_TIMEOUT_S", 1800.0))
+    status_every_s = max(0.0, env_float("HELDOUT_SAMPLE_WAIT_STATUS_EVERY_S", 60.0))
+    poll_s = max(0.1, env_float("HELDOUT_SAMPLE_WAIT_POLL_S", 1.0))
+    fail_on_timeout = env_bool("HELDOUT_FAIL_ON_SAMPLE_WAIT_TIMEOUT", True)
+    started = time.monotonic()
+    last_status = started
+
     while True:
         if collector is not None and not bool(getattr(collector, "is_async_mode", False)):
-            dataset.maybe_collect(seen)
-        yield next(dataset_iter)
-        seen += 1
+            dataset.maybe_collect(seen_total)
+
+        sample = dataset.try_next_sample()
+        if sample is not None:
+            return sample
+
+        if collector is not None and hasattr(collector, "assert_healthy"):
+            collector.assert_healthy()
+
+        now = time.monotonic()
+        waited_s = now - started
+        if status_every_s > 0.0 and now - last_status >= status_every_s:
+            logger.warning(
+                "Waiting for held-out sample: waited_s=%.1f context=%s runtime=%s",
+                waited_s,
+                wait_context() if callable(wait_context) else {},
+                _compact_collector_snapshot(dataset, collector),
+            )
+            last_status = now
+
+        if timeout_s > 0.0 and waited_s >= timeout_s:
+            message = (
+                "Timed out waiting for held-out sample "
+                f"(waited_s={waited_s:.1f}, timeout_s={timeout_s:.1f}, "
+                f"context={wait_context() if callable(wait_context) else {}}, "
+                f"runtime={_compact_collector_snapshot(dataset, collector)})"
+            )
+            if fail_on_timeout:
+                raise TimeoutError(message)
+            logger.warning("%s; stopping build because HELDOUT_FAIL_ON_SAMPLE_WAIT_TIMEOUT=false", message)
+            raise StopIteration
+
+        time.sleep(poll_s)
 
 
 def _should_accept_pair_in_size_mode(
@@ -70,7 +165,8 @@ def _should_accept_pair_in_size_mode(
 def _build_balanced_heldout_dataset(
     cfg: DictConfig,
     *,
-    dataset_iter: Iterator[Any],
+    dataset: Any,
+    collector: Any,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     offline_cfg = cfg.train.get("offline_dataset", {})
@@ -115,6 +211,23 @@ def _build_balanced_heldout_dataset(
             return False
         return all(int(pair_counts.get(pair, 0)) >= records_per_pair for pair in expected_pairs)
 
+    def wait_context() -> dict[str, Any]:
+        writer_stats = writer.stats()
+        return {
+            "seen_total": int(seen_total),
+            "accepted": int(writer_stats["accepted_records"]),
+            "size_gb": round(float(writer_stats["written_size_gb"]), 3),
+            "pair_min": min(int(pair_counts.get(pair, 0)) for pair in expected_pairs),
+            "pair_max": max(int(pair_counts.get(pair, 0)) for pair in expected_pairs),
+            "missing_pairs": _format_missing_pairs(
+                pair_counts,
+                expected_pairs,
+                records_per_pair=records_per_pair,
+            ),
+            "skipped_pair_cap": int(status_counts["skipped_pair_cap"]),
+            "skipped_unexpected_pair": int(status_counts["skipped_unexpected_pair"]),
+        }
+
     try:
         while True:
             if records_per_pair > 0 and pair_targets_reached():
@@ -128,7 +241,13 @@ def _build_balanced_heldout_dataset(
                 break
 
             try:
-                sample = next(dataset_iter)
+                sample = _next_sample_with_collection(
+                    dataset,
+                    collector,
+                    seen_total=seen_total,
+                    logger=logger,
+                    wait_context=wait_context,
+                )
             except StopIteration:
                 logger.warning("Held-out build dataset iterator exhausted")
                 break
@@ -163,12 +282,14 @@ def _build_balanced_heldout_dataset(
                 max_pair = max(int(pair_counts.get(pair, 0)) for pair in expected_pairs)
                 logger.info(
                     "Held-out build progress: seen_total=%s accepted=%s size_gb=%.2f "
-                    "pair_min=%s pair_max=%s skipped_pair_cap=%s skipped_balance=%s writer_skipped_invalid=%s",
+                    "pair_min=%s pair_max=%s missing_pairs=%s skipped_pair_cap=%s "
+                    "skipped_balance=%s writer_skipped_invalid=%s",
                     seen_total,
                     int(writer_stats["accepted_records"]),
                     float(writer_stats["written_size_gb"]),
                     min_pair,
                     max_pair,
+                    _format_missing_pairs(pair_counts, expected_pairs, records_per_pair=records_per_pair),
                     int(status_counts["skipped_pair_cap"]),
                     int(status_counts["skipped_balance_slack"]),
                     int(writer_stats["skipped_invalid"]),
@@ -223,6 +344,7 @@ def main() -> None:
         "HELDOUT_ROOT",
         "post_train_research/big_vae_heldout_eval/artifacts/offline_dataset",
     )
+    log_dir = apply_heldout_log_dir(cfg, root_dir=root_dir)
     apply_heldout_data_profile(cfg)
     apply_offline_dataset_defaults(cfg, root_dir=root_dir)
     apply_builder_defaults_from_env(cfg, root_dir=root_dir)
@@ -230,6 +352,7 @@ def main() -> None:
     log_path = configure_process_logging(cfg=cfg, role="build_big_vae_heldout_offline_dataset", rank=0, force=True)
     logger = LOGGER
     logger.info("Run log file: %s", log_path)
+    logger.info("Held-out log dir: %s", log_dir)
     logger.info("Starting held-out BigVAE offline dataset build")
     logger.info("Held-out pairs: %s", {key: list(value) for key, value in HELDOUT_DATASET_MODELS.items()})
     logger.info("Effective offline root: %s", root_dir)
@@ -238,7 +361,8 @@ def main() -> None:
     with data_pipeline(cfg, logger=logger, emit_run_report=True, rank=0) as (dataset, collector):
         summary = _build_balanced_heldout_dataset(
             cfg,
-            dataset_iter=_dataset_iterator_with_collection(dataset, collector),
+            dataset=dataset,
+            collector=collector,
             logger=logger,
         )
 
