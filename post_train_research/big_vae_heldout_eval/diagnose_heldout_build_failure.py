@@ -23,6 +23,20 @@ WAIT_RE = re.compile(r"Waiting for held-out sample: waited_s=(?P<waited>[0-9.]+)
 MODEL_FAILURE_RE = re.compile(
     r"Disabling collector model after runtime failure: model=(?P<model>\S+) error=(?P<error>.*)"
 )
+ERROR_MARKERS = (
+    "Disabling collector model",
+    "Collector model remains disabled",
+    "Collector job failed",
+    "collector job failed",
+    "failed model",
+    "model failed",
+    "Traceback",
+    "RuntimeError",
+    "Exception",
+    "ERROR",
+    "CUDA",
+    "out of memory",
+)
 HELDOUT_EXPECTED_MODELS = {
     "clip_vit_l14",
     "detr_resnet50",
@@ -33,6 +47,32 @@ HELDOUT_EXPECTED_MODELS = {
     "vit_base_p16_224",
     "vit_large_p16_224",
 }
+
+
+def _line_contains_error_marker(line: str) -> bool:
+    lowered = line.lower()
+    return any(marker in line or marker.lower() in lowered for marker in ERROR_MARKERS)
+
+
+def _models_in_text(text: str) -> list[str]:
+    return sorted(model for model in HELDOUT_EXPECTED_MODELS if model in text)
+
+
+def _make_log_snippet(
+    lines: list[str],
+    *,
+    idx: int,
+    snippet_lines: int,
+) -> dict[str, Any]:
+    start = max(0, int(idx) - 3)
+    stop = min(len(lines), int(idx) + max(1, int(snippet_lines)))
+    snippet = lines[start:stop]
+    return {
+        "line_number": int(start + 1),
+        "header": lines[int(idx)] if 0 <= int(idx) < len(lines) else "",
+        "models": _models_in_text("\n".join(snippet)),
+        "snippet": snippet,
+    }
 HELDOUT_EXPECTED_DATASETS = {
     "bigearthnet",
     "chexpert",
@@ -249,7 +289,13 @@ def _collect_load_reports(report_dirs: list[Path], limit_events: int = 80) -> di
     }
 
 
-def _collect_process_logs(log_dirs: list[Path], limit_files: int = 16, tail_lines: int = 160) -> dict[str, Any]:
+def _collect_process_logs(
+    log_dirs: list[Path],
+    limit_files: int = 16,
+    tail_lines: int = 160,
+    snippet_lines: int = 40,
+    max_snippets: int = 32,
+) -> dict[str, Any]:
     patterns = [
         "collector_process*.log",
         "*collector_process*.stdout.log",
@@ -291,11 +337,37 @@ def _collect_process_logs(log_dirs: list[Path], limit_files: int = 16, tail_line
                 or "rvl_cdip" in line
             )
         ]
+        model_mention_counts = Counter(
+            model for line in lines for model in HELDOUT_EXPECTED_MODELS if model in line
+        )
+        error_snippets: list[dict[str, Any]] = []
+        model_failure_snippets: list[dict[str, Any]] = []
+        seen_snippets: set[tuple[int, str]] = set()
+        for idx, line in enumerate(lines):
+            if not _line_contains_error_marker(line):
+                continue
+            snippet_payload = _make_log_snippet(lines, idx=idx, snippet_lines=snippet_lines)
+            error_snippets.append(snippet_payload)
+            if len(error_snippets) > max(1, int(max_snippets)):
+                error_snippets = error_snippets[-max(1, int(max_snippets)) :]
+            models = list(snippet_payload.get("models", []))
+            if not models and "Disabling collector model after runtime failure" not in line:
+                continue
+            key = (int(snippet_payload.get("line_number", 0)), line)
+            if key in seen_snippets:
+                continue
+            seen_snippets.add(key)
+            model_failure_snippets.append(snippet_payload)
+            if len(model_failure_snippets) >= max(1, int(max_snippets)):
+                break
         files.append(
             {
                 "path": str(path),
                 "mtime": path.stat().st_mtime,
                 "line_count": len(lines),
+                "model_mention_counts": {str(key): int(value) for key, value in sorted(model_mention_counts.items())},
+                "error_snippets": error_snippets,
+                "model_failure_snippets": model_failure_snippets,
                 "interesting_tail": interesting[-max(1, int(tail_lines)) :],
                 "tail": lines[-min(len(lines), max(1, int(tail_lines))) :],
             }
@@ -430,6 +502,35 @@ def _extract_model_failures_from_process_logs(process_logs: dict[str, Any]) -> d
         if not isinstance(file_payload, dict):
             continue
         path = str(file_payload.get("path", ""))
+        for snippet_payload in file_payload.get("model_failure_snippets", []) or []:
+            if not isinstance(snippet_payload, dict):
+                continue
+            header = str(snippet_payload.get("header", ""))
+            lines = snippet_payload.get("snippet", [])
+            snippet_text = "\n".join(str(line) for line in lines) if isinstance(lines, list) else ""
+            match = MODEL_FAILURE_RE.search(header)
+            models = []
+            if match is not None:
+                model = str(match.group("model")).strip()
+                if model:
+                    models.append(model)
+            explicit_models = snippet_payload.get("models", [])
+            if isinstance(explicit_models, list):
+                models.extend(str(model) for model in explicit_models if str(model))
+            if not models:
+                models.extend(_models_in_text(header + "\n" + snippet_text))
+            for model in sorted(set(models)):
+                out.setdefault(model, []).append(f"{path}:{snippet_payload.get('line_number')}: " + snippet_text)
+        for snippet_payload in file_payload.get("error_snippets", []) or []:
+            if not isinstance(snippet_payload, dict):
+                continue
+            explicit_models = snippet_payload.get("models", [])
+            if not isinstance(explicit_models, list) or not explicit_models:
+                continue
+            lines = snippet_payload.get("snippet", [])
+            snippet_text = "\n".join(str(line) for line in lines) if isinstance(lines, list) else ""
+            for model in sorted(set(str(model) for model in explicit_models if str(model))):
+                out.setdefault(model, []).append(f"{path}:{snippet_payload.get('line_number')}: " + snippet_text)
         for line in file_payload.get("interesting_tail", []) or []:
             if not isinstance(line, str):
                 continue
@@ -440,6 +541,29 @@ def _extract_model_failures_from_process_logs(process_logs: dict[str, Any]) -> d
             if model:
                 out.setdefault(model, []).append(f"{path}: {line}")
     return out
+
+
+def _extract_general_error_snippets(process_logs: dict[str, Any], limit: int = 16) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not isinstance(process_logs, dict):
+        return out
+    for file_payload in process_logs.get("files", []) or []:
+        if not isinstance(file_payload, dict):
+            continue
+        path = str(file_payload.get("path", ""))
+        for snippet_payload in file_payload.get("error_snippets", []) or []:
+            if not isinstance(snippet_payload, dict):
+                continue
+            out.append(
+                {
+                    "path": path,
+                    "line_number": snippet_payload.get("line_number"),
+                    "header": snippet_payload.get("header"),
+                    "models": snippet_payload.get("models", []),
+                    "snippet": snippet_payload.get("snippet", []),
+                }
+            )
+    return out[-max(1, int(limit)) :]
 
 
 def _extract_dataset_mentions_from_process_logs(process_logs: dict[str, Any]) -> dict[str, list[str]]:
@@ -528,9 +652,11 @@ def _build_failure_attribution(report: dict[str, Any]) -> dict[str, Any]:
     return {
         "models": models,
         "datasets": datasets,
+        "process_log_errors": _extract_general_error_snippets(process_logs),
         "note": (
             "If a failed model only appears by name without an error payload, the old run did not persist "
-            "the traceback; check load_report/events or main log around 'Disabling collector model'."
+            "the traceback. process_log_errors is the bounded proof set from saved collector/dataset logs; "
+            "if it has no model failure traceback, the traceback is absent from the copied artifacts."
         ),
     }
 
