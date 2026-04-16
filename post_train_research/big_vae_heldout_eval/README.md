@@ -40,6 +40,7 @@ Main outputs:
 
 ```text
 metrics_summary.json
+coverage.json
 metrics_global.json
 metrics_macro.json
 metrics_by_model.csv
@@ -50,3 +51,34 @@ record_metrics.csv
 ```
 
 `metrics_summary.json` contains micro-global metrics plus macro averages over models, datasets, and dataset/model pairs. `record_metrics.csv` is intentionally verbose for outlier debugging.
+
+Coverage checks:
+
+```bash
+cat "$HELDOUT_ROOT/eval/<checkpoint_dir>_<checkpoint_name>/coverage.json"
+```
+
+`coverage.ok=true` means all expected held-out datasets, models, and dataset/model pairs produced finite metrics and no eval samples were skipped. By default `run_evaluate_big_vae_heldout.sh` sets `EVAL_REQUIRE_FULL_COVERAGE=true`, so the eval process exits non-zero if coverage fails. For smoke runs with `EVAL_MAX_RECORDS>0`, set `EVAL_REQUIRE_FULL_COVERAGE=false`.
+
+Post-facto coverage check for runs started before `coverage.json` existed:
+
+```bash
+python post_train_research/big_vae_heldout_eval/check_heldout_coverage.py \
+  --heldout-root "$HELDOUT_ROOT" \
+  --latest-eval
+```
+
+Or point at a concrete eval output directory:
+
+```bash
+python post_train_research/big_vae_heldout_eval/check_heldout_coverage.py \
+  --eval-dir "$HELDOUT_ROOT/eval/<checkpoint_dir>_<checkpoint_name>"
+```
+
+Build dataset coverage can be checked from the already written build summary:
+
+```bash
+python post_train_research/big_vae_heldout_eval/check_heldout_coverage.py \
+  --heldout-root "$HELDOUT_ROOT" \
+  --build
+```

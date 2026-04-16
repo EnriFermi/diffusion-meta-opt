@@ -199,6 +199,67 @@ def allowed_pairs() -> set[tuple[str, str]]:
     }
 
 
+def expected_datasets() -> set[str]:
+    return set(HELDOUT_DATASET_MODELS.keys())
+
+
+def expected_models() -> set[str]:
+    return {model_name for model_names in HELDOUT_DATASET_MODELS.values() for model_name in model_names}
+
+
+def pair_label(dataset_name: str, model_name: str) -> str:
+    return f"{dataset_name}::{model_name}"
+
+
+def coverage_report(
+    *,
+    observed_datasets: Iterable[str],
+    observed_models: Iterable[str],
+    observed_pairs: Iterable[tuple[str, str]],
+    skipped: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    expected_dataset_set = expected_datasets()
+    expected_model_set = expected_models()
+    expected_pair_set = allowed_pairs()
+
+    observed_dataset_set = {str(item) for item in observed_datasets if str(item)}
+    observed_model_set = {str(item) for item in observed_models if str(item)}
+    observed_pair_set = {(str(dataset), str(model)) for dataset, model in observed_pairs}
+
+    missing_datasets = sorted(expected_dataset_set - observed_dataset_set)
+    missing_models = sorted(expected_model_set - observed_model_set)
+    missing_pairs = sorted(expected_pair_set - observed_pair_set)
+    unexpected_datasets = sorted(observed_dataset_set - expected_dataset_set)
+    unexpected_models = sorted(observed_model_set - expected_model_set)
+    unexpected_pairs = sorted(observed_pair_set - expected_pair_set)
+    skipped_counts = {str(key): int(value) for key, value in dict(skipped or {}).items()}
+    skipped_total = int(sum(max(0, value) for value in skipped_counts.values()))
+
+    return {
+        "ok": not missing_datasets
+        and not missing_models
+        and not missing_pairs
+        and not unexpected_datasets
+        and not unexpected_models
+        and not unexpected_pairs
+        and skipped_total == 0,
+        "expected_dataset_count": int(len(expected_dataset_set)),
+        "observed_dataset_count": int(len(observed_dataset_set & expected_dataset_set)),
+        "missing_datasets": missing_datasets,
+        "unexpected_datasets": unexpected_datasets,
+        "expected_model_count": int(len(expected_model_set)),
+        "observed_model_count": int(len(observed_model_set & expected_model_set)),
+        "missing_models": missing_models,
+        "unexpected_models": unexpected_models,
+        "expected_pair_count": int(len(expected_pair_set)),
+        "observed_pair_count": int(len(observed_pair_set & expected_pair_set)),
+        "missing_pairs": [pair_label(dataset, model) for dataset, model in missing_pairs],
+        "unexpected_pairs": [pair_label(dataset, model) for dataset, model in unexpected_pairs],
+        "skipped": skipped_counts,
+        "skipped_total": skipped_total,
+    }
+
+
 def tensor_to_float(value: torch.Tensor | float | int) -> float:
     if torch.is_tensor(value):
         return float(value.detach().float().cpu().item())

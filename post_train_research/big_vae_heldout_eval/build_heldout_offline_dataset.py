@@ -23,6 +23,7 @@ from common import (
     env_bool,
     env_int,
     env_path,
+    coverage_report,
     primary_dataset_name,
     promote_run_profile_to_root,
     resolved_cfg_snapshot,
@@ -189,6 +190,16 @@ def _build_balanced_heldout_dataset(
         "dataset_counts": {str(key): int(value) for key, value in sorted(dataset_counts.items())},
         "model_counts": {str(key): int(value) for key, value in sorted(model_counts.items())},
     }
+    summary["coverage"] = coverage_report(
+        observed_datasets=dataset_counts.keys(),
+        observed_models=model_counts.keys(),
+        observed_pairs=pair_counts.keys(),
+        skipped={
+            "unexpected_pair": int(status_counts["skipped_unexpected_pair"]),
+            "writer_invalid": int(manifest.get("skipped_invalid", 0)) if isinstance(manifest, dict) else 0,
+            "writer_incompatible": int(manifest.get("skipped_incompatible", 0)) if isinstance(manifest, dict) else 0,
+        },
+    )
 
     analysis_dir = root_dir / "heldout_build_analysis"
     write_json(analysis_dir / "summary.json", summary)
