@@ -590,6 +590,7 @@ class CollectorService:
         cfg: DictConfig | dict[str, Any],
         cache: SharedSampleCache | None = None,
         status_queue: Any | None = None,
+        control_queue: Any | None = None,
     ) -> None:
         self.cfg = cfg
         self.cfg_dict = to_plain_dict(cfg)
@@ -728,12 +729,15 @@ class CollectorService:
         self._stop_event: Any | None = None
         self._process: mp.Process | None = None
         self._status_queue: Any | None = status_queue
+        self._control_queue: Any | None = control_queue
         self._last_status_emit_ts = 0.0
         self._async_last_status: dict[str, Any] | None = None
         self._async_last_atomizer_event: dict[str, Any] | None = None
         self._async_recent_jobs: deque[dict[str, Any]] = deque(maxlen=128)
         self._async_events_dropped = 0
         self._cgroup_events_baseline = _read_cgroup_memory_events()
+        self._active_pairs_lock = threading.Lock()
+        self._active_pairs: set[tuple[str, str]] | None = None
 
     @property
     def is_async_mode(self) -> bool:
@@ -948,6 +952,20 @@ class CollectorService:
 
         self._ensure_runtime_ready()
 
+    def set_active_pairs(self, pairs: list[tuple[str, str]] | set[tuple[str, str]] | tuple[tuple[str, str], ...] | None) -> None:
+        normalized = self._normalize_active_pairs(pairs)
+        self._apply_active_pairs(normalized)
+        if not self.is_async_mode or self._process is None or self._control_queue is None:
+            return
+        if not self._process.is_alive():
+            return
+        try:
+            self._control_queue.put({"type": "set_active_pairs", "pairs": normalized}, timeout=2.0)
+        except Full:
+            self.logger.warning("Could not update async collector active pairs: control queue is full")
+        except Exception as exc:
+            self.logger.warning("Could not update async collector active pairs: %s", exc)
+
     def shutdown(self) -> None:
         if self._process is not None:
             forced_terminate = False
@@ -992,6 +1010,12 @@ class CollectorService:
             except Exception:
                 pass
             self._status_queue = None
+        if self._control_queue is not None:
+            try:
+                self._control_queue.close()
+            except Exception:
+                pass
+            self._control_queue = None
 
         self._shutdown_runtime_components()
 
@@ -1008,6 +1032,11 @@ class CollectorService:
             in_flight: set[Future[CollectorJobStats]] = set()
             future_to_prepared: dict[Future[CollectorJobStats], _PreparedCollectorJob] = {}
             while not active_stop_event.is_set():
+                self._drain_control_queue()
+                if self._has_no_active_pairs():
+                    time.sleep(0.05)
+                    self._maybe_emit_status_event(event_type="heartbeat")
+                    continue
                 self._ensure_prepared_job_producer_alive()
                 submitted = False
                 while (
@@ -1062,9 +1091,17 @@ class CollectorService:
             return
 
         while not active_stop_event.is_set():
+            self._drain_control_queue()
+            if self._has_no_active_pairs():
+                time.sleep(0.05)
+                self._maybe_emit_status_event(event_type="heartbeat")
+                continue
             if self._sink.needs_fill():
                 for _ in range(self.num_inflight_jobs):
                     if active_stop_event.is_set():
+                        break
+                    self._drain_control_queue()
+                    if self._has_no_active_pairs():
                         break
                     if not self._sink.needs_fill():
                         break
@@ -1102,6 +1139,7 @@ class CollectorService:
 
     def collect_one_job(self) -> CollectorJobStats:
         self._ensure_runtime_ready()
+        self._drain_control_queue()
 
         assert self._scheduler is not None
         assert self._raw_pool is not None
@@ -1154,12 +1192,23 @@ class CollectorService:
                 duration_s=0.0,
                 **_memory_payload_after(),
             )
+        if self._has_no_active_pairs():
+            return CollectorJobStats(
+                model_name="none",
+                num_images=0,
+                num_layers=0,
+                num_samples_emitted=0,
+                dataset_mix={},
+                duration_s=0.0,
+                **_memory_payload_after(),
+            )
 
         started = time.time()
 
         model_name = self._select_next_model_name()
         model_cfg = self.compat_index.get_model_cfg(model_name)
         batch_size = max(1, int(model_cfg.get("batch_size", 1)))
+        allowed_dataset_names = self._active_dataset_names_for_model(model_name)
 
         raw_batch_fetch_started = time.time()
         image_refs, image_meta = self._raw_pool.sample_mixed_batch_refs(
@@ -1167,6 +1216,7 @@ class CollectorService:
             batch_size=batch_size,
             dataset_sampling_strategy=self.dataset_sampling_strategy,
             max_dataset_fraction_per_batch=self.max_dataset_fraction_per_batch,
+            allowed_dataset_names=allowed_dataset_names,
         )
         raw_batch_fetch_s = time.time() - raw_batch_fetch_started
 
@@ -1298,6 +1348,15 @@ class CollectorService:
             "worker_status_enabled": bool(self.worker_status_enabled),
             "worker_status_dir": str(self.worker_status_dir),
         }
+        with self._stats_lock:
+            payload["failed_models"] = sorted(self._failed_models)
+        active_pairs = self._active_pairs_snapshot()
+        payload["active_pair_count"] = None if active_pairs is None else int(len(active_pairs))
+        payload["active_pairs"] = (
+            None
+            if active_pairs is None
+            else [f"{dataset_name}::{model_name}" for dataset_name, model_name in sorted(active_pairs)]
+        )
 
         if self.is_async_mode:
             payload["async_process_alive"] = bool(self._process is not None and self._process.is_alive())
@@ -1320,6 +1379,12 @@ class CollectorService:
                     payload["scheduler"] = self._async_last_status.get("scheduler")
                 if payload["sink"] is None:
                     payload["sink"] = self._async_last_status.get("sink")
+                payload["failed_models"] = self._async_last_status.get("failed_models", payload["failed_models"])
+                payload["active_pair_count"] = self._async_last_status.get(
+                    "active_pair_count",
+                    payload["active_pair_count"],
+                )
+                payload["active_pairs"] = self._async_last_status.get("active_pairs", payload["active_pairs"])
 
         return payload
 
@@ -1535,6 +1600,75 @@ class CollectorService:
                 exc,
             )
 
+    @staticmethod
+    def _normalize_active_pairs(
+        pairs: list[tuple[str, str]] | set[tuple[str, str]] | tuple[tuple[str, str], ...] | None,
+    ) -> list[tuple[str, str]] | None:
+        if pairs is None:
+            return None
+        normalized: set[tuple[str, str]] = set()
+        for item in pairs:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            dataset_name = str(item[0]).strip()
+            model_name = str(item[1]).strip()
+            if dataset_name and model_name:
+                normalized.add((dataset_name, model_name))
+        return sorted(normalized)
+
+    def _apply_active_pairs(self, pairs: list[tuple[str, str]] | None) -> None:
+        active_pairs = None if pairs is None else set(pairs)
+        with self._active_pairs_lock:
+            self._active_pairs = active_pairs
+
+    def _drain_control_queue(self) -> None:
+        if self._control_queue is None:
+            return
+        while True:
+            try:
+                payload = self._control_queue.get_nowait()
+            except Empty:
+                return
+            except Exception:
+                return
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") == "set_active_pairs":
+                self._apply_active_pairs(self._normalize_active_pairs(payload.get("pairs")))
+
+    def _active_pairs_snapshot(self) -> set[tuple[str, str]] | None:
+        with self._active_pairs_lock:
+            return None if self._active_pairs is None else set(self._active_pairs)
+
+    def _has_no_active_pairs(self) -> bool:
+        active_pairs = self._active_pairs_snapshot()
+        return active_pairs is not None and not active_pairs
+
+    def _active_dataset_names_for_model(self, model_name: str) -> set[str] | None:
+        active_pairs = self._active_pairs_snapshot()
+        if active_pairs is None:
+            return None
+        model_key = str(model_name)
+        configured = set(self.compat_index.get_datasets_for_model(model_key))
+        return {
+            dataset_name
+            for dataset_name, pair_model_name in active_pairs
+            if pair_model_name == model_key and dataset_name in configured
+            and (self._raw_pool is None or not self._raw_pool._is_dataset_disabled(dataset_name))
+        }
+
+    def _model_has_active_pair(self, model_name: str) -> bool:
+        active_pairs = self._active_pairs_snapshot()
+        if active_pairs is None:
+            return True
+        model_key = str(model_name)
+        configured = set(self.compat_index.get_datasets_for_model(model_key))
+        return any(
+            pair_model_name == model_key and dataset_name in configured
+            and (self._raw_pool is None or not self._raw_pool._is_dataset_disabled(dataset_name))
+            for dataset_name, pair_model_name in active_pairs
+        )
+
     def _is_model_failed(self, model_name: str) -> bool:
         with self._stats_lock:
             return str(model_name) in self._failed_models
@@ -1643,10 +1777,12 @@ class CollectorService:
         cache_arg = self.cache if self.streaming_mode == "none" else None
         if self._status_queue is None:
             self._status_queue = self._ctx.Queue(maxsize=self.status_queue_max_items)
+        if self._control_queue is None:
+            self._control_queue = self._ctx.Queue(maxsize=1024)
 
         self._process = self._ctx.Process(
             target=collector_process_main,
-            args=(cfg_dict, cache_arg, self._stop_event, self._status_queue),
+            args=(cfg_dict, cache_arg, self._stop_event, self._status_queue, self._control_queue),
             daemon=False,  # must be False: collector spawns dataset workers (daemon cannot have children)
             name="collector_service",
         )
@@ -1729,16 +1865,22 @@ class CollectorService:
         assert self._scheduler is not None
         assert self._raw_pool is not None
 
+        self._drain_control_queue()
+        if self._has_no_active_pairs():
+            return None
+
         started = time.time()
         model_name = self._select_next_model_name()
         model_cfg = self.compat_index.get_model_cfg(model_name)
         batch_size = max(1, int(model_cfg.get("batch_size", 1)))
+        allowed_dataset_names = self._active_dataset_names_for_model(model_name)
 
         image_refs, image_meta = self._raw_pool.sample_mixed_batch_refs(
             model_name=model_name,
             batch_size=batch_size,
             dataset_sampling_strategy=self.dataset_sampling_strategy,
             max_dataset_fraction_per_batch=self.max_dataset_fraction_per_batch,
+            allowed_dataset_names=allowed_dataset_names,
         )
         raw_batch_fetch_s = time.time() - started
         if not image_refs:
@@ -1848,22 +1990,23 @@ class CollectorService:
             raise RuntimeError("collector has no compatible models to schedule")
         with self._stats_lock:
             failed_models = set(self._failed_models)
-        if len(failed_models) >= len(all_models):
+        eligible_models = [
+            model_name
+            for model_name in all_models
+            if model_name not in failed_models and self._model_has_active_pair(model_name)
+        ]
+        if not eligible_models and failed_models:
             raise RuntimeError(
-                "collector exhausted all compatible models after runtime failures: "
-                f"{sorted(failed_models)}"
+                "collector has no active held-out models left after runtime failures: "
+                f"failed_models={sorted(failed_models)}"
             )
+        if not eligible_models:
+            raise RuntimeError("collector has no active held-out models to schedule")
         for _ in range(len(all_models) * 2):
             model_name = self._scheduler.next_model()
-            if model_name not in failed_models:
+            if model_name in eligible_models:
                 return model_name
-        for model_name in all_models:
-            if model_name not in failed_models:
-                return model_name
-        raise RuntimeError(
-            "collector failed to select an active model after runtime failures: "
-            f"{sorted(failed_models)}"
-        )
+        return eligible_models[0]
 
     def _mark_model_failed(self, model_name: str | None, exc: BaseException) -> None:
         if model_name is None:
@@ -1910,6 +2053,7 @@ class CollectorService:
             items_emitted = int(self._items_emitted)
             failed_models = sorted(self._failed_models)
             failed_model_errors = dict(self._failed_model_errors)
+        active_pairs = self._active_pairs_snapshot()
         payload: dict[str, Any] = {
             "type": str(event_type),
             "timestamp": float(time.time()),
@@ -1929,6 +2073,12 @@ class CollectorService:
             "items_emitted": items_emitted,
             "failed_models": failed_models,
             "failed_model_errors": failed_model_errors,
+            "active_pair_count": None if active_pairs is None else int(len(active_pairs)),
+            "active_pairs": (
+                None
+                if active_pairs is None
+                else [f"{dataset_name}::{model_name}" for dataset_name, model_name in sorted(active_pairs)]
+            ),
             "scheduler": self._scheduler.stats() if self._scheduler else None,
             "sink": self._sink.stats() if self._sink else None,
             "events_dropped": int(self._async_events_dropped),
@@ -2097,6 +2247,7 @@ def collector_process_main(
     cache: SharedSampleCache | None,
     stop_event: Any,
     status_queue: Any | None = None,
+    control_queue: Any | None = None,
 ) -> None:
     forensics_cfg_dict = dict(cfg_dict)
     if "train" not in forensics_cfg_dict and isinstance(forensics_cfg_dict.get("mini_train"), dict):
@@ -2117,7 +2268,7 @@ def collector_process_main(
         if fault_path is not None:
             logger.info("Collector fault log file: %s", fault_path)
 
-        service = CollectorService(cfg=cfg_dict, cache=cache, status_queue=status_queue)
+        service = CollectorService(cfg=cfg_dict, cache=cache, status_queue=status_queue, control_queue=control_queue)
         try:
             service.run_forever(stop_event=stop_event)
         except KeyboardInterrupt:

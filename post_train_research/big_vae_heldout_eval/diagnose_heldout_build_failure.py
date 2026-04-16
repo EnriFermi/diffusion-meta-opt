@@ -360,12 +360,26 @@ def _collect_process_logs(
             model_failure_snippets.append(snippet_payload)
             if len(model_failure_snippets) >= max(1, int(max_snippets)):
                 break
+        exact_failure_lines: list[dict[str, Any]] = []
+        for idx, line in enumerate(lines):
+            match = MODEL_FAILURE_RE.search(line)
+            if match is None:
+                continue
+            exact_failure_lines.append(
+                {
+                    "line_number": int(idx + 1),
+                    "model": str(match.group("model")).strip(),
+                    "error": str(match.group("error")).strip(),
+                    "line": line,
+                }
+            )
         files.append(
             {
                 "path": str(path),
                 "mtime": path.stat().st_mtime,
                 "line_count": len(lines),
                 "model_mention_counts": {str(key): int(value) for key, value in sorted(model_mention_counts.items())},
+                "exact_model_failure_lines": exact_failure_lines,
                 "error_snippets": error_snippets,
                 "model_failure_snippets": model_failure_snippets,
                 "interesting_tail": interesting[-max(1, int(tail_lines)) :],
@@ -502,6 +516,13 @@ def _extract_model_failures_from_process_logs(process_logs: dict[str, Any]) -> d
         if not isinstance(file_payload, dict):
             continue
         path = str(file_payload.get("path", ""))
+        for payload in file_payload.get("exact_model_failure_lines", []) or []:
+            if not isinstance(payload, dict):
+                continue
+            model = str(payload.get("model", "")).strip()
+            if not model:
+                continue
+            out.setdefault(model, []).append(f"{path}:{payload.get('line_number')}: {payload.get('line')}")
         for snippet_payload in file_payload.get("model_failure_snippets", []) or []:
             if not isinstance(snippet_payload, dict):
                 continue
@@ -509,28 +530,12 @@ def _extract_model_failures_from_process_logs(process_logs: dict[str, Any]) -> d
             lines = snippet_payload.get("snippet", [])
             snippet_text = "\n".join(str(line) for line in lines) if isinstance(lines, list) else ""
             match = MODEL_FAILURE_RE.search(header)
-            models = []
-            if match is not None:
-                model = str(match.group("model")).strip()
-                if model:
-                    models.append(model)
-            explicit_models = snippet_payload.get("models", [])
-            if isinstance(explicit_models, list):
-                models.extend(str(model) for model in explicit_models if str(model))
-            if not models:
-                models.extend(_models_in_text(header + "\n" + snippet_text))
-            for model in sorted(set(models)):
-                out.setdefault(model, []).append(f"{path}:{snippet_payload.get('line_number')}: " + snippet_text)
-        for snippet_payload in file_payload.get("error_snippets", []) or []:
-            if not isinstance(snippet_payload, dict):
+            if match is None:
                 continue
-            explicit_models = snippet_payload.get("models", [])
-            if not isinstance(explicit_models, list) or not explicit_models:
+            model = str(match.group("model")).strip()
+            if not model:
                 continue
-            lines = snippet_payload.get("snippet", [])
-            snippet_text = "\n".join(str(line) for line in lines) if isinstance(lines, list) else ""
-            for model in sorted(set(str(model) for model in explicit_models if str(model))):
-                out.setdefault(model, []).append(f"{path}:{snippet_payload.get('line_number')}: " + snippet_text)
+            out.setdefault(model, []).append(f"{path}:{snippet_payload.get('line_number')}: " + snippet_text)
         for line in file_payload.get("interesting_tail", []) or []:
             if not isinstance(line, str):
                 continue
