@@ -722,6 +722,7 @@ class CollectorService:
         self._jobs_by_model: Counter[str] = Counter()
         self._items_emitted = 0
         self._failed_models: set[str] = set()
+        self._failed_model_errors: dict[str, dict[str, str]] = {}
 
         self._ctx = mp.get_context("spawn")
         self._stop_event: Any | None = None
@@ -876,6 +877,7 @@ class CollectorService:
             "async_events_dropped": int(self._async_events_dropped),
             "async_recent_jobs": list(self._async_recent_jobs),
             "async_last_status": self._async_last_status,
+            "failed_model_errors": dict(self._failed_model_errors),
             "worker_status_enabled": bool(self.worker_status_enabled),
             "worker_status_dir": str(self.worker_status_dir),
             "host_snapshot": _collect_process_resource_snapshot(
@@ -1867,9 +1869,15 @@ class CollectorService:
         if model_name is None:
             self.logger.exception("Collector job failed for unknown model", exc_info=exc)
             return
+        error_payload = {
+            "error": str(exc),
+            "type": type(exc).__name__,
+            "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+        }
         with self._stats_lock:
             first_failure = model_name not in self._failed_models
             self._failed_models.add(model_name)
+            self._failed_model_errors[str(model_name)] = error_payload
         self._purge_failed_model_from_pools(model_name)
         if first_failure:
             self.logger.exception(
@@ -1901,6 +1909,7 @@ class CollectorService:
             jobs_by_model = {name: int(value) for name, value in self._jobs_by_model.items()}
             items_emitted = int(self._items_emitted)
             failed_models = sorted(self._failed_models)
+            failed_model_errors = dict(self._failed_model_errors)
         payload: dict[str, Any] = {
             "type": str(event_type),
             "timestamp": float(time.time()),
@@ -1919,6 +1928,7 @@ class CollectorService:
             "jobs_by_model": jobs_by_model,
             "items_emitted": items_emitted,
             "failed_models": failed_models,
+            "failed_model_errors": failed_model_errors,
             "scheduler": self._scheduler.stats() if self._scheduler else None,
             "sink": self._sink.stats() if self._sink else None,
             "events_dropped": int(self._async_events_dropped),

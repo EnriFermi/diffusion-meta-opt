@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from common import (
     GroupedMetrics,
+    apply_heldout_log_dir,
     coverage_report,
     env_bool,
     env_int,
@@ -437,6 +438,7 @@ def main() -> None:
         "HELDOUT_ROOT",
         "post_train_research/big_vae_heldout_eval/artifacts/offline_dataset",
     )
+    log_dir = apply_heldout_log_dir(cfg, root_dir=offline_root)
     if not (offline_root / "manifest.json").exists():
         raise FileNotFoundError(f"Held-out offline dataset manifest not found: {offline_root / 'manifest.json'}")
 
@@ -446,6 +448,7 @@ def main() -> None:
 
     log_path = configure_process_logging(cfg=cfg, role="evaluate_big_vae_heldout", rank=0, force=True)
     LOGGER.info("Run log file: %s", log_path)
+    LOGGER.info("Held-out log dir: %s", log_dir)
     LOGGER.info("Loading BigVAE checkpoint: %s", checkpoint_path)
     device = _resolve_eval_device(cfg)
     model, ckpt_cfg, ckpt_payload = _load_checkpoint_model(checkpoint_path, device)

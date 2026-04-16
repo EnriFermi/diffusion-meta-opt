@@ -112,6 +112,19 @@ def sanitize_programmatic_hydra_logging(cfg: DictConfig, *, role: str) -> None:
         cfg.logging.file_path = str(Path(log_dir) / file_name)
 
 
+def apply_heldout_log_dir(cfg: DictConfig, *, root_dir: str | Path) -> Path:
+    default_log_dir = Path(root_dir).expanduser().parent / "logs"
+    log_dir = env_path("HELDOUT_LOG_DIR", default_log_dir)
+    with open_dict(cfg):
+        if "training_artifacts" not in cfg or cfg.training_artifacts is None:
+            cfg.training_artifacts = {}
+        if "logging" not in cfg or cfg.logging is None:
+            cfg.logging = {}
+        cfg.training_artifacts.logs_dir = str(log_dir)
+        cfg.logging.dir = str(log_dir)
+    return log_dir
+
+
 def apply_heldout_data_profile(cfg: DictConfig) -> None:
     with open_dict(cfg):
         cfg.data.enabled_datasets = list(HELDOUT_DATASET_MODELS.keys())

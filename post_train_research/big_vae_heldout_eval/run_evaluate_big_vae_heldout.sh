@@ -14,6 +14,7 @@ fi
 : "${BIG_VAE_CHECKPOINT:?Set BIG_VAE_CHECKPOINT=/path/to/stage_N/latest.pt or step_XXXXXXX.pt}"
 
 export HELDOUT_ROOT="${HELDOUT_ROOT:-$PROJECT_ROOT/post_train_research/big_vae_heldout_eval/artifacts/offline_dataset}"
+export HELDOUT_LOG_DIR="${HELDOUT_LOG_DIR:-$PROJECT_ROOT/post_train_research/big_vae_heldout_eval/artifacts/logs}"
 export EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-256}"
 export EVAL_MAX_RECORDS="${EVAL_MAX_RECORDS:-0}"
 export EVAL_MAX_SLICES_PER_SOURCE="${EVAL_MAX_SLICES_PER_SOURCE:-0}"

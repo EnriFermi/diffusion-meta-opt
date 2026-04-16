@@ -22,9 +22,11 @@ Build once:
 
 ```bash
 HELDOUT_ROOT=post_train_research/big_vae_heldout_eval/artifacts/offline_dataset \
+HELDOUT_LOG_DIR=post_train_research/big_vae_heldout_eval/artifacts/logs \
 HELDOUT_RECORDS_PER_PAIR=1024 \
 HELDOUT_TARGET_SIZE_GB=20 \
 HELDOUT_OVERWRITE=true \
+HELDOUT_SAMPLE_WAIT_TIMEOUT_S=1800 \
 post_train_research/big_vae_heldout_eval/run_build_heldout_offline_dataset.sh
 ```
 
@@ -33,8 +35,22 @@ Evaluate any checkpoint:
 ```bash
 BIG_VAE_CHECKPOINT=artifacts/training/checkpoints/weight_quantile_vae/stage_1/latest.pt \
 HELDOUT_ROOT=post_train_research/big_vae_heldout_eval/artifacts/offline_dataset \
+HELDOUT_LOG_DIR=post_train_research/big_vae_heldout_eval/artifacts/logs \
 post_train_research/big_vae_heldout_eval/run_evaluate_big_vae_heldout.sh
 ```
+
+Run logs are written to `HELDOUT_LOG_DIR` by default:
+
+```text
+post_train_research/big_vae_heldout_eval/artifacts/logs/build_big_vae_heldout_offline_dataset_rank0.log
+post_train_research/big_vae_heldout_eval/artifacts/logs/evaluate_big_vae_heldout_rank0.log
+```
+
+During dataset build, waiting for a new collector sample is logged every
+`HELDOUT_SAMPLE_WAIT_STATUS_EVERY_S` seconds and fails after
+`HELDOUT_SAMPLE_WAIT_TIMEOUT_S` seconds by default. Set
+`HELDOUT_FAIL_ON_SAMPLE_WAIT_TIMEOUT=false` only if you want a partial dataset
+instead of a failing build.
 
 Main outputs:
 
@@ -82,3 +98,15 @@ python post_train_research/big_vae_heldout_eval/check_heldout_coverage.py \
   --heldout-root "$HELDOUT_ROOT" \
   --build
 ```
+
+If build stalls or the async collector exits, inspect the build failure context:
+
+```bash
+post_train_research/big_vae_heldout_eval/run_diagnose_heldout_build_failure.sh
+```
+
+This reads the latest heldout build log, collector crash report, dataset worker
+status files, and recent fatal reports. It also writes a JSON copy to
+`post_train_research/big_vae_heldout_eval/artifacts/heldout_diag.json` by
+default. Override that path with `HELDOUT_DIAG_JSON_OUT=/tmp/heldout_diag.json`
+if needed.

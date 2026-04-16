@@ -46,7 +46,10 @@ def _latest_eval_dir(heldout_root: Path) -> Path:
         raise FileNotFoundError(f"Eval root not found: {eval_root}")
     candidates = [path for path in eval_root.iterdir() if path.is_dir()]
     if not candidates:
-        raise FileNotFoundError(f"No eval run directories under {eval_root}")
+        raise FileNotFoundError(
+            f"No eval run directories under {eval_root}. "
+            "If eval is still starting, wait until it creates an output run directory."
+        )
     candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     return candidates[0]
 
@@ -99,6 +102,13 @@ def check_eval_dir(eval_dir: Path) -> dict[str, Any]:
     eval_dir = _resolve_path(eval_dir)
     if not eval_dir.exists():
         raise FileNotFoundError(f"Eval dir not found: {eval_dir}")
+    if (eval_dir / "manifest.json").exists() and (eval_dir / "eval").is_dir():
+        eval_dir = _latest_eval_dir(eval_dir)
+    elif (eval_dir / "eval").is_dir() and not any(
+        (eval_dir / name).exists()
+        for name in ("coverage.json", "metrics_summary.json", "metrics_by_dataset_model_pair.csv", "record_metrics.csv")
+    ):
+        eval_dir = _latest_eval_dir(eval_dir)
 
     coverage_path = eval_dir / "coverage.json"
     if coverage_path.exists():
