@@ -113,7 +113,7 @@ def _extract_first_tensor(value: Any) -> torch.Tensor | None:
 
 def _append_with_cap(storage: list[torch.Tensor], values: torch.Tensor, max_rows: int | None) -> None:
     if max_rows is None:
-        storage.append(values)
+        storage.append(values.detach().to(device="cpu", dtype=torch.float32, copy=True).contiguous())
         return
 
     current_rows = sum(chunk.shape[0] for chunk in storage)
@@ -124,4 +124,4 @@ def _append_with_cap(storage: list[torch.Tensor], values: torch.Tensor, max_rows
     if values.shape[0] > remaining:
         values = values[:remaining]
 
-    storage.append(values)
+    storage.append(values.detach().to(device="cpu", dtype=torch.float32, copy=True).contiguous())

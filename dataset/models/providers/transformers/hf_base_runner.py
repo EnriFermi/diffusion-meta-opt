@@ -143,12 +143,15 @@ class HFBaseRunner(BaseVirtualModel):
 
         self._reset_buffers()
 
-        model_inputs = self.prepare_inputs(batch_pil)
-        with torch.no_grad():
-            self.forward_impl(model_inputs=model_inputs, batch_pil=batch_pil)
+        try:
+            model_inputs = self.prepare_inputs(batch_pil)
+            with torch.no_grad():
+                self.forward_impl(model_inputs=model_inputs, batch_pil=batch_pil)
 
-        self._num_runs += 1
-        return self._build_records()
+            self._num_runs += 1
+            return self._build_records()
+        finally:
+            self._reset_buffers()
 
     def stats(self) -> dict[str, Any]:
         return {
