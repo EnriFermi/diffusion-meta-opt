@@ -8,7 +8,6 @@ This directory contains a two-stage post-train pipeline:
 Held-out pairs:
 
 ```text
-bigearthnet: vit_large_p16_224, siglip_so400m_p14_384
 chexpert: vit_large_p16_224, clip_vit_l14
 flickr30k: clip_vit_l14, vit_base_p16_224
 food101: siglip_so400m_p14_384, vit_large_p16_224

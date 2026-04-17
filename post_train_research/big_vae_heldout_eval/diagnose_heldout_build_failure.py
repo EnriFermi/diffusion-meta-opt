@@ -74,7 +74,6 @@ def _make_log_snippet(
         "snippet": snippet,
     }
 HELDOUT_EXPECTED_DATASETS = {
-    "bigearthnet",
     "chexpert",
     "flickr30k",
     "food101",
