@@ -90,8 +90,10 @@ class HFEncDecRunner(HFBaseRunner):
             if "pixel_mask" in model_inputs:
                 trocr_inputs["pixel_mask"] = model_inputs["pixel_mask"]
 
-            get_encoder = getattr(self._model, "get_encoder", None)
-            target = get_encoder() if callable(get_encoder) else self._model
+            target = self._model
+            get_encoder = getattr(target, "get_encoder", None)
+            if getattr(target, "decoder", None) is not None and callable(get_encoder):
+                target = get_encoder()
             try:
                 return target(**trocr_inputs)
             except TypeError:
