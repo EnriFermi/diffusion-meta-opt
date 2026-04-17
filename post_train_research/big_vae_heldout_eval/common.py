@@ -15,7 +15,6 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 
 HELDOUT_DATASET_MODELS: dict[str, tuple[str, ...]] = {
-    "bigearthnet": ("vit_large_p16_224", "siglip_so400m_p14_384"),
     "chexpert": ("vit_large_p16_224", "clip_vit_l14"),
     "flickr30k": ("clip_vit_l14", "vit_base_p16_224"),
     "food101": ("siglip_so400m_p14_384", "vit_large_p16_224"),
@@ -168,31 +167,8 @@ def apply_heldout_collector_defaults_from_env(cfg: DictConfig) -> None:
         collector.in_memory_buffer.low_watermark_samples = env_int("HELDOUT_COLLECTOR_IN_MEMORY_LOW_WATERMARK_SAMPLES", 1)
 
 
-def _configured_hf_token(cfg: DictConfig) -> str:
-    hf_cfg = cfg.get("hf", {})
-    token_value = hf_cfg.get("token") if isinstance(hf_cfg, (dict, DictConfig)) else None
-    token = str(token_value or os.environ.get("HF_TOKEN") or os.environ.get("HF_HUB_TOKEN") or "").strip()
-    if token.upper() in {"", "NULL", "NONE"}:
-        return ""
-    if token in {"YOUR_HF_TOKEN_HERE", "<YOUR_HF_TOKEN_HERE>", "${oc.env:HF_TOKEN,\"\"}"}:
-        return ""
-    return token
-
-
 def validate_heldout_preflight(cfg: DictConfig) -> None:
-    if not env_bool("HELDOUT_REQUIRE_GATED_DATASET_TOKEN", True):
-        return
-    enabled_datasets = {str(name) for name in cfg.data.get("enabled_datasets", [])}
-    if "bigearthnet" not in enabled_datasets:
-        return
-    if _configured_hf_token(cfg):
-        return
-    raise RuntimeError(
-        "Held-out build includes gated dataset 'bigearthnet', but HF token is empty. "
-        "Set HF_TOKEN/hf.token with accepted BigEarthNet access, or remove bigearthnet "
-        "from HELDOUT_DATASET_MODELS before building. To bypass this fail-fast check for "
-        "partial/debug runs, set HELDOUT_REQUIRE_GATED_DATASET_TOKEN=false."
-    )
+    del cfg
 
 
 def apply_offline_dataset_defaults(cfg: DictConfig, *, root_dir: str | Path) -> None:
