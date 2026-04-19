@@ -27,6 +27,14 @@ kl_schedule:
   start_beta: 0.0
   warmup_steps: 100000
   ramp_steps: 200000
+latent_sampling_gate:
+  # Absolute global-step schedule. For AE -> VAE fine-tune, set start_step
+  # to the resumed checkpoint step if the gate should start small after resume.
+  enabled: true
+  start_step: ${train.kl_schedule.warmup_steps}
+  ramp_steps: ${train.kl_schedule.ramp_steps}
+  start_value: 1e-4
+  end_value: 1.0
 weight_decay: 0.01
 lr: 5e-5
 

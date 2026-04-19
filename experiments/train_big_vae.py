@@ -200,6 +200,9 @@ def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
             dropout=float(big_cfg.get("dropout", 0.0)),
             pos_fourier_dim=int(big_cfg.get("pos_fourier_dim", 64)),
             use_latent_sampling=bool(big_cfg.get("use_latent_sampling", True)),
+            latent_sampling_min_std=float(big_cfg.get("latent_sampling_min_std", 1e-4)),
+            latent_sampling_logvar_min=float(big_cfg.get("latent_sampling_logvar_min", -20.0)),
+            latent_sampling_logvar_max=float(big_cfg.get("latent_sampling_logvar_max", 10.0)),
             disable_z_shortcut=bool(big_cfg.get("disable_z_shortcut", False)),
             disable_distribution_encoder=bool(big_cfg.get("disable_distribution_encoder", False)),
             patch_tokenizer_kind=str(big_cfg.get("patch_tokenizer_kind", "residual")),
@@ -276,6 +279,34 @@ def _compute_kl_beta_for_step(
     return float(start_beta + (target_beta - start_beta) * cosine_progress)
 
 
+def _compute_latent_sampling_gate_for_step(
+    global_step: int,
+    *,
+    schedule_enabled: bool,
+    start_step: int,
+    ramp_steps: int,
+    start_value: float,
+    end_value: float,
+) -> float:
+    if not schedule_enabled:
+        return float(end_value)
+    if global_step <= max(0, int(start_step)):
+        return float(start_value)
+    if ramp_steps <= 0:
+        return float(end_value)
+    progress = min(1.0, max(0.0, float(global_step - start_step) / float(ramp_steps)))
+    cosine_progress = 0.5 * (1.0 - math.cos(math.pi * progress))
+    value = float(start_value + (end_value - start_value) * cosine_progress)
+    return max(0.0, min(1.0, value))
+
+
+def _set_model_latent_sampling_gate(model: torch.nn.Module, gate: float) -> None:
+    target = _unwrap_model_for_state_io(model)
+    setter = getattr(target, "set_latent_sampling_gate", None)
+    if callable(setter):
+        setter(float(gate))
+
+
 def _resolve_amp(cfg: DictConfig, device: torch.device) -> tuple[bool, torch.dtype | None]:
     return runtime_resolve_amp(cfg, device, section="train")
 
@@ -304,6 +335,11 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         behavioral_loss_cfg = {}
     if not isinstance(behavioral_loss_cfg, (dict, DictConfig)):
         behavioral_loss_cfg = {}
+    latent_sampling_gate_cfg = train_cfg.get("latent_sampling_gate", {})
+    if latent_sampling_gate_cfg is None:
+        latent_sampling_gate_cfg = {}
+    if not isinstance(latent_sampling_gate_cfg, (dict, DictConfig)):
+        latent_sampling_gate_cfg = {}
     raw_max_source_samples = batch_source_mixing_cfg.get("max_source_samples", 0)
     if raw_max_source_samples is None:
         parsed_max_source_samples = 0
@@ -321,6 +357,11 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         "train.kl_schedule.start_beta": float(train_cfg.get("kl_schedule", {}).get("start_beta", 0.0)),
         "train.kl_schedule.warmup_steps": int(train_cfg.get("kl_schedule", {}).get("warmup_steps", 0)),
         "train.kl_schedule.ramp_steps": int(train_cfg.get("kl_schedule", {}).get("ramp_steps", 0)),
+        "train.latent_sampling_gate.enabled": bool(latent_sampling_gate_cfg.get("enabled", True)),
+        "train.latent_sampling_gate.start_step": int(latent_sampling_gate_cfg.get("start_step", 0)),
+        "train.latent_sampling_gate.ramp_steps": int(latent_sampling_gate_cfg.get("ramp_steps", 0)),
+        "train.latent_sampling_gate.start_value": float(latent_sampling_gate_cfg.get("start_value", 1e-4)),
+        "train.latent_sampling_gate.end_value": float(latent_sampling_gate_cfg.get("end_value", 1.0)),
         "train.behavioral_coef": float(train_cfg.get("behavioral_coef", 0.0)),
         "train.structural_coef": float(train_cfg.get("structural_coef", 0.0)),
         "train.behavioral_loss.lambda_operator": float(behavioral_loss_cfg.get("lambda_operator", 1.0)),
@@ -340,6 +381,9 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         "train.offline_dataset.shard_by_rank": bool(train_cfg.get("offline_dataset", {}).get("shard_by_rank", True)),
         "model.patch_size": int(model_cfg.get("patch_size", 16)),
         "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
+        "model.big_vae.latent_sampling_min_std": float(big_cfg.get("latent_sampling_min_std", 1e-4)),
+        "model.big_vae.latent_sampling_logvar_min": float(big_cfg.get("latent_sampling_logvar_min", -20.0)),
+        "model.big_vae.latent_sampling_logvar_max": float(big_cfg.get("latent_sampling_logvar_max", 10.0)),
         "model.big_vae.disable_distribution_encoder": bool(big_cfg.get("disable_distribution_encoder", False)),
         "model.big_vae.patch_tokenizer_kind": str(big_cfg.get("patch_tokenizer_kind", "residual")),
         "model.big_vae.distribution_encoder_conditioning_kind": str(
@@ -2563,17 +2607,81 @@ def _scalar_debug_value(tensor: torch.Tensor) -> float | str:
     return float(scalar) if isinstance(scalar, (int, float)) else str(scalar)
 
 
+_VAE_POSTERIOR_HEAD_PREFIXES = ("to_mu.", "to_logvar.")
+
+
+def _model_uses_latent_sampling(model: torch.nn.Module) -> bool:
+    cfg = getattr(model, "cfg", None)
+    big_vae_cfg = getattr(cfg, "big_vae", None)
+    return bool(getattr(big_vae_cfg, "use_latent_sampling", False))
+
+
+def _is_vae_posterior_head_key(key: str) -> bool:
+    return any(str(key).startswith(prefix) for prefix in _VAE_POSTERIOR_HEAD_PREFIXES)
+
+
+def _load_model_state_allowing_vae_head_migration(
+    *,
+    target: torch.nn.Module,
+    state_dict: dict[str, Any],
+    logger: logging.Logger,
+    source: str | Path,
+) -> bool:
+    target_state = target.state_dict()
+    missing_keys = sorted(key for key in target_state.keys() if key not in state_dict)
+    unexpected_keys = sorted(key for key in state_dict.keys() if key not in target_state)
+
+    if not missing_keys and not unexpected_keys:
+        target.load_state_dict(state_dict, strict=True)
+        return False
+
+    allowed_missing = sorted(key for key in missing_keys if _is_vae_posterior_head_key(key))
+    should_migrate_ae_to_vae = (
+        _model_uses_latent_sampling(target)
+        and bool(allowed_missing)
+        and allowed_missing == missing_keys
+        and not unexpected_keys
+    )
+    if not should_migrate_ae_to_vae:
+        target.load_state_dict(state_dict, strict=True)
+        return False
+
+    incompatible = target.load_state_dict(state_dict, strict=False)
+    unexpected_after_load = list(getattr(incompatible, "unexpected_keys", []))
+    missing_after_load = sorted(getattr(incompatible, "missing_keys", []))
+    disallowed_missing = [key for key in missing_after_load if not _is_vae_posterior_head_key(key)]
+    if unexpected_after_load or disallowed_missing:
+        raise RuntimeError(
+            "Unexpected checkpoint incompatibility while migrating AE checkpoint to VAE heads: "
+            f"source={source} missing={missing_after_load} unexpected={unexpected_after_load}"
+        )
+
+    logger.warning(
+        "Loaded AE checkpoint into use_latent_sampling=true BigVAE; initialized missing posterior heads "
+        "from current model init. source=%s missing_head_keys=%s",
+        source,
+        missing_after_load,
+    )
+    return True
+
+
 def _load_model_weights_from_checkpoint(
     model: torch.nn.Module,
     path: str,
     logger: logging.Logger,
-) -> None:
+) -> bool:
     logger.info("Loading model weights from checkpoint: %s", path)
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     state_dict = _normalize_model_state_dict_keys(ckpt["model_state"])
     target = _unwrap_model_for_state_io(model)
-    target.load_state_dict(state_dict, strict=True)
+    migrated_ae_to_vae = _load_model_state_allowing_vae_head_migration(
+        target=target,
+        state_dict=state_dict,
+        logger=logger,
+        source=path,
+    )
     logger.info("Model weights loaded successfully (step=%s)", ckpt.get("step", "?"))
+    return migrated_ae_to_vae
 
 
 def _find_latest_resume_state_checkpoint(state_dir: Path) -> Path | None:
@@ -2614,11 +2722,23 @@ def _load_training_state_from_checkpoint(
 ) -> int:
     logger.info("Loading training state from checkpoint: %s", path)
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    migrated_ae_to_vae = False
     if load_model_state:
         target = _unwrap_model_for_state_io(model)
         state_dict = _normalize_model_state_dict_keys(ckpt["model_state"])
-        target.load_state_dict(state_dict, strict=True)
+        migrated_ae_to_vae = _load_model_state_allowing_vae_head_migration(
+            target=target,
+            state_dict=state_dict,
+            logger=logger,
+            source=path,
+        )
 
+    if migrated_ae_to_vae and load_optimizer_state:
+        raise RuntimeError(
+            "Cannot load optimizer_state while migrating an AE checkpoint without posterior heads "
+            "into use_latent_sampling=true BigVAE. Set train.resume_state.load_optimizer_state=false "
+            "and resume model-only for AE -> VAE fine-tuning."
+        )
     optimizer_state = ckpt.get("optimizer_state")
     if load_optimizer_state and optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
@@ -3049,6 +3169,24 @@ def _run_worker(
             if not hasattr(cfg_holder, "cfg"):
                 raise AttributeError(f"Model does not expose cfg: type={type(model_unwrapped)}")
             use_latent_sampling = bool(cfg_holder.cfg.big_vae.use_latent_sampling)
+            latent_sampling_gate_cfg = cfg.train.get("latent_sampling_gate", {})
+            if latent_sampling_gate_cfg is None:
+                latent_sampling_gate_cfg = {}
+            if not isinstance(latent_sampling_gate_cfg, (dict, DictConfig)):
+                raise TypeError("train.latent_sampling_gate must be a mapping when provided")
+            latent_sampling_gate_enabled = bool(latent_sampling_gate_cfg.get("enabled", True))
+            latent_sampling_gate_start_step = max(
+                0,
+                int(latent_sampling_gate_cfg.get("start_step", kl_schedule_warmup_steps)),
+            )
+            latent_sampling_gate_ramp_steps = max(
+                0,
+                int(latent_sampling_gate_cfg.get("ramp_steps", kl_schedule_ramp_steps)),
+            )
+            latent_sampling_gate_start_value = float(latent_sampling_gate_cfg.get("start_value", 1e-4))
+            latent_sampling_gate_end_value = float(latent_sampling_gate_cfg.get("end_value", 1.0))
+            latent_sampling_gate_start_value = max(0.0, min(1.0, latent_sampling_gate_start_value))
+            latent_sampling_gate_end_value = max(0.0, min(1.0, latent_sampling_gate_end_value))
             behavioral_coef = float(cfg.train.get("behavioral_coef", 1.0))
             structural_coef = float(cfg.train.get("structural_coef", 0.5))
             behavioral_loss_cfg = cfg.train.get("behavioral_loss", {})
@@ -3295,6 +3433,26 @@ def _run_worker(
                         use_latent_sampling,
                         kl_beta,
                     )
+                if use_latent_sampling:
+                    initial_latent_sampling_gate = _compute_latent_sampling_gate_for_step(
+                        resumed_training_step,
+                        schedule_enabled=latent_sampling_gate_enabled,
+                        start_step=latent_sampling_gate_start_step,
+                        ramp_steps=latent_sampling_gate_ramp_steps,
+                        start_value=latent_sampling_gate_start_value,
+                        end_value=latent_sampling_gate_end_value,
+                    )
+                    _set_model_latent_sampling_gate(model, initial_latent_sampling_gate)
+                    logger.info(
+                        "BigVAE latent sampling gate: enabled=%s start_step=%s ramp_steps=%s "
+                        "start_value=%.6g end_value=%.6g current_at_resume=%.6g",
+                        latent_sampling_gate_enabled,
+                        latent_sampling_gate_start_step,
+                        latent_sampling_gate_ramp_steps,
+                        latent_sampling_gate_start_value,
+                        latent_sampling_gate_end_value,
+                        initial_latent_sampling_gate,
+                    )
                 if unknown_clip_groups:
                     logger.warning(
                         "Ignoring unknown train.grad_clip_norm_by_part groups: %s",
@@ -3383,6 +3541,20 @@ def _run_worker(
                     warmup_steps=kl_schedule_warmup_steps,
                     ramp_steps=kl_schedule_ramp_steps,
                 )
+                current_latent_sampling_gate = (
+                    _compute_latent_sampling_gate_for_step(
+                        global_step,
+                        schedule_enabled=latent_sampling_gate_enabled,
+                        start_step=latent_sampling_gate_start_step,
+                        ramp_steps=latent_sampling_gate_ramp_steps,
+                        start_value=latent_sampling_gate_start_value,
+                        end_value=latent_sampling_gate_end_value,
+                    )
+                    if use_latent_sampling
+                    else 0.0
+                )
+                if use_latent_sampling:
+                    _set_model_latent_sampling_gate(model, current_latent_sampling_gate)
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -3878,15 +4050,16 @@ def _run_worker(
                                 "rank": int(rank),
                                 "fixed_training_batch": bool(fixed_training_batch_enabled),
                                 "synthetic_layer_source": bool(synthetic_layer_enabled),
-                                    "loss": {
-                                        "total": _scalar_debug_value(total_loss),
-                                        "behavioral": _scalar_debug_value(behavioral_loss),
-                                        "behavioral_operator": _scalar_debug_value(behavioral_operator_loss),
-                                        "behavioral_dir": _scalar_debug_value(behavioral_dir_loss),
-                                        "behavioral_scale": _scalar_debug_value(behavioral_scale_loss),
-                                        "structural": _scalar_debug_value(structural_loss),
-                                        "kl": _scalar_debug_value(kl_loss),
+                                "loss": {
+                                    "total": _scalar_debug_value(total_loss),
+                                    "behavioral": _scalar_debug_value(behavioral_loss),
+                                    "behavioral_operator": _scalar_debug_value(behavioral_operator_loss),
+                                    "behavioral_dir": _scalar_debug_value(behavioral_dir_loss),
+                                    "behavioral_scale": _scalar_debug_value(behavioral_scale_loss),
+                                    "structural": _scalar_debug_value(structural_loss),
+                                    "kl": _scalar_debug_value(kl_loss),
                                     "kl_beta": float(current_kl_beta),
+                                    "latent_sampling_gate": float(current_latent_sampling_gate),
                                     "struct_dir": _scalar_debug_value(struct_details["L_dir"]),
                                     "struct_scale": _scalar_debug_value(struct_details["L_scale"]),
                                     "struct_rec": _scalar_debug_value(struct_details["L_rec"]),
@@ -4350,7 +4523,7 @@ def _run_worker(
                         "step=%s/%s loss=%.6f behav=%.6f struct=%.6f "
                         "b_op=%.6f b_dir=%.6f b_scl=%.6f "
                         "s_dir=%.6f s_scl=%.6f s_rec=%.6f s_rel=%.6f "
-                        "kl=%.6f kl_beta=%.6f lr=%.6e steps/s=%.2f cache=%s",
+                        "kl=%.6f kl_beta=%.6f latent_gate=%.6f lr=%.6e steps/s=%.2f cache=%s",
                         global_step,
                         max_steps,
                         avg_loss,
@@ -4365,6 +4538,7 @@ def _run_worker(
                         avg_struct_rel,
                         avg_kl,
                         current_kl_beta,
+                        current_latent_sampling_gate,
                         lr,
                         speed,
                         cache_metric,
@@ -4450,6 +4624,7 @@ def _run_worker(
                             "train/struct_rel": float(avg_struct_rel),
                             "train/lr": float(lr),
                             "train/kl_beta": float(current_kl_beta),
+                            "train/latent_sampling_gate": float(current_latent_sampling_gate),
                             "train/steps_per_sec": float(speed),
                             "data/cache_size": float(cache_metric),
                             "grad/global_norm_before_clip": float(grad_stats.get("grad/global_norm_before_clip", 0.0)),

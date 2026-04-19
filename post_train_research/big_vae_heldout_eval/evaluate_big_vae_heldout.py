@@ -30,7 +30,7 @@ from common import (
     write_csv,
     write_json,
 )
-from dataset.big_vae_offline import OfflineBigVAEDataset
+from dataset.big_vae_offline import OfflineBigVAEDataset, infer_layer_depth, infer_layer_type
 from dataset.logging_utils import configure_process_logging
 from experiments.train_big_vae import (
     SourceSampleRecord,
@@ -252,6 +252,354 @@ def _record_metrics_writer(path: Path) -> tuple[csv.DictWriter, Any] | tuple[Non
     return writer, fh
 
 
+@torch.no_grad()
+def _extract_latents_for_batch(
+    *,
+    model: torch.nn.Module,
+    W_s: torch.Tensor,
+    x_s: torch.Tensor,
+    x_mask_s: torch.Tensor,
+    d_in_mask_s: torch.Tensor,
+    d_out_mask_s: torch.Tensor,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
+        _W_hat, mu, logvar, _pred_dirs = model(
+            W_s,
+            x_s,
+            x_mask=x_mask_s,
+            d_in_mask=d_in_mask_s,
+            d_out_mask=d_out_mask_s,
+        )
+    return mu.detach().to(device="cpu", dtype=torch.float32), logvar.detach().to(device="cpu", dtype=torch.float32)
+
+
+def _depth_label(depth: int | None) -> str:
+    return f"depth_{int(depth):03d}" if depth is not None else "<unknown_depth>"
+
+
+def _plot_safe_label(value: Any) -> str:
+    text = str(value if value is not None else "").strip()
+    return text if text else "<unknown>"
+
+
+def _latent_dump_metadata_row(
+    *,
+    entry_index: int,
+    record_index: int,
+    slice_index: int,
+    source_batch_index: int,
+    dataset_name: str,
+    model_name: str,
+    layer_name: str,
+    source: SourceSampleRecord,
+) -> dict[str, Any]:
+    depth = infer_layer_depth(layer_name)
+    return {
+        "entry_index": int(entry_index),
+        "record_index": int(record_index),
+        "slice_index": int(slice_index),
+        "source_batch_index": int(source_batch_index),
+        "dataset": dataset_name,
+        "model": model_name,
+        "layer": layer_name,
+        "layer_type": infer_layer_type(layer_name),
+        "layer_depth": "" if depth is None else int(depth),
+        "depth_label": _depth_label(depth),
+        "weight_shape": "x".join(str(int(dim)) for dim in source.W.shape),
+        "x_shape": "x".join(str(int(dim)) for dim in source.x.shape),
+    }
+
+
+def _write_latent_dump(
+    *,
+    output_dir: Path,
+    latents: list[torch.Tensor],
+    logvars: list[torch.Tensor],
+    rows: list[dict[str, Any]],
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not rows:
+        return {
+            "enabled": bool(config.get("enabled", False)),
+            "count": 0,
+            "path": "",
+            "metadata_csv": "",
+        }
+
+    dump_path = env_path("EVAL_LATENT_DUMP_PATH", output_dir / "latent_dump.pt")
+    metadata_csv_path = dump_path.with_suffix(".metadata.csv")
+    dump_path.parent.mkdir(parents=True, exist_ok=True)
+
+    latent_tensor = torch.cat(latents, dim=0).contiguous()
+    logvar_tensor = torch.cat(logvars, dim=0).contiguous()
+    payload = {
+        "latents": latent_tensor,
+        "logvars": logvar_tensor,
+        "rows": rows,
+        "config": dict(config),
+    }
+    torch.save(payload, dump_path)
+    write_csv(metadata_csv_path, rows)
+    LOGGER.info("Latent dump written: path=%s entries=%s dim=%s", dump_path, len(rows), int(latent_tensor.shape[1]))
+    return {
+        "enabled": True,
+        "count": int(len(rows)),
+        "latent_dim": int(latent_tensor.shape[1]),
+        "path": str(dump_path),
+        "metadata_csv": str(metadata_csv_path),
+    }
+
+
+def _load_latent_dump(dump_path: Path) -> tuple[Any, list[dict[str, Any]]]:
+    payload = torch.load(dump_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise TypeError(f"Latent dump must be a dict, got {type(payload)!r}: {dump_path}")
+    latents = payload.get("latents")
+    rows = payload.get("rows")
+    if not torch.is_tensor(latents) or latents.ndim != 2:
+        raise ValueError(f"Latent dump is missing a 2D tensor 'latents': {dump_path}")
+    if not isinstance(rows, list) or len(rows) != int(latents.shape[0]):
+        raise ValueError(f"Latent dump rows must be a list with len={int(latents.shape[0])}: {dump_path}")
+    return latents.to(dtype=torch.float32), [dict(row) for row in rows]
+
+
+def _standardize_latents(latents: Any) -> Any:
+    import numpy as np
+
+    x = latents.detach().cpu().numpy().astype("float32", copy=False)
+    x = x - x.mean(axis=0, keepdims=True)
+    scale = x.std(axis=0, keepdims=True)
+    x = x / np.maximum(scale, 1e-6)
+    return x
+
+
+def _pca_embedding(latents: Any) -> tuple[Any, dict[str, Any]]:
+    import numpy as np
+
+    x = _standardize_latents(latents)
+    n = int(x.shape[0])
+    if n < 2:
+        coords = np.zeros((n, 2), dtype="float32")
+        return coords, {"explained_variance_ratio": [0.0, 0.0]}
+
+    _u, s, vt = np.linalg.svd(x, full_matrices=False)
+    coords = x @ vt[:2].T
+    if int(coords.shape[1]) < 2:
+        coords = np.pad(coords, ((0, 0), (0, 2 - int(coords.shape[1]))), mode="constant")
+    denom = float(np.square(s).sum())
+    explained = (np.square(s[:2]) / denom).tolist() if denom > 0.0 else [0.0, 0.0]
+    while len(explained) < 2:
+        explained.append(0.0)
+    return coords.astype("float32", copy=False), {"explained_variance_ratio": explained[:2]}
+
+
+def _tsne_embedding(latents: Any, *, seed: int, perplexity: int) -> tuple[Any, dict[str, Any]]:
+    import numpy as np
+    from sklearn.manifold import TSNE
+
+    x = _standardize_latents(latents)
+    n = int(x.shape[0])
+    if n < 3:
+        coords = np.zeros((n, 2), dtype="float32")
+        return coords, {"perplexity": 0, "skipped": "need at least 3 points"}
+
+    safe_perplexity = max(1, min(int(perplexity), n - 1, max(1, (n - 1) // 3)))
+    coords = TSNE(
+        n_components=2,
+        init="pca",
+        learning_rate="auto",
+        perplexity=safe_perplexity,
+        random_state=int(seed),
+    ).fit_transform(x)
+    return coords.astype("float32", copy=False), {"perplexity": int(safe_perplexity)}
+
+
+def _embedding_rows(
+    *,
+    rows: list[dict[str, Any]],
+    coords: Any,
+    x_name: str,
+    y_name: str,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            **row,
+            x_name: float(coords[idx, 0]),
+            y_name: float(coords[idx, 1]),
+        }
+        for idx, row in enumerate(rows)
+    ]
+
+
+def _sorted_group_values(rows: list[dict[str, Any]], color_by: str) -> list[str]:
+    values = {_plot_safe_label(row.get(color_by)) for row in rows}
+    if color_by in {"layer_depth", "depth_label"}:
+        def depth_key(value: str) -> tuple[int, str]:
+            if value.startswith("depth_"):
+                try:
+                    return (0, f"{int(value.split('_', 1)[1]):09d}")
+                except Exception:
+                    pass
+            return (1, value)
+
+        return sorted(values, key=depth_key)
+    return sorted(values)
+
+
+def _plot_embedding_by_metadata(
+    *,
+    coords: Any,
+    rows: list[dict[str, Any]],
+    method: str,
+    color_by: str,
+    output_path: Path,
+    title: str,
+    max_legend_labels: int,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=160)
+    groups = _sorted_group_values(rows, color_by)
+    cmap = plt.get_cmap("tab20", max(1, min(len(groups), 20)))
+    for group_idx, group_value in enumerate(groups):
+        indices = [idx for idx, row in enumerate(rows) if _plot_safe_label(row.get(color_by)) == group_value]
+        if not indices:
+            continue
+        label = group_value if group_idx < max_legend_labels else "_nolegend_"
+        ax.scatter(
+            coords[indices, 0],
+            coords[indices, 1],
+            s=18,
+            alpha=0.78,
+            linewidths=0.0,
+            color=cmap(group_idx % max(1, min(len(groups), 20))),
+            label=label,
+        )
+
+    ax.set_title(title)
+    ax.set_xlabel(f"{method.upper()} 1")
+    ax.set_ylabel(f"{method.upper()} 2")
+    ax.grid(True, alpha=0.2)
+    if len(groups) <= max_legend_labels:
+        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=7, frameon=False)
+    elif max_legend_labels > 0:
+        ax.legend(
+            title=f"first {max_legend_labels} of {len(groups)}",
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            fontsize=7,
+            frameon=False,
+        )
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_latent_dump(
+    dump_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    seed: int | None = None,
+    run_tsne: bool | None = None,
+) -> dict[str, Any]:
+    dump_path = Path(dump_path).expanduser()
+    if not dump_path.is_absolute():
+        dump_path = PROJECT_ROOT / dump_path
+    if not dump_path.exists():
+        raise FileNotFoundError(f"Latent dump not found: {dump_path}")
+
+    output_path = Path(output_dir).expanduser() if output_dir is not None else dump_path.parent / "latent_plots"
+    if not output_path.is_absolute():
+        output_path = PROJECT_ROOT / output_path
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=False)
+    except Exception as exc:
+        LOGGER.warning("Skipping latent plots because matplotlib is unavailable: %r", exc)
+        return {"enabled": False, "reason": "matplotlib_unavailable", "output_dir": str(output_path)}
+
+    latents, rows = _load_latent_dump(dump_path)
+    if int(latents.shape[0]) <= 0:
+        return {"enabled": False, "reason": "empty_dump", "output_dir": str(output_path)}
+
+    color_specs = [
+        ("dataset", "dataset"),
+        ("model", "model"),
+        ("layer_type", "layer type"),
+        ("depth_label", "layer depth"),
+    ]
+    max_legend_labels = max(0, env_int("EVAL_LATENT_PLOT_MAX_LEGEND_LABELS", 40))
+    seed_value = int(seed if seed is not None else env_int("EVAL_SEED", 42))
+    methods: dict[str, dict[str, Any]] = {}
+    files: list[str] = []
+
+    pca_coords, pca_info = _pca_embedding(latents)
+    pca_csv = output_path / "latent_embedding_pca.csv"
+    write_csv(pca_csv, _embedding_rows(rows=rows, coords=pca_coords, x_name="pca_x", y_name="pca_y"))
+    files.append(str(pca_csv))
+    pca_files = []
+    for color_by, label in color_specs:
+        target = output_path / f"latent_pca_by_{color_by}.png"
+        _plot_embedding_by_metadata(
+            coords=pca_coords,
+            rows=rows,
+            method="pca",
+            color_by=color_by,
+            output_path=target,
+            title=f"Latent PCA by {label}",
+            max_legend_labels=max_legend_labels,
+        )
+        pca_files.append(str(target))
+        files.append(str(target))
+    methods["pca"] = {**pca_info, "csv": str(pca_csv), "plots": pca_files}
+
+    should_run_tsne = env_bool("EVAL_LATENT_PLOT_TSNE", True) if run_tsne is None else bool(run_tsne)
+    if should_run_tsne:
+        try:
+            perplexity = max(1, env_int("EVAL_LATENT_TSNE_PERPLEXITY", 30))
+            tsne_coords, tsne_info = _tsne_embedding(latents, seed=seed_value, perplexity=perplexity)
+            tsne_csv = output_path / "latent_embedding_tsne.csv"
+            write_csv(tsne_csv, _embedding_rows(rows=rows, coords=tsne_coords, x_name="tsne_x", y_name="tsne_y"))
+            files.append(str(tsne_csv))
+            tsne_files = []
+            for color_by, label in color_specs:
+                target = output_path / f"latent_tsne_by_{color_by}.png"
+                _plot_embedding_by_metadata(
+                    coords=tsne_coords,
+                    rows=rows,
+                    method="tsne",
+                    color_by=color_by,
+                    output_path=target,
+                    title=f"Latent t-SNE by {label}",
+                    max_legend_labels=max_legend_labels,
+                )
+                tsne_files.append(str(target))
+                files.append(str(target))
+            methods["tsne"] = {**tsne_info, "csv": str(tsne_csv), "plots": tsne_files}
+        except Exception as exc:
+            LOGGER.warning("Skipping latent t-SNE plots: %r", exc)
+            methods["tsne"] = {"skipped": repr(exc)}
+
+    info = {
+        "enabled": True,
+        "dump_path": str(dump_path),
+        "output_dir": str(output_path),
+        "count": int(latents.shape[0]),
+        "latent_dim": int(latents.shape[1]),
+        "methods": methods,
+        "files": files,
+    }
+    write_json(output_path / "latent_plot_summary.json", info)
+    LOGGER.info("Latent plots written: output_dir=%s files=%s", output_path, len(files))
+    return info
+
+
 def _evaluate_dataset(
     *,
     model: torch.nn.Module,
@@ -292,6 +640,17 @@ def _evaluate_dataset(
     records_seen = 0
     records_evaluated = 0
     slices_evaluated = 0
+    latent_dump_enabled = env_bool("EVAL_LATENT_DUMP_ENABLED", True)
+    latent_dump_max_entries = max(0, env_int("EVAL_LATENT_DUMP_MAX_ENTRIES", 512))
+    latent_dump_latents: list[torch.Tensor] = []
+    latent_dump_logvars: list[torch.Tensor] = []
+    latent_dump_rows: list[dict[str, Any]] = []
+    latent_dump_config = {
+        "enabled": bool(latent_dump_enabled),
+        "max_entries": int(latent_dump_max_entries),
+        "source": "posterior_mu_when_sampling_enabled_else_base_z",
+        "point_unit": "slice",
+    }
 
     try:
         for sample in dataset:
@@ -336,17 +695,51 @@ def _evaluate_dataset(
                     target_d_in=target_d_in,
                     target_d_out=target_d_out,
                 )
+                W_batch = batch_payload.W.to(device=device, non_blocking=True)
+                x_batch = batch_payload.x.to(device=device, non_blocking=True)
+                x_mask_batch = batch_payload.x_mask.to(device=device, non_blocking=True)
+                d_in_mask_batch = batch_payload.d_in_mask.to(device=device, non_blocking=True)
+                d_out_mask_batch = batch_payload.d_out_mask.to(device=device, non_blocking=True)
                 metrics = _compute_loss_metrics(
                     model=model,
                     cfg=ckpt_cfg,
-                    W_s=batch_payload.W.to(device=device, non_blocking=True),
-                    x_s=batch_payload.x.to(device=device, non_blocking=True),
-                    x_mask_s=batch_payload.x_mask.to(device=device, non_blocking=True),
-                    d_in_mask_s=batch_payload.d_in_mask.to(device=device, non_blocking=True),
-                    d_out_mask_s=batch_payload.d_out_mask.to(device=device, non_blocking=True),
+                    W_s=W_batch,
+                    x_s=x_batch,
+                    x_mask_s=x_mask_batch,
+                    d_in_mask_s=d_in_mask_batch,
+                    d_out_mask_s=d_out_mask_batch,
                     amp_enabled=amp_enabled,
                     amp_dtype=amp_dtype,
                 )
+                if latent_dump_enabled and len(latent_dump_rows) < latent_dump_max_entries:
+                    dump_remaining = latent_dump_max_entries - len(latent_dump_rows)
+                    mu_cpu, logvar_cpu = _extract_latents_for_batch(
+                        model=model,
+                        W_s=W_batch,
+                        x_s=x_batch,
+                        x_mask_s=x_mask_batch,
+                        d_in_mask_s=d_in_mask_batch,
+                        d_out_mask_s=d_out_mask_batch,
+                        amp_enabled=amp_enabled,
+                        amp_dtype=amp_dtype,
+                    )
+                    dump_take = min(int(dump_remaining), int(mu_cpu.shape[0]))
+                    if dump_take > 0:
+                        latent_dump_latents.append(mu_cpu[:dump_take].contiguous())
+                        latent_dump_logvars.append(logvar_cpu[:dump_take].contiguous())
+                        for local_idx in range(dump_take):
+                            latent_dump_rows.append(
+                                _latent_dump_metadata_row(
+                                    entry_index=len(latent_dump_rows),
+                                    record_index=records_seen,
+                                    slice_index=evaluated_for_source + local_idx,
+                                    source_batch_index=source_batch_idx,
+                                    dataset_name=dataset_name,
+                                    model_name=model_name,
+                                    layer_name=layer_name,
+                                    source=source,
+                                )
+                            )
                 if not finite_metrics(metrics):
                     skipped["non_finite"] += 1
                 else:
@@ -415,6 +808,13 @@ def _evaluate_dataset(
         "amp_dtype": str(amp_dtype),
         "device": str(device),
     }
+    payload["latent_dump"] = _write_latent_dump(
+        output_dir=output_dir,
+        latents=latent_dump_latents,
+        logvars=latent_dump_logvars,
+        rows=latent_dump_rows,
+        config=latent_dump_config,
+    )
     return payload
 
 
@@ -481,6 +881,15 @@ def main() -> None:
         "stage": int(ckpt_payload.get("stage", 0) or 0),
     }
     payload["offline_dataset"] = dataset.summary()
+    latent_dump_path = str(payload.get("latent_dump", {}).get("path", "")).strip()
+    if latent_dump_path and env_bool("EVAL_LATENT_PLOT_ENABLED", True):
+        payload["latent_plots"] = plot_latent_dump(
+            latent_dump_path,
+            output_dir=env_path("EVAL_LATENT_PLOT_DIR", output_dir / "latent_plots"),
+            seed=env_int("EVAL_SEED", int(cfg.data.get("seed", 42))),
+        )
+    else:
+        payload["latent_plots"] = {"enabled": False}
 
     write_json(output_dir / "metrics_summary.json", payload)
     write_json(output_dir / "coverage.json", payload["coverage"])
