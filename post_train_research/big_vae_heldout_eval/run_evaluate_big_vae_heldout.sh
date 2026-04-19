@@ -11,8 +11,8 @@ if [ -f "$PROJECT_ROOT/mom.env" ]; then
   set +a
 fi
 
-: "${BIG_VAE_CHECKPOINT:?Set BIG_VAE_CHECKPOINT=/path/to/stage_N/latest.pt or step_XXXXXXX.pt}"
 
+export BIG_VAE_CHECKPOINT="${BIG_VAE_CHECKPOINT:-/home/coder/project/artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt}"
 export HELDOUT_ROOT="${HELDOUT_ROOT:-$PROJECT_ROOT/post_train_research/big_vae_heldout_eval/artifacts/offline_dataset}"
 export HELDOUT_LOG_DIR="${HELDOUT_LOG_DIR:-$PROJECT_ROOT/post_train_research/big_vae_heldout_eval/artifacts/logs}"
 export EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-256}"
