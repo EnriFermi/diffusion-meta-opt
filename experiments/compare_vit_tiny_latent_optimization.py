@@ -79,6 +79,9 @@ class ExperimentConfig:
     big_vae_checkpoint: str = ""
     big_vae_latent_init: str = "random"
     big_vae_latent_noise_std: float = 0.0
+    big_vae_encoder_context_rows: int = 64
+    big_vae_encoder_context_std: float = 1.0
+    big_vae_encoder_batch_size: int = 16
     big_vae_decode: str = "weights"
     big_vae_tile_T_patches: int = 16
     big_vae_tile_d_out: int = 8
@@ -270,11 +273,14 @@ class BigVAELatentTensorStore(nn.Module):
         decode_policy: str,
         tile_T_patches: int,
         tile_d_out: int,
+        encoder_context_rows: int = 64,
+        encoder_context_std: float = 1.0,
+        encoder_batch_size: int = 16,
     ) -> None:
         super().__init__()
         init_mode = str(latent_init).strip().lower()
-        if init_mode not in {"base", "random"}:
-            raise ValueError(f"big_vae_latent_init must be 'base' or 'random', got {latent_init!r}")
+        if init_mode not in {"base", "random", "encoded"}:
+            raise ValueError(f"big_vae_latent_init must be 'base', 'random' or 'encoded', got {latent_init!r}")
         policy = str(decode_policy).strip().lower()
         if policy not in {"weights", "all"}:
             raise ValueError(f"big_vae_decode must be 'weights' or 'all', got {decode_policy!r}")
@@ -304,6 +310,10 @@ class BigVAELatentTensorStore(nn.Module):
         self.tile_d_out = int(tile_d_out)
         self.use_distribution_encoder = bool(getattr(self.big_vae, "use_distribution_encoder", False))
         self.d_dist = int(self.big_vae.cfg.distribution.d_dist)
+        self.encoder_context_rows = max(1, int(encoder_context_rows))
+        self.encoder_context_std = float(encoder_context_std)
+        self.encoder_batch_size = max(1, int(encoder_batch_size))
+        self.latent_noise_std = float(latent_noise_std)
 
         base_latents = self.big_vae.latent_base.detach().clone()
         for idx, (name, initial) in enumerate(initial_tensors.items()):
@@ -342,7 +352,7 @@ class BigVAELatentTensorStore(nn.Module):
                 group_key = (int(self.tile_d_in), int(self.tile_d_out), int(self.tile_T_patches))
                 self._groups.setdefault(group_key, []).append(tile_key)
 
-                if init_mode == "base":
+                if init_mode in {"base", "encoded"}:
                     latent = base_latents.clone()
                 else:
                     latent = torch.randn_like(base_latents) * 0.02
@@ -375,6 +385,9 @@ class BigVAELatentTensorStore(nn.Module):
                         flush_tile()
                         current_tile_rows = 0
             flush_tile()
+
+        if init_mode == "encoded":
+            self._initialize_latents_from_encoder(initial_tensors)
 
     @staticmethod
     def _should_decode_with_big_vae(*, name: str, tensor: torch.Tensor, policy: str) -> bool:
@@ -436,6 +449,88 @@ class BigVAELatentTensorStore(nn.Module):
     def target_matrix(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         key = self._name_to_key[name]
         return tensor_to_matrix(tensor, self._specs[key])
+
+    def _encoder_context(self, batch_size: int, d_in: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        rows = torch.arange(self.encoder_context_rows, device=device, dtype=torch.float32).view(1, -1, 1)
+        cols = torch.arange(int(d_in), device=device, dtype=torch.float32).view(1, 1, -1)
+        batch_phase = torch.arange(int(batch_size), device=device, dtype=torch.float32).view(-1, 1, 1) * 0.173
+        context = torch.sin((rows + 1.0) * (cols + 1.0) * 0.017 + batch_phase)
+        return (context * float(self.encoder_context_std)).to(dtype=dtype)
+
+    def _initialize_latents_from_encoder(self, initial_tensors: dict[str, torch.Tensor]) -> None:
+        if not self.latent_slots:
+            return
+        first_latent = next(iter(self.latent_slots.values()))
+        device = first_latent.device
+        dtype = first_latent.dtype
+        matrix_cache: dict[str, torch.Tensor] = {}
+
+        with torch.no_grad():
+            for (d_in, d_out, expected_T), keys in self._groups.items():
+                for start in range(0, len(keys), self.encoder_batch_size):
+                    batch_keys = keys[start : start + self.encoder_batch_size]
+                    batch = int(len(batch_keys))
+                    W = torch.zeros(batch, int(d_in), int(d_out), device=device, dtype=dtype)
+                    d_in_mask = torch.zeros(batch, int(d_in), device=device, dtype=torch.bool)
+                    d_out_mask = torch.zeros(batch, int(d_out), device=device, dtype=torch.bool)
+
+                    for item_idx, key in enumerate(batch_keys):
+                        tile = self._tile_specs[key]
+                        for segment in tile.segments:
+                            matrix = matrix_cache.get(segment.tensor_name)
+                            if matrix is None:
+                                source = initial_tensors[segment.tensor_name].to(device=device, dtype=dtype)
+                                matrix = tensor_to_matrix(source, self._specs[segment.tensor_key])
+                                matrix_cache[segment.tensor_name] = matrix
+
+                            tile_row_start = int(segment.tile_row_start)
+                            tile_row_end = tile_row_start + int(segment.row_len)
+                            row_start = int(segment.row_start)
+                            row_end = row_start + int(segment.row_len)
+                            col_start = int(segment.col_start)
+                            col_end = col_start + int(segment.col_len)
+                            W[item_idx, tile_row_start:tile_row_end, : int(segment.col_len)] = matrix[
+                                row_start:row_end,
+                                col_start:col_end,
+                            ]
+                            d_in_mask[item_idx, tile_row_start:tile_row_end] = True
+                            d_out_mask[item_idx, : int(segment.col_len)] = True
+
+                    X = self._encoder_context(batch, int(d_in), device=device, dtype=dtype)
+                    X = X * d_in_mask.to(dtype=dtype).unsqueeze(1)
+                    x_mask = torch.ones(batch, self.encoder_context_rows, device=device, dtype=torch.bool)
+                    (
+                        T,
+                        d_in_pad,
+                        patch_mask,
+                        _structural_patch_mask,
+                        dist_var_by_patch,
+                        dist_patch_by_patch,
+                        dist_var_pooled,
+                    ) = self.big_vae._encode_distribution_context(
+                        X,
+                        x_mask=x_mask,
+                        d_in_mask=d_in_mask,
+                    )
+                    if int(T) != int(expected_T):
+                        raise RuntimeError(
+                            f"BigVAE encoder T mismatch for group {(d_in, d_out, expected_T)}: got T={T}"
+                        )
+                    latents = self.big_vae._encode_latent_slots(
+                        W,
+                        T=int(T),
+                        d_in_pad=int(d_in_pad),
+                        patch_mask=patch_mask,
+                        d_out_mask=d_out_mask,
+                        dist_var_by_patch=dist_var_by_patch,
+                        dist_patch_by_patch=dist_patch_by_patch,
+                        dist_var_pooled=dist_var_pooled,
+                    )
+                    for item_idx, key in enumerate(batch_keys):
+                        encoded = latents[item_idx].detach().to(device=device, dtype=dtype)
+                        if self.latent_noise_std > 0.0:
+                            encoded = encoded + torch.randn_like(encoded) * self.latent_noise_std
+                        self.latent_slots[key].data.copy_(encoded)
 
     def decoded_matrix(self, name: str) -> torch.Tensor:
         return self.decode_all_matrices()[name]
@@ -528,6 +623,9 @@ class FunctionalViTTiny(nn.Module):
         big_vae: BigWeightVAE | None = None,
         big_vae_latent_init: str = "random",
         big_vae_latent_noise_std: float = 0.0,
+        big_vae_encoder_context_rows: int = 64,
+        big_vae_encoder_context_std: float = 1.0,
+        big_vae_encoder_batch_size: int = 16,
         big_vae_decode: str = "weights",
         big_vae_tile_T_patches: int = 16,
         big_vae_tile_d_out: int = 8,
@@ -545,6 +643,9 @@ class FunctionalViTTiny(nn.Module):
                 decode_policy=big_vae_decode,
                 tile_T_patches=int(big_vae_tile_T_patches),
                 tile_d_out=int(big_vae_tile_d_out),
+                encoder_context_rows=int(big_vae_encoder_context_rows),
+                encoder_context_std=float(big_vae_encoder_context_std),
+                encoder_batch_size=int(big_vae_encoder_batch_size),
             )
         else:
             store_mode = "latent" if parameter_mode == "lowrank_latent" else parameter_mode
@@ -952,6 +1053,9 @@ def train_setup(
         big_vae=big_vae_decoder,
         big_vae_latent_init=str(cfg.big_vae_latent_init),
         big_vae_latent_noise_std=float(cfg.big_vae_latent_noise_std),
+        big_vae_encoder_context_rows=int(cfg.big_vae_encoder_context_rows),
+        big_vae_encoder_context_std=float(cfg.big_vae_encoder_context_std),
+        big_vae_encoder_batch_size=int(cfg.big_vae_encoder_batch_size),
         big_vae_decode=str(cfg.big_vae_decode),
         big_vae_tile_T_patches=int(cfg.big_vae_tile_T_patches),
         big_vae_tile_d_out=int(cfg.big_vae_tile_d_out),
@@ -1132,6 +1236,9 @@ def train_setup(
         "weight_decay": float(weight_decay),
         "big_vae_checkpoint": str(cfg.big_vae_checkpoint) if setup == "bigvae_latent" else "",
         "big_vae_init_fit_steps": int(cfg.big_vae_init_fit_steps) if setup == "bigvae_latent" else 0,
+        "big_vae_latent_init": str(cfg.big_vae_latent_init) if setup == "bigvae_latent" else "",
+        "big_vae_encoder_context_rows": int(cfg.big_vae_encoder_context_rows) if setup == "bigvae_latent" else 0,
+        "big_vae_encoder_context_std": float(cfg.big_vae_encoder_context_std) if setup == "bigvae_latent" else 0.0,
         "decode_groups": int(decode_groups),
         "big_vae_decoded_params": int(big_vae_decoded_params),
         "big_vae_tile_count": int(big_vae_tile_count),
@@ -1230,8 +1337,27 @@ def parse_args() -> tuple[ExperimentConfig, ViTTinyConfig]:
     parser.add_argument("--latent-delta-scale", type=float, default=default_exp.latent_delta_scale)
     parser.add_argument("--latent-factor-init-std", type=float, default=default_exp.latent_factor_init_std)
     parser.add_argument("--big-vae-checkpoint", default=default_exp.big_vae_checkpoint)
-    parser.add_argument("--big-vae-latent-init", choices=("base", "random"), default=default_exp.big_vae_latent_init)
+    parser.add_argument(
+        "--big-vae-latent-init",
+        choices=("base", "random", "encoded"),
+        default=default_exp.big_vae_latent_init,
+    )
     parser.add_argument("--big-vae-latent-noise-std", type=float, default=default_exp.big_vae_latent_noise_std)
+    parser.add_argument(
+        "--big-vae-encoder-context-rows",
+        type=int,
+        default=default_exp.big_vae_encoder_context_rows,
+    )
+    parser.add_argument(
+        "--big-vae-encoder-context-std",
+        type=float,
+        default=default_exp.big_vae_encoder_context_std,
+    )
+    parser.add_argument(
+        "--big-vae-encoder-batch-size",
+        type=int,
+        default=default_exp.big_vae_encoder_batch_size,
+    )
     parser.add_argument("--big-vae-decode", choices=("weights", "all"), default=default_exp.big_vae_decode)
     parser.add_argument(
         "--big-vae-tile-t-patches",
@@ -1293,6 +1419,9 @@ def parse_args() -> tuple[ExperimentConfig, ViTTinyConfig]:
         big_vae_checkpoint=str(args.big_vae_checkpoint),
         big_vae_latent_init=str(args.big_vae_latent_init),
         big_vae_latent_noise_std=float(args.big_vae_latent_noise_std),
+        big_vae_encoder_context_rows=int(args.big_vae_encoder_context_rows),
+        big_vae_encoder_context_std=float(args.big_vae_encoder_context_std),
+        big_vae_encoder_batch_size=int(args.big_vae_encoder_batch_size),
         big_vae_decode=str(args.big_vae_decode),
         big_vae_tile_T_patches=int(args.big_vae_tile_T_patches),
         big_vae_tile_d_out=int(args.big_vae_tile_d_out),

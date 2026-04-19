@@ -54,6 +54,9 @@ class BigVAEConfig:
     dropout: float = 0.0
     pos_fourier_dim: int = 64
     use_latent_sampling: bool = True
+    latent_sampling_min_std: float = 1e-4
+    latent_sampling_logvar_min: float = -20.0
+    latent_sampling_logvar_max: float = 10.0
     disable_z_shortcut: bool = False
     disable_distribution_encoder: bool = False
     patch_tokenizer_kind: str = "residual"
@@ -502,6 +505,14 @@ class BigWeightVAE(nn.Module):
         self.latent_base = nn.Parameter(torch.randn(num_latents, d_lat) * 0.02)
         self.z_dim = self.flat_lat_dim
         self.latent_norm = nn.LayerNorm(self.flat_lat_dim)
+        self.register_buffer("latent_sampling_gate", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        if bool(cfg.big_vae.use_latent_sampling):
+            self.to_mu: nn.Linear | None = nn.Linear(d_lat, d_lat)
+            self.to_logvar: nn.Linear | None = nn.Linear(d_lat, d_lat)
+            self._init_latent_sampling_heads()
+        else:
+            self.to_mu = None
+            self.to_logvar = None
 
         self.dec_L_latents = num_latents
         self.latent_to_decoder = nn.Linear(d_lat, d_model)
@@ -540,6 +551,22 @@ class BigWeightVAE(nn.Module):
             self.z_shortcut_proj.requires_grad_(False)
             self.z_shortcut.requires_grad_(False)
 
+    def _init_latent_sampling_heads(self) -> None:
+        if self.to_mu is None or self.to_logvar is None:
+            return
+        with torch.no_grad():
+            nn.init.eye_(self.to_mu.weight)
+            self.to_mu.bias.zero_()
+            self.to_logvar.weight.zero_()
+            self.to_logvar.bias.zero_()
+
+    def set_latent_sampling_gate(self, gate: float) -> None:
+        gate_value = max(0.0, min(1.0, float(gate)))
+        self.latent_sampling_gate.fill_(gate_value)
+
+    def _latent_sampling_gate_tensor(self, ref: torch.Tensor) -> torch.Tensor:
+        return self.latent_sampling_gate.to(device=ref.device, dtype=ref.dtype).clamp(0.0, 1.0)
+
     @staticmethod
     def _normalize_patch_tokenizer_kind(kind: str) -> str:
         value = str(kind).strip().lower()
@@ -566,7 +593,54 @@ class BigWeightVAE(nn.Module):
 
     @staticmethod
     def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        return mu.new_zeros(())
+        mu_f = mu.to(dtype=torch.float32)
+        logvar_f = logvar.to(dtype=torch.float32).clamp(-30.0, 20.0)
+        kl = 0.5 * torch.sum(torch.exp(logvar_f) + mu_f.pow(2) - 1.0 - logvar_f, dim=-1)
+        return kl.mean()
+
+    def _sample_latent_posterior(self, base_z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if base_z.ndim != 2 or int(base_z.shape[1]) != self.z_dim:
+            raise ValueError(f"base_z must be [B, {self.z_dim}], got {tuple(base_z.shape)}")
+
+        B = int(base_z.shape[0])
+        if not bool(self.cfg.big_vae.use_latent_sampling):
+            return base_z, base_z, base_z.new_zeros(B, self.z_dim)
+        if self.to_mu is None or self.to_logvar is None:
+            raise RuntimeError("Latent sampling is enabled, but posterior heads are not initialized")
+
+        num_latents = int(self.cfg.big_vae.num_latents)
+        d_lat = int(self.cfg.big_vae.d_lat)
+        base_slots = base_z.view(B, num_latents, d_lat)
+        gate = self._latent_sampling_gate_tensor(base_z)
+
+        mu_slots = (1.0 - gate) * base_slots + gate * self.to_mu(base_slots)
+
+        logvar_min = float(self.cfg.big_vae.latent_sampling_logvar_min)
+        logvar_max = float(self.cfg.big_vae.latent_sampling_logvar_max)
+        if logvar_min > logvar_max:
+            raise ValueError(
+                "big_vae.latent_sampling_logvar_min must be <= "
+                "big_vae.latent_sampling_logvar_max"
+            )
+        raw_logvar_slots = self.to_logvar(base_slots).clamp(logvar_min, logvar_max)
+        raw_std_slots = torch.exp(0.5 * raw_logvar_slots)
+
+        min_std = max(0.0, float(self.cfg.big_vae.latent_sampling_min_std))
+        if min_std <= 0.0:
+            std_gate = gate
+            std_slots = std_gate * raw_std_slots
+        else:
+            min_std_tensor = base_z.new_tensor(min_std)
+            std_gate = torch.maximum(gate, min_std_tensor)
+            std_slots = (std_gate * raw_std_slots).clamp_min(min_std)
+        logvar_slots = 2.0 * torch.log(std_slots.clamp_min(torch.finfo(std_slots.dtype).tiny))
+
+        if self.training:
+            sampled_slots = mu_slots + torch.randn_like(std_slots) * std_slots
+        else:
+            sampled_slots = mu_slots
+
+        return sampled_slots.reshape(B, self.z_dim), mu_slots.reshape(B, self.z_dim), logvar_slots.reshape(B, self.z_dim)
 
     @staticmethod
     def patch_structure_loss(
@@ -1496,8 +1570,9 @@ class BigWeightVAE(nn.Module):
         if d_in_pad != expected_d_in_pad:
             raise ValueError(f"d_in_pad must equal T*patch_size={expected_d_in_pad}, got {d_in_pad}")
 
-        z = self.latent_norm(latent_slots.reshape(B, self.flat_lat_dim))
-        lat = self.latent_to_decoder(z.view(B, num_latents, d_lat))
+        base_z = self.latent_norm(latent_slots.reshape(B, self.flat_lat_dim))
+        decoder_z, mu, logvar = self._sample_latent_posterior(base_z)
+        lat = self.latent_to_decoder(decoder_z.view(B, num_latents, d_lat))
 
         q_tokens_base, q_pos_emb, q_pos_o, q_pos_t = self._build_decoder_query_state(
             batch_size=B,
@@ -1521,7 +1596,7 @@ class BigWeightVAE(nn.Module):
                 raise ValueError("encoder_patch_tokens are required when debug_direct_from_encoder_tokens=True")
             outputs = self._decode_direct_from_encoder_patch_tokens(
                 encoder_patch_tokens,
-                z=z,
+                z=decoder_z,
                 d_in=d_in,
                 d_out=d_out,
                 d_in_pad=d_in_pad,
@@ -1559,7 +1634,7 @@ class BigWeightVAE(nn.Module):
                 )
             outputs = self._decode_query_tokens_to_output(
                 q_hidden,
-                z=z,
+                z=decoder_z,
                 q_pos_emb=q_pos_emb,
                 d_in=d_in,
                 d_out=d_out,
@@ -1572,14 +1647,22 @@ class BigWeightVAE(nn.Module):
                 disable_z_shortcut=disable_z_shortcut,
             )
 
+        if return_direction_pre_norms:
+            W_hat, _decoder_z_out, pred_dirs, direction_pre_norms = outputs
+        else:
+            W_hat, _decoder_z_out, pred_dirs = outputs
+        outputs_with_posterior = (W_hat, mu, logvar, pred_dirs)
+
         if return_debug_info:
-            pred_dirs = outputs[2]
             debug_info: dict[str, object] = {
                 "debug_patch_tokenizer_kind": self.patch_tokenizer_kind,
                 "debug_encoder_conditioning_kind": self.distribution_encoder_conditioning_kind,
                 "debug_decoder_kv_source": self._normalize_debug_decoder_kv_source(debug_decoder_kv_source),
                 "debug_query_hint": self._normalize_debug_query_hint(debug_query_hint),
                 "debug_direct_from_encoder_tokens": bool(debug_direct_from_encoder_tokens),
+                "latent_sampling_gate": self._latent_sampling_gate_tensor(mu).detach(),
+                "latent_base_z": base_z,
+                "latent_decoder_z": decoder_z,
                 "decoder_queries_base": q_tokens_base,
                 "decoder_queries_init": q_tokens,
                 "decoder_query_pos_emb": q_pos_emb,
@@ -1590,8 +1673,12 @@ class BigWeightVAE(nn.Module):
                 "decoder_kv_mask": kv_mask,
                 "pred_dirs": pred_dirs,
             }
-            return outputs + (debug_info,)
-        return outputs
+            if return_direction_pre_norms:
+                return outputs_with_posterior + (direction_pre_norms, debug_info)
+            return outputs_with_posterior + (debug_info,)
+        if return_direction_pre_norms:
+            return outputs_with_posterior + (direction_pre_norms,)
+        return outputs_with_posterior
 
     def forward_debug(
         self,
@@ -1671,9 +1758,9 @@ class BigWeightVAE(nn.Module):
             return_debug_info=True,
         )
         if return_direction_pre_norms:
-            W_hat, z, pred_dirs, direction_pre_norms, decode_debug = decode_outputs
+            W_hat, mu, logvar, pred_dirs, direction_pre_norms, decode_debug = decode_outputs
         else:
-            W_hat, z, pred_dirs, decode_debug = decode_outputs
+            W_hat, mu, logvar, pred_dirs, decode_debug = decode_outputs
 
         debug_info = {
             "T": int(T),
@@ -1691,15 +1778,15 @@ class BigWeightVAE(nn.Module):
         if squeeze_batch:
             outputs = (
                 W_hat.squeeze(0),
-                z.squeeze(0),
-                z.new_zeros(self.z_dim),
+                mu.squeeze(0),
+                logvar.squeeze(0),
                 pred_dirs.squeeze(0),
             )
             if return_direction_pre_norms:
                 return outputs + (direction_pre_norms, debug_info)
             return outputs + (debug_info,)
 
-        outputs = (W_hat, z, z.new_zeros(B, self.z_dim), pred_dirs)
+        outputs = (W_hat, mu, logvar, pred_dirs)
         if return_direction_pre_norms:
             return outputs + (direction_pre_norms, debug_info)
         return outputs + (debug_info,)
@@ -1786,22 +1873,22 @@ class BigWeightVAE(nn.Module):
             disable_z_shortcut=disable_z_shortcut,
         )
         if return_direction_pre_norms:
-            W_hat, z, pred_dirs, direction_pre_norms = decode_outputs
+            W_hat, mu, logvar, pred_dirs, direction_pre_norms = decode_outputs
         else:
-            W_hat, z, pred_dirs = decode_outputs
+            W_hat, mu, logvar, pred_dirs = decode_outputs
 
         if squeeze_batch:
             outputs = (
                 W_hat.squeeze(0),
-                z.squeeze(0),
-                z.new_zeros(self.z_dim),
+                mu.squeeze(0),
+                logvar.squeeze(0),
                 pred_dirs.squeeze(0),
             )
             if return_direction_pre_norms:
                 return outputs + (direction_pre_norms,)
             return outputs
 
-        outputs = (W_hat, z, z.new_zeros(B, self.z_dim), pred_dirs)
+        outputs = (W_hat, mu, logvar, pred_dirs)
         if return_direction_pre_norms:
             return outputs + (direction_pre_norms,)
         return outputs
@@ -1855,16 +1942,14 @@ def smoke_test_big_weight_vae() -> None:
     X = torch.randn(B, n, d_in)
     W = torch.randn(B, d_in, d_out)
 
-    W_hat, z, logvar_dummy, pred_dirs = model(W, X)
+    W_hat, z, logvar, pred_dirs = model(W, X)
 
     assert tuple(W_hat.shape) == (B, d_in, d_out), f"W_hat shape mismatch: {tuple(W_hat.shape)}"
     assert tuple(z.shape) == (B, z_dim_expected), f"z shape mismatch: {tuple(z.shape)}, expected {(B, z_dim_expected)}"
-    assert (logvar_dummy == 0).all(), "logvar dummy should be all zeros"
+    assert (logvar == 0).all(), "AE-mode logvar should be all zeros"
 
     behavioral_loss = BigWeightVAE.operator_recon_loss(X, W, W_hat)
     structural_loss, struct_details = BigWeightVAE.patch_structure_loss(W, W_hat, patch_size=cfg.patch_size, pred_dirs=pred_dirs)
-    kl_loss = BigWeightVAE.kl_loss(z, logvar_dummy)
-    assert kl_loss.item() == 0.0, f"kl_loss should be 0, got {kl_loss.item()}"
     total_loss = behavioral_loss + 0.5 * structural_loss
     total_loss.backward()
 

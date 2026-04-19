@@ -199,6 +199,9 @@ def _build_model_cfg_local(cfg: DictConfig) -> ModelConfig:
             dropout=float(big_cfg.get("dropout", 0.0)),
             pos_fourier_dim=int(big_cfg.get("pos_fourier_dim", 64)),
             use_latent_sampling=bool(big_cfg.get("use_latent_sampling", True)),
+            latent_sampling_min_std=float(big_cfg.get("latent_sampling_min_std", 1e-4)),
+            latent_sampling_logvar_min=float(big_cfg.get("latent_sampling_logvar_min", -20.0)),
+            latent_sampling_logvar_max=float(big_cfg.get("latent_sampling_logvar_max", 10.0)),
             disable_z_shortcut=bool(big_cfg.get("disable_z_shortcut", False)),
             disable_distribution_encoder=bool(big_cfg.get("disable_distribution_encoder", False)),
             patch_tokenizer_kind=str(big_cfg.get("patch_tokenizer_kind", "residual")),
@@ -1184,11 +1187,12 @@ def _experiment_4(
 
         for step in range(steps + 1):
             optimizer.zero_grad(set_to_none=True)
-            W_hat, z, pred_dirs, direction_pre_norms = model._decode_from_latent_slots(
+            W_hat, z, _logvar, pred_dirs, direction_pre_norms = model._decode_from_latent_slots(
                 H,
                 dist_patch_by_patch=dist_patch_by_patch,
                 patch_mask=patch_mask,
                 d_in_mask=frozen.d_in_mask_s if frozen.d_in_mask_s is not None else torch.ones_like(frozen.W_s[:, :, 0], dtype=torch.bool),
+                d_out_mask=torch.ones_like(frozen.W_s[:, 0, :], dtype=torch.bool),
                 d_in=int(frozen.meta["d_in"]),
                 d_out=int(frozen.meta["d_out"]),
                 d_in_pad=d_in_pad,
