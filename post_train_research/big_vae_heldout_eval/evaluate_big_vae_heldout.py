@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import random
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -49,6 +50,7 @@ from training.runtime import resolve_device as runtime_resolve_device
 
 
 LOGGER = logging.getLogger("evaluate_big_vae_heldout")
+_LATENT_DUMP_BALANCE_KEY_DEFAULT = "dataset,model,layer_type,depth_label"
 
 
 def _load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn.Module, DictConfig, dict[str, Any]]:
@@ -352,6 +354,120 @@ def _write_latent_dump(
     }
 
 
+def _parse_latent_dump_balance_keys() -> tuple[str, ...]:
+    raw = str(os.environ.get("EVAL_LATENT_DUMP_BALANCE_KEYS", _LATENT_DUMP_BALANCE_KEY_DEFAULT)).strip()
+    keys = tuple(key.strip() for key in raw.split(",") if key.strip())
+    allowed = {
+        "dataset",
+        "model",
+        "layer",
+        "layer_type",
+        "layer_depth",
+        "depth_label",
+        "weight_shape",
+        "x_shape",
+    }
+    unknown = [key for key in keys if key not in allowed]
+    if unknown:
+        raise ValueError(
+            "EVAL_LATENT_DUMP_BALANCE_KEYS contains unsupported keys: "
+            f"{unknown}. Supported keys: {sorted(allowed)}"
+        )
+    return keys
+
+
+def _latent_dump_group_key(row: Mapping[str, Any], balance_keys: tuple[str, ...]) -> tuple[str, ...]:
+    if not balance_keys:
+        return ("__all__",)
+    return tuple(_plot_safe_label(row.get(key)) for key in balance_keys)
+
+
+def _latent_dump_replacement_index(
+    *,
+    buckets: dict[tuple[str, ...], list[dict[str, Any]]],
+    seen_by_group: dict[tuple[str, ...], int],
+    group_key: tuple[str, ...],
+    max_per_group: int,
+    rng: random.Random,
+) -> int | None:
+    seen = int(seen_by_group.get(group_key, 0)) + 1
+    seen_by_group[group_key] = seen
+
+    bucket = buckets.setdefault(group_key, [])
+    if len(bucket) < max_per_group:
+        return len(bucket)
+
+    replacement_idx = rng.randrange(seen)
+    if replacement_idx < max_per_group:
+        return replacement_idx
+    return None
+
+
+def _store_latent_dump_entry(
+    *,
+    buckets: dict[tuple[str, ...], list[dict[str, Any]]],
+    group_key: tuple[str, ...],
+    replacement_idx: int,
+    row: dict[str, Any],
+    latent: torch.Tensor,
+    logvar: torch.Tensor,
+) -> None:
+    entry = {"row": dict(row), "latent": latent.contiguous(), "logvar": logvar.contiguous()}
+    bucket = buckets.setdefault(group_key, [])
+    if replacement_idx == len(bucket):
+        bucket.append(entry)
+    else:
+        bucket[replacement_idx] = entry
+
+
+def _select_balanced_latent_dump_entries(
+    *,
+    buckets: Mapping[tuple[str, ...], list[dict[str, Any]]],
+    max_entries: int,
+    balance_keys: tuple[str, ...],
+    seed: int,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for group_key in sorted(buckets.keys()):
+        candidates.extend(buckets[group_key])
+    if max_entries <= 0 or not candidates:
+        return []
+    if len(candidates) <= max_entries:
+        return candidates
+
+    rng = random.Random(seed)
+    rng.shuffle(candidates)
+    selected: list[dict[str, Any]] = []
+    selected_indices: set[int] = set()
+    counts_by_key: dict[str, dict[str, int]] = {key: {} for key in balance_keys}
+
+    for _ in range(min(max_entries, len(candidates))):
+        best_idx = -1
+        best_score: tuple[int, int] | None = None
+        for idx, entry in enumerate(candidates):
+            if idx in selected_indices:
+                continue
+            row = entry["row"]
+            marginal_score = sum(
+                counts_by_key[key].get(_plot_safe_label(row.get(key)), 0)
+                for key in balance_keys
+            )
+            score = (int(marginal_score), idx)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_idx = idx
+        if best_idx < 0:
+            break
+        entry = candidates[best_idx]
+        selected.append(entry)
+        selected_indices.add(best_idx)
+        for key in balance_keys:
+            value = _plot_safe_label(entry["row"].get(key))
+            counts_by_key[key][value] = counts_by_key[key].get(value, 0) + 1
+
+    return selected
+
+
 def _load_latent_dump(dump_path: Path) -> tuple[Any, list[dict[str, Any]]]:
     payload = torch.load(dump_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
@@ -538,6 +654,22 @@ def plot_latent_dump(
     seed_value = int(seed if seed is not None else env_int("EVAL_SEED", 42))
     methods: dict[str, dict[str, Any]] = {}
     files: list[str] = []
+    count_files = []
+    for color_by, _label in color_specs:
+        counts: dict[str, int] = {}
+        for row in rows:
+            value = _plot_safe_label(row.get(color_by))
+            counts[value] = counts.get(value, 0) + 1
+        count_csv = output_path / f"latent_counts_by_{color_by}.csv"
+        write_csv(
+            count_csv,
+            [
+                {color_by: value, "count": int(count)}
+                for value, count in sorted(counts.items(), key=lambda item: (-int(item[1]), item[0]))
+            ],
+        )
+        count_files.append(str(count_csv))
+        files.append(str(count_csv))
 
     pca_coords, pca_info = _pca_embedding(latents)
     pca_csv = output_path / "latent_embedding_pca.csv"
@@ -593,6 +725,7 @@ def plot_latent_dump(
         "count": int(latents.shape[0]),
         "latent_dim": int(latents.shape[1]),
         "methods": methods,
+        "count_files": count_files,
         "files": files,
     }
     write_json(output_path / "latent_plot_summary.json", info)
@@ -641,13 +774,22 @@ def _evaluate_dataset(
     records_evaluated = 0
     slices_evaluated = 0
     latent_dump_enabled = env_bool("EVAL_LATENT_DUMP_ENABLED", True)
-    latent_dump_max_entries = max(0, env_int("EVAL_LATENT_DUMP_MAX_ENTRIES", 512))
-    latent_dump_latents: list[torch.Tensor] = []
-    latent_dump_logvars: list[torch.Tensor] = []
-    latent_dump_rows: list[dict[str, Any]] = []
+    latent_dump_max_entries = max(0, env_int("EVAL_LATENT_DUMP_MAX_ENTRIES", 256))
+    latent_dump_max_slices_per_source = max(1, env_int("EVAL_LATENT_DUMP_MAX_SLICES_PER_SOURCE", 1))
+    latent_dump_balance_enabled = env_bool("EVAL_LATENT_DUMP_BALANCE_ENABLED", True)
+    latent_dump_balance_keys = _parse_latent_dump_balance_keys() if latent_dump_balance_enabled else ()
+    default_max_per_group = 1 if latent_dump_balance_enabled else max(1, latent_dump_max_entries)
+    latent_dump_max_per_group = max(1, env_int("EVAL_LATENT_DUMP_MAX_PER_GROUP", default_max_per_group))
+    latent_dump_buckets: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    latent_dump_seen_by_group: dict[tuple[str, ...], int] = {}
+    latent_dump_rng = random.Random(seed)
     latent_dump_config = {
         "enabled": bool(latent_dump_enabled),
         "max_entries": int(latent_dump_max_entries),
+        "max_slices_per_source": int(latent_dump_max_slices_per_source),
+        "balance_enabled": bool(latent_dump_balance_enabled),
+        "balance_keys": list(latent_dump_balance_keys),
+        "max_per_group": int(latent_dump_max_per_group),
         "source": "posterior_mu_when_sampling_enabled_else_base_z",
         "point_unit": "slice",
     }
@@ -683,6 +825,7 @@ def _evaluate_dataset(
 
             source_batch_idx = 0
             evaluated_for_source = 0
+            dumped_for_source = 0
             while evaluated_for_source < total_to_eval:
                 remaining = _remaining_source_state_slices(state)
                 if remaining <= 0:
@@ -711,35 +854,50 @@ def _evaluate_dataset(
                     amp_enabled=amp_enabled,
                     amp_dtype=amp_dtype,
                 )
-                if latent_dump_enabled and len(latent_dump_rows) < latent_dump_max_entries:
-                    dump_remaining = latent_dump_max_entries - len(latent_dump_rows)
-                    mu_cpu, logvar_cpu = _extract_latents_for_batch(
-                        model=model,
-                        W_s=W_batch,
-                        x_s=x_batch,
-                        x_mask_s=x_mask_batch,
-                        d_in_mask_s=d_in_mask_batch,
-                        d_out_mask_s=d_out_mask_batch,
-                        amp_enabled=amp_enabled,
-                        amp_dtype=amp_dtype,
-                    )
-                    dump_take = min(int(dump_remaining), int(mu_cpu.shape[0]))
-                    if dump_take > 0:
-                        latent_dump_latents.append(mu_cpu[:dump_take].contiguous())
-                        latent_dump_logvars.append(logvar_cpu[:dump_take].contiguous())
-                        for local_idx in range(dump_take):
-                            latent_dump_rows.append(
-                                _latent_dump_metadata_row(
-                                    entry_index=len(latent_dump_rows),
-                                    record_index=records_seen,
-                                    slice_index=evaluated_for_source + local_idx,
-                                    source_batch_index=source_batch_idx,
-                                    dataset_name=dataset_name,
-                                    model_name=model_name,
-                                    layer_name=layer_name,
-                                    source=source,
-                                )
-                            )
+                source_dump_remaining = latent_dump_max_slices_per_source - dumped_for_source
+                if latent_dump_enabled and latent_dump_max_entries > 0 and source_dump_remaining > 0:
+                    candidate_take = min(int(source_dump_remaining), int(batch_slices))
+                    for local_idx in range(candidate_take):
+                        row = _latent_dump_metadata_row(
+                            entry_index=0,
+                            record_index=records_seen,
+                            slice_index=evaluated_for_source + local_idx,
+                            source_batch_index=source_batch_idx,
+                            dataset_name=dataset_name,
+                            model_name=model_name,
+                            layer_name=layer_name,
+                            source=source,
+                        )
+                        group_key = _latent_dump_group_key(row, latent_dump_balance_keys)
+                        row["balance_group"] = " | ".join(group_key)
+                        replacement_idx = _latent_dump_replacement_index(
+                            buckets=latent_dump_buckets,
+                            seen_by_group=latent_dump_seen_by_group,
+                            group_key=group_key,
+                            max_per_group=latent_dump_max_per_group,
+                            rng=latent_dump_rng,
+                        )
+                        if replacement_idx is None:
+                            continue
+                        mu_cpu, logvar_cpu = _extract_latents_for_batch(
+                            model=model,
+                            W_s=W_batch[local_idx : local_idx + 1],
+                            x_s=x_batch[local_idx : local_idx + 1],
+                            x_mask_s=x_mask_batch[local_idx : local_idx + 1],
+                            d_in_mask_s=d_in_mask_batch[local_idx : local_idx + 1],
+                            d_out_mask_s=d_out_mask_batch[local_idx : local_idx + 1],
+                            amp_enabled=amp_enabled,
+                            amp_dtype=amp_dtype,
+                        )
+                        _store_latent_dump_entry(
+                            buckets=latent_dump_buckets,
+                            group_key=group_key,
+                            replacement_idx=int(replacement_idx),
+                            row=row,
+                            latent=mu_cpu[:1],
+                            logvar=logvar_cpu[:1],
+                        )
+                    dumped_for_source += int(candidate_take)
                 if not finite_metrics(metrics):
                     skipped["non_finite"] += 1
                 else:
@@ -808,6 +966,24 @@ def _evaluate_dataset(
         "amp_dtype": str(amp_dtype),
         "device": str(device),
     }
+    candidate_entries = sum(len(bucket) for bucket in latent_dump_buckets.values())
+    latent_dump_config["candidate_groups"] = int(len(latent_dump_buckets))
+    latent_dump_config["candidate_entries_before_global_cap"] = int(candidate_entries)
+    selected_latent_entries = _select_balanced_latent_dump_entries(
+        buckets=latent_dump_buckets,
+        max_entries=latent_dump_max_entries,
+        balance_keys=latent_dump_balance_keys,
+        seed=seed,
+    )
+    latent_dump_rows = []
+    latent_dump_latents = []
+    latent_dump_logvars = []
+    for entry_index, entry in enumerate(selected_latent_entries):
+        row = dict(entry["row"])
+        row["entry_index"] = int(entry_index)
+        latent_dump_rows.append(row)
+        latent_dump_latents.append(entry["latent"])
+        latent_dump_logvars.append(entry["logvar"])
     payload["latent_dump"] = _write_latent_dump(
         output_dir=output_dir,
         latents=latent_dump_latents,
