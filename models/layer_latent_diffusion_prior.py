@@ -45,6 +45,11 @@ class LayerLatentDiffusionPriorConfig:
     decoder_aux_lambda: float = 0.0
     decoder_aux_max_sigma: float = 0.5
     decoder_aux_behavioral_coef: float = 1.0
+    decoder_aux_behavioral_lambda_operator: float = 1.0
+    decoder_aux_behavioral_lambda_dir: float = 0.0
+    decoder_aux_behavioral_lambda_scale: float = 0.0
+    decoder_aux_behavioral_gamma: float = 0.5
+    decoder_aux_behavioral_huber_delta: float = 0.1
     decoder_aux_structural_coef: float = 1.0
     decoder_aux_struct_gamma: float = 0.5
     decoder_aux_struct_lambda_dir: float = 1.0
@@ -82,6 +87,11 @@ def build_layer_latent_diffusion_prior_config(raw_cfg: Mapping[str, Any]) -> Lay
         decoder_aux_lambda=float(raw_cfg.get("decoder_aux_lambda", 0.0)),
         decoder_aux_max_sigma=float(raw_cfg.get("decoder_aux_max_sigma", 0.5)),
         decoder_aux_behavioral_coef=float(raw_cfg.get("decoder_aux_behavioral_coef", 1.0)),
+        decoder_aux_behavioral_lambda_operator=float(raw_cfg.get("decoder_aux_behavioral_lambda_operator", 1.0)),
+        decoder_aux_behavioral_lambda_dir=float(raw_cfg.get("decoder_aux_behavioral_lambda_dir", 0.0)),
+        decoder_aux_behavioral_lambda_scale=float(raw_cfg.get("decoder_aux_behavioral_lambda_scale", 0.0)),
+        decoder_aux_behavioral_gamma=float(raw_cfg.get("decoder_aux_behavioral_gamma", 0.5)),
+        decoder_aux_behavioral_huber_delta=float(raw_cfg.get("decoder_aux_behavioral_huber_delta", 0.1)),
         decoder_aux_structural_coef=float(raw_cfg.get("decoder_aux_structural_coef", 1.0)),
         decoder_aux_struct_gamma=float(raw_cfg.get("decoder_aux_struct_gamma", 0.5)),
         decoder_aux_struct_lambda_dir=float(raw_cfg.get("decoder_aux_struct_lambda_dir", 1.0)),
@@ -852,6 +862,9 @@ def compute_layer_latent_diffusion_loss(
     zero = diffusion_loss.new_zeros(())
     decoder_aux_loss = zero
     decoder_aux_behavioral_loss = zero
+    decoder_aux_behavioral_operator_loss = zero
+    decoder_aux_behavioral_dir_loss = zero
+    decoder_aux_behavioral_scale_loss = zero
     decoder_aux_structural_loss = zero
     decoder_aux_applied_fraction = zero
     decoder_aux_weight_mean = zero
@@ -927,17 +940,42 @@ def compute_layer_latent_diffusion_loss(
             from models.big_weight_vae import BigWeightVAE
 
             behavioral_terms: list[torch.Tensor] = []
+            behavioral_operator_terms: list[torch.Tensor] = []
+            behavioral_dir_terms: list[torch.Tensor] = []
+            behavioral_scale_terms: list[torch.Tensor] = []
             structural_terms: list[torch.Tensor] = []
             for sample_idx in range(int(active_idx.numel())):
-                behavioral_terms.append(
-                    BigWeightVAE.operator_recon_loss(
+                behavioral_operator_term = BigWeightVAE.operator_recon_loss(
+                    target_X_active[sample_idx],
+                    target_W_active[sample_idx],
+                    target_W_hat[sample_idx],
+                    x_mask=x_mask_active[sample_idx],
+                    d_in_mask=d_in_mask_active[sample_idx],
+                    d_out_mask=d_out_mask_active[sample_idx],
+                )
+                if (
+                    float(model.cfg.decoder_aux_behavioral_lambda_dir) != 0.0
+                    or float(model.cfg.decoder_aux_behavioral_lambda_scale) != 0.0
+                ):
+                    behavioral_dir_term, behavioral_scale_term = BigWeightVAE.operator_direction_scale_loss(
                         target_X_active[sample_idx],
                         target_W_active[sample_idx],
                         target_W_hat[sample_idx],
                         x_mask=x_mask_active[sample_idx],
-                        d_in_mask=d_in_mask_active[sample_idx],
                         d_out_mask=d_out_mask_active[sample_idx],
+                        gamma=float(model.cfg.decoder_aux_behavioral_gamma),
+                        huber_delta=float(model.cfg.decoder_aux_behavioral_huber_delta),
                     )
+                else:
+                    behavioral_dir_term = behavioral_operator_term.new_zeros(())
+                    behavioral_scale_term = behavioral_operator_term.new_zeros(())
+                behavioral_operator_terms.append(behavioral_operator_term)
+                behavioral_dir_terms.append(behavioral_dir_term)
+                behavioral_scale_terms.append(behavioral_scale_term)
+                behavioral_terms.append(
+                    float(model.cfg.decoder_aux_behavioral_lambda_operator) * behavioral_operator_term
+                    + float(model.cfg.decoder_aux_behavioral_lambda_dir) * behavioral_dir_term
+                    + float(model.cfg.decoder_aux_behavioral_lambda_scale) * behavioral_scale_term
                 )
                 structural_term, _decoder_struct_details = BigWeightVAE.patch_structure_loss(
                     target_W_active[sample_idx],
@@ -956,9 +994,15 @@ def compute_layer_latent_diffusion_loss(
                 structural_terms.append(structural_term)
 
             behavioral_per_sample = torch.stack(behavioral_terms, dim=0)
+            behavioral_operator_per_sample = torch.stack(behavioral_operator_terms, dim=0)
+            behavioral_dir_per_sample = torch.stack(behavioral_dir_terms, dim=0)
+            behavioral_scale_per_sample = torch.stack(behavioral_scale_terms, dim=0)
             structural_per_sample = torch.stack(structural_terms, dim=0)
             batch_denom = float(clean_latents.shape[0])
             decoder_aux_behavioral_loss = (active_weights * behavioral_per_sample).sum() / batch_denom
+            decoder_aux_behavioral_operator_loss = (active_weights * behavioral_operator_per_sample).sum() / batch_denom
+            decoder_aux_behavioral_dir_loss = (active_weights * behavioral_dir_per_sample).sum() / batch_denom
+            decoder_aux_behavioral_scale_loss = (active_weights * behavioral_scale_per_sample).sum() / batch_denom
             decoder_aux_structural_loss = (active_weights * structural_per_sample).sum() / batch_denom
             decoder_aux_loss = (
                 float(model.cfg.decoder_aux_behavioral_coef) * decoder_aux_behavioral_loss
@@ -971,6 +1015,9 @@ def compute_layer_latent_diffusion_loss(
         "diffusion_loss": diffusion_loss,
         "decoder_aux_loss": decoder_aux_loss,
         "decoder_aux_behavioral_loss": decoder_aux_behavioral_loss,
+        "decoder_aux_behavioral_operator_loss": decoder_aux_behavioral_operator_loss,
+        "decoder_aux_behavioral_dir_loss": decoder_aux_behavioral_dir_loss,
+        "decoder_aux_behavioral_scale_loss": decoder_aux_behavioral_scale_loss,
         "decoder_aux_structural_loss": decoder_aux_structural_loss,
         "decoder_aux_applied_fraction": decoder_aux_applied_fraction,
         "decoder_aux_weight_mean": decoder_aux_weight_mean,

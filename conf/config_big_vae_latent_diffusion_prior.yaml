@@ -98,6 +98,11 @@ model:
     decoder_aux_lambda: 0.1
     decoder_aux_max_sigma: 0.5
     decoder_aux_behavioral_coef: 1.0
+    decoder_aux_behavioral_lambda_operator: 1.0
+    decoder_aux_behavioral_lambda_dir: 0.0
+    decoder_aux_behavioral_lambda_scale: 0.0
+    decoder_aux_behavioral_gamma: 0.5
+    decoder_aux_behavioral_huber_delta: 0.1
     decoder_aux_structural_coef: 1.0
     decoder_aux_struct_gamma: 0.5
     decoder_aux_struct_lambda_dir: 1.0
