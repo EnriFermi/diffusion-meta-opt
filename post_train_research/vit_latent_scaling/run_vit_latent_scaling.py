@@ -32,6 +32,7 @@ from experiments.compare_vit_tiny_latent_optimization import (
     seed_everything,
 )
 from models.weight_quantile_vae import BigWeightVAE
+from training.big_vae_latent_diffusion import load_frozen_layer_latent_diffusion_prior
 
 
 MNIST_MEAN = (0.1307,)
@@ -74,6 +75,11 @@ class ScalingRunConfig:
     save_checkpoints: bool
     raw_checkpoint: str
     big_vae_checkpoint: str
+    big_vae_latent_init: str
+    big_vae_diffusion_prior_checkpoint: str
+    big_vae_diffusion_prior_steps: int
+    big_vae_diffusion_prior_sampler: str
+    big_vae_diffusion_prior_eta: float
     big_vae_decode: str
     big_vae_tile_T_patches: int
     big_vae_tile_d_out: int
@@ -326,6 +332,7 @@ def build_model(
     initial_tensors: dict[str, torch.Tensor],
     *,
     big_vae_decoder: BigWeightVAE | None,
+    big_vae_diffusion_prior: Any | None,
 ) -> nn.Module:
     if cfg.setup == "raw":
         return FunctionalViTTiny(vit_cfg, initial_tensors, parameter_mode="direct")
@@ -338,7 +345,11 @@ def build_model(
         initial_tensors,
         parameter_mode="bigvae_latent",
         big_vae=big_vae_decoder,
-        big_vae_latent_init="encoded",
+        big_vae_latent_init=str(cfg.big_vae_latent_init),
+        big_vae_diffusion_prior=big_vae_diffusion_prior,
+        big_vae_diffusion_prior_steps=int(cfg.big_vae_diffusion_prior_steps),
+        big_vae_diffusion_prior_sampler=str(cfg.big_vae_diffusion_prior_sampler),
+        big_vae_diffusion_prior_eta=float(cfg.big_vae_diffusion_prior_eta),
         big_vae_decode=str(cfg.big_vae_decode),
         big_vae_tile_T_patches=int(cfg.big_vae_tile_T_patches),
         big_vae_tile_d_out=int(cfg.big_vae_tile_d_out),
@@ -370,11 +381,27 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         initial_tensors = make_initial_tensors(vit_cfg, seed=int(cfg.seed))
 
     big_vae_decoder = None
+    big_vae_diffusion_prior = None
     if cfg.setup == "latent":
         print(f"[latent] loading frozen BigVAE decoder: {cfg.big_vae_checkpoint}", flush=True)
         big_vae_decoder = load_frozen_big_vae_decoder(cfg.big_vae_checkpoint, device=device)
+        if str(cfg.big_vae_latent_init).strip().lower() == "diffusion_prior":
+            print(
+                f"[latent] loading frozen latent diffusion prior: {cfg.big_vae_diffusion_prior_checkpoint}",
+                flush=True,
+            )
+            big_vae_diffusion_prior = load_frozen_layer_latent_diffusion_prior(
+                cfg.big_vae_diffusion_prior_checkpoint,
+                device=device,
+            )
 
-    model = build_model(cfg, vit_cfg, initial_tensors, big_vae_decoder=big_vae_decoder).to(device)
+    model = build_model(
+        cfg,
+        vit_cfg,
+        initial_tensors,
+        big_vae_decoder=big_vae_decoder,
+        big_vae_diffusion_prior=big_vae_diffusion_prior,
+    ).to(device)
     if bool(cfg.compile):
         model = torch.compile(model)
 
@@ -532,6 +559,15 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         "bigvae_tile_count": int(tile_count),
         "raw_checkpoint": str(cfg.raw_checkpoint) if cfg.setup == "latent" else "",
         "big_vae_checkpoint": str(cfg.big_vae_checkpoint) if cfg.setup == "latent" else "",
+        "big_vae_latent_init": str(cfg.big_vae_latent_init) if cfg.setup == "latent" else "",
+        "big_vae_diffusion_prior_checkpoint": (
+            str(cfg.big_vae_diffusion_prior_checkpoint) if cfg.setup == "latent" else ""
+        ),
+        "big_vae_diffusion_prior_steps": int(cfg.big_vae_diffusion_prior_steps) if cfg.setup == "latent" else 0,
+        "big_vae_diffusion_prior_sampler": (
+            str(cfg.big_vae_diffusion_prior_sampler) if cfg.setup == "latent" else ""
+        ),
+        "big_vae_diffusion_prior_eta": float(cfg.big_vae_diffusion_prior_eta) if cfg.setup == "latent" else 0.0,
     }
     write_json(output_dir / "summary.json", summary)
     return summary
@@ -572,6 +608,15 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
     parser.add_argument("--save-checkpoints", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--raw-checkpoint", default="")
     parser.add_argument("--big-vae-checkpoint", default="")
+    parser.add_argument(
+        "--big-vae-latent-init",
+        choices=("base", "random", "encoded", "diffusion_prior"),
+        default="encoded",
+    )
+    parser.add_argument("--big-vae-diffusion-prior-checkpoint", default="")
+    parser.add_argument("--big-vae-diffusion-prior-steps", type=int, default=50)
+    parser.add_argument("--big-vae-diffusion-prior-sampler", choices=("ddim", "ddpm"), default="ddim")
+    parser.add_argument("--big-vae-diffusion-prior-eta", type=float, default=0.0)
     parser.add_argument("--big-vae-decode", choices=("weights", "all"), default="all")
     parser.add_argument("--big-vae-tile-t-patches", "--big-vae-tile-T-patches", dest="big_vae_tile_T_patches", type=int, default=16)
     parser.add_argument("--big-vae-tile-d-out", type=int, default=8)
@@ -598,6 +643,12 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
             raise ValueError("--raw-checkpoint is required for setup=latent")
         if not str(args.big_vae_checkpoint).strip():
             raise ValueError("--big-vae-checkpoint is required for setup=latent")
+        if str(args.big_vae_latent_init).strip().lower() == "diffusion_prior" and not str(
+            args.big_vae_diffusion_prior_checkpoint
+        ).strip():
+            raise ValueError(
+                "--big-vae-diffusion-prior-checkpoint is required when --big-vae-latent-init=diffusion_prior"
+            )
     if str(args.dataset).strip().lower() == "imagenet" and bool(args.download):
         args.download = False
 
@@ -632,6 +683,11 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         save_checkpoints=bool(args.save_checkpoints),
         raw_checkpoint=str(args.raw_checkpoint),
         big_vae_checkpoint=str(args.big_vae_checkpoint),
+        big_vae_latent_init=str(args.big_vae_latent_init),
+        big_vae_diffusion_prior_checkpoint=str(args.big_vae_diffusion_prior_checkpoint),
+        big_vae_diffusion_prior_steps=int(args.big_vae_diffusion_prior_steps),
+        big_vae_diffusion_prior_sampler=str(args.big_vae_diffusion_prior_sampler),
+        big_vae_diffusion_prior_eta=float(args.big_vae_diffusion_prior_eta),
         big_vae_decode=str(args.big_vae_decode),
         big_vae_tile_T_patches=int(args.big_vae_tile_T_patches),
         big_vae_tile_d_out=int(args.big_vae_tile_d_out),

@@ -14,6 +14,13 @@ from models.big_weight_vae import (
     smoke_test_big_weight_vae,
 )
 from models.distribution_encoder import CrossLayer, DCNv2, DistributionConfig, InputDistributionEncodingModule
+from models.layer_latent_diffusion_prior import (
+    DiffusionSchedule,
+    DiffusionScheduleConfig,
+    LayerLatentDiffusionPrior,
+    LayerLatentDiffusionPriorConfig,
+    compute_layer_latent_diffusion_loss,
+)
 from models.mini_patch_vae import (
     CrossAttnPatchDecoder,
     MLPNoCompressionPatchDecoder,
@@ -40,8 +47,12 @@ __all__ = [
     "DCNv2",
     "DecoderCrossBlock",
     "DistributionConfig",
+    "DiffusionSchedule",
+    "DiffusionScheduleConfig",
     "EncoderConfig",
     "InputDistributionEncodingModule",
+    "LayerLatentDiffusionPrior",
+    "LayerLatentDiffusionPriorConfig",
     "LatentEncoderLayer",
     "LocalOutputSelfAttentionBlock",
     "MLP",
@@ -62,6 +73,7 @@ __all__ = [
     "TransformerNoCompressionPatchEncoder",
     "WeightQuantileVAE",
     "build_weight_quantile_vae",
+    "compute_layer_latent_diffusion_loss",
     "sinusoidal_embedding",
     "smoke_test_big_weight_vae",
     "_decode_direction_and_logscale",

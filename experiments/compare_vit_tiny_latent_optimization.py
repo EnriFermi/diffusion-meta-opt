@@ -14,10 +14,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
-from omegaconf import OmegaConf
 
-from experiments.train_big_vae import _build_model_cfg, _normalize_model_state_dict_keys
-from models.weight_quantile_vae import BigWeightVAE, build_weight_quantile_vae
+from models.weight_quantile_vae import BigWeightVAE
+from training.big_vae_latent_diffusion import (
+    load_frozen_big_vae_from_checkpoint,
+    load_frozen_layer_latent_diffusion_prior,
+)
 
 
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
@@ -78,6 +80,10 @@ class ExperimentConfig:
     latent_factor_init_std: float = 0.02
     big_vae_checkpoint: str = ""
     big_vae_latent_init: str = "random"
+    big_vae_diffusion_prior_checkpoint: str = ""
+    big_vae_diffusion_prior_steps: int = 50
+    big_vae_diffusion_prior_sampler: str = "ddim"
+    big_vae_diffusion_prior_eta: float = 0.0
     big_vae_latent_noise_std: float = 0.0
     big_vae_encoder_context_rows: int = 64
     big_vae_encoder_context_std: float = 1.0
@@ -273,14 +279,21 @@ class BigVAELatentTensorStore(nn.Module):
         decode_policy: str,
         tile_T_patches: int,
         tile_d_out: int,
+        latent_diffusion_prior: Any | None = None,
+        latent_diffusion_prior_steps: int = 50,
+        latent_diffusion_prior_sampler: str = "ddim",
+        latent_diffusion_prior_eta: float = 0.0,
         encoder_context_rows: int = 64,
         encoder_context_std: float = 1.0,
         encoder_batch_size: int = 16,
     ) -> None:
         super().__init__()
         init_mode = str(latent_init).strip().lower()
-        if init_mode not in {"base", "random", "encoded"}:
-            raise ValueError(f"big_vae_latent_init must be 'base', 'random' or 'encoded', got {latent_init!r}")
+        if init_mode not in {"base", "random", "encoded", "diffusion_prior"}:
+            raise ValueError(
+                "big_vae_latent_init must be 'base', 'random', 'encoded' or 'diffusion_prior', "
+                f"got {latent_init!r}"
+            )
         policy = str(decode_policy).strip().lower()
         if policy not in {"weights", "all"}:
             raise ValueError(f"big_vae_decode must be 'weights' or 'all', got {decode_policy!r}")
@@ -301,9 +314,11 @@ class BigVAELatentTensorStore(nn.Module):
         self._tensor_key_to_tile_keys: dict[str, list[str]] = {}
         self._groups: dict[tuple[int, int, int], list[str]] = {}
         self._direct_name_to_key: dict[str, str] = {}
+        self._tile_cond_patch: dict[str, torch.Tensor] = {}
         self.latent_slots = nn.ParameterDict()
         self.direct_tensors = nn.ModuleDict()
         self.latent_init_mode = init_mode
+        self.latent_space = "decoder_z" if init_mode == "diffusion_prior" else "encoder_slots"
         self.patch_size = int(self.big_vae.cfg.patch_size)
         self.tile_T_patches = int(tile_T_patches)
         self.tile_d_in = int(self.patch_size) * int(self.tile_T_patches)
@@ -314,6 +329,24 @@ class BigVAELatentTensorStore(nn.Module):
         self.encoder_context_std = float(encoder_context_std)
         self.encoder_batch_size = max(1, int(encoder_batch_size))
         self.latent_noise_std = float(latent_noise_std)
+        self.latent_diffusion_prior = latent_diffusion_prior
+        self.latent_diffusion_prior_steps = max(1, int(latent_diffusion_prior_steps))
+        self.latent_diffusion_prior_sampler = str(latent_diffusion_prior_sampler).strip().lower()
+        self.latent_diffusion_prior_eta = float(latent_diffusion_prior_eta)
+        if self.latent_diffusion_prior is not None:
+            self.latent_diffusion_prior.to(device=self.big_vae.latent_base.device)
+            self.latent_diffusion_prior.eval()
+            for param in self.latent_diffusion_prior.parameters():
+                param.requires_grad_(False)
+        if self.latent_init_mode == "diffusion_prior":
+            if self.latent_diffusion_prior is None:
+                raise ValueError(
+                    "big_vae_latent_init='diffusion_prior' requires latent_diffusion_prior checkpoint/model"
+                )
+            if not self.use_distribution_encoder:
+                raise ValueError(
+                    "big_vae_latent_init='diffusion_prior' requires BigVAE distribution encoder to be enabled"
+                )
 
         base_latents = self.big_vae.latent_base.detach().clone()
         for idx, (name, initial) in enumerate(initial_tensors.items()):
@@ -388,6 +421,8 @@ class BigVAELatentTensorStore(nn.Module):
 
         if init_mode == "encoded":
             self._initialize_latents_from_encoder(initial_tensors)
+        elif init_mode == "diffusion_prior":
+            self._initialize_latents_from_diffusion_prior(initial_tensors)
 
     @staticmethod
     def _should_decode_with_big_vae(*, name: str, tensor: torch.Tensor, policy: str) -> bool:
@@ -528,9 +563,91 @@ class BigVAELatentTensorStore(nn.Module):
                     )
                     for item_idx, key in enumerate(batch_keys):
                         encoded = latents[item_idx].detach().to(device=device, dtype=dtype)
+                        if dist_patch_by_patch is not None:
+                            cond_patch = dist_patch_by_patch[item_idx].detach().to(device=device, dtype=dtype)
+                            self._tile_cond_patch[key] = cond_patch
                         if self.latent_noise_std > 0.0:
                             encoded = encoded + torch.randn_like(encoded) * self.latent_noise_std
                         self.latent_slots[key].data.copy_(encoded)
+
+    def _initialize_latents_from_diffusion_prior(self, initial_tensors: dict[str, torch.Tensor]) -> None:
+        if not self.latent_slots:
+            return
+        if self.latent_diffusion_prior is None:
+            raise RuntimeError("latent_diffusion_prior is required for diffusion_prior initialization")
+        first_latent = next(iter(self.latent_slots.values()))
+        device = first_latent.device
+        dtype = first_latent.dtype
+        matrix_cache: dict[str, torch.Tensor] = {}
+
+        with torch.no_grad():
+            for (d_in, d_out, expected_T), keys in self._groups.items():
+                for start in range(0, len(keys), self.encoder_batch_size):
+                    batch_keys = keys[start : start + self.encoder_batch_size]
+                    batch = int(len(batch_keys))
+                    W = torch.zeros(batch, int(d_in), int(d_out), device=device, dtype=dtype)
+                    d_in_mask = torch.zeros(batch, int(d_in), device=device, dtype=torch.bool)
+                    d_out_mask = torch.zeros(batch, int(d_out), device=device, dtype=torch.bool)
+
+                    for item_idx, key in enumerate(batch_keys):
+                        tile = self._tile_specs[key]
+                        for segment in tile.segments:
+                            matrix = matrix_cache.get(segment.tensor_name)
+                            if matrix is None:
+                                source = initial_tensors[segment.tensor_name].to(device=device, dtype=dtype)
+                                matrix = tensor_to_matrix(source, self._specs[segment.tensor_key])
+                                matrix_cache[segment.tensor_name] = matrix
+
+                            tile_row_start = int(segment.tile_row_start)
+                            tile_row_end = tile_row_start + int(segment.row_len)
+                            row_start = int(segment.row_start)
+                            row_end = row_start + int(segment.row_len)
+                            col_start = int(segment.col_start)
+                            col_end = col_start + int(segment.col_len)
+                            W[item_idx, tile_row_start:tile_row_end, : int(segment.col_len)] = matrix[
+                                row_start:row_end,
+                                col_start:col_end,
+                            ]
+                            d_in_mask[item_idx, tile_row_start:tile_row_end] = True
+                            d_out_mask[item_idx, : int(segment.col_len)] = True
+
+                    X = self._encoder_context(batch, int(d_in), device=device, dtype=dtype)
+                    X = X * d_in_mask.to(dtype=dtype).unsqueeze(1)
+                    x_mask = torch.ones(batch, self.encoder_context_rows, device=device, dtype=torch.bool)
+                    (
+                        T,
+                        _d_in_pad,
+                        patch_mask,
+                        _structural_patch_mask,
+                        _dist_var_by_patch,
+                        dist_patch_by_patch,
+                        _dist_var_pooled,
+                    ) = self.big_vae._encode_distribution_context(
+                        X,
+                        x_mask=x_mask,
+                        d_in_mask=d_in_mask,
+                    )
+                    if int(T) != int(expected_T):
+                        raise RuntimeError(
+                            f"BigVAE encoder T mismatch for group {(d_in, d_out, expected_T)}: got T={T}"
+                        )
+                    if dist_patch_by_patch is None:
+                        raise RuntimeError("distribution encoder must provide dist_patch_by_patch for diffusion prior")
+                    sampled = self.latent_diffusion_prior.sample_latents(
+                        cond_patch=dist_patch_by_patch,
+                        patch_mask=patch_mask,
+                        num_steps=self.latent_diffusion_prior_steps,
+                        sampler_type=self.latent_diffusion_prior_sampler,
+                        eta=self.latent_diffusion_prior_eta,
+                    )
+                    sampled = sampled.view(batch, *first_latent.shape)
+                    for item_idx, key in enumerate(batch_keys):
+                        sampled_item = sampled[item_idx].detach().to(device=device, dtype=dtype)
+                        cond_patch = dist_patch_by_patch[item_idx].detach().to(device=device, dtype=dtype)
+                        self._tile_cond_patch[key] = cond_patch
+                        if self.latent_noise_std > 0.0:
+                            sampled_item = sampled_item + torch.randn_like(sampled_item) * self.latent_noise_std
+                        self.latent_slots[key].data.copy_(sampled_item)
 
     def decoded_matrix(self, name: str) -> torch.Tensor:
         return self.decode_all_matrices()[name]
@@ -569,22 +686,36 @@ class BigVAELatentTensorStore(nn.Module):
                 valid_patches = int(math.ceil(float(used_rows) / float(self.patch_size)))
                 patch_mask[item_idx, :valid_patches] = True
                 d_out_mask[item_idx, :used_cols] = True
-            dist_patch = (
-                torch.zeros(batch, int(T), self.d_dist, device=device, dtype=latents.dtype)
-                if self.use_distribution_encoder
-                else None
-            )
-            decoded = self.big_vae._decode_from_latent_slots(
-                latents,
-                dist_patch_by_patch=dist_patch,
-                patch_mask=patch_mask,
-                d_in_mask=d_in_mask,
-                d_out_mask=d_out_mask,
-                d_in=int(d_in),
-                d_out=int(d_out),
-                d_in_pad=d_in_pad,
-                T=int(T),
-            )[0]
+            dist_patch = None
+            if self.use_distribution_encoder:
+                if all(key in self._tile_cond_patch for key in keys):
+                    dist_patch = torch.stack([self._tile_cond_patch[key].to(device=device, dtype=latents.dtype) for key in keys], dim=0)
+                else:
+                    dist_patch = torch.zeros(batch, int(T), self.d_dist, device=device, dtype=latents.dtype)
+            if self.latent_space == "decoder_z":
+                decoded = self.big_vae._decode_from_decoder_latent(
+                    latents,
+                    dist_patch_by_patch=dist_patch,
+                    patch_mask=patch_mask,
+                    d_in_mask=d_in_mask,
+                    d_out_mask=d_out_mask,
+                    d_in=int(d_in),
+                    d_out=int(d_out),
+                    d_in_pad=d_in_pad,
+                    T=int(T),
+                )[0]
+            else:
+                decoded = self.big_vae._decode_from_latent_slots(
+                    latents,
+                    dist_patch_by_patch=dist_patch,
+                    patch_mask=patch_mask,
+                    d_in_mask=d_in_mask,
+                    d_out_mask=d_out_mask,
+                    d_in=int(d_in),
+                    d_out=int(d_out),
+                    d_in_pad=d_in_pad,
+                    T=int(T),
+                )[0]
             for item_idx, key in enumerate(keys):
                 tile = self._tile_specs[key]
                 for segment in tile.segments:
@@ -622,6 +753,10 @@ class FunctionalViTTiny(nn.Module):
         latent_factor_init_std: float = 0.02,
         big_vae: BigWeightVAE | None = None,
         big_vae_latent_init: str = "random",
+        big_vae_diffusion_prior: Any | None = None,
+        big_vae_diffusion_prior_steps: int = 50,
+        big_vae_diffusion_prior_sampler: str = "ddim",
+        big_vae_diffusion_prior_eta: float = 0.0,
         big_vae_latent_noise_std: float = 0.0,
         big_vae_encoder_context_rows: int = 64,
         big_vae_encoder_context_std: float = 1.0,
@@ -643,6 +778,10 @@ class FunctionalViTTiny(nn.Module):
                 decode_policy=big_vae_decode,
                 tile_T_patches=int(big_vae_tile_T_patches),
                 tile_d_out=int(big_vae_tile_d_out),
+                latent_diffusion_prior=big_vae_diffusion_prior,
+                latent_diffusion_prior_steps=int(big_vae_diffusion_prior_steps),
+                latent_diffusion_prior_sampler=str(big_vae_diffusion_prior_sampler),
+                latent_diffusion_prior_eta=float(big_vae_diffusion_prior_eta),
                 encoder_context_rows=int(big_vae_encoder_context_rows),
                 encoder_context_std=float(big_vae_encoder_context_std),
                 encoder_batch_size=int(big_vae_encoder_batch_size),
@@ -812,37 +951,7 @@ def normalize_setup_name(setup: str) -> str:
 
 
 def load_frozen_big_vae_decoder(checkpoint_path: str, *, device: torch.device) -> BigWeightVAE:
-    path = Path(str(checkpoint_path)).expanduser()
-    if not path.exists():
-        raise FileNotFoundError(f"BigVAE checkpoint not found: {path}")
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict):
-        raise TypeError(f"BigVAE checkpoint must contain a dict payload, got {type(payload)}")
-    if "config" not in payload:
-        raise KeyError(f"BigVAE checkpoint has no 'config' field: {path}")
-    state = payload.get("model_state", payload.get("state_dict"))
-    if not isinstance(state, dict):
-        raise KeyError(f"BigVAE checkpoint has no model_state/state_dict field: {path}")
-
-    cfg = OmegaConf.create(payload["config"])
-    model_cfg = _build_model_cfg(cfg)
-    model = build_weight_quantile_vae(model_cfg)
-    if not isinstance(model, BigWeightVAE):
-        raise TypeError(
-            "BigVAE latent optimization requires the full BigWeightVAE decoder, "
-            f"got {type(model).__name__} from checkpoint config"
-        )
-    missing, unexpected = model.load_state_dict(_normalize_model_state_dict_keys(state), strict=False)
-    if missing or unexpected:
-        raise RuntimeError(
-            "BigVAE checkpoint state_dict mismatch: "
-            f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
-        )
-    model.to(device)
-    model.eval()
-    for param in model.parameters():
-        param.requires_grad_(False)
-    return model
+    return load_frozen_big_vae_from_checkpoint(checkpoint_path, device=device)
 
 
 def resolve_device(raw: str) -> torch.device:
@@ -1035,6 +1144,7 @@ def train_setup(
     device: torch.device,
     output_dir: Path,
     big_vae_decoder: BigWeightVAE | None = None,
+    big_vae_diffusion_prior: Any | None = None,
 ) -> dict[str, Any]:
     setup = normalize_setup_name(setup)
     if setup not in {"direct", "lowrank_latent", "bigvae_latent"}:
@@ -1052,6 +1162,10 @@ def train_setup(
         latent_factor_init_std=float(cfg.latent_factor_init_std),
         big_vae=big_vae_decoder,
         big_vae_latent_init=str(cfg.big_vae_latent_init),
+        big_vae_diffusion_prior=big_vae_diffusion_prior,
+        big_vae_diffusion_prior_steps=int(cfg.big_vae_diffusion_prior_steps),
+        big_vae_diffusion_prior_sampler=str(cfg.big_vae_diffusion_prior_sampler),
+        big_vae_diffusion_prior_eta=float(cfg.big_vae_diffusion_prior_eta),
         big_vae_latent_noise_std=float(cfg.big_vae_latent_noise_std),
         big_vae_encoder_context_rows=int(cfg.big_vae_encoder_context_rows),
         big_vae_encoder_context_std=float(cfg.big_vae_encoder_context_std),
@@ -1110,7 +1224,7 @@ def train_setup(
             else 0.0
         )
         print(
-            f"[{setup}] latent_init={store.latent_init_mode} "
+            f"[{setup}] latent_init={store.latent_init_mode} latent_space={store.latent_space} "
             f"latent_tiles={int(diversity['count'])} "
             f"tile_decode_shape=({tile_d_in},{tile_d_out},T={tile_T}) "
             f"latent_params={big_vae_latent_params} decoded_per_latent={compression:.3g} "
@@ -1237,6 +1351,14 @@ def train_setup(
         "big_vae_checkpoint": str(cfg.big_vae_checkpoint) if setup == "bigvae_latent" else "",
         "big_vae_init_fit_steps": int(cfg.big_vae_init_fit_steps) if setup == "bigvae_latent" else 0,
         "big_vae_latent_init": str(cfg.big_vae_latent_init) if setup == "bigvae_latent" else "",
+        "big_vae_diffusion_prior_checkpoint": (
+            str(cfg.big_vae_diffusion_prior_checkpoint) if setup == "bigvae_latent" else ""
+        ),
+        "big_vae_diffusion_prior_steps": int(cfg.big_vae_diffusion_prior_steps) if setup == "bigvae_latent" else 0,
+        "big_vae_diffusion_prior_sampler": (
+            str(cfg.big_vae_diffusion_prior_sampler) if setup == "bigvae_latent" else ""
+        ),
+        "big_vae_diffusion_prior_eta": float(cfg.big_vae_diffusion_prior_eta) if setup == "bigvae_latent" else 0.0,
         "big_vae_encoder_context_rows": int(cfg.big_vae_encoder_context_rows) if setup == "bigvae_latent" else 0,
         "big_vae_encoder_context_std": float(cfg.big_vae_encoder_context_std) if setup == "bigvae_latent" else 0.0,
         "decode_groups": int(decode_groups),
@@ -1339,8 +1461,27 @@ def parse_args() -> tuple[ExperimentConfig, ViTTinyConfig]:
     parser.add_argument("--big-vae-checkpoint", default=default_exp.big_vae_checkpoint)
     parser.add_argument(
         "--big-vae-latent-init",
-        choices=("base", "random", "encoded"),
+        choices=("base", "random", "encoded", "diffusion_prior"),
         default=default_exp.big_vae_latent_init,
+    )
+    parser.add_argument(
+        "--big-vae-diffusion-prior-checkpoint",
+        default=default_exp.big_vae_diffusion_prior_checkpoint,
+    )
+    parser.add_argument(
+        "--big-vae-diffusion-prior-steps",
+        type=int,
+        default=default_exp.big_vae_diffusion_prior_steps,
+    )
+    parser.add_argument(
+        "--big-vae-diffusion-prior-sampler",
+        choices=("ddim", "ddpm"),
+        default=default_exp.big_vae_diffusion_prior_sampler,
+    )
+    parser.add_argument(
+        "--big-vae-diffusion-prior-eta",
+        type=float,
+        default=default_exp.big_vae_diffusion_prior_eta,
     )
     parser.add_argument("--big-vae-latent-noise-std", type=float, default=default_exp.big_vae_latent_noise_std)
     parser.add_argument(
@@ -1418,6 +1559,10 @@ def parse_args() -> tuple[ExperimentConfig, ViTTinyConfig]:
         latent_factor_init_std=float(args.latent_factor_init_std),
         big_vae_checkpoint=str(args.big_vae_checkpoint),
         big_vae_latent_init=str(args.big_vae_latent_init),
+        big_vae_diffusion_prior_checkpoint=str(args.big_vae_diffusion_prior_checkpoint),
+        big_vae_diffusion_prior_steps=int(args.big_vae_diffusion_prior_steps),
+        big_vae_diffusion_prior_sampler=str(args.big_vae_diffusion_prior_sampler),
+        big_vae_diffusion_prior_eta=float(args.big_vae_diffusion_prior_eta),
         big_vae_latent_noise_std=float(args.big_vae_latent_noise_std),
         big_vae_encoder_context_rows=int(args.big_vae_encoder_context_rows),
         big_vae_encoder_context_std=float(args.big_vae_encoder_context_std),
@@ -1461,11 +1606,26 @@ def main() -> None:
     requested_setup = normalize_setup_name(cfg.setup)
     setups = ["direct", "bigvae_latent"] if requested_setup == "both" else [requested_setup]
     big_vae_decoder = None
+    big_vae_diffusion_prior = None
     if "bigvae_latent" in setups:
         if not str(cfg.big_vae_checkpoint).strip():
             raise ValueError("--big-vae-checkpoint is required for setup=bigvae_latent/both")
         print(f"[bigvae_latent] loading frozen BigVAE decoder: {cfg.big_vae_checkpoint}", flush=True)
         big_vae_decoder = load_frozen_big_vae_decoder(cfg.big_vae_checkpoint, device=device)
+        if str(cfg.big_vae_latent_init).strip().lower() == "diffusion_prior":
+            if not str(cfg.big_vae_diffusion_prior_checkpoint).strip():
+                raise ValueError(
+                    "--big-vae-diffusion-prior-checkpoint is required when --big-vae-latent-init=diffusion_prior"
+                )
+            print(
+                "[bigvae_latent] loading frozen latent diffusion prior: "
+                f"{cfg.big_vae_diffusion_prior_checkpoint}",
+                flush=True,
+            )
+            big_vae_diffusion_prior = load_frozen_layer_latent_diffusion_prior(
+                cfg.big_vae_diffusion_prior_checkpoint,
+                device=device,
+            )
 
     summaries = []
     for setup in setups:
@@ -1480,6 +1640,7 @@ def main() -> None:
                 device=device,
                 output_dir=output_dir,
                 big_vae_decoder=big_vae_decoder,
+                big_vae_diffusion_prior=big_vae_diffusion_prior,
             )
         )
     write_json(output_dir / "summary.json", {"summaries": summaries})

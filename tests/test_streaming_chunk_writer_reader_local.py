@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 
+from dataset.shared.streaming.backends.base import ChunkRef
 from dataset.shared.streaming.backends.local_disk import LocalDiskChunkStore
 from dataset.shared.streaming.chunk_format import load_chunk
 from dataset.shared.streaming.chunk_reader import ChunkReader
@@ -109,6 +110,63 @@ class TestStreamingChunkWriterReaderLocal(unittest.TestCase):
 
             self.assertTrue(saw_mixed_run_chunk)
             self.assertTrue(saw_mixed_dataset_chunk)
+
+    def test_reader_prefetch_scans_ready_only_once_per_fill_cycle(self) -> None:
+        class _FakeStore:
+            def __init__(self, refs: list[ChunkRef]) -> None:
+                self.refs = refs
+                self.list_ready_calls = 0
+
+            def list_ready(self, limit: int | None = None) -> list[ChunkRef]:
+                self.list_ready_calls += 1
+                del limit
+                return list(self.refs)
+
+            def fetch_to_local(self, chunk_ref: ChunkRef, target_path: str | Path) -> Path:
+                source = Path(chunk_ref.backend_key)
+                target = Path(target_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.read_bytes())
+                return target
+
+            def delete_ready(self, chunk_ref: ChunkRef) -> None:
+                del chunk_ref
+
+            def count_ready(self) -> int:
+                return len(self.refs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            refs: list[ChunkRef] = []
+            for idx in range(3):
+                chunk_path = root / f"chunk_{idx}.pt"
+                save_samples = [_make_sample(idx)]
+                from dataset.shared.streaming.chunk_format import save_chunk
+
+                save_chunk(chunk_path, samples=save_samples, meta={"chunk_id": f"chunk_{idx}"}, compression="none")
+                refs.append(
+                    ChunkRef(
+                        chunk_id=f"chunk_{idx}",
+                        uri=str(chunk_path),
+                        size_bytes=int(chunk_path.stat().st_size),
+                        created_at=float(idx),
+                        backend_key=str(chunk_path),
+                    )
+                )
+
+            reader = ChunkReader(
+                store=_FakeStore(refs),
+                cache_dir=root / "cache",
+                prefetch_max_chunks=3,
+                delete_remote_after="consume",
+                distributed_cfg={"enabled": False},
+            )
+            try:
+                reader._prefetch_once()
+                self.assertEqual(reader.store.list_ready_calls, 1)
+                self.assertEqual(len(reader._pending_chunks), 3)
+            finally:
+                reader.close()
 
 
 if __name__ == "__main__":

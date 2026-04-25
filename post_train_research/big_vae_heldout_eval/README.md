@@ -63,9 +63,52 @@ metrics_by_dataset.csv
 metrics_by_dataset_model_pair.csv
 metrics_by_layer.csv
 record_metrics.csv
+latent_dump.pt
+latent_dump.metadata.csv
+latent_plots/latent_embedding_pca.csv
+latent_plots/latent_counts_by_<field>.csv
+latent_plots/latent_pca_by_dataset.png
+latent_plots/latent_pca_by_model.png
+latent_plots/latent_pca_by_layer_type.png
+latent_plots/latent_pca_by_depth_label.png
+latent_plots/latent_embedding_tsne.csv
+latent_plots/latent_tsne_by_dataset.png
+latent_plots/latent_tsne_by_model.png
+latent_plots/latent_tsne_by_layer_type.png
+latent_plots/latent_tsne_by_depth_label.png
 ```
 
 `metrics_summary.json` contains micro-global metrics plus macro averages over models, datasets, and dataset/model pairs. `record_metrics.csv` is intentionally verbose for outlier debugging.
+
+Latent dump/plots:
+
+```bash
+EVAL_LATENT_DUMP_ENABLED=true \
+EVAL_LATENT_DUMP_MAX_ENTRIES=256 \
+EVAL_LATENT_DUMP_MAX_SLICES_PER_SOURCE=1 \
+EVAL_LATENT_DUMP_BALANCE_ENABLED=true \
+EVAL_LATENT_DUMP_BALANCE_KEYS=dataset,model,layer_type,depth_label \
+EVAL_LATENT_DUMP_MAX_PER_GROUP=1 \
+EVAL_LATENT_PLOT_ENABLED=true \
+EVAL_LATENT_PLOT_TSNE=true \
+post_train_research/big_vae_heldout_eval/run_evaluate_big_vae_heldout.sh
+```
+
+The dump stores one latent vector per evaluated slice, capped by
+`EVAL_LATENT_DUMP_MAX_ENTRIES`. For VAE checkpoints this is posterior `mu`; for
+non-sampling checkpoints this is the deterministic base latent. Metadata
+columns include `dataset`, `model`, `layer`, `layer_type`, and `depth_label`.
+By default the dump keeps only one slice per source record, so a large batch
+from one layer cannot fill the whole latent sample. It also balances candidates
+over the joint key `(dataset, model, layer_type, depth_label)` and then applies a
+final greedy marginal balancing pass if there are more candidate groups than
+`EVAL_LATENT_DUMP_MAX_ENTRIES`. Rebuild the PCA/t-SNE plots without rerunning
+held-out eval:
+
+```bash
+python post_train_research/big_vae_heldout_eval/plot_latent_dump.py \
+  "$HELDOUT_ROOT/eval/<checkpoint_dir>_<checkpoint_name>/latent_dump.pt"
+```
 
 Coverage checks:
 

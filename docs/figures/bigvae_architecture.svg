@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">BigVAE architecture schematic</title>
+  <desc id="desc">A schematic of BigVAE: weight slices and activation context are encoded into latent slots and decoded back into reconstructed weights.</desc>
+  <defs>
+    <style>
+      .bg { fill: #fbfbf8; }
+      .box { fill: #ffffff; stroke: #20242a; stroke-width: 2; rx: 8; }
+      .soft { fill: #edf6f9; stroke: #24748a; stroke-width: 2; rx: 8; }
+      .latent { fill: #f6edff; stroke: #7146a2; stroke-width: 2; rx: 8; }
+      .loss { fill: #fff3e6; stroke: #b86b12; stroke-width: 2; rx: 8; }
+      .text { font-family: Inter, Arial, sans-serif; fill: #16191d; font-size: 24px; font-weight: 650; }
+      .small { font-family: Inter, Arial, sans-serif; fill: #30343a; font-size: 17px; }
+      .tiny { font-family: Inter, Arial, sans-serif; fill: #3f454d; font-size: 14px; }
+      .arrow { stroke: #20242a; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .arrow2 { stroke: #24748a; stroke-width: 3; fill: none; marker-end: url(#arrowBlue); }
+      .dash { stroke: #b86b12; stroke-width: 3; fill: none; stroke-dasharray: 8 8; marker-end: url(#arrowOrange); }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#20242a"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#24748a"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#b86b12"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1280" height="720"/>
+
+  <text x="64" y="64" class="text" style="font-size:32px">BigVAE learns a latent manifold of neural-network layers</text>
+  <text x="64" y="96" class="small">Input: a source layer weight slice W and activation context X. Output: reconstructed weight slice W_hat.</text>
+
+  <rect x="64" y="150" width="180" height="105" class="box"/>
+  <text x="88" y="192" class="text">W slice</text>
+  <text x="88" y="222" class="small">linear layer</text>
+  <text x="88" y="246" class="tiny">d_in x d_out</text>
+
+  <rect x="64" y="330" width="180" height="105" class="soft"/>
+  <text x="88" y="372" class="text">X context</text>
+  <text x="88" y="402" class="small">activations</text>
+  <text x="88" y="426" class="tiny">n x d_in</text>
+
+  <rect x="320" y="150" width="210" height="105" class="box"/>
+  <text x="344" y="190" class="text">Patch tokenizer</text>
+  <text x="344" y="221" class="small">per-output</text>
+  <text x="344" y="246" class="tiny">weight patch tokens</text>
+
+  <rect x="320" y="330" width="210" height="105" class="soft"/>
+  <text x="344" y="370" class="text">Distribution</text>
+  <text x="344" y="400" class="text">encoder</text>
+  <text x="344" y="426" class="tiny">patch stats + context tokens</text>
+
+  <rect x="610" y="150" width="220" height="285" class="latent"/>
+  <text x="640" y="196" class="text">Latent encoder</text>
+  <text x="640" y="226" class="small">15 transformer layers</text>
+  <text x="640" y="254" class="tiny">local token attention</text>
+  <text x="640" y="278" class="tiny">latent resampling</text>
+  <text x="640" y="324" class="small">learned base slots</text>
+  <text x="640" y="350" class="tiny">K=8, d_lat=256</text>
+  <text x="640" y="396" class="small">fixed-size z0</text>
+
+  <rect x="900" y="150" width="220" height="105" class="latent"/>
+  <text x="924" y="190" class="text">Posterior</text>
+  <text x="924" y="221" class="small">mu, sigma, gate</text>
+  <text x="924" y="246" class="tiny">AE -> VAE schedule</text>
+
+  <rect x="900" y="330" width="220" height="105" class="box"/>
+  <text x="924" y="370" class="text">Decoder</text>
+  <text x="924" y="400" class="small">cross-attention</text>
+  <text x="924" y="426" class="tiny">direction + scale heads</text>
+
+  <rect x="1048" y="530" width="170" height="96" class="loss"/>
+  <text x="1078" y="570" class="text">Losses</text>
+  <text x="1078" y="598" class="small">operator</text>
+  <text x="1078" y="620" class="small">structure + KL</text>
+
+  <rect x="64" y="530" width="180" height="96" class="box"/>
+  <text x="88" y="570" class="text">W_hat</text>
+  <text x="88" y="598" class="small">decoded weights</text>
+  <text x="88" y="620" class="tiny">used by downstream model</text>
+
+  <path d="M244 202 H320" class="arrow"/>
+  <path d="M244 382 H320" class="arrow2"/>
+  <path d="M530 202 H610" class="arrow"/>
+  <path d="M530 382 C560 382 575 330 610 330" class="arrow2"/>
+  <path d="M830 292 H900" class="arrow"/>
+  <path d="M1010 255 V330" class="arrow"/>
+  <path d="M900 382 C710 510 432 560 244 578" class="arrow"/>
+  <path d="M244 578 H1048" class="dash"/>
+  <path d="M154 255 V530" class="dash"/>
+  <path d="M154 330 V255" class="dash"/>
+</svg>

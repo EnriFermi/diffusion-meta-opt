@@ -1,0 +1,303 @@
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+from experiments.compare_vit_tiny_latent_optimization import (
+    ExperimentConfig,
+    FunctionalViTTiny,
+    ViTTinyConfig,
+    build_optimizer,
+    count_trainable_parameters,
+    make_initial_tensors,
+)
+from models.layer_latent_diffusion_prior import LayerLatentDiffusionPrior, LayerLatentDiffusionPriorConfig
+from models.weight_quantile_vae import BigVAEConfig, BigWeightVAE, DistributionConfig, EncoderConfig, MiniVAEConfig, ModelConfig
+
+
+def _small_vit_cfg() -> ViTTinyConfig:
+    return ViTTinyConfig(
+        image_size=32,
+        patch_size=8,
+        hidden_dim=24,
+        depth=2,
+        num_heads=3,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        attention_dropout=0.0,
+    )
+
+
+def test_latent_vit_initial_logits_match_direct_vit() -> None:
+    cfg = _small_vit_cfg()
+    initial = make_initial_tensors(cfg, seed=123)
+    direct = FunctionalViTTiny(cfg, initial, parameter_mode="direct")
+    latent = FunctionalViTTiny(cfg, initial, parameter_mode="lowrank_latent", latent_rank=4)
+
+    x = torch.randn(3, 3, 32, 32)
+    direct_logits = direct(x)
+    latent_logits = latent(x)
+
+    assert direct_logits.shape == (3, 10)
+    assert torch.allclose(direct_logits, latent_logits, atol=1e-6, rtol=1e-6)
+
+
+def test_latent_vit_has_fewer_trainable_parameters_and_receives_gradients() -> None:
+    cfg = _small_vit_cfg()
+    initial = make_initial_tensors(cfg, seed=456)
+    direct = FunctionalViTTiny(cfg, initial, parameter_mode="direct")
+    latent = FunctionalViTTiny(cfg, initial, parameter_mode="lowrank_latent", latent_rank=2)
+
+    assert count_trainable_parameters(latent) < count_trainable_parameters(direct)
+
+    x = torch.randn(4, 3, 32, 32)
+    y = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    loss = F.cross_entropy(latent(x), y)
+    loss.backward()
+
+    grad_sum = 0.0
+    for param in latent.parameters():
+        if param.grad is not None:
+            grad_sum += float(param.grad.detach().abs().sum().item())
+    assert grad_sum > 0.0
+
+
+def test_bigvae_latent_vit_decodes_weights_and_receives_latent_gradients() -> None:
+    cfg = _small_vit_cfg()
+    initial = make_initial_tensors(cfg, seed=789)
+    big_vae = BigWeightVAE(
+        ModelConfig(
+            patch_size=8,
+            distribution=DistributionConfig(k_s=4, Kq=4, d_var=16, d_dist=16, use_covariance=False),
+            mini_vae=MiniVAEConfig(z_dim=8, d_e=16, num_attn_layers_encoder=1, num_layers_decoder=1, n_heads=2, d_patch=8),
+            big_vae=BigVAEConfig(
+                d_model=24,
+                d_lat=12,
+                num_latents=2,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                n_heads=3,
+                ffn_mult=2.0,
+                pos_fourier_dim=12,
+                use_latent_sampling=False,
+                disable_distribution_encoder=True,
+                disable_z_shortcut=True,
+                encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
+            ),
+        )
+    )
+    model = FunctionalViTTiny(cfg, initial, parameter_mode="bigvae_latent", big_vae=big_vae)
+
+    assert model.store.decode_group_count() == 1
+    assert model.store.tile_decode_shape() == (128, 8, 16)
+    assert model.store.decoded_tile_count() > len(model.store.decoded_tensor_names())
+    qkv_matrix = model.store.target_matrix("blocks.0.attn.qkv.weight", initial["blocks.0.attn.qkv.weight"])
+    assert qkv_matrix.shape == (cfg.hidden_dim, 3 * cfg.hidden_dim)
+
+    x = torch.randn(2, 3, 32, 32)
+    y = torch.tensor([0, 1], dtype=torch.long)
+    logits = model(x)
+    assert logits.shape == (2, 10)
+
+    loss = F.cross_entropy(logits, y)
+    loss.backward()
+    grad_sum = 0.0
+    frozen_decoder_grad_sum = 0.0
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        if "latent_slots" in name:
+            grad_sum += float(param.grad.detach().abs().sum().item())
+        if "big_vae" in name:
+            frozen_decoder_grad_sum += float(param.grad.detach().abs().sum().item())
+    assert grad_sum > 0.0
+    assert frozen_decoder_grad_sum == 0.0
+
+
+def test_bigvae_latent_default_keeps_non_weight_tensors_direct() -> None:
+    cfg = _small_vit_cfg()
+    initial = make_initial_tensors(cfg, seed=101)
+    big_vae = BigWeightVAE(
+        ModelConfig(
+            patch_size=8,
+            distribution=DistributionConfig(k_s=4, Kq=4, d_var=16, d_dist=16, use_covariance=False),
+            mini_vae=MiniVAEConfig(z_dim=8, d_e=16, num_attn_layers_encoder=1, num_layers_decoder=1, n_heads=2, d_patch=8),
+            big_vae=BigVAEConfig(
+                d_model=24,
+                d_lat=12,
+                num_latents=2,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                n_heads=3,
+                ffn_mult=2.0,
+                pos_fourier_dim=12,
+                use_latent_sampling=False,
+                disable_distribution_encoder=True,
+                disable_z_shortcut=True,
+                encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
+            ),
+        )
+    )
+    model = FunctionalViTTiny(cfg, initial, parameter_mode="bigvae_latent", big_vae=big_vae)
+
+    assert "pos_embed" in model.store._direct_name_to_key
+    assert "cls_token" in model.store._direct_name_to_key
+    assert "patch_embed.weight" in model.store._direct_name_to_key
+    assert "blocks.0.attn.qkv.weight" in model.store._name_to_key
+    assert model.store.decode_group_count() < len(initial)
+    assert model.store.decoded_tile_count() > len(model.store.decoded_tensor_names())
+
+    diversity = model.store.latent_init_diversity()
+    assert diversity["across_layer_std_mean"] > 0.0
+    assert diversity["max_pair_delta"] > 0.0
+
+
+def test_bigvae_latent_encoded_init_can_optimize_only_latent_slots() -> None:
+    cfg = _small_vit_cfg()
+    initial = make_initial_tensors(cfg, seed=202)
+    big_vae = BigWeightVAE(
+        ModelConfig(
+            patch_size=8,
+            distribution=DistributionConfig(k_s=4, Kq=4, d_var=16, d_dist=16, use_covariance=False),
+            mini_vae=MiniVAEConfig(z_dim=8, d_e=16, num_attn_layers_encoder=1, num_layers_decoder=1, n_heads=2, d_patch=8),
+            big_vae=BigVAEConfig(
+                d_model=24,
+                d_lat=12,
+                num_latents=2,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                n_heads=3,
+                ffn_mult=2.0,
+                pos_fourier_dim=12,
+                use_latent_sampling=False,
+                disable_distribution_encoder=True,
+                disable_z_shortcut=True,
+                encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
+            ),
+        )
+    )
+    model = FunctionalViTTiny(
+        cfg,
+        initial,
+        parameter_mode="bigvae_latent",
+        big_vae=big_vae,
+        big_vae_latent_init="encoded",
+        big_vae_decode="all",
+        big_vae_encoder_context_rows=4,
+        big_vae_encoder_batch_size=2,
+    )
+
+    assert len(model.store.direct_tensors) == 0
+    assert model.store.latent_numel() == sum(param.numel() for param in model.parameters() if param.requires_grad)
+    first_latent = next(iter(model.store.latent_slots.values())).detach()
+    assert not torch.allclose(first_latent, big_vae.latent_base.detach(), atol=1e-6, rtol=1e-6)
+
+    x = torch.randn(2, 3, 32, 32)
+    y = torch.tensor([0, 1], dtype=torch.long)
+    loss = F.cross_entropy(model(x), y)
+    loss.backward()
+
+    latent_grad_sum = 0.0
+    frozen_decoder_grad_sum = 0.0
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        if "latent_slots" in name:
+            latent_grad_sum += float(param.grad.detach().abs().sum().item())
+        if "big_vae" in name:
+            frozen_decoder_grad_sum += float(param.grad.detach().abs().sum().item())
+    assert latent_grad_sum > 0.0
+    assert frozen_decoder_grad_sum == 0.0
+
+
+def test_build_optimizer_supports_adamw_and_sgd() -> None:
+    cfg = ExperimentConfig()
+    param = torch.nn.Parameter(torch.ones(2))
+
+    adamw = build_optimizer([param], optimizer_name="adamw", lr=1e-3, weight_decay=0.01, cfg=cfg)
+    assert isinstance(adamw, torch.optim.AdamW)
+
+    sgd = build_optimizer([param], optimizer_name="sgd", lr=1e-2, weight_decay=0.0, cfg=cfg)
+    assert isinstance(sgd, torch.optim.SGD)
+
+
+def test_bigvae_latent_diffusion_prior_init_decodes_weights_and_keeps_prior_frozen() -> None:
+    cfg = _small_vit_cfg()
+    initial = make_initial_tensors(cfg, seed=303)
+    big_vae = BigWeightVAE(
+        ModelConfig(
+            patch_size=8,
+            distribution=DistributionConfig(k_s=4, Kq=4, d_var=16, d_dist=16, use_covariance=False),
+            mini_vae=MiniVAEConfig(z_dim=8, d_e=16, num_attn_layers_encoder=1, num_layers_decoder=1, n_heads=2, d_patch=8),
+            big_vae=BigVAEConfig(
+                d_model=24,
+                d_lat=12,
+                num_latents=2,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                n_heads=3,
+                ffn_mult=2.0,
+                pos_fourier_dim=12,
+                use_latent_sampling=False,
+                disable_distribution_encoder=False,
+                disable_z_shortcut=True,
+                encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
+            ),
+        )
+    )
+    prior = LayerLatentDiffusionPrior(
+        LayerLatentDiffusionPriorConfig(
+            z_dim=24,
+            num_latent_tokens=2,
+            cond_dim=16,
+            d_model=16,
+            n_layers=2,
+            n_heads=2,
+            ffn_mult=2.0,
+            dropout=0.0,
+            cond_pool_tokens=2,
+            pos_fourier_dim=8,
+            time_embed_dim=16,
+            use_cross_conditioning=False,
+            prediction_type="v",
+        )
+    )
+    model = FunctionalViTTiny(
+        cfg,
+        initial,
+        parameter_mode="bigvae_latent",
+        big_vae=big_vae,
+        big_vae_latent_init="diffusion_prior",
+        big_vae_diffusion_prior=prior,
+        big_vae_diffusion_prior_steps=4,
+        big_vae_diffusion_prior_sampler="ddim",
+        big_vae_diffusion_prior_eta=0.0,
+        big_vae_decode="all",
+        big_vae_encoder_context_rows=4,
+        big_vae_encoder_batch_size=2,
+    )
+
+    assert model.store.latent_space == "decoder_z"
+    assert len(model.store.direct_tensors) == 0
+    assert all(not param.requires_grad for param in model.store.latent_diffusion_prior.parameters())
+
+    x = torch.randn(2, 3, 32, 32)
+    y = torch.tensor([0, 1], dtype=torch.long)
+    loss = F.cross_entropy(model(x), y)
+    loss.backward()
+
+    latent_grad_sum = 0.0
+    frozen_decoder_grad_sum = 0.0
+    frozen_prior_grad_sum = 0.0
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        if "latent_slots" in name:
+            latent_grad_sum += float(param.grad.detach().abs().sum().item())
+        if "big_vae" in name:
+            frozen_decoder_grad_sum += float(param.grad.detach().abs().sum().item())
+        if "latent_diffusion_prior" in name:
+            frozen_prior_grad_sum += float(param.grad.detach().abs().sum().item())
+    assert latent_grad_sum > 0.0
+    assert frozen_decoder_grad_sum == 0.0
+    assert frozen_prior_grad_sum == 0.0

@@ -1,0 +1,31 @@
+defaults:
+  - /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
+  - _self_
+
+hydra:
+  job:
+    name: build_big_vae_latent_diffusion_dataset
+
+latent_diffusion_prior:
+  big_vae_checkpoint: ${oc.env:BIG_VAE_CHECKPOINT,""}
+
+latent_diffusion_dataset:
+  root_dir: ${oc.env:BIG_VAE_LATENT_DIFFUSION_DATASET_DIR,${training_artifacts.base_root_dir}/datasets/big_vae_latent_diffusion/stage_1}
+  source_big_vae_offline_root: ${oc.env:BIG_VAE_OFFLINE_DATASET_DIR,""}
+  device: auto
+  source:
+    shuffle_chunks: false
+    shuffle_records_within_chunk: false
+    seed: 42
+    weight_cache_size: 64
+    sampling_mode: random
+    sampling_group_keys: [dataset, model, layer_type, depth]
+    sampling_window_size: 2048
+    sampling_max_records_per_chunk_round: 8
+    x_chunk_cache_size: 4
+  builder:
+    overwrite_existing: false
+    chunk_size_records: 128
+    batch_size: 8
+    log_every_batches: 100
+    max_records: 0

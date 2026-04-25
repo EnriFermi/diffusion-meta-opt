@@ -27,6 +27,11 @@ RAW_INIT_LR=${RAW_INIT_LR:-1e-3}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.05}
 LATENT_WEIGHT_DECAY=${LATENT_WEIGHT_DECAY:-0.0}
 BIG_VAE_DECODE=${BIG_VAE_DECODE:-all}
+BIG_VAE_LATENT_INIT=${BIG_VAE_LATENT_INIT:-encoded}
+BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT=${BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT:-}
+BIG_VAE_DIFFUSION_PRIOR_STEPS=${BIG_VAE_DIFFUSION_PRIOR_STEPS:-50}
+BIG_VAE_DIFFUSION_PRIOR_SAMPLER=${BIG_VAE_DIFFUSION_PRIOR_SAMPLER:-ddim}
+BIG_VAE_DIFFUSION_PRIOR_ETA=${BIG_VAE_DIFFUSION_PRIOR_ETA:-0.0}
 BIG_VAE_TILE_T_PATCHES=${BIG_VAE_TILE_T_PATCHES:-16}
 BIG_VAE_TILE_D_OUT=${BIG_VAE_TILE_D_OUT:-8}
 BIG_VAE_ENCODER_CONTEXT_ROWS=${BIG_VAE_ENCODER_CONTEXT_ROWS:-64}
@@ -64,6 +69,20 @@ require_big_vae() {
   : "${BIG_VAE_CHECKPOINT:?Set BIG_VAE_CHECKPOINT=/path/to/stage_N/latest.pt before latent modes}"
 }
 
+require_big_vae_diffusion_prior() {
+  if [ "$BIG_VAE_LATENT_INIT" = "diffusion_prior" ]; then
+    : "${BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT:?Set BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT=/path/to/prior.pt when BIG_VAE_LATENT_INIT=diffusion_prior}"
+  fi
+}
+
+latent_mode_tag() {
+  if [ "$BIG_VAE_LATENT_INIT" = "encoded" ]; then
+    printf '%s' "latent"
+    return
+  fi
+  printf 'latent_%s' "$BIG_VAE_LATENT_INIT"
+}
+
 run_one() {
   RUN_DATASET=$1
   RUN_SIZE=$2
@@ -96,6 +115,7 @@ run_one() {
 
   if [ "$RUN_SETUP" = "latent" ]; then
     require_big_vae
+    require_big_vae_diffusion_prior
   fi
 
   set -- "$SCRIPT_DIR/run_vit_latent_scaling.py" \
@@ -117,6 +137,7 @@ run_one() {
     --log-every-steps 50 \
     --eval-every-steps "$RUN_EVAL_EVERY" \
     --raw-checkpoint "$RUN_RAW_CHECKPOINT" \
+    --big-vae-latent-init "$BIG_VAE_LATENT_INIT" \
     --big-vae-decode "$BIG_VAE_DECODE" \
     --big-vae-tile-T-patches "$BIG_VAE_TILE_T_PATCHES" \
     --big-vae-tile-d-out "$BIG_VAE_TILE_D_OUT" \
@@ -134,6 +155,13 @@ run_one() {
 
   if [ "$RUN_SETUP" = "latent" ]; then
     set -- "$@" --big-vae-checkpoint "$BIG_VAE_CHECKPOINT"
+    if [ "$BIG_VAE_LATENT_INIT" = "diffusion_prior" ]; then
+      set -- "$@" \
+        --big-vae-diffusion-prior-checkpoint "$BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT" \
+        --big-vae-diffusion-prior-steps "$BIG_VAE_DIFFUSION_PRIOR_STEPS" \
+        --big-vae-diffusion-prior-sampler "$BIG_VAE_DIFFUSION_PRIOR_SAMPLER" \
+        --big-vae-diffusion-prior-eta "$BIG_VAE_DIFFUSION_PRIOR_ETA"
+    fi
   fi
 
   run_python "$@"
@@ -208,7 +236,8 @@ run_config_latent() {
 
   for LR in $LR_GRID; do
     TAG=$(lr_tag "$LR")
-    OUT="$OUTPUT_ROOT/$CFG_DATASET/$CFG_SIZE/latent_lr_$TAG"
+    MODE_TAG=$(latent_mode_tag)
+    OUT="$OUTPUT_ROOT/$CFG_DATASET/$CFG_SIZE/${MODE_TAG}_lr_$TAG"
     run_one "$CFG_DATASET" "$CFG_SIZE" latent "$LR" "$OUT" "$CFG_DATA_DIR" "$CFG_EPOCHS" "$CFG_MAX_STEPS" \
       "$CFG_BATCH_SIZE" "$CFG_EVAL_BATCH_SIZE" "$CFG_NUM_WORKERS" "$CFG_EVAL_EVERY" \
       "$CFG_IMAGE_SIZE" "$CFG_PATCH_SIZE" "$CFG_IN_CHANNELS" "$CFG_NUM_CLASSES" \
