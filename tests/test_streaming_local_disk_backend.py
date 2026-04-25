@@ -28,8 +28,10 @@ class TestStreamingLocalDiskBackend(unittest.TestCase):
             self.assertEqual(fetched.read_bytes(), b"payload")
 
             store.delete_ready(refs[0])
+            self.assertEqual(fetched.read_bytes(), b"payload")
             self.assertEqual(store.count_ready(), 0)
             self.assertEqual(len(store.list_ready(limit=None)), 0)
+            self.assertTrue(source.exists())
 
             staging_files = [path for path in (root / "staging").iterdir() if path.is_file()]
             self.assertEqual(staging_files, [])

@@ -1,0 +1,106 @@
+defaults:
+  - /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
+  - _self_
+
+hydra:
+  job:
+    name: train_big_vae_latent_diffusion_prior
+
+latent_diffusion_prior:
+  big_vae_checkpoint: ${oc.env:BIG_VAE_CHECKPOINT,""}
+
+latent_diffusion_dataset:
+  root_dir: ${oc.env:BIG_VAE_LATENT_DIFFUSION_DATASET_DIR,${training_artifacts.base_root_dir}/datasets/big_vae_latent_diffusion/stage_${train.stage}}
+
+train:
+  stage: 1
+  device: ${oc.env:LATENT_DIFFUSION_DEVICE,${oc.env:DEVICE,cuda:0}}
+  distributed: false
+  num_gpus: 1
+  amp: auto
+  tf32: true
+  cudnn_benchmark: true
+  compile: false
+  compile_mode: reduce-overhead
+  compile_dynamic: false
+  compile_disable_cudagraphs: true
+  optimizer_name: adamw
+  scheduler_name: cosine
+  lr: 1e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  warmup_steps: 1000
+  min_lr_ratio: 0.1
+  max_steps: 100000
+  batch_size: 32
+  grad_accum_steps: 1
+  grad_clip_norm: 1.0
+  checkpoint_every: 5000
+  log_every: 100
+  checkpoint_dir: ${training_artifacts.base_root_dir}/checkpoints/big_vae_latent_diffusion_prior
+  dataset:
+    root_dir: ${latent_diffusion_dataset.root_dir}
+    shuffle_chunks: true
+    shuffle_records_within_chunk: true
+    repeat: true
+    seed: 42
+    chunk_cache_size: 4
+  resume_state:
+    enabled: true
+    auto_resume: true
+    save_every: ${train.checkpoint_every}
+    dir: ${train.checkpoint_dir}/stage_${train.stage}/resume_state
+    load_model_state: true
+    load_optimizer_state: true
+    load_scheduler_state: true
+    load_scaler_state: true
+    load_step: true
+  telemetry:
+    comet:
+      enabled: true
+      api_key: ${oc.env:COMET_API_KEY,""}
+      workspace: ${oc.env:COMET_WORKSPACE,""}
+      project_name: big_vae_latent_diffusion_prior
+      experiment_name: ""
+      tags: []
+      offline_directory: ""
+      log_code: false
+    wandb:
+      enabled: true
+      project_name: big_vae_latent_diffusion_prior
+      entity: ${oc.env:WANDB_ENTITY,""}
+      run_name: ""
+      tags: []
+      mode: ${oc.env:WANDB_MODE,"offline"}
+      dir: ${train.checkpoint_dir}/stage_${train.stage}/wandb
+      log_code: false
+
+model:
+  latent_diffusion_prior:
+    z_dim: 0
+    num_latent_tokens: 8
+    cond_dim: 0
+    cond_global_dim: 0
+    d_model: 256
+    n_layers: 6
+    n_heads: 8
+    ffn_mult: 4.0
+    dropout: 0.0
+    cond_pool_tokens: 8
+    pos_fourier_dim: 64
+    time_embed_dim: 256
+    use_qk_norm: true
+    use_cross_conditioning: false
+    prediction_type: v
+    latent_normalization: diagonal
+    use_decoder_aux: false
+    schedule:
+      num_train_timesteps: 1000
+      schedule_type: cosine
+      beta_start: 1e-4
+      beta_end: 0.02
+      cosine_s: 0.008
+      default_sampling_steps: 50
+      sampler_type: ddim
+      ddim_eta: 0.0

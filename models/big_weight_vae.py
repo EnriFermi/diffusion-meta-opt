@@ -1680,6 +1680,106 @@ class BigWeightVAE(nn.Module):
             return outputs_with_posterior + (direction_pre_norms,)
         return outputs_with_posterior
 
+    def _decode_from_decoder_latent(
+        self,
+        decoder_z: torch.Tensor,
+        *,
+        dist_patch_by_patch: torch.Tensor | None,
+        patch_mask: torch.Tensor,
+        d_in_mask: torch.Tensor,
+        d_out_mask: torch.Tensor,
+        d_in: int,
+        d_out: int,
+        d_in_pad: int,
+        T: int,
+        return_direction_pre_norms: bool = False,
+        disable_z_shortcut: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
+        if decoder_z.ndim == 3:
+            B, num_latents, d_lat = decoder_z.shape
+            expected_shape = (int(self.cfg.big_vae.num_latents), int(self.cfg.big_vae.d_lat))
+            if (num_latents, d_lat) != expected_shape:
+                raise ValueError(
+                    "decoder_z token shape mismatch: "
+                    f"got {(B, num_latents, d_lat)}, expected (*, {expected_shape[0]}, {expected_shape[1]})"
+                )
+            z = decoder_z.reshape(B, self.flat_lat_dim)
+        elif decoder_z.ndim == 2:
+            B = int(decoder_z.shape[0])
+            if int(decoder_z.shape[1]) != int(self.flat_lat_dim):
+                raise ValueError(
+                    f"decoder_z flat shape must be [B,{self.flat_lat_dim}], got {tuple(decoder_z.shape)}"
+                )
+            z = decoder_z
+        else:
+            raise ValueError(f"decoder_z must be [B,z_dim] or [B,num_latents,d_lat], got {tuple(decoder_z.shape)}")
+
+        if self.use_distribution_encoder:
+            if dist_patch_by_patch is None:
+                raise ValueError("dist_patch_by_patch is required when distribution encoder is enabled")
+            if tuple(dist_patch_by_patch.shape[:2]) != (B, T):
+                raise ValueError(
+                    "dist_patch_by_patch must be [B, T, d_dist], got "
+                    f"{tuple(dist_patch_by_patch.shape)} for expected {(B, T, self.cfg.distribution.d_dist)}"
+                )
+        elif dist_patch_by_patch is not None:
+            raise ValueError("dist_patch_by_patch must be None when distribution encoder is disabled")
+        if patch_mask.ndim != 2 or tuple(patch_mask.shape) != (B, T):
+            raise ValueError(f"patch_mask must be {(B, T)}, got {tuple(patch_mask.shape)}")
+        if d_in_mask.ndim != 2 or tuple(d_in_mask.shape) != (B, d_in):
+            raise ValueError(f"d_in_mask must be {(B, d_in)}, got {tuple(d_in_mask.shape)}")
+        if d_out_mask.ndim != 2 or tuple(d_out_mask.shape) != (B, d_out):
+            raise ValueError(f"d_out_mask must be {(B, d_out)}, got {tuple(d_out_mask.shape)}")
+
+        expected_d_in_pad = int(T) * int(self.cfg.patch_size)
+        if int(d_in_pad) != expected_d_in_pad:
+            raise ValueError(f"d_in_pad must equal T*patch_size={expected_d_in_pad}, got {d_in_pad}")
+
+        lat = self.latent_to_decoder(z.view(B, int(self.cfg.big_vae.num_latents), int(self.cfg.big_vae.d_lat)))
+        q_tokens_base, q_pos_emb, q_pos_o, q_pos_t = self._build_decoder_query_state(
+            batch_size=B,
+            dist_patch_by_patch=dist_patch_by_patch,
+            d_out=d_out,
+            T=T,
+        )
+        query_mask = (patch_mask.unsqueeze(1).expand(-1, d_out, -1) & d_out_mask.unsqueeze(-1)).reshape(B, d_out * T)
+        q_hidden = _apply_sequence_mask(q_tokens_base, query_mask)
+
+        for dec_layer in self.decoder_layers:
+            q_hidden = dec_layer(
+                q=q_hidden,
+                kv=lat,
+                q_pos=q_pos_o,
+                kv_pos=torch.arange(lat.shape[1], device=lat.device, dtype=torch.float32),
+                q_pos2=q_pos_t,
+                kv_pos2=torch.arange(lat.shape[1], device=lat.device, dtype=torch.float32),
+                q_mask=query_mask,
+                kv_mask=None,
+            )
+
+        outputs = self._decode_query_tokens_to_output(
+            q_hidden,
+            z=z,
+            q_pos_emb=q_pos_emb,
+            d_in=d_in,
+            d_out=d_out,
+            d_in_pad=d_in_pad,
+            T=T,
+            patch_mask=patch_mask,
+            d_in_mask=d_in_mask,
+            d_out_mask=d_out_mask,
+            return_direction_pre_norms=return_direction_pre_norms,
+            disable_z_shortcut=disable_z_shortcut,
+        )
+        if return_direction_pre_norms:
+            W_hat, _decoder_z_out, pred_dirs, direction_pre_norms = outputs
+            logvar = torch.zeros_like(z)
+            return W_hat, z, logvar, pred_dirs, direction_pre_norms
+
+        W_hat, _decoder_z_out, pred_dirs = outputs
+        logvar = torch.zeros_like(z)
+        return W_hat, z, logvar, pred_dirs
+
     def forward_debug(
         self,
         W: torch.Tensor,

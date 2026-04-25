@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="680" viewBox="0 0 1280 680" role="img" aria-labelledby="title desc">
+  <title id="title">Evidence matrix for BigVAE</title>
+  <desc id="desc">Four evaluation tracks connect reconstruction, latent geometry, loss landscapes, and downstream optimization.</desc>
+  <defs>
+    <style>
+      .bg { fill: #fbfbf8; }
+      .card { fill: #ffffff; stroke: #20242a; stroke-width: 2; rx: 8; }
+      .blue { fill: #e9f5fb; stroke: #2b7895; }
+      .green { fill: #edf8ef; stroke: #388a4b; }
+      .purple { fill: #f3edff; stroke: #7553a7; }
+      .orange { fill: #fff1df; stroke: #b86b12; }
+      .text { font-family: Inter, Arial, sans-serif; fill: #16191d; font-size: 25px; font-weight: 650; }
+      .small { font-family: Inter, Arial, sans-serif; fill: #30343a; font-size: 18px; }
+      .tiny { font-family: Inter, Arial, sans-serif; fill: #3f454d; font-size: 15px; }
+      .arrow { stroke: #20242a; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#20242a"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1280" height="680"/>
+  <text x="64" y="62" class="text" style="font-size:32px">Evidence needed for the latent-manifold hypothesis</text>
+  <text x="64" y="96" class="small">No single plot is decisive. The claim is supported only if several diagnostics agree.</text>
+
+  <rect x="95" y="155" width="250" height="160" class="card blue"/>
+  <text x="122" y="198" class="text">1. Reconstruct</text>
+  <text x="122" y="232" class="small">held-out source layers</text>
+  <text x="122" y="262" class="tiny">behavioral loss</text>
+  <text x="122" y="286" class="tiny">direction and scale loss</text>
+
+  <rect x="395" y="155" width="250" height="160" class="card green"/>
+  <text x="422" y="198" class="text">2. Organize</text>
+  <text x="422" y="232" class="small">latent geometry</text>
+  <text x="422" y="262" class="tiny">PCA and t-SNE</text>
+  <text x="422" y="286" class="tiny">model, dataset, type, depth</text>
+
+  <rect x="695" y="155" width="250" height="160" class="card purple"/>
+  <text x="722" y="198" class="text">3. Smooth</text>
+  <text x="722" y="232" class="small">loss landscapes</text>
+  <text x="722" y="262" class="tiny">sharpness S_rho</text>
+  <text x="722" y="286" class="tiny">good-area fraction</text>
+
+  <rect x="995" y="155" width="250" height="160" class="card orange"/>
+  <text x="1022" y="198" class="text">4. Optimize</text>
+  <text x="1022" y="232" class="small">downstream ViTs</text>
+  <text x="1022" y="262" class="tiny">raw vs latent AdamW</text>
+  <text x="1022" y="286" class="tiny">accuracy vs parameters</text>
+
+  <path d="M345 235 H395" class="arrow"/>
+  <path d="M645 235 H695" class="arrow"/>
+  <path d="M945 235 H995" class="arrow"/>
+
+  <rect x="170" y="420" width="940" height="130" class="card"/>
+  <text x="210" y="462" class="text">Supported claim</text>
+  <text x="210" y="498" class="small">BigVAE latents are useful optimization coordinates only if reconstruction, geometry,</text>
+  <text x="210" y="528" class="small">landscape metrics, and downstream training tell a consistent story.</text>
+
+  <path d="M220 315 C220 370 420 385 520 420" class="arrow"/>
+  <path d="M520 315 C540 370 580 390 640 420" class="arrow"/>
+  <path d="M820 315 C800 370 745 390 700 420" class="arrow"/>
+  <path d="M1120 315 C1115 370 900 392 760 420" class="arrow"/>
+</svg>
