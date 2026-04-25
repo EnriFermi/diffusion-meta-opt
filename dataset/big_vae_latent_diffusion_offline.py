@@ -34,6 +34,17 @@ class _ExplicitSliceTarget:
         return int(self.patch_size) * int(self.target_T_patches)
 
 
+@dataclass(slots=True)
+class _LatentDiffusionSourceState:
+    source: SharedSample
+    patch_size: int
+    row_patch_groups: tuple[torch.Tensor, ...] | None
+    col_groups: tuple[torch.Tensor, ...] | None
+    row_cursor: int = 0
+    col_cursor: int = 0
+    single_unsliced_consumed: bool = False
+
+
 def _source_key(model_name: str, layer_name: str) -> str:
     payload = f"{str(model_name).strip()}\n{str(layer_name).strip()}".encode("utf-8")
     return hashlib.sha1(payload).hexdigest()
@@ -86,12 +97,35 @@ def _resolve_explicit_slice_target(builder_cfg: Mapping[str, Any], *, patch_size
     )
 
 
-def _slice_shared_sample_to_explicit_target(
+def _build_without_replacement_index_groups(
+    *,
+    num_items: int,
+    group_size: int,
+    device: torch.device,
+    rng: torch.Generator,
+) -> tuple[torch.Tensor, ...] | None:
+    if num_items <= 0:
+        raise ValueError(f"num_items must be > 0, got {num_items}")
+    if group_size <= 0:
+        raise ValueError(f"group_size must be > 0, got {group_size}")
+    if group_size >= num_items:
+        return None
+
+    num_groups = num_items // group_size
+    order = torch.randperm(num_items, generator=rng, device=device)
+    groups: list[torch.Tensor] = []
+    for group_idx in range(num_groups):
+        group = order[group_idx * group_size : (group_idx + 1) * group_size].sort().values
+        groups.append(group)
+    return tuple(groups)
+
+
+def _make_latent_diffusion_source_state(
     sample: SharedSample,
     *,
     target: _ExplicitSliceTarget,
     rng: torch.Generator,
-) -> SharedSample | None:
+) -> _LatentDiffusionSourceState | None:
     x_cpu = _prepare_cpu_tensor(sample.x)
     weight_cpu = _prepare_cpu_tensor(sample.weight)
     d_in, d_out = int(weight_cpu.shape[0]), int(weight_cpu.shape[1])
@@ -99,39 +133,181 @@ def _slice_shared_sample_to_explicit_target(
     if available_full_patches < int(target.target_T_patches) or d_out < int(target.target_d_out):
         return None
 
-    if available_full_patches == int(target.target_T_patches):
-        patch_idx = torch.arange(available_full_patches, dtype=torch.long)
-    else:
-        patch_idx = torch.randperm(available_full_patches, generator=rng)[: int(target.target_T_patches)].sort().values
-    row_offsets = torch.arange(int(target.patch_size), dtype=torch.long)
-    row_idx = (patch_idx.unsqueeze(1) * int(target.patch_size) + row_offsets.unsqueeze(0)).flatten()
-
-    if d_out == int(target.target_d_out):
-        col_idx = torch.arange(d_out, dtype=torch.long)
-    else:
-        col_idx = torch.randperm(d_out, generator=rng)[: int(target.target_d_out)].sort().values
-
-    sliced_weight = weight_cpu.index_select(dim=0, index=row_idx).index_select(dim=1, index=col_idx)
-    sliced_x = x_cpu.index_select(dim=1, index=row_idx)
     meta = dict(sample.meta or {})
-    meta["latent_diffusion_builder_explicit_slice"] = True
+    meta["latent_diffusion_builder_explicit_slice"] = False
+    meta["latent_diffusion_builder_slice_mode"] = "train_style_without_replacement"
     meta["latent_diffusion_target_T_patches"] = int(target.target_T_patches)
     meta["latent_diffusion_target_d_in"] = int(target.target_d_in)
     meta["latent_diffusion_target_d_out"] = int(target.target_d_out)
     meta["latent_diffusion_source_d_in"] = d_in
     meta["latent_diffusion_source_d_out"] = d_out
     meta["latent_diffusion_available_full_patches"] = int(available_full_patches)
-    meta["latent_diffusion_row_patch_idx_preview"] = [int(idx) for idx in patch_idx[:32].tolist()]
-    meta["latent_diffusion_col_idx_preview"] = [int(idx) for idx in col_idx[:32].tolist()]
+    return _LatentDiffusionSourceState(
+        source=SharedSample(
+            model_name=str(sample.model_name),
+            layer_name=str(sample.layer_name),
+            weight=weight_cpu,
+            x=x_cpu,
+            y=sample.y,
+            meta=meta,
+        ),
+        patch_size=int(target.patch_size),
+        row_patch_groups=_build_without_replacement_index_groups(
+            num_items=int(available_full_patches),
+            group_size=int(target.target_T_patches),
+            device=weight_cpu.device,
+            rng=rng,
+        ),
+        col_groups=_build_without_replacement_index_groups(
+            num_items=int(d_out),
+            group_size=int(target.target_d_out),
+            device=weight_cpu.device,
+            rng=rng,
+        ),
+    )
+
+
+def _remaining_latent_diffusion_source_slices(state: _LatentDiffusionSourceState) -> int:
+    capacities: list[int] = []
+    if state.row_patch_groups is not None:
+        capacities.append(len(state.row_patch_groups) - int(state.row_cursor))
+    if state.col_groups is not None:
+        capacities.append(len(state.col_groups) - int(state.col_cursor))
+    if not capacities:
+        return 0 if state.single_unsliced_consumed else 1
+    return max(0, min(capacities))
+
+
+def _prune_exhausted_latent_diffusion_source_states_with_offset(
+    source_states: list[_LatentDiffusionSourceState] | None,
+    start_offset: int,
+) -> tuple[list[_LatentDiffusionSourceState], int]:
+    if not source_states:
+        return [], 0
+
+    survivors: list[_LatentDiffusionSourceState] = []
+    remapped_offset = 0
+    normalized_offset = int(start_offset)
+    for idx, state in enumerate(source_states):
+        if _remaining_latent_diffusion_source_slices(state) <= 0:
+            continue
+        if idx < normalized_offset:
+            remapped_offset += 1
+        survivors.append(state)
+
+    if not survivors:
+        return [], 0
+    return survivors, remapped_offset % len(survivors)
+
+
+def _latent_diffusion_source_states_total_remaining_slices(
+    source_states: Sequence[_LatentDiffusionSourceState] | None,
+) -> int:
+    if not source_states:
+        return 0
+    return sum(_remaining_latent_diffusion_source_slices(state) for state in source_states)
+
+
+def _consume_slice_from_latent_diffusion_source_state(
+    state: _LatentDiffusionSourceState,
+) -> SharedSample | None:
+    remaining = _remaining_latent_diffusion_source_slices(state)
+    if remaining <= 0:
+        return None
+
+    W_i = state.source.weight
+    x_i = state.source.x
+    d_in = int(W_i.shape[0])
+    d_out = int(W_i.shape[1])
+    total_patches = d_in // int(state.patch_size)
+    meta = dict(state.source.meta or {})
+
+    if state.row_patch_groups is not None:
+        patch_idx = state.row_patch_groups[state.row_cursor]
+        state.row_cursor += 1
+        offsets = torch.arange(state.patch_size, device=W_i.device)
+        row_idx = (patch_idx.unsqueeze(1) * state.patch_size + offsets.unsqueeze(0)).flatten()
+        row_idx = row_idx.clamp(max=d_in - 1)
+        W_i = W_i.index_select(dim=0, index=row_idx)
+        x_i = x_i.index_select(dim=1, index=row_idx)
+        meta["latent_diffusion_builder_explicit_slice"] = True
+        meta["latent_diffusion_row_patch_idx"] = [int(idx) for idx in patch_idx.tolist()]
+        meta["latent_diffusion_row_idx_preview"] = [int(idx) for idx in row_idx[:64].tolist()]
+    else:
+        meta["latent_diffusion_row_patch_idx"] = [int(idx) for idx in range(total_patches)]
+
+    if state.col_groups is not None:
+        col_idx = state.col_groups[state.col_cursor]
+        state.col_cursor += 1
+        W_i = W_i.index_select(dim=1, index=col_idx)
+        meta["latent_diffusion_builder_explicit_slice"] = True
+        meta["latent_diffusion_col_idx"] = [int(idx) for idx in col_idx.tolist()]
+    else:
+        meta["latent_diffusion_col_idx"] = [int(idx) for idx in range(d_out)]
+
+    if state.row_patch_groups is None and state.col_groups is None:
+        state.single_unsliced_consumed = True
 
     return SharedSample(
-        model_name=str(sample.model_name),
-        layer_name=str(sample.layer_name),
-        weight=sliced_weight,
-        x=sliced_x,
-        y=sample.y,
+        model_name=str(state.source.model_name),
+        layer_name=str(state.source.layer_name),
+        weight=W_i.contiguous(),
+        x=x_i.contiguous(),
+        y=state.source.y,
         meta=meta,
     )
+
+
+def _build_latent_diffusion_batch_from_source_states(
+    source_states: Sequence[_LatentDiffusionSourceState],
+    *,
+    batch_size: int,
+    start_offset: int = 0,
+) -> tuple[dict[str, Any], int, tuple[int, ...]]:
+    if not source_states:
+        raise ValueError("source_states must not be empty")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+
+    source_pool_remaining_slices_pre = _latent_diffusion_source_states_total_remaining_slices(source_states)
+    if source_pool_remaining_slices_pre < batch_size:
+        raise ValueError(
+            "source pool does not have enough remaining slices to build a batch without replacement: "
+            f"needed={batch_size} available={source_pool_remaining_slices_pre}"
+        )
+
+    sliced_samples: list[SharedSample] = []
+    used_source_indices: list[int] = []
+    cursor = int(start_offset) % len(source_states)
+    stagnant_scans = 0
+
+    while len(sliced_samples) < batch_size:
+        state = source_states[cursor]
+        if _remaining_latent_diffusion_source_slices(state) <= 0:
+            stagnant_scans += 1
+            if stagnant_scans >= len(source_states):
+                raise RuntimeError(
+                    "source pool stalled while assembling latent diffusion slices without replacement"
+                )
+            cursor = (cursor + 1) % len(source_states)
+            continue
+
+        sliced = _consume_slice_from_latent_diffusion_source_state(state)
+        if sliced is None:
+            stagnant_scans += 1
+            if stagnant_scans >= len(source_states):
+                raise RuntimeError(
+                    "source pool stalled while assembling latent diffusion slices without replacement"
+                )
+            cursor = (cursor + 1) % len(source_states)
+            continue
+
+        stagnant_scans = 0
+        sliced_samples.append(sliced)
+        used_source_indices.append(cursor)
+        cursor = (cursor + 1) % len(source_states)
+
+    return _pad_source_samples(sliced_samples), int(cursor), tuple(used_source_indices)
 
 
 class BigVAELatentDiffusionOfflineWriter:
@@ -563,20 +739,30 @@ def build_big_vae_latent_diffusion_offline_dataset(
         nonlocal pending, total_shape_incompatible
         if not pending:
             return
-        sliced_pending: list[SharedSample] = []
+        source_states: list[_LatentDiffusionSourceState] = []
         for raw_sample in pending:
-            sliced = _slice_shared_sample_to_explicit_target(raw_sample, target=target, rng=rng)
-            if sliced is None:
+            state = _make_latent_diffusion_source_state(raw_sample, target=target, rng=rng)
+            if state is None:
                 total_shape_incompatible += 1
                 continue
-            sliced_pending.append(sliced)
-        if not sliced_pending:
+            source_states.append(state)
+        if not source_states:
             pending = []
             return
         model_device = next(big_vae.parameters()).device
-        for start in range(0, len(sliced_pending), encode_batch_size):
-            samples_group = sliced_pending[start : start + encode_batch_size]
-            batch_payload = _pad_source_samples(samples_group)
+        start_offset = 0
+        while source_states:
+            emit_batch_size = min(
+                int(encode_batch_size),
+                int(_latent_diffusion_source_states_total_remaining_slices(source_states)),
+            )
+            if emit_batch_size <= 0:
+                break
+            batch_payload, start_offset, _used_source_indices = _build_latent_diffusion_batch_from_source_states(
+                source_states,
+                batch_size=emit_batch_size,
+                start_offset=start_offset,
+            )
             with torch.no_grad():
                 encoded = encode_big_vae_layer_batch(
                     big_vae,
@@ -595,7 +781,7 @@ def build_big_vae_latent_diffusion_offline_dataset(
             if not torch.is_tensor(latent_mu) or not torch.is_tensor(latent_logvar):
                 raise RuntimeError("BigVAE latent diffusion build expected tensor latent_mu and latent_logvar")
 
-            batch = len(samples_group)
+            batch = int(latent_mu.shape[0])
             for idx in range(batch):
                 valid_t = int(patch_mask[idx].to(dtype=torch.long).sum().item())
                 writer.ingest(
@@ -616,6 +802,10 @@ def build_big_vae_latent_diffusion_offline_dataset(
                         "target_d_out": int(target.target_d_out),
                     }
                 )
+            source_states, start_offset = _prune_exhausted_latent_diffusion_source_states_with_offset(
+                list(source_states),
+                start_offset,
+            )
         pending = []
 
     for sample in dataset_iter:
