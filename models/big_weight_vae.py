@@ -1153,13 +1153,28 @@ class BigWeightVAE(nn.Module):
             assert dist_var_by_patch is not None
             assert dist_patch_by_patch is not None
             assert dist_var_pooled is not None
-            dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
-            dist_var_expanded = dist_var_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1, -1)
-            dist_patch_flat_expanded = dist_patch_expanded.reshape(B * d_out * T, d_dist)
-            dist_var_flat_expanded: torch.Tensor | None = dist_var_expanded.reshape(B * d_out * T, p, d_var)
-            dist_var_for_inject = dist_var_pooled.unsqueeze(1).expand(-1, d_out, -1, -1)
-            valid_patch_counts = patch_mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
-            dist_var_global = (dist_var_pooled * patch_mask_float.unsqueeze(-1)).sum(dim=1) / valid_patch_counts
+            needs_dist_patch_embed = not isinstance(self.patch_tokenizer, PatchConditionedMLPTokenizer)
+            needs_dist_var_patch_tokens = isinstance(self.patch_tokenizer, (PatchConditionedMLPTokenizer, MixerPatchTokenizer))
+
+            if needs_dist_patch_embed:
+                dist_patch_expanded = dist_patch_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1)
+                dist_patch_flat_expanded = dist_patch_expanded.reshape(B * d_out * T, d_dist)
+            else:
+                dist_patch_flat_expanded = None
+
+            if needs_dist_var_patch_tokens:
+                dist_var_expanded = dist_var_by_patch.unsqueeze(1).expand(-1, d_out, -1, -1, -1)
+                dist_var_flat_expanded: torch.Tensor | None = dist_var_expanded.reshape(B * d_out * T, p, d_var)
+            else:
+                dist_var_flat_expanded = None
+
+            if self.use_legacy_distribution_encoder_conditioning:
+                dist_var_for_inject = dist_var_pooled.unsqueeze(1).expand(-1, d_out, -1, -1)
+                valid_patch_counts = patch_mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
+                dist_var_global = (dist_var_pooled * patch_mask_float.unsqueeze(-1)).sum(dim=1) / valid_patch_counts
+            else:
+                dist_var_for_inject = None
+                dist_var_global = None
         else:
             dist_patch_flat_expanded = w_flat.new_zeros((B * d_out * T, 0))
             dist_var_flat_expanded = None

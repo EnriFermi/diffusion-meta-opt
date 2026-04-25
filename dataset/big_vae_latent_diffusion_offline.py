@@ -8,6 +8,7 @@ import random
 import shutil
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -15,10 +16,22 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from dataset.big_vae_offline import OfflineBigVAEDataset, infer_layer_depth, infer_layer_type
+from dataset.shared.types import SharedSample
 from training.big_vae_latent_diffusion import encode_big_vae_layer_batch
 
 
 OFFLINE_BIG_VAE_LATENT_DIFFUSION_FORMAT_VERSION = 1
+
+
+@dataclass(slots=True)
+class _ExplicitSliceTarget:
+    patch_size: int
+    target_T_patches: int
+    target_d_out: int
+
+    @property
+    def target_d_in(self) -> int:
+        return int(self.patch_size) * int(self.target_T_patches)
 
 
 def _source_key(model_name: str, layer_name: str) -> str:
@@ -59,6 +72,68 @@ def _directory_size_bytes(root: Path) -> int:
     return total
 
 
+def _resolve_explicit_slice_target(builder_cfg: Mapping[str, Any], *, patch_size: int) -> _ExplicitSliceTarget:
+    target_T_patches = int(builder_cfg.get("target_T_patches", 0))
+    target_d_out = int(builder_cfg.get("target_d_out", 0))
+    if target_T_patches <= 0:
+        raise ValueError("latent_diffusion_dataset.builder.target_T_patches must be > 0")
+    if target_d_out <= 0:
+        raise ValueError("latent_diffusion_dataset.builder.target_d_out must be > 0")
+    return _ExplicitSliceTarget(
+        patch_size=int(patch_size),
+        target_T_patches=target_T_patches,
+        target_d_out=target_d_out,
+    )
+
+
+def _slice_shared_sample_to_explicit_target(
+    sample: SharedSample,
+    *,
+    target: _ExplicitSliceTarget,
+    rng: torch.Generator,
+) -> SharedSample | None:
+    x_cpu = _prepare_cpu_tensor(sample.x)
+    weight_cpu = _prepare_cpu_tensor(sample.weight)
+    d_in, d_out = int(weight_cpu.shape[0]), int(weight_cpu.shape[1])
+    available_full_patches = d_in // int(target.patch_size)
+    if available_full_patches < int(target.target_T_patches) or d_out < int(target.target_d_out):
+        return None
+
+    if available_full_patches == int(target.target_T_patches):
+        patch_idx = torch.arange(available_full_patches, dtype=torch.long)
+    else:
+        patch_idx = torch.randperm(available_full_patches, generator=rng)[: int(target.target_T_patches)].sort().values
+    row_offsets = torch.arange(int(target.patch_size), dtype=torch.long)
+    row_idx = (patch_idx.unsqueeze(1) * int(target.patch_size) + row_offsets.unsqueeze(0)).flatten()
+
+    if d_out == int(target.target_d_out):
+        col_idx = torch.arange(d_out, dtype=torch.long)
+    else:
+        col_idx = torch.randperm(d_out, generator=rng)[: int(target.target_d_out)].sort().values
+
+    sliced_weight = weight_cpu.index_select(dim=0, index=row_idx).index_select(dim=1, index=col_idx)
+    sliced_x = x_cpu.index_select(dim=1, index=row_idx)
+    meta = dict(sample.meta or {})
+    meta["latent_diffusion_builder_explicit_slice"] = True
+    meta["latent_diffusion_target_T_patches"] = int(target.target_T_patches)
+    meta["latent_diffusion_target_d_in"] = int(target.target_d_in)
+    meta["latent_diffusion_target_d_out"] = int(target.target_d_out)
+    meta["latent_diffusion_source_d_in"] = d_in
+    meta["latent_diffusion_source_d_out"] = d_out
+    meta["latent_diffusion_available_full_patches"] = int(available_full_patches)
+    meta["latent_diffusion_row_patch_idx_preview"] = [int(idx) for idx in patch_idx[:32].tolist()]
+    meta["latent_diffusion_col_idx_preview"] = [int(idx) for idx in col_idx[:32].tolist()]
+
+    return SharedSample(
+        model_name=str(sample.model_name),
+        layer_name=str(sample.layer_name),
+        weight=sliced_weight,
+        x=sliced_x,
+        y=sample.y,
+        meta=meta,
+    )
+
+
 class BigVAELatentDiffusionOfflineWriter:
     def __init__(
         self,
@@ -66,6 +141,9 @@ class BigVAELatentDiffusionOfflineWriter:
         root_dir: str | Path,
         overwrite_existing: bool,
         chunk_size_records: int,
+        patch_size: int,
+        target_T_patches: int,
+        target_d_out: int,
         logger: logging.Logger | None = None,
         config_snapshot: dict[str, Any] | None = None,
     ) -> None:
@@ -74,6 +152,9 @@ class BigVAELatentDiffusionOfflineWriter:
             raise ValueError("latent diffusion dataset root_dir must be non-empty")
         self.logger = logger or logging.getLogger(self.__class__.__name__)
         self.chunk_size_records = max(1, int(chunk_size_records))
+        self.patch_size = max(1, int(patch_size))
+        self.target_T_patches = max(1, int(target_T_patches))
+        self.target_d_out = max(1, int(target_d_out))
         self.config_snapshot = dict(config_snapshot or {})
         self.chunks_dir = self.root_dir / "chunks"
         self.manifest_path = self.root_dir / "manifest.json"
@@ -205,6 +286,12 @@ class BigVAELatentDiffusionOfflineWriter:
             "cond_dim": int(self._cond_dim or 0),
             "actual_size_bytes": int(_directory_size_bytes(self.root_dir)),
             "actual_size_gb": float(_directory_size_bytes(self.root_dir)) / (1024.0 ** 3),
+            "slice_shape": {
+                "patch_size": int(self.patch_size),
+                "target_T_patches": int(self.target_T_patches),
+                "target_d_in": int(self.patch_size) * int(self.target_T_patches),
+                "target_d_out": int(self.target_d_out),
+            },
             "layout": {
                 "chunks_dir": str(self.chunks_dir.relative_to(self.root_dir)),
                 "stats_path": str(self.stats_path.relative_to(self.root_dir)),
@@ -446,65 +533,89 @@ def build_big_vae_latent_diffusion_offline_dataset(
         raise ValueError("latent_diffusion_dataset.root_dir must be set")
     if not bool(getattr(big_vae, "use_distribution_encoder", False)):
         raise ValueError("latent diffusion dataset build requires frozen BigVAE with distribution encoder enabled")
+    target = _resolve_explicit_slice_target(builder_cfg, patch_size=int(big_vae.cfg.patch_size))
 
     cfg_snapshot = OmegaConf.to_container(cfg, resolve=True)
     writer = BigVAELatentDiffusionOfflineWriter(
         root_dir=root_dir,
         overwrite_existing=bool(builder_cfg.get("overwrite_existing", False)),
         chunk_size_records=int(builder_cfg.get("chunk_size_records", 128)),
+        patch_size=int(target.patch_size),
+        target_T_patches=int(target.target_T_patches),
+        target_d_out=int(target.target_d_out),
         logger=logger,
         config_snapshot=cfg_snapshot if isinstance(cfg_snapshot, dict) else {},
     )
     logger_local = logger or logging.getLogger("dataset.big_vae_latent_diffusion_offline")
     batch_size = max(1, int(builder_cfg.get("batch_size", 8)))
+    encode_batch_size = max(1, int(builder_cfg.get("encode_batch_size", 1)))
     log_every_batches = max(1, int(builder_cfg.get("log_every_batches", 100)))
     max_records = max(0, int(builder_cfg.get("max_records", 0)))
+    seed = int(builder_cfg.get("seed", dataset_cfg.get("source", {}).get("seed", 42)))
+    rng = torch.Generator(device="cpu")
+    rng.manual_seed(seed)
 
     pending: list[Any] = []
     total_seen = 0
+    total_shape_incompatible = 0
 
     def _flush_pending() -> None:
-        nonlocal pending
+        nonlocal pending, total_shape_incompatible
         if not pending:
             return
-        batch_payload = _pad_source_samples(pending)
+        sliced_pending: list[SharedSample] = []
+        for raw_sample in pending:
+            sliced = _slice_shared_sample_to_explicit_target(raw_sample, target=target, rng=rng)
+            if sliced is None:
+                total_shape_incompatible += 1
+                continue
+            sliced_pending.append(sliced)
+        if not sliced_pending:
+            pending = []
+            return
         model_device = next(big_vae.parameters()).device
-        with torch.no_grad():
-            encoded = encode_big_vae_layer_batch(
-                big_vae,
-                W=batch_payload["W"].to(device=model_device),
-                X=batch_payload["X"].to(device=model_device),
-                x_mask=batch_payload["x_mask"].to(device=model_device),
-                d_in_mask=batch_payload["d_in_mask"].to(device=model_device),
-                d_out_mask=batch_payload["d_out_mask"].to(device=model_device),
-            )
-        cond_patch = encoded["cond_patch"]
-        patch_mask = encoded["patch_mask"]
-        latent_mu = encoded["latent_mu"]
-        latent_logvar = encoded["latent_logvar"]
-        if not torch.is_tensor(cond_patch) or not torch.is_tensor(patch_mask):
-            raise RuntimeError("BigVAE latent diffusion build expected tensor cond_patch and patch_mask")
-        if not torch.is_tensor(latent_mu) or not torch.is_tensor(latent_logvar):
-            raise RuntimeError("BigVAE latent diffusion build expected tensor latent_mu and latent_logvar")
+        for start in range(0, len(sliced_pending), encode_batch_size):
+            samples_group = sliced_pending[start : start + encode_batch_size]
+            batch_payload = _pad_source_samples(samples_group)
+            with torch.no_grad():
+                encoded = encode_big_vae_layer_batch(
+                    big_vae,
+                    W=batch_payload["W"].to(device=model_device),
+                    X=batch_payload["X"].to(device=model_device),
+                    x_mask=batch_payload["x_mask"].to(device=model_device),
+                    d_in_mask=batch_payload["d_in_mask"].to(device=model_device),
+                    d_out_mask=batch_payload["d_out_mask"].to(device=model_device),
+                )
+            cond_patch = encoded["cond_patch"]
+            patch_mask = encoded["patch_mask"]
+            latent_mu = encoded["latent_mu"]
+            latent_logvar = encoded["latent_logvar"]
+            if not torch.is_tensor(cond_patch) or not torch.is_tensor(patch_mask):
+                raise RuntimeError("BigVAE latent diffusion build expected tensor cond_patch and patch_mask")
+            if not torch.is_tensor(latent_mu) or not torch.is_tensor(latent_logvar):
+                raise RuntimeError("BigVAE latent diffusion build expected tensor latent_mu and latent_logvar")
 
-        batch = len(pending)
-        for idx in range(batch):
-            valid_t = int(patch_mask[idx].to(dtype=torch.long).sum().item())
-            record = {
-                "source_key": _source_key(batch_payload["model_names"][idx], batch_payload["layer_names"][idx]),
-                "model_name": batch_payload["model_names"][idx],
-                "layer_name": batch_payload["layer_names"][idx],
-                "layer_type": infer_layer_type(batch_payload["layer_names"][idx]),
-                "layer_depth": infer_layer_depth(batch_payload["layer_names"][idx]),
-                "d_in": int(batch_payload["d_in_mask"][idx].to(dtype=torch.long).sum().item()),
-                "d_out": int(batch_payload["d_out_mask"][idx].to(dtype=torch.long).sum().item()),
-                "cond_patch": cond_patch[idx, :valid_t],
-                "patch_mask": torch.ones(valid_t, dtype=torch.bool),
-                "latent_mu": latent_mu[idx],
-                "latent_logvar": latent_logvar[idx],
-                "meta": batch_payload["meta"][idx],
-            }
-            writer.ingest(record)
+            batch = len(samples_group)
+            for idx in range(batch):
+                valid_t = int(patch_mask[idx].to(dtype=torch.long).sum().item())
+                writer.ingest(
+                    {
+                        "source_key": _source_key(batch_payload["model_names"][idx], batch_payload["layer_names"][idx]),
+                        "model_name": batch_payload["model_names"][idx],
+                        "layer_name": batch_payload["layer_names"][idx],
+                        "layer_type": infer_layer_type(batch_payload["layer_names"][idx]),
+                        "layer_depth": infer_layer_depth(batch_payload["layer_names"][idx]),
+                        "d_in": int(batch_payload["d_in_mask"][idx].to(dtype=torch.long).sum().item()),
+                        "d_out": int(batch_payload["d_out_mask"][idx].to(dtype=torch.long).sum().item()),
+                        "cond_patch": cond_patch[idx, :valid_t],
+                        "patch_mask": torch.ones(valid_t, dtype=torch.bool),
+                        "latent_mu": latent_mu[idx],
+                        "latent_logvar": latent_logvar[idx],
+                        "meta": batch_payload["meta"][idx],
+                        "target_T_patches": int(target.target_T_patches),
+                        "target_d_out": int(target.target_d_out),
+                    }
+                )
         pending = []
 
     for sample in dataset_iter:
@@ -515,9 +626,13 @@ def build_big_vae_latent_diffusion_offline_dataset(
             processed_batches = total_seen // batch_size
             if processed_batches % log_every_batches == 0:
                 logger_local.info(
-                    "Latent diffusion dataset build progress: seen=%s accepted=%s root=%s",
+                    "Latent diffusion dataset build progress: seen=%s accepted=%s skipped_shape_incompatible=%s "
+                    "target_T_patches=%s target_d_out=%s root=%s",
                     total_seen,
                     int(writer._accepted_records),
+                    int(total_shape_incompatible),
+                    int(target.target_T_patches),
+                    int(target.target_d_out),
                     root_dir,
                 )
         if max_records > 0 and total_seen >= max_records:
@@ -525,10 +640,15 @@ def build_big_vae_latent_diffusion_offline_dataset(
 
     _flush_pending()
     summary = writer.close()
+    summary["skipped_shape_incompatible"] = int(total_shape_incompatible)
     logger_local.info(
-        "Latent diffusion dataset build complete: root=%s accepted_records=%s actual_size_gb=%.2f",
+        "Latent diffusion dataset build complete: root=%s accepted_records=%s skipped_shape_incompatible=%s "
+        "target_T_patches=%s target_d_out=%s actual_size_gb=%.2f",
         root_dir,
         int(summary.get("accepted_records", 0)),
+        int(total_shape_incompatible),
+        int(target.target_T_patches),
+        int(target.target_d_out),
         float(summary.get("actual_size_gb", 0.0)),
     )
     return summary
