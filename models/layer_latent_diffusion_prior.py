@@ -854,6 +854,7 @@ def compute_layer_latent_diffusion_loss(
     decoder_aux_behavioral_loss = zero
     decoder_aux_structural_loss = zero
     decoder_aux_applied_fraction = zero
+    decoder_aux_weight_mean = zero
 
     if bool(model.cfg.use_decoder_aux) and float(model.cfg.decoder_aux_lambda) > 0.0:
         missing: list[str] = []
@@ -878,10 +879,20 @@ def compute_layer_latent_diffusion_loss(
             )
 
         sigma_t = model.schedule.alpha_sigma(timesteps, x_ndim=1)[1]
-        active_mask = sigma_t <= float(model.cfg.decoder_aux_max_sigma)
+        max_sigma = float(model.cfg.decoder_aux_max_sigma)
+        sigma_ratio = (sigma_t / max_sigma).clamp(0.0, 1.0)
+        decoder_aux_weights = torch.cos(0.5 * math.pi * sigma_ratio)
+        decoder_aux_weights = torch.where(
+            sigma_t <= max_sigma,
+            decoder_aux_weights,
+            torch.zeros_like(decoder_aux_weights),
+        )
+        active_mask = decoder_aux_weights > 0.0
         decoder_aux_applied_fraction = active_mask.to(dtype=diffusion_loss.dtype).mean()
+        decoder_aux_weight_mean = decoder_aux_weights.mean()
         if bool(active_mask.any().item()):
             active_idx = torch.nonzero(active_mask, as_tuple=False).squeeze(1)
+            active_weights = decoder_aux_weights.index_select(dim=0, index=active_idx)
             decoder_z = model.unnormalize_latents(model.latents_from_tokens(x0_pred_tokens, flatten=True))
             decoder_z_active = decoder_z.index_select(dim=0, index=active_idx)
             cond_patch_active = cond_patch.index_select(dim=0, index=active_idx)
@@ -915,28 +926,40 @@ def compute_layer_latent_diffusion_loss(
             pred_dirs = decode_outputs[3]
             from models.big_weight_vae import BigWeightVAE
 
-            decoder_aux_behavioral_loss = BigWeightVAE.operator_recon_loss(
-                target_X_active,
-                target_W_active,
-                target_W_hat,
-                x_mask=x_mask_active,
-                d_in_mask=d_in_mask_active,
-                d_out_mask=d_out_mask_active,
-            )
-            decoder_aux_structural_loss, _decoder_struct_details = BigWeightVAE.patch_structure_loss(
-                target_W_active,
-                target_W_hat,
-                patch_size=int(decoder_aux_model.cfg.patch_size),
-                gamma=float(model.cfg.decoder_aux_struct_gamma),
-                lambda_dir=float(model.cfg.decoder_aux_struct_lambda_dir),
-                lambda_scale=float(model.cfg.decoder_aux_struct_lambda_scale),
-                lambda_rec=float(model.cfg.decoder_aux_struct_lambda_rec),
-                lambda_rel=float(model.cfg.decoder_aux_struct_lambda_rel),
-                huber_delta=float(model.cfg.decoder_aux_struct_huber_delta),
-                pred_dirs=pred_dirs,
-                d_in_mask=d_in_mask_active,
-                d_out_mask=d_out_mask_active,
-            )
+            behavioral_terms: list[torch.Tensor] = []
+            structural_terms: list[torch.Tensor] = []
+            for sample_idx in range(int(active_idx.numel())):
+                behavioral_terms.append(
+                    BigWeightVAE.operator_recon_loss(
+                        target_X_active[sample_idx],
+                        target_W_active[sample_idx],
+                        target_W_hat[sample_idx],
+                        x_mask=x_mask_active[sample_idx],
+                        d_in_mask=d_in_mask_active[sample_idx],
+                        d_out_mask=d_out_mask_active[sample_idx],
+                    )
+                )
+                structural_term, _decoder_struct_details = BigWeightVAE.patch_structure_loss(
+                    target_W_active[sample_idx],
+                    target_W_hat[sample_idx],
+                    patch_size=int(decoder_aux_model.cfg.patch_size),
+                    gamma=float(model.cfg.decoder_aux_struct_gamma),
+                    lambda_dir=float(model.cfg.decoder_aux_struct_lambda_dir),
+                    lambda_scale=float(model.cfg.decoder_aux_struct_lambda_scale),
+                    lambda_rec=float(model.cfg.decoder_aux_struct_lambda_rec),
+                    lambda_rel=float(model.cfg.decoder_aux_struct_lambda_rel),
+                    huber_delta=float(model.cfg.decoder_aux_struct_huber_delta),
+                    pred_dirs=pred_dirs[sample_idx : sample_idx + 1],
+                    d_in_mask=d_in_mask_active[sample_idx],
+                    d_out_mask=d_out_mask_active[sample_idx],
+                )
+                structural_terms.append(structural_term)
+
+            behavioral_per_sample = torch.stack(behavioral_terms, dim=0)
+            structural_per_sample = torch.stack(structural_terms, dim=0)
+            batch_denom = float(clean_latents.shape[0])
+            decoder_aux_behavioral_loss = (active_weights * behavioral_per_sample).sum() / batch_denom
+            decoder_aux_structural_loss = (active_weights * structural_per_sample).sum() / batch_denom
             decoder_aux_loss = (
                 float(model.cfg.decoder_aux_behavioral_coef) * decoder_aux_behavioral_loss
                 + float(model.cfg.decoder_aux_structural_coef) * decoder_aux_structural_loss
@@ -950,6 +973,7 @@ def compute_layer_latent_diffusion_loss(
         "decoder_aux_behavioral_loss": decoder_aux_behavioral_loss,
         "decoder_aux_structural_loss": decoder_aux_structural_loss,
         "decoder_aux_applied_fraction": decoder_aux_applied_fraction,
+        "decoder_aux_weight_mean": decoder_aux_weight_mean,
         "pred_tokens": pred_tokens_shaped,
         "target_tokens": target_tokens,
         "clean_tokens": clean_tokens,

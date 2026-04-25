@@ -398,6 +398,7 @@ def main(cfg: DictConfig) -> None:
             step_decoder_aux_behavioral = 0.0
             step_decoder_aux_structural = 0.0
             step_decoder_aux_applied_fraction = 0.0
+            step_decoder_aux_weight_mean = 0.0
 
             for micro_idx in range(grad_accum_steps):
                 batch = _move_batch_to_device(_next_batch(iterator, batch_size=batch_size), device=device)
@@ -429,6 +430,7 @@ def main(cfg: DictConfig) -> None:
                     step_decoder_aux_behavioral += float(loss_payload["decoder_aux_behavioral_loss"].detach().item())
                     step_decoder_aux_structural += float(loss_payload["decoder_aux_structural_loss"].detach().item())
                     step_decoder_aux_applied_fraction += float(loss_payload["decoder_aux_applied_fraction"].detach().item())
+                    step_decoder_aux_weight_mean += float(loss_payload["decoder_aux_weight_mean"].detach().item())
                     step_clean_std += float(loss_payload["clean_tokens"].detach().float().std(unbiased=False).item())
                     step_pred_std += float(loss_payload["pred_tokens"].detach().float().std(unbiased=False).item())
                     step_target_std += float(loss_payload["target_tokens"].detach().float().std(unbiased=False).item())
@@ -458,6 +460,7 @@ def main(cfg: DictConfig) -> None:
                 "data/patch_tokens_mean": step_patch_tokens / float(grad_accum_steps),
                 "data/patch_tokens_max": step_patch_tokens_max,
                 "data/decoder_aux_applied_fraction": step_decoder_aux_applied_fraction / float(grad_accum_steps),
+                "data/decoder_aux_weight_mean": step_decoder_aux_weight_mean / float(grad_accum_steps),
                 "latent/clean_std": step_clean_std / float(grad_accum_steps),
                 "latent/pred_std": step_pred_std / float(grad_accum_steps),
                 "latent/target_std": step_target_std / float(grad_accum_steps),
