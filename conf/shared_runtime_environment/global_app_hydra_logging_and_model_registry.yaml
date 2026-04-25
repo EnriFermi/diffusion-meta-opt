@@ -1,9 +1,9 @@
 # @package _global_
 hf:
   token: ${oc.env:HF_TOKEN,""}
-  hf_home: ${data.path}/hf_home
-  datasets_cache: ${data.path}/hf_datasets_cache
-  hub_cache: ${data.path}/hf_hub_cache
+  hf_home: ${oc.select:data.path,./data}/hf_home
+  datasets_cache: ${oc.select:data.path,./data}/hf_datasets_cache
+  hub_cache: ${oc.select:data.path,./data}/hf_hub_cache
 
 hydra:
   run:
