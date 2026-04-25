@@ -28,6 +28,7 @@ from models.layer_latent_diffusion_prior import (
     compute_layer_latent_diffusion_loss,
 )
 from training.optim import build_adamw_optimizer, build_cosine_scheduler
+from training.big_vae_latent_diffusion import load_frozen_big_vae_from_checkpoint
 from training.runtime import (
     autocast_context,
     configure_per_run_artifacts,
@@ -232,7 +233,19 @@ def _next_batch(iterator: Iterator[dict[str, Any]], *, batch_size: int) -> dict[
 
 def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     moved = dict(batch)
-    for key in ("latent_mu", "latent_logvar", "cond_patch", "patch_mask", "d_in", "d_out"):
+    for key in (
+        "latent_mu",
+        "latent_logvar",
+        "cond_patch",
+        "patch_mask",
+        "d_in",
+        "d_out",
+        "X",
+        "W",
+        "x_mask",
+        "d_in_mask",
+        "d_out_mask",
+    ):
         value = moved.get(key)
         if torch.is_tensor(value):
             moved[key] = value.to(device=device, non_blocking=True)
@@ -266,11 +279,12 @@ def main(cfg: DictConfig) -> None:
         prior_cfg = build_layer_latent_diffusion_prior_config(prior_cfg_raw)
 
         logger.info(
-            "Latent dataset summary: root=%s accepted_records=%s z_dim=%s cond_dim=%s",
+            "Latent dataset summary: root=%s accepted_records=%s z_dim=%s cond_dim=%s has_decoder_aux_tensors=%s",
             dataset_summary.get("root_dir", ""),
             int(dataset_summary.get("accepted_records", 0)),
             int(dataset_summary.get("z_dim", 0)),
             int(dataset_summary.get("cond_dim", 0)),
+            bool(dataset_summary.get("has_decoder_aux_tensors", False)),
         )
         logger.info(
             "Model config: z_dim=%s num_latent_tokens=%s cond_dim=%s d_model=%s n_layers=%s n_heads=%s prediction_type=%s",
@@ -289,6 +303,20 @@ def main(cfg: DictConfig) -> None:
             latent_std=dataset_stats["latent_std"],
         )
         model = maybe_compile_model(model, cfg, logger, section="train", label="latent_diffusion_prior")
+        decoder_aux_model = None
+        if bool(prior_cfg.use_decoder_aux):
+            if not bool(dataset_summary.get("has_decoder_aux_tensors", False)):
+                raise ValueError(
+                    "decoder auxiliary loss requires offline latent diffusion dataset with stored reconstruction targets. "
+                    "Rebuild the dataset with latent_diffusion_dataset.builder.store_decoder_aux_tensors=true."
+                )
+            aux_checkpoint = str(cfg.get("latent_diffusion_prior", {}).get("big_vae_checkpoint", "")).strip()
+            if not aux_checkpoint:
+                raise ValueError(
+                    "latent_diffusion_prior.big_vae_checkpoint must be set when model.latent_diffusion_prior.use_decoder_aux=true"
+                )
+            decoder_aux_model = load_frozen_big_vae_from_checkpoint(aux_checkpoint, device=device)
+            logger.info("Loaded frozen BigVAE decoder for auxiliary loss: %s", aux_checkpoint)
 
         optimizer = build_adamw_optimizer(
             model=model,
@@ -365,6 +393,12 @@ def main(cfg: DictConfig) -> None:
             step_clean_std = 0.0
             step_pred_std = 0.0
             step_target_std = 0.0
+            step_diffusion_loss = 0.0
+            step_decoder_aux_loss = 0.0
+            step_decoder_aux_behavioral = 0.0
+            step_decoder_aux_structural = 0.0
+            step_decoder_aux_applied_fraction = 0.0
+            step_decoder_aux_weight_mean = 0.0
 
             for micro_idx in range(grad_accum_steps):
                 batch = _move_batch_to_device(_next_batch(iterator, batch_size=batch_size), device=device)
@@ -383,8 +417,20 @@ def main(cfg: DictConfig) -> None:
                         cond_patch=batch["cond_patch"],
                         timesteps=timesteps,
                         patch_mask=batch["patch_mask"],
+                        decoder_aux_model=decoder_aux_model,
+                        decoder_aux_W=batch.get("W"),
+                        decoder_aux_X=batch.get("X"),
+                        decoder_aux_x_mask=batch.get("x_mask"),
+                        decoder_aux_d_in_mask=batch.get("d_in_mask"),
+                        decoder_aux_d_out_mask=batch.get("d_out_mask"),
                     )
                     loss = loss_payload["loss"]
+                    step_diffusion_loss += float(loss_payload["diffusion_loss"].detach().item())
+                    step_decoder_aux_loss += float(loss_payload["decoder_aux_loss"].detach().item())
+                    step_decoder_aux_behavioral += float(loss_payload["decoder_aux_behavioral_loss"].detach().item())
+                    step_decoder_aux_structural += float(loss_payload["decoder_aux_structural_loss"].detach().item())
+                    step_decoder_aux_applied_fraction += float(loss_payload["decoder_aux_applied_fraction"].detach().item())
+                    step_decoder_aux_weight_mean += float(loss_payload["decoder_aux_weight_mean"].detach().item())
                     step_clean_std += float(loss_payload["clean_tokens"].detach().float().std(unbiased=False).item())
                     step_pred_std += float(loss_payload["pred_tokens"].detach().float().std(unbiased=False).item())
                     step_target_std += float(loss_payload["target_tokens"].detach().float().std(unbiased=False).item())
@@ -405,10 +451,16 @@ def main(cfg: DictConfig) -> None:
             step_time = time.perf_counter() - step_start
             metrics = {
                 "loss/total": step_loss_sum / float(grad_accum_steps),
+                "loss/diffusion": step_diffusion_loss / float(grad_accum_steps),
+                "loss/decoder_aux": step_decoder_aux_loss / float(grad_accum_steps),
+                "loss/decoder_aux_behavioral": step_decoder_aux_behavioral / float(grad_accum_steps),
+                "loss/decoder_aux_structural": step_decoder_aux_structural / float(grad_accum_steps),
                 "schedule/alpha_mean": step_alpha_sum / float(grad_accum_steps),
                 "schedule/sigma_mean": step_sigma_sum / float(grad_accum_steps),
                 "data/patch_tokens_mean": step_patch_tokens / float(grad_accum_steps),
                 "data/patch_tokens_max": step_patch_tokens_max,
+                "data/decoder_aux_applied_fraction": step_decoder_aux_applied_fraction / float(grad_accum_steps),
+                "data/decoder_aux_weight_mean": step_decoder_aux_weight_mean / float(grad_accum_steps),
                 "latent/clean_std": step_clean_std / float(grad_accum_steps),
                 "latent/pred_std": step_pred_std / float(grad_accum_steps),
                 "latent/target_std": step_target_std / float(grad_accum_steps),

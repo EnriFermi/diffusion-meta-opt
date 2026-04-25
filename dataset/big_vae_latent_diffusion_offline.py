@@ -320,6 +320,7 @@ class BigVAELatentDiffusionOfflineWriter:
         patch_size: int,
         target_T_patches: int,
         target_d_out: int,
+        store_decoder_aux_tensors: bool = False,
         logger: logging.Logger | None = None,
         config_snapshot: dict[str, Any] | None = None,
     ) -> None:
@@ -331,6 +332,7 @@ class BigVAELatentDiffusionOfflineWriter:
         self.patch_size = max(1, int(patch_size))
         self.target_T_patches = max(1, int(target_T_patches))
         self.target_d_out = max(1, int(target_d_out))
+        self.store_decoder_aux_tensors = bool(store_decoder_aux_tensors)
         self.config_snapshot = dict(config_snapshot or {})
         self.chunks_dir = self.root_dir / "chunks"
         self.manifest_path = self.root_dir / "manifest.json"
@@ -365,6 +367,11 @@ class BigVAELatentDiffusionOfflineWriter:
         latent_mu_cpu = _prepare_cpu_tensor(latent_mu)
         cond_patch_cpu = _prepare_cpu_tensor(cond_patch)
         patch_mask_cpu = patch_mask.detach().to(device="cpu", dtype=torch.bool).contiguous()
+        target_X = record.get("X")
+        target_W = record.get("W")
+        target_x_mask = record.get("x_mask")
+        target_d_in_mask = record.get("d_in_mask")
+        target_d_out_mask = record.get("d_out_mask")
 
         z_dim = int(latent_mu_cpu.numel())
         cond_dim = int(cond_patch_cpu.shape[1])
@@ -392,6 +399,22 @@ class BigVAELatentDiffusionOfflineWriter:
         latent_logvar = payload.get("latent_logvar")
         if torch.is_tensor(latent_logvar):
             payload["latent_logvar"] = _prepare_cpu_tensor(latent_logvar)
+        if self.store_decoder_aux_tensors:
+            if not torch.is_tensor(target_X) or target_X.ndim != 2:
+                raise TypeError("record.X must be rank-2 tensor when store_decoder_aux_tensors=true")
+            if not torch.is_tensor(target_W) or target_W.ndim != 2:
+                raise TypeError("record.W must be rank-2 tensor when store_decoder_aux_tensors=true")
+            if not torch.is_tensor(target_x_mask) or target_x_mask.ndim != 1:
+                raise TypeError("record.x_mask must be rank-1 tensor when store_decoder_aux_tensors=true")
+            if not torch.is_tensor(target_d_in_mask) or target_d_in_mask.ndim != 1:
+                raise TypeError("record.d_in_mask must be rank-1 tensor when store_decoder_aux_tensors=true")
+            if not torch.is_tensor(target_d_out_mask) or target_d_out_mask.ndim != 1:
+                raise TypeError("record.d_out_mask must be rank-1 tensor when store_decoder_aux_tensors=true")
+            payload["X"] = _prepare_cpu_tensor(target_X)
+            payload["W"] = _prepare_cpu_tensor(target_W)
+            payload["x_mask"] = target_x_mask.detach().to(device="cpu", dtype=torch.bool).contiguous()
+            payload["d_in_mask"] = target_d_in_mask.detach().to(device="cpu", dtype=torch.bool).contiguous()
+            payload["d_out_mask"] = target_d_out_mask.detach().to(device="cpu", dtype=torch.bool).contiguous()
         self._chunk_buffer.append(payload)
         self._accepted_records += 1
         if len(self._chunk_buffer) >= self.chunk_size_records:
@@ -462,6 +485,7 @@ class BigVAELatentDiffusionOfflineWriter:
             "cond_dim": int(self._cond_dim or 0),
             "actual_size_bytes": int(_directory_size_bytes(self.root_dir)),
             "actual_size_gb": float(_directory_size_bytes(self.root_dir)) / (1024.0 ** 3),
+            "has_decoder_aux_tensors": bool(self.store_decoder_aux_tensors),
             "slice_shape": {
                 "patch_size": int(self.patch_size),
                 "target_T_patches": int(self.target_T_patches),
@@ -605,6 +629,30 @@ def collate_big_vae_latent_diffusion_batch(items: Sequence[Mapping[str, Any]]) -
     metas: list[dict[str, Any]] = []
     d_in_list: list[int] = []
     d_out_list: list[int] = []
+    has_decoder_aux_tensors = any(torch.is_tensor(item.get("W")) or torch.is_tensor(item.get("X")) for item in items)
+    X: torch.Tensor | None = None
+    W: torch.Tensor | None = None
+    x_mask: torch.Tensor | None = None
+    d_in_mask: torch.Tensor | None = None
+    d_out_mask: torch.Tensor | None = None
+    if has_decoder_aux_tensors:
+        if not all(
+            torch.is_tensor(item.get("W"))
+            and torch.is_tensor(item.get("X"))
+            and torch.is_tensor(item.get("x_mask"))
+            and torch.is_tensor(item.get("d_in_mask"))
+            and torch.is_tensor(item.get("d_out_mask"))
+            for item in items
+        ):
+            raise ValueError("decoder auxiliary tensors must be present for every item in the batch or none")
+        max_rows = max(int(item["X"].shape[0]) for item in items)
+        max_d_in = max(int(item["W"].shape[0]) for item in items)
+        max_d_out = max(int(item["W"].shape[1]) for item in items)
+        X = torch.zeros(batch, max_rows, max_d_in, dtype=torch.float32)
+        W = torch.zeros(batch, max_d_in, max_d_out, dtype=torch.float32)
+        x_mask = torch.zeros(batch, max_rows, dtype=torch.bool)
+        d_in_mask = torch.zeros(batch, max_d_in, dtype=torch.bool)
+        d_out_mask = torch.zeros(batch, max_d_out, dtype=torch.bool)
 
     for idx, item in enumerate(items):
         item_latent = item.get("latent_mu")
@@ -630,8 +678,23 @@ def collate_big_vae_latent_diffusion_batch(items: Sequence[Mapping[str, Any]]) -
         metas.append(dict(item.get("meta", {}) or {}))
         d_in_list.append(int(item.get("d_in", 0)))
         d_out_list.append(int(item.get("d_out", 0)))
+        if has_decoder_aux_tensors:
+            item_X = _prepare_cpu_tensor(item["X"])
+            item_W = _prepare_cpu_tensor(item["W"])
+            item_x_mask = item["x_mask"].detach().to(device="cpu", dtype=torch.bool).contiguous()
+            item_d_in_mask = item["d_in_mask"].detach().to(device="cpu", dtype=torch.bool).contiguous()
+            item_d_out_mask = item["d_out_mask"].detach().to(device="cpu", dtype=torch.bool).contiguous()
+            rows = int(item_X.shape[0])
+            d_in = int(item_W.shape[0])
+            d_out = int(item_W.shape[1])
+            assert X is not None and W is not None and x_mask is not None and d_in_mask is not None and d_out_mask is not None
+            X[idx, :rows, :d_in] = item_X
+            W[idx, :d_in, :d_out] = item_W
+            x_mask[idx, :rows] = item_x_mask
+            d_in_mask[idx, :d_in] = item_d_in_mask
+            d_out_mask[idx, :d_out] = item_d_out_mask
 
-    return {
+    batch_payload = {
         "latent_mu": latent_mu,
         "latent_logvar": latent_logvar,
         "cond_patch": cond_patch,
@@ -643,6 +706,14 @@ def collate_big_vae_latent_diffusion_batch(items: Sequence[Mapping[str, Any]]) -
         "d_in": torch.tensor(d_in_list, dtype=torch.long),
         "d_out": torch.tensor(d_out_list, dtype=torch.long),
     }
+    if has_decoder_aux_tensors:
+        assert X is not None and W is not None and x_mask is not None and d_in_mask is not None and d_out_mask is not None
+        batch_payload["X"] = X
+        batch_payload["W"] = W
+        batch_payload["x_mask"] = x_mask
+        batch_payload["d_in_mask"] = d_in_mask
+        batch_payload["d_out_mask"] = d_out_mask
+    return batch_payload
 
 
 def _pad_source_samples(samples: Sequence[Any]) -> dict[str, Any]:
@@ -719,12 +790,14 @@ def build_big_vae_latent_diffusion_offline_dataset(
         patch_size=int(target.patch_size),
         target_T_patches=int(target.target_T_patches),
         target_d_out=int(target.target_d_out),
+        store_decoder_aux_tensors=bool(builder_cfg.get("store_decoder_aux_tensors", False)),
         logger=logger,
         config_snapshot=cfg_snapshot if isinstance(cfg_snapshot, dict) else {},
     )
     logger_local = logger or logging.getLogger("dataset.big_vae_latent_diffusion_offline")
     batch_size = max(1, int(builder_cfg.get("batch_size", 8)))
     encode_batch_size = max(1, int(builder_cfg.get("encode_batch_size", 1)))
+    store_decoder_aux_tensors = bool(builder_cfg.get("store_decoder_aux_tensors", False))
     log_every_batches = max(1, int(builder_cfg.get("log_every_batches", 100)))
     max_records = max(0, int(builder_cfg.get("max_records", 0)))
     seed = int(builder_cfg.get("seed", dataset_cfg.get("source", {}).get("seed", 42)))
@@ -784,23 +857,33 @@ def build_big_vae_latent_diffusion_offline_dataset(
             batch = int(latent_mu.shape[0])
             for idx in range(batch):
                 valid_t = int(patch_mask[idx].to(dtype=torch.long).sum().item())
+                valid_rows = int(batch_payload["x_mask"][idx].to(dtype=torch.long).sum().item())
+                valid_d_in = int(batch_payload["d_in_mask"][idx].to(dtype=torch.long).sum().item())
+                valid_d_out = int(batch_payload["d_out_mask"][idx].to(dtype=torch.long).sum().item())
+                record = {
+                    "source_key": _source_key(batch_payload["model_names"][idx], batch_payload["layer_names"][idx]),
+                    "model_name": batch_payload["model_names"][idx],
+                    "layer_name": batch_payload["layer_names"][idx],
+                    "layer_type": infer_layer_type(batch_payload["layer_names"][idx]),
+                    "layer_depth": infer_layer_depth(batch_payload["layer_names"][idx]),
+                    "d_in": valid_d_in,
+                    "d_out": valid_d_out,
+                    "cond_patch": cond_patch[idx, :valid_t],
+                    "patch_mask": torch.ones(valid_t, dtype=torch.bool),
+                    "latent_mu": latent_mu[idx],
+                    "latent_logvar": latent_logvar[idx],
+                    "meta": batch_payload["meta"][idx],
+                    "target_T_patches": int(target.target_T_patches),
+                    "target_d_out": int(target.target_d_out),
+                }
+                if store_decoder_aux_tensors:
+                    record["X"] = batch_payload["X"][idx, :valid_rows, :valid_d_in]
+                    record["W"] = batch_payload["W"][idx, :valid_d_in, :valid_d_out]
+                    record["x_mask"] = batch_payload["x_mask"][idx, :valid_rows]
+                    record["d_in_mask"] = batch_payload["d_in_mask"][idx, :valid_d_in]
+                    record["d_out_mask"] = batch_payload["d_out_mask"][idx, :valid_d_out]
                 writer.ingest(
-                    {
-                        "source_key": _source_key(batch_payload["model_names"][idx], batch_payload["layer_names"][idx]),
-                        "model_name": batch_payload["model_names"][idx],
-                        "layer_name": batch_payload["layer_names"][idx],
-                        "layer_type": infer_layer_type(batch_payload["layer_names"][idx]),
-                        "layer_depth": infer_layer_depth(batch_payload["layer_names"][idx]),
-                        "d_in": int(batch_payload["d_in_mask"][idx].to(dtype=torch.long).sum().item()),
-                        "d_out": int(batch_payload["d_out_mask"][idx].to(dtype=torch.long).sum().item()),
-                        "cond_patch": cond_patch[idx, :valid_t],
-                        "patch_mask": torch.ones(valid_t, dtype=torch.bool),
-                        "latent_mu": latent_mu[idx],
-                        "latent_logvar": latent_logvar[idx],
-                        "meta": batch_payload["meta"][idx],
-                        "target_T_patches": int(target.target_T_patches),
-                        "target_d_out": int(target.target_d_out),
-                    }
+                    record
                 )
             source_states, start_offset = _prune_exhausted_latent_diffusion_source_states_with_offset(
                 list(source_states),
@@ -869,11 +952,12 @@ def offline_big_vae_latent_diffusion_data_pipeline(
     logger_local = logger or logging.getLogger("dataset.big_vae_latent_diffusion_offline")
     summary = dataset.summary()
     logger_local.info(
-        "Offline latent diffusion dataset ready: root=%s accepted_records=%s z_dim=%s cond_dim=%s",
+        "Offline latent diffusion dataset ready: root=%s accepted_records=%s z_dim=%s cond_dim=%s has_decoder_aux_tensors=%s",
         summary.get("root_dir", root_dir),
         int(summary.get("accepted_records", 0)),
         int(summary.get("z_dim", 0)),
         int(summary.get("cond_dim", 0)),
+        bool(summary.get("has_decoder_aux_tensors", False)),
     )
     try:
         yield dataset

@@ -27,8 +27,9 @@ latent_diffusion_dataset:
     chunk_size_records: 128
     batch_size: 8
     encode_batch_size: 1
-    target_T_patches: 4
-    target_d_out: 64
+    target_T_patches: 16
+    target_d_out: 8
+    store_decoder_aux_tensors: false
     seed: 42
     log_every_batches: 100
     max_records: 0

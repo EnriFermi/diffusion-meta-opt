@@ -95,6 +95,16 @@ model:
     prediction_type: v
     latent_normalization: diagonal
     use_decoder_aux: false
+    decoder_aux_lambda: 0.1
+    decoder_aux_max_sigma: 0.5
+    decoder_aux_behavioral_coef: 1.0
+    decoder_aux_structural_coef: 1.0
+    decoder_aux_struct_gamma: 0.5
+    decoder_aux_struct_lambda_dir: 1.0
+    decoder_aux_struct_lambda_scale: 0.25
+    decoder_aux_struct_lambda_rec: 0.5
+    decoder_aux_struct_lambda_rel: 0.1
+    decoder_aux_struct_huber_delta: 0.1
     schedule:
       num_train_timesteps: 1000
       schedule_type: cosine
