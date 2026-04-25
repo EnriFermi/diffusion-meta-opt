@@ -42,6 +42,16 @@ class LayerLatentDiffusionPriorConfig:
     prediction_type: str = "v"
     latent_normalization: str = "diagonal"
     use_decoder_aux: bool = False
+    decoder_aux_lambda: float = 0.0
+    decoder_aux_max_sigma: float = 0.5
+    decoder_aux_behavioral_coef: float = 1.0
+    decoder_aux_structural_coef: float = 1.0
+    decoder_aux_struct_gamma: float = 0.5
+    decoder_aux_struct_lambda_dir: float = 1.0
+    decoder_aux_struct_lambda_scale: float = 0.25
+    decoder_aux_struct_lambda_rec: float = 0.5
+    decoder_aux_struct_lambda_rel: float = 0.1
+    decoder_aux_struct_huber_delta: float = 0.1
     schedule: DiffusionScheduleConfig = field(default_factory=DiffusionScheduleConfig)
 
 
@@ -69,6 +79,16 @@ def build_layer_latent_diffusion_prior_config(raw_cfg: Mapping[str, Any]) -> Lay
         prediction_type=str(raw_cfg.get("prediction_type", "v")),
         latent_normalization=str(raw_cfg.get("latent_normalization", "diagonal")),
         use_decoder_aux=bool(raw_cfg.get("use_decoder_aux", False)),
+        decoder_aux_lambda=float(raw_cfg.get("decoder_aux_lambda", 0.0)),
+        decoder_aux_max_sigma=float(raw_cfg.get("decoder_aux_max_sigma", 0.5)),
+        decoder_aux_behavioral_coef=float(raw_cfg.get("decoder_aux_behavioral_coef", 1.0)),
+        decoder_aux_structural_coef=float(raw_cfg.get("decoder_aux_structural_coef", 1.0)),
+        decoder_aux_struct_gamma=float(raw_cfg.get("decoder_aux_struct_gamma", 0.5)),
+        decoder_aux_struct_lambda_dir=float(raw_cfg.get("decoder_aux_struct_lambda_dir", 1.0)),
+        decoder_aux_struct_lambda_scale=float(raw_cfg.get("decoder_aux_struct_lambda_scale", 0.25)),
+        decoder_aux_struct_lambda_rec=float(raw_cfg.get("decoder_aux_struct_lambda_rec", 0.5)),
+        decoder_aux_struct_lambda_rel=float(raw_cfg.get("decoder_aux_struct_lambda_rel", 0.1)),
+        decoder_aux_struct_huber_delta=float(raw_cfg.get("decoder_aux_struct_huber_delta", 0.1)),
         schedule=DiffusionScheduleConfig(
             num_train_timesteps=int(schedule_raw.get("num_train_timesteps", 1000)),
             schedule_type=str(schedule_raw.get("schedule_type", "cosine")),
@@ -543,8 +563,10 @@ class LayerLatentDiffusionPrior(nn.Module):
                 "Only diagonal latent normalization is currently supported; "
                 f"got {cfg.latent_normalization!r}"
             )
-        if bool(cfg.use_decoder_aux):
-            raise ValueError("use_decoder_aux=true is reserved for a later extension and is not implemented yet")
+        if float(cfg.decoder_aux_lambda) < 0.0:
+            raise ValueError(f"decoder_aux_lambda must be >= 0, got {cfg.decoder_aux_lambda}")
+        if float(cfg.decoder_aux_max_sigma) <= 0.0:
+            raise ValueError(f"decoder_aux_max_sigma must be > 0, got {cfg.decoder_aux_max_sigma}")
 
         self.cfg = cfg
         self.z_dim = int(cfg.z_dim)
@@ -800,6 +822,12 @@ def compute_layer_latent_diffusion_loss(
     patch_mask: torch.Tensor | None = None,
     cond_global: torch.Tensor | None = None,
     noise: torch.Tensor | None = None,
+    decoder_aux_model: Any | None = None,
+    decoder_aux_W: torch.Tensor | None = None,
+    decoder_aux_X: torch.Tensor | None = None,
+    decoder_aux_x_mask: torch.Tensor | None = None,
+    decoder_aux_d_in_mask: torch.Tensor | None = None,
+    decoder_aux_d_out_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     noisy_tokens, target_tokens, clean_tokens = model.compute_training_targets(
         clean_latents,
@@ -814,13 +842,119 @@ def compute_layer_latent_diffusion_loss(
         patch_mask=patch_mask,
     )
     pred_tokens_shaped, _ = model.tokens_from_latents(pred_tokens)
-    loss = F.mse_loss(pred_tokens_shaped, target_tokens)
+    diffusion_loss = F.mse_loss(pred_tokens_shaped, target_tokens)
+    x0_pred_tokens = model.schedule.predict_x0(
+        x_t=noisy_tokens,
+        model_pred=pred_tokens_shaped,
+        timesteps=timesteps,
+        prediction_type=model.prediction_type,
+    )
+    zero = diffusion_loss.new_zeros(())
+    decoder_aux_loss = zero
+    decoder_aux_behavioral_loss = zero
+    decoder_aux_structural_loss = zero
+    decoder_aux_applied_fraction = zero
+
+    if bool(model.cfg.use_decoder_aux) and float(model.cfg.decoder_aux_lambda) > 0.0:
+        missing: list[str] = []
+        if decoder_aux_model is None:
+            missing.append("decoder_aux_model")
+        if decoder_aux_W is None:
+            missing.append("decoder_aux_W")
+        if decoder_aux_X is None:
+            missing.append("decoder_aux_X")
+        if decoder_aux_x_mask is None:
+            missing.append("decoder_aux_x_mask")
+        if decoder_aux_d_in_mask is None:
+            missing.append("decoder_aux_d_in_mask")
+        if decoder_aux_d_out_mask is None:
+            missing.append("decoder_aux_d_out_mask")
+        if patch_mask is None:
+            missing.append("patch_mask")
+        if missing:
+            raise ValueError(
+                "decoder auxiliary loss requires additional tensors; missing="
+                + ",".join(missing)
+            )
+
+        sigma_t = model.schedule.alpha_sigma(timesteps, x_ndim=1)[1]
+        active_mask = sigma_t <= float(model.cfg.decoder_aux_max_sigma)
+        decoder_aux_applied_fraction = active_mask.to(dtype=diffusion_loss.dtype).mean()
+        if bool(active_mask.any().item()):
+            active_idx = torch.nonzero(active_mask, as_tuple=False).squeeze(1)
+            decoder_z = model.unnormalize_latents(model.latents_from_tokens(x0_pred_tokens, flatten=True))
+            decoder_z_active = decoder_z.index_select(dim=0, index=active_idx)
+            cond_patch_active = cond_patch.index_select(dim=0, index=active_idx)
+            patch_mask_active = patch_mask.index_select(dim=0, index=active_idx)
+            target_W_active = decoder_aux_W.index_select(dim=0, index=active_idx)
+            target_X_active = decoder_aux_X.index_select(dim=0, index=active_idx)
+            x_mask_active = decoder_aux_x_mask.index_select(dim=0, index=active_idx)
+            d_in_mask_active = decoder_aux_d_in_mask.index_select(dim=0, index=active_idx)
+            d_out_mask_active = decoder_aux_d_out_mask.index_select(dim=0, index=active_idx)
+            d_in = int(target_W_active.shape[1])
+            d_out = int(target_W_active.shape[2])
+            T = int(cond_patch_active.shape[1])
+            d_in_pad = int(T) * int(decoder_aux_model.cfg.patch_size)
+            if d_in != d_in_pad:
+                raise ValueError(
+                    "decoder auxiliary expected W slices with d_in == T*patch_size, "
+                    f"got d_in={d_in} T={T} patch_size={decoder_aux_model.cfg.patch_size}"
+                )
+            decode_outputs = decoder_aux_model._decode_from_decoder_latent(
+                decoder_z_active,
+                dist_patch_by_patch=cond_patch_active,
+                patch_mask=patch_mask_active,
+                d_in_mask=d_in_mask_active,
+                d_out_mask=d_out_mask_active,
+                d_in=d_in,
+                d_out=d_out,
+                d_in_pad=d_in_pad,
+                T=T,
+            )
+            target_W_hat = decode_outputs[0]
+            pred_dirs = decode_outputs[3]
+            from models.big_weight_vae import BigWeightVAE
+
+            decoder_aux_behavioral_loss = BigWeightVAE.operator_recon_loss(
+                target_X_active,
+                target_W_active,
+                target_W_hat,
+                x_mask=x_mask_active,
+                d_in_mask=d_in_mask_active,
+                d_out_mask=d_out_mask_active,
+            )
+            decoder_aux_structural_loss, _decoder_struct_details = BigWeightVAE.patch_structure_loss(
+                target_W_active,
+                target_W_hat,
+                patch_size=int(decoder_aux_model.cfg.patch_size),
+                gamma=float(model.cfg.decoder_aux_struct_gamma),
+                lambda_dir=float(model.cfg.decoder_aux_struct_lambda_dir),
+                lambda_scale=float(model.cfg.decoder_aux_struct_lambda_scale),
+                lambda_rec=float(model.cfg.decoder_aux_struct_lambda_rec),
+                lambda_rel=float(model.cfg.decoder_aux_struct_lambda_rel),
+                huber_delta=float(model.cfg.decoder_aux_struct_huber_delta),
+                pred_dirs=pred_dirs,
+                d_in_mask=d_in_mask_active,
+                d_out_mask=d_out_mask_active,
+            )
+            decoder_aux_loss = (
+                float(model.cfg.decoder_aux_behavioral_coef) * decoder_aux_behavioral_loss
+                + float(model.cfg.decoder_aux_structural_coef) * decoder_aux_structural_loss
+            )
+
+    loss = diffusion_loss + float(model.cfg.decoder_aux_lambda) * decoder_aux_loss
     return {
         "loss": loss,
+        "diffusion_loss": diffusion_loss,
+        "decoder_aux_loss": decoder_aux_loss,
+        "decoder_aux_behavioral_loss": decoder_aux_behavioral_loss,
+        "decoder_aux_structural_loss": decoder_aux_structural_loss,
+        "decoder_aux_applied_fraction": decoder_aux_applied_fraction,
         "pred_tokens": pred_tokens_shaped,
         "target_tokens": target_tokens,
         "clean_tokens": clean_tokens,
         "noisy_tokens": noisy_tokens,
+        "x0_pred_tokens": x0_pred_tokens,
     }
 
 
