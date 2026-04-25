@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -19,6 +20,9 @@ from models.weight_quantile_vae import (
     ModelConfig,
     build_weight_quantile_vae,
 )
+
+LOGGER = logging.getLogger(__name__)
+_VAE_POSTERIOR_HEAD_PREFIXES = ("to_mu.", "to_logvar.")
 
 
 def _strip_state_prefix(name: str) -> str:
@@ -40,6 +44,60 @@ def _normalize_state_dict_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
     for raw_key, value in state_dict.items():
         normalized[_strip_state_prefix(str(raw_key))] = value
     return normalized
+
+
+def _model_uses_latent_sampling(model: torch.nn.Module) -> bool:
+    cfg = getattr(model, "cfg", None)
+    big_vae_cfg = getattr(cfg, "big_vae", None)
+    return bool(getattr(big_vae_cfg, "use_latent_sampling", False))
+
+
+def _is_vae_posterior_head_key(key: str) -> bool:
+    return any(str(key).startswith(prefix) for prefix in _VAE_POSTERIOR_HEAD_PREFIXES)
+
+
+def _load_model_state_allowing_vae_head_migration(
+    *,
+    target: torch.nn.Module,
+    state_dict: dict[str, Any],
+    source: str | Path,
+) -> bool:
+    target_state = target.state_dict()
+    missing_keys = sorted(key for key in target_state.keys() if key not in state_dict)
+    unexpected_keys = sorted(key for key in state_dict.keys() if key not in target_state)
+
+    if not missing_keys and not unexpected_keys:
+        target.load_state_dict(state_dict, strict=True)
+        return False
+
+    allowed_missing = sorted(key for key in missing_keys if _is_vae_posterior_head_key(key))
+    should_migrate_ae_to_vae = (
+        _model_uses_latent_sampling(target)
+        and bool(allowed_missing)
+        and allowed_missing == missing_keys
+        and not unexpected_keys
+    )
+    if not should_migrate_ae_to_vae:
+        target.load_state_dict(state_dict, strict=True)
+        return False
+
+    incompatible = target.load_state_dict(state_dict, strict=False)
+    unexpected_after_load = list(getattr(incompatible, "unexpected_keys", []))
+    missing_after_load = sorted(getattr(incompatible, "missing_keys", []))
+    disallowed_missing = [key for key in missing_after_load if not _is_vae_posterior_head_key(key)]
+    if unexpected_after_load or disallowed_missing:
+        raise RuntimeError(
+            "Unexpected checkpoint incompatibility while migrating AE checkpoint to VAE heads: "
+            f"source={source} missing={missing_after_load} unexpected={unexpected_after_load}"
+        )
+
+    LOGGER.warning(
+        "Loaded AE checkpoint into use_latent_sampling=true BigVAE; initialized missing posterior heads "
+        "from current model init. source=%s missing_head_keys=%s",
+        source,
+        missing_after_load,
+    )
+    return True
 
 
 def build_big_vae_model_cfg(raw_cfg: Mapping[str, Any]) -> ModelConfig:
@@ -134,12 +192,11 @@ def load_frozen_big_vae_from_checkpoint(checkpoint_path: str | Path, *, device: 
             "Expected full BigWeightVAE when loading frozen BigVAE checkpoint, "
             f"got {type(model).__name__}"
         )
-    missing, unexpected = model.load_state_dict(_normalize_state_dict_keys(state), strict=False)
-    if missing or unexpected:
-        raise RuntimeError(
-            "BigVAE checkpoint state_dict mismatch: "
-            f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
-        )
+    _load_model_state_allowing_vae_head_migration(
+        target=model,
+        state_dict=_normalize_state_dict_keys(state),
+        source=path,
+    )
     model.to(device)
     model.eval()
     for param in model.parameters():
