@@ -7,11 +7,10 @@ hydra:
     name: build_big_vae_latent_diffusion_dataset
 
 latent_diffusion_prior:
-  big_vae_checkpoint: ${oc.env:BIG_VAE_CHECKPOINT,""}
-
+  big_vae_checkpoint: /home/coder/project/artifacts/training/checkpoints/weight_quantile_vae_gpu0_square_VAE/stage_1/latest.pt
 latent_diffusion_dataset:
   root_dir: ${oc.env:BIG_VAE_LATENT_DIFFUSION_DATASET_DIR,${training_artifacts.base_root_dir}/datasets/big_vae_latent_diffusion/stage_1}
-  source_big_vae_offline_root: ${oc.env:BIG_VAE_OFFLINE_DATASET_DIR,""}
+  source_big_vae_offline_root: /home/coder/project/artifacts/training/checkpoints/weight_quantile_vae/stage_1/offline_dataset
   device: auto
   source:
     shuffle_chunks: false
@@ -24,7 +23,7 @@ latent_diffusion_dataset:
     sampling_max_records_per_chunk_round: 8
     x_chunk_cache_size: 4
   builder:
-    overwrite_existing: false
+    overwrite_existing: true
     chunk_size_records: 128
     batch_size: 8
     log_every_batches: 100
