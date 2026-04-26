@@ -396,6 +396,9 @@ def main(cfg: DictConfig) -> None:
             step_diffusion_loss = 0.0
             step_decoder_aux_loss = 0.0
             step_decoder_aux_behavioral = 0.0
+            step_decoder_aux_behavioral_operator = 0.0
+            step_decoder_aux_behavioral_dir = 0.0
+            step_decoder_aux_behavioral_scale = 0.0
             step_decoder_aux_structural = 0.0
             step_decoder_aux_applied_fraction = 0.0
             step_decoder_aux_weight_mean = 0.0
@@ -428,6 +431,15 @@ def main(cfg: DictConfig) -> None:
                     step_diffusion_loss += float(loss_payload["diffusion_loss"].detach().item())
                     step_decoder_aux_loss += float(loss_payload["decoder_aux_loss"].detach().item())
                     step_decoder_aux_behavioral += float(loss_payload["decoder_aux_behavioral_loss"].detach().item())
+                    step_decoder_aux_behavioral_operator += float(
+                        loss_payload["decoder_aux_behavioral_operator_loss"].detach().item()
+                    )
+                    step_decoder_aux_behavioral_dir += float(
+                        loss_payload["decoder_aux_behavioral_dir_loss"].detach().item()
+                    )
+                    step_decoder_aux_behavioral_scale += float(
+                        loss_payload["decoder_aux_behavioral_scale_loss"].detach().item()
+                    )
                     step_decoder_aux_structural += float(loss_payload["decoder_aux_structural_loss"].detach().item())
                     step_decoder_aux_applied_fraction += float(loss_payload["decoder_aux_applied_fraction"].detach().item())
                     step_decoder_aux_weight_mean += float(loss_payload["decoder_aux_weight_mean"].detach().item())
@@ -454,6 +466,9 @@ def main(cfg: DictConfig) -> None:
                 "loss/diffusion": step_diffusion_loss / float(grad_accum_steps),
                 "loss/decoder_aux": step_decoder_aux_loss / float(grad_accum_steps),
                 "loss/decoder_aux_behavioral": step_decoder_aux_behavioral / float(grad_accum_steps),
+                "loss/decoder_aux_behavioral_operator": step_decoder_aux_behavioral_operator / float(grad_accum_steps),
+                "loss/decoder_aux_behavioral_dir": step_decoder_aux_behavioral_dir / float(grad_accum_steps),
+                "loss/decoder_aux_behavioral_scale": step_decoder_aux_behavioral_scale / float(grad_accum_steps),
                 "loss/decoder_aux_structural": step_decoder_aux_structural / float(grad_accum_steps),
                 "schedule/alpha_mean": step_alpha_sum / float(grad_accum_steps),
                 "schedule/sigma_mean": step_sigma_sum / float(grad_accum_steps),
