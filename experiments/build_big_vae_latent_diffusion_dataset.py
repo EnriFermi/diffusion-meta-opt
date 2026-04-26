@@ -81,7 +81,7 @@ def main(cfg: DictConfig) -> None:
         summary = build_big_vae_latent_diffusion_offline_dataset(
             cfg,
             big_vae=big_vae,
-            dataset_iter=iter(source_dataset),
+            dataset_iter=source_dataset,
             logger=logger,
         )
     finally:

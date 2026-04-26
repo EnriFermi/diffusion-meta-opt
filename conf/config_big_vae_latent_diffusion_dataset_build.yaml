@@ -30,6 +30,11 @@ latent_diffusion_dataset:
     encode_batch_size: 1
     target_T_patches: 16
     target_d_out: 8
+    max_latent_records: 0
+    max_slices_per_source_record: 1
+    distribution_match:
+      mode: source_proportional_joint
+      group_keys: [dataset, model, layer_type, layer]
     store_decoder_aux_tensors: false
     seed: 42
     log_every_batches: 100
