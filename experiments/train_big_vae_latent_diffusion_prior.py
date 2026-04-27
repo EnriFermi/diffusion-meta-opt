@@ -244,18 +244,27 @@ def _promote_run_profile_to_root(cfg: DictConfig) -> None:
                 cfg[section] = run_profiles_cfg[section]
 
 
-def _resolve_prior_cfg(cfg: DictConfig, *, dataset_summary: dict[str, Any]) -> DictConfig:
+def _resolve_prior_cfg(
+    cfg: DictConfig,
+    *,
+    dataset_summary: dict[str, Any],
+    dataset_stats: dict[str, Any] | None = None,
+) -> DictConfig:
     model_cfg = cfg.get("model", {})
     if not isinstance(model_cfg, (dict, DictConfig)):
         raise TypeError("model must be a mapping")
     prior_cfg = model_cfg.get("latent_diffusion_prior", {})
     if not isinstance(prior_cfg, (dict, DictConfig)):
         raise TypeError("model.latent_diffusion_prior must be a mapping")
+    stats_payload = dict(dataset_stats or {})
     with open_dict(cfg):
         if "latent_diffusion_prior" not in cfg.model:
             cfg.model.latent_diffusion_prior = {}
         if int(prior_cfg.get("z_dim", 0)) <= 0:
-            cfg.model.latent_diffusion_prior.z_dim = int(dataset_summary.get("z_dim", 0))
+            cfg.model.latent_diffusion_prior.z_dim = max(
+                int(dataset_summary.get("z_dim", 0)),
+                int(stats_payload.get("z_dim", 0)),
+            )
         if int(prior_cfg.get("cond_dim", 0)) <= 0:
             cfg.model.latent_diffusion_prior.cond_dim = int(dataset_summary.get("cond_dim", 0))
         metadata_cond_dim = latent_diffusion_layer_metadata_cond_dim(
@@ -264,9 +273,11 @@ def _resolve_prior_cfg(cfg: DictConfig, *, dataset_summary: dict[str, Any]) -> D
             depth_fourier_dim=int(prior_cfg.get("layer_depth_fourier_dim", 16)),
         )
         if int(prior_cfg.get("cond_global_dim", 0)) <= 0:
-            cfg.model.latent_diffusion_prior.cond_global_dim = int(dataset_summary.get("cond_global_dim", 0)) + int(
-                metadata_cond_dim
+            resolved_cond_global_dim = max(
+                int(dataset_summary.get("cond_global_dim", 0)),
+                int(stats_payload.get("cond_global_dim", 0)),
             )
+            cfg.model.latent_diffusion_prior.cond_global_dim = int(resolved_cond_global_dim) + int(metadata_cond_dim)
     return cfg.model.latent_diffusion_prior
 
 
@@ -608,7 +619,7 @@ def main(cfg: DictConfig) -> None:
     with offline_big_vae_latent_diffusion_data_pipeline(cfg, logger=logger) as dataset:
         dataset_summary = dataset.summary()
         dataset_stats = dataset.latent_stats()
-        prior_cfg_raw = _resolve_prior_cfg(cfg, dataset_summary=dataset_summary)
+        prior_cfg_raw = _resolve_prior_cfg(cfg, dataset_summary=dataset_summary, dataset_stats=dataset_stats)
         prior_cfg = build_layer_latent_diffusion_prior_config(prior_cfg_raw)
 
         logger.info(

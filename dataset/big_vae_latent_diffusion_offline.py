@@ -857,6 +857,11 @@ class OfflineBigVAELatentDiffusionDataset(torch.utils.data.IterableDataset):
 
     def summary(self) -> dict[str, Any]:
         payload = dict(self._manifest)
+        payload["z_dim"] = max(int(payload.get("z_dim", 0)), int(self._stats.get("z_dim", 0)))
+        payload["cond_global_dim"] = max(
+            int(payload.get("cond_global_dim", 0)),
+            int(self._stats.get("cond_global_dim", 0)),
+        )
         payload["latent_stats_count"] = int(self._stats.get("count", 0))
         return payload
 
