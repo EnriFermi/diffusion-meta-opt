@@ -13,7 +13,7 @@ BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/checkpoints/big_vae_lat
 BIG_VAE_INIT_CALIBRATION_BATCHES="4"
 
 LATENT_LR_SCHEDULER="cosine_decay_to_floor"
-LATENT_LR_FLOOR_RATIO="0.1"
+LATENT_LR_FLOOR_RATIO="0.05"
 LATENT_LR_DECAY_FRACTION="0.7"
 
 : "${BIG_VAE_CHECKPOINT:?Edit BIG_VAE_CHECKPOINT in this script before running}"

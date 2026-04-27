@@ -27,7 +27,7 @@ vit_latent_scaling:
   num_workers: 4
   train_subset: 0
   test_subset: 0
-  lr: 3e-4
+  lr: 1e-2
   weight_decay: 0.0
   latent_lr_scheduler: cosine_decay_to_floor
   latent_lr_floor_ratio: 0.1
