@@ -319,13 +319,15 @@ def configure_per_run_artifacts(
         if isinstance(cfg.get("logging"), (dict, DictConfig)):
             cfg["logging"]["dir"] = str(logs_dir)
 
-        if isinstance(cfg.get("train"), (dict, DictConfig)) and str(cfg["train"].get("checkpoint_dir", "")).strip():
-            cfg["train"]["checkpoint_dir"] = str(big_ckpt_dir)
-
-        if isinstance(cfg.get("mini_train"), (dict, DictConfig)) and str(cfg["mini_train"].get("checkpoint_dir", "")).strip():
-            cfg["mini_train"]["checkpoint_dir"] = str(mini_ckpt_dir)
-
-    for path in (root_dir, run_root_dir, logs_dir, reports_dir, crashes_dir, mini_ckpt_dir, big_ckpt_dir):
+    for path in (
+        root_dir,
+        run_root_dir,
+        logs_dir,
+        reports_dir,
+        crashes_dir,
+        mini_ckpt_dir,
+        big_ckpt_dir,
+    ):
         path.mkdir(parents=True, exist_ok=True)
 
     return {
