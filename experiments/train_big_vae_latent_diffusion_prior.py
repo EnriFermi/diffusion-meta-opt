@@ -35,6 +35,7 @@ from training.big_vae_latent_diffusion import (
     build_cond_global_from_dist_var_pooled,
     build_layer_metadata_condition_vector,
     encode_big_vae_distribution_context_batch,
+    infer_big_vae_cond_global_dim_from_checkpoint,
     latent_diffusion_layer_metadata_cond_dim,
     load_big_vae_with_trainable_distribution_encoder,
     load_frozen_big_vae_from_checkpoint,
@@ -249,6 +250,7 @@ def _resolve_prior_cfg(
     *,
     dataset_summary: dict[str, Any],
     dataset_stats: dict[str, Any] | None = None,
+    live_cond_global_dim: int | None = None,
 ) -> DictConfig:
     model_cfg = cfg.get("model", {})
     if not isinstance(model_cfg, (dict, DictConfig)):
@@ -276,6 +278,7 @@ def _resolve_prior_cfg(
             resolved_cond_global_dim = max(
                 int(dataset_summary.get("cond_global_dim", 0)),
                 int(stats_payload.get("cond_global_dim", 0)),
+                max(0, int(live_cond_global_dim or 0)),
             )
             cfg.model.latent_diffusion_prior.cond_global_dim = int(resolved_cond_global_dim) + int(metadata_cond_dim)
     return cfg.model.latent_diffusion_prior
@@ -619,7 +622,22 @@ def main(cfg: DictConfig) -> None:
     with offline_big_vae_latent_diffusion_data_pipeline(cfg, logger=logger) as dataset:
         dataset_summary = dataset.summary()
         dataset_stats = dataset.latent_stats()
-        prior_cfg_raw = _resolve_prior_cfg(cfg, dataset_summary=dataset_summary, dataset_stats=dataset_stats)
+        distribution_encoder_finetune_cfg = _resolve_distribution_encoder_finetune_cfg(cfg)
+        conditioning_checkpoint = str(cfg.get("latent_diffusion_prior", {}).get("big_vae_checkpoint", "")).strip()
+        live_cond_global_dim = 0
+        if distribution_encoder_finetune_cfg.enabled:
+            if not conditioning_checkpoint:
+                raise ValueError(
+                    "latent_diffusion_prior.big_vae_checkpoint must be set when "
+                    "train.distribution_encoder_finetune.enabled=true"
+                )
+            live_cond_global_dim = infer_big_vae_cond_global_dim_from_checkpoint(conditioning_checkpoint)
+        prior_cfg_raw = _resolve_prior_cfg(
+            cfg,
+            dataset_summary=dataset_summary,
+            dataset_stats=dataset_stats,
+            live_cond_global_dim=live_cond_global_dim,
+        )
         prior_cfg = build_layer_latent_diffusion_prior_config(prior_cfg_raw)
 
         logger.info(
@@ -652,7 +670,6 @@ def main(cfg: DictConfig) -> None:
             latent_std=dataset_stats["latent_std"],
         )
         model = maybe_compile_model(model, cfg, logger, section="train", label="latent_diffusion_prior")
-        distribution_encoder_finetune_cfg = _resolve_distribution_encoder_finetune_cfg(cfg)
         conditioning_big_vae = None
         trainable_distribution_encoder = None
         if distribution_encoder_finetune_cfg.enabled:
@@ -661,17 +678,13 @@ def main(cfg: DictConfig) -> None:
                     "Distribution encoder fine-tuning requires offline latent diffusion dataset with stored X/W/masks. "
                     "Rebuild the dataset with latent_diffusion_dataset.builder.store_decoder_aux_tensors=true."
                 )
-            encoder_checkpoint = str(cfg.get("latent_diffusion_prior", {}).get("big_vae_checkpoint", "")).strip()
-            if not encoder_checkpoint:
-                raise ValueError(
-                    "latent_diffusion_prior.big_vae_checkpoint must be set when "
-                    "train.distribution_encoder_finetune.enabled=true"
-                )
-            conditioning_big_vae = load_big_vae_with_trainable_distribution_encoder(encoder_checkpoint, device=device)
+            conditioning_big_vae = load_big_vae_with_trainable_distribution_encoder(conditioning_checkpoint, device=device)
             trainable_distribution_encoder = conditioning_big_vae.distribution_encoder
             logger.info(
-                "Loaded BigVAE distribution encoder for joint conditioning fine-tuning: checkpoint=%s lr=%.3e weight_decay=%.3e",
-                encoder_checkpoint,
+                "Loaded BigVAE distribution encoder for joint conditioning fine-tuning: checkpoint=%s "
+                "live_cond_global_dim=%s lr=%.3e weight_decay=%.3e",
+                conditioning_checkpoint,
+                int(live_cond_global_dim),
                 float(distribution_encoder_finetune_cfg.lr),
                 float(distribution_encoder_finetune_cfg.weight_decay),
             )

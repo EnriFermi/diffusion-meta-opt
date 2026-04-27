@@ -581,12 +581,23 @@ def load_checkpoint_config(path: str | Path) -> Any:
     return OmegaConf.create(payload["config"])
 
 
+def infer_big_vae_cond_global_dim_from_checkpoint(checkpoint_path: str | Path) -> int:
+    raw_cfg = load_checkpoint_config(checkpoint_path)
+    if not isinstance(raw_cfg, Mapping):
+        raise TypeError(f"checkpoint config must be a mapping, got {type(raw_cfg)!r}")
+    model_cfg = build_big_vae_model_cfg(raw_cfg)
+    if bool(model_cfg.big_vae.disable_distribution_encoder):
+        return 0
+    return int(model_cfg.distribution.d_var)
+
+
 __all__ = [
     "build_cond_global_from_dist_var_pooled",
     "build_layer_metadata_condition_vector",
     "build_big_vae_model_cfg",
     "encode_big_vae_distribution_context_batch",
     "encode_big_vae_layer_batch",
+    "infer_big_vae_cond_global_dim_from_checkpoint",
     "LATENT_DIFFUSION_LAYER_TYPE_VOCAB",
     "latent_diffusion_layer_metadata_cond_dim",
     "latent_diffusion_layer_type_to_id",
