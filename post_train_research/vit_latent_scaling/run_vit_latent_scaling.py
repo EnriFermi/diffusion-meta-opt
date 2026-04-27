@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 import math
 import random
@@ -64,6 +65,8 @@ class ScalingRunConfig:
     num_workers: int
     train_subset: int
     test_subset: int
+    optimizer_name: str
+    optimizer_kwargs: dict[str, Any]
     lr: float
     latent_lr_scheduler: str
     latent_lr_floor_ratio: float
@@ -121,6 +124,10 @@ def validate_scaling_run_config(cfg: ScalingRunConfig) -> None:
         raise ValueError("--latent-lr-floor-ratio must be in the interval (0, 1]")
     if int(cfg.latent_lr_decay_steps) <= 0:
         raise ValueError("--latent-lr-decay-steps must be a positive integer")
+    if not str(cfg.optimizer_name).strip():
+        raise ValueError("--optimizer-name must be non-empty")
+    if not isinstance(cfg.optimizer_kwargs, dict):
+        raise ValueError("--optimizer-kwargs must be a mapping")
     if str(cfg.dataset).strip().lower() == "imagenet" and bool(cfg.download):
         cfg.download = False
 
@@ -168,20 +175,96 @@ def evaluate(
     )
 
 
+def resolve_optimizer_class(name: str) -> type[torch.optim.Optimizer]:
+    candidate = str(name).strip()
+    if not candidate:
+        raise ValueError("Optimizer name must be non-empty")
+    normalized = candidate.casefold()
+    for attr_name in dir(torch.optim):
+        attr = getattr(torch.optim, attr_name)
+        if not inspect.isclass(attr):
+            continue
+        if not issubclass(attr, torch.optim.Optimizer):
+            continue
+        if attr is torch.optim.Optimizer:
+            continue
+        if attr_name.casefold() == normalized:
+            return attr
+    raise ValueError(f"Unknown torch optimizer: {name}")
+
+
+def _parse_optimizer_kwarg_value(raw_value: str) -> Any:
+    try:
+        return json.loads(raw_value)
+    except json.JSONDecodeError:
+        lowered = raw_value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        if lowered == "none" or lowered == "null":
+            return None
+        return raw_value
+
+
+def parse_optimizer_kwargs_cli(items: list[str]) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(
+                f"Invalid --optimizer-kwarg value {item!r}; expected key=value"
+            )
+        key, raw_value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"Invalid --optimizer-kwarg value {item!r}; empty key")
+        parsed[key] = _parse_optimizer_kwarg_value(raw_value.strip())
+    return parsed
+
+
 def build_optimizer(
     parameters: list[torch.nn.Parameter],
     *,
     cfg: ScalingRunConfig,
     setup: str,
 ) -> torch.optim.Optimizer:
+    optimizer_cls = resolve_optimizer_class(cfg.optimizer_name)
     weight_decay = float(cfg.latent_weight_decay if setup == "latent" else cfg.weight_decay)
-    return torch.optim.AdamW(
-        parameters,
-        lr=float(cfg.lr),
-        betas=(float(cfg.adam_beta1), float(cfg.adam_beta2)),
-        eps=float(cfg.adam_eps),
-        weight_decay=weight_decay,
+    signature = inspect.signature(optimizer_cls.__init__)
+    accepted = {
+        name
+        for name, parameter in signature.parameters.items()
+        if name not in {"self", "params"}
+        and parameter.kind
+        in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    }
+    accepts_var_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
     )
+
+    optimizer_kwargs: dict[str, Any] = {}
+    if "lr" in accepted:
+        optimizer_kwargs["lr"] = float(cfg.lr)
+    if "weight_decay" in accepted:
+        optimizer_kwargs["weight_decay"] = weight_decay
+    if "betas" in accepted:
+        optimizer_kwargs["betas"] = (float(cfg.adam_beta1), float(cfg.adam_beta2))
+    if "eps" in accepted:
+        optimizer_kwargs["eps"] = float(cfg.adam_eps)
+
+    explicit_kwargs = dict(cfg.optimizer_kwargs)
+    if not accepts_var_kwargs:
+        unsupported = sorted(set(explicit_kwargs) - accepted)
+        if unsupported:
+            raise ValueError(
+                f"Optimizer {optimizer_cls.__name__} does not accept kwargs: {unsupported}"
+            )
+    optimizer_kwargs.update(explicit_kwargs)
+    return optimizer_cls(parameters, **optimizer_kwargs)
 
 
 def resolve_planned_train_steps(cfg: ScalingRunConfig, *, steps_per_epoch: int) -> int:
@@ -544,6 +627,7 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
     tile_count = store.decoded_tile_count() if isinstance(store, BigVAELatentTensorStore) else 0
     print(
         f"[{cfg.setup}] dataset={cfg.dataset} model={cfg.model_size} base_lr={float(cfg.lr):g} "
+        f"optimizer={cfg.optimizer_name} "
         f"lr_schedule={lr_schedule_description} "
         f"trainable_params={trainable_params} decoded_params={decoded_params} "
         f"latent_params={latent_params} bigvae_decoded_params={decoded_big_vae_params} tiles={tile_count}",
@@ -608,6 +692,7 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                     "dataset": str(cfg.dataset),
                     "model_size": str(cfg.model_size),
                     "setup": str(cfg.setup),
+                    "optimizer_name": str(cfg.optimizer_name),
                     "lr": float(step_lr),
                     "base_lr": float(cfg.lr),
                     "step": int(global_step),
@@ -674,6 +759,8 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         "dataset": str(cfg.dataset),
         "model_size": str(cfg.model_size),
         "setup": str(cfg.setup),
+        "optimizer_name": str(cfg.optimizer_name),
+        "optimizer_kwargs": dict(cfg.optimizer_kwargs),
         "steps": int(global_step),
         "init_raw_steps": int(init_checkpoint_steps if cfg.setup == "latent" else 0),
         "total_steps_with_raw_init": int(global_step + (init_checkpoint_steps if cfg.setup == "latent" else 0)),
@@ -728,6 +815,13 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--train-subset", type=int, default=0)
     parser.add_argument("--test-subset", type=int, default=0)
+    parser.add_argument("--optimizer-name", default="AdamW")
+    parser.add_argument(
+        "--optimizer-kwarg",
+        action="append",
+        default=[],
+        help="Additional optimizer kwarg as key=value. Values are parsed via JSON when possible.",
+    )
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument(
         "--latent-lr-scheduler",
@@ -799,6 +893,8 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         num_workers=int(args.num_workers),
         train_subset=int(args.train_subset),
         test_subset=int(args.test_subset),
+        optimizer_name=str(args.optimizer_name),
+        optimizer_kwargs=parse_optimizer_kwargs_cli(list(args.optimizer_kwarg)),
         lr=float(args.lr),
         latent_lr_scheduler=str(args.latent_lr_scheduler),
         latent_lr_floor_ratio=float(args.latent_lr_floor_ratio),

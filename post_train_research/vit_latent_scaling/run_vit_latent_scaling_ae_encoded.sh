@@ -10,6 +10,7 @@ PRESET="cifar10_small"
 OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
 RAW_CHECKPOINT=""
 BIG_VAE_CHECKPOINT=""
+OPTIMIZER_NAME="AdamW"
 LATENT_LR_SCHEDULER="cosine_decay_to_floor"
 LATENT_LR_FLOOR_RATIO="0.1"
 LATENT_LR_DECAY_STEPS="5250"
@@ -37,6 +38,7 @@ run_python \
   --config-name vit_latent_scaling/config_ae_encoded \
   "vit_latent_scaling/preset=$PRESET" \
   "vit_latent_scaling.output_root=$OUTPUT_ROOT" \
+  "vit_latent_scaling.optimizer_name=$OPTIMIZER_NAME" \
   "vit_latent_scaling.raw_checkpoint=$RAW_CHECKPOINT" \
   "vit_latent_scaling.big_vae_checkpoint=$BIG_VAE_CHECKPOINT" \
   "vit_latent_scaling.latent_lr_scheduler=$LATENT_LR_SCHEDULER" \
