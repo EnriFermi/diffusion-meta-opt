@@ -20,23 +20,23 @@ vit_latent_scaling:
   download: true
   device: ${oc.env:DEVICE,auto}
   seed: 42
-  epochs: 30
-  max_steps: 7500
+  epochs: 5
+  max_steps: 3000
   batch_size: 128
   eval_batch_size: 256
   num_workers: 4
   train_subset: 0
   test_subset: 0
-  lr: 5e-2
-  optimizer_name: AdamW
+  lr: 1e2
+  optimizer_name: Adam
   optimizer_kwargs: {}
   latent_lr_scheduler: cosine_decay_to_floor
   latent_lr_floor_ratio: 0.1
   latent_lr_decay_steps: 700
   latent_weight_decay: 0.0
   adam_beta1: 0.9
-  adam_beta2: 0.999
-  adam_eps: 1e-8
+  adam_beta2: 0.95
+  adam_eps: 1e-9
   label_smoothing: 0.0
   grad_clip_norm: 0.0
   amp: true
