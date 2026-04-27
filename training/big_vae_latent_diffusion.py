@@ -204,6 +204,22 @@ def load_frozen_big_vae_from_checkpoint(checkpoint_path: str | Path, *, device: 
     return model
 
 
+def load_big_vae_with_trainable_distribution_encoder(
+    checkpoint_path: str | Path,
+    *,
+    device: torch.device,
+) -> BigWeightVAE:
+    model = load_frozen_big_vae_from_checkpoint(checkpoint_path, device=device)
+    if not bool(getattr(model, "use_distribution_encoder", False)) or model.distribution_encoder is None:
+        raise ValueError(
+            "BigVAE checkpoint must have distribution encoder enabled to fine-tune conditioning for latent diffusion prior"
+        )
+    model.distribution_encoder.train()
+    for param in model.distribution_encoder.parameters():
+        param.requires_grad_(True)
+    return model
+
+
 def load_frozen_layer_latent_diffusion_prior(
     checkpoint_path: str | Path,
     *,
@@ -241,6 +257,81 @@ def load_frozen_layer_latent_diffusion_prior(
     for param in model.parameters():
         param.requires_grad_(False)
     return model
+
+
+def load_distribution_encoder_state_from_latent_diffusion_prior_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    big_vae: BigWeightVAE,
+) -> bool:
+    path = Path(str(checkpoint_path)).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Diffusion prior checkpoint not found: {path}")
+    if not bool(getattr(big_vae, "use_distribution_encoder", False)) or big_vae.distribution_encoder is None:
+        raise ValueError("Target BigVAE must have distribution encoder enabled to load finetuned conditioning state")
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"Diffusion prior checkpoint must contain a mapping payload, got {type(payload)!r}")
+    raw_state = payload.get("distribution_encoder_state")
+    if raw_state is None:
+        return False
+    if not isinstance(raw_state, Mapping):
+        raise TypeError(
+            "Diffusion prior checkpoint field 'distribution_encoder_state' must be a mapping, "
+            f"got {type(raw_state)!r}: {path}"
+        )
+
+    missing, unexpected = big_vae.distribution_encoder.load_state_dict(
+        _normalize_state_dict_keys(raw_state),
+        strict=False,
+    )
+    if missing or unexpected:
+        raise RuntimeError(
+            "Diffusion prior distribution_encoder_state mismatch: "
+            f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
+        )
+    return True
+
+
+def encode_big_vae_distribution_context_batch(
+    big_vae: BigWeightVAE,
+    *,
+    X: torch.Tensor,
+    x_mask: torch.Tensor | None = None,
+    d_in_mask: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor | int | None]:
+    if not bool(getattr(big_vae, "use_distribution_encoder", False)) or big_vae.distribution_encoder is None:
+        raise ValueError("BigVAE distribution encoder must be enabled to encode latent diffusion conditioning")
+    if X.ndim not in {2, 3}:
+        raise ValueError(f"X must be rank-2 or rank-3, got {tuple(X.shape)}")
+    squeeze_batch = X.ndim == 2
+    if squeeze_batch:
+        X = X.unsqueeze(0)
+        if x_mask is not None:
+            x_mask = x_mask.unsqueeze(0)
+        if d_in_mask is not None:
+            d_in_mask = d_in_mask.unsqueeze(0)
+
+    batch, _rows, d_in = X.shape
+    validated_d_in_mask = big_vae._validate_d_in_mask(d_in_mask, batch_size=batch, d_in=d_in, device=X.device)
+    T, d_in_pad, patch_mask, structural_patch_mask, dist_var_by_patch, dist_patch_by_patch, dist_var_pooled = (
+        big_vae._encode_distribution_context(
+            X,
+            x_mask=x_mask,
+            d_in_mask=validated_d_in_mask,
+        )
+    )
+    return {
+        "cond_patch": dist_patch_by_patch.squeeze(0) if squeeze_batch and dist_patch_by_patch is not None else dist_patch_by_patch,
+        "patch_mask": patch_mask.squeeze(0) if squeeze_batch else patch_mask,
+        "structural_patch_mask": structural_patch_mask.squeeze(0) if squeeze_batch else structural_patch_mask,
+        "dist_var_by_patch": dist_var_by_patch.squeeze(0) if squeeze_batch and dist_var_by_patch is not None else dist_var_by_patch,
+        "dist_var_pooled": dist_var_pooled.squeeze(0) if squeeze_batch and dist_var_pooled is not None else dist_var_pooled,
+        "d_in_mask": validated_d_in_mask.squeeze(0) if squeeze_batch else validated_d_in_mask,
+        "T": int(T),
+        "d_in_pad": int(d_in_pad),
+    }
 
 
 def encode_big_vae_layer_batch(
@@ -326,8 +417,11 @@ def load_checkpoint_config(path: str | Path) -> Any:
 
 __all__ = [
     "build_big_vae_model_cfg",
+    "encode_big_vae_distribution_context_batch",
     "encode_big_vae_layer_batch",
     "load_checkpoint_config",
+    "load_big_vae_with_trainable_distribution_encoder",
+    "load_distribution_encoder_state_from_latent_diffusion_prior_checkpoint",
     "load_frozen_big_vae_from_checkpoint",
     "load_frozen_layer_latent_diffusion_prior",
 ]
