@@ -5,12 +5,12 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 cd "$PROJECT_ROOT"
 
-CONDA_ENV_NAME="onerec"
+CONDA_ENV_NAME="diff-meta-opt312"
 PRESET="cifar10_small"
 OUTPUT_ROOT="./artifacts/training/post_train_research/vit_latent_scaling"
 RAW_CHECKPOINT=""
-BIG_VAE_CHECKPOINT=""
-BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT=""
+BIG_VAE_CHECKPOINT="./artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt"
+BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/checkpoints/big_vae_latent_diffusion_prior_AE/stage_1/latest.pt"
 
 : "${RAW_CHECKPOINT:?Edit RAW_CHECKPOINT in this script before running}"
 : "${BIG_VAE_CHECKPOINT:?Edit BIG_VAE_CHECKPOINT in this script before running}"
