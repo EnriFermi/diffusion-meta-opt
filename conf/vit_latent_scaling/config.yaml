@@ -1,8 +1,10 @@
+# @package _global_
+
 defaults:
   - /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
   - _self_
-  - vit_latent_scaling/preset: cifar10_small
-  - vit_latent_scaling/setup: ae_encoded
+  - /vit_latent_scaling/preset: cifar10_small
+  - /vit_latent_scaling/setup: ae_encoded
 
 hydra:
   job:

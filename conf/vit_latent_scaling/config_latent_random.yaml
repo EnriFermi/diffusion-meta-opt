@@ -1,3 +1,5 @@
+# @package _global_
+
 defaults:
-  - config_vit_latent_scaling
+  - config
   - override /vit_latent_scaling/setup: latent_random

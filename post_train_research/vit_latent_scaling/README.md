@@ -102,8 +102,8 @@ There is now an additional Hydra entrypoint for single targeted runs:
 
 ```bash
 python post_train_research/vit_latent_scaling/run_vit_latent_scaling_hydra.py \
-  --config-name config_vit_latent_scaling_ae_encoded \
-  vit_latent_scaling/preset=cifar10_small \
+  --config-name vit_latent_scaling/config_ae_encoded \
+  preset=cifar10_small \
   vit_latent_scaling.raw_checkpoint=/path/to/raw_final.pt \
   vit_latent_scaling.big_vae_checkpoint=/path/to/big_vae.pt
 ```
@@ -111,9 +111,9 @@ python post_train_research/vit_latent_scaling/run_vit_latent_scaling_hydra.py \
 The three convenience configs are:
 
 ```text
-config_vit_latent_scaling_ae_encoded
-config_vit_latent_scaling_latent_random
-config_vit_latent_scaling_ae_diffusion_prior
+vit_latent_scaling/config_ae_encoded
+vit_latent_scaling/config_latent_random
+vit_latent_scaling/config_ae_diffusion_prior
 ```
 
 They correspond to:
@@ -163,9 +163,9 @@ You can also use the general config and switch groups explicitly:
 
 ```bash
 python post_train_research/vit_latent_scaling/run_vit_latent_scaling_hydra.py \
-  vit_latent_scaling/preset=cifar10_small \
-  vit_latent_scaling/setup=ae_diffusion_prior \
-  vit_latent_scaling.raw_checkpoint=/path/to/raw_final.pt \
+  --config-name vit_latent_scaling/config \
+  preset=cifar10_small \
+  setup=ae_diffusion_prior \
   vit_latent_scaling.big_vae_checkpoint=/path/to/big_vae.pt \
   vit_latent_scaling.big_vae_diffusion_prior_checkpoint=/path/to/prior.pt
 ```
