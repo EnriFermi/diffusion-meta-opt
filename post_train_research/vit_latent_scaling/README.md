@@ -131,6 +131,7 @@ run_vit_latent_scaling_raw.sh
 run_vit_latent_scaling_ae_encoded.sh
 run_vit_latent_scaling_latent_random.sh
 run_vit_latent_scaling_ae_diffusion_prior.sh
+run_vit_latent_scaling_latent_transfer.sh
 ```
 
 Each script has editable variables at the top for:
@@ -154,6 +155,39 @@ run_vit_latent_scaling_ae_diffusion_prior.sh
 
 `RAW_CHECKPOINT` is only needed by the optional `ae_encoded` path, because that mode initializes latents by encoding an already existing raw ViT solution.
 `BIG_VAE_INIT_CALIBRATION_BATCHES` controls how many train batches are used to build real activation contexts for autoregressive diffusion-prior initialization.
+
+## Latent Transfer
+
+There is also a two-stage latent-transfer wrapper:
+
+```text
+run_vit_latent_scaling_latent_transfer.sh
+```
+
+It does:
+
+```text
+task A latent training -> save stage1 latent_final.pt
+task B latent training -> initialize from stage1 latent slots
+```
+
+The second stage loads compatible latent slots from the first-stage checkpoint via
+`vit_latent_scaling.latent_checkpoint`. If the target task changes the classifier
+head shape, incompatible head latents are skipped and the target run keeps its
+freshly initialized head latents.
+
+Editable variables at the top of the transfer script:
+
+```text
+STAGE1_CONFIG_NAME
+STAGE2_CONFIG_NAME
+STAGE1_PRESET
+STAGE2_PRESET
+STAGE1_OUTPUT_DIR
+STAGE2_OUTPUT_DIR
+BIG_VAE_CHECKPOINT
+BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT
+```
 
 By default the Hydra runner and these wrappers write outputs under:
 

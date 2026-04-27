@@ -47,6 +47,7 @@ vit_latent_scaling:
   eval_every_steps: 375
   save_checkpoints: true
   raw_checkpoint: ${oc.env:RAW_VIT_CHECKPOINT,""}
+  latent_checkpoint: ""
   big_vae_checkpoint: ${oc.env:BIG_VAE_CHECKPOINT,""}
   big_vae_diffusion_prior_checkpoint: ${oc.env:BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT,""}
   big_vae_diffusion_prior_steps: 50
