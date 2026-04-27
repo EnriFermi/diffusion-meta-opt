@@ -271,8 +271,10 @@ def configure_per_run_artifacts(
     """
     Configure per-run artifact directories under training_artifacts.
 
-    By default this creates:
-      <base_root_dir>/runs/<run_id>/{logs,reports,crashes,checkpoints/...}
+    By default this keeps shared artifacts under:
+      <base_root_dir>/{checkpoints,reports,crashes}
+    and uses per-run directories only for logs:
+      <base_root_dir>/runs/<run_id>/logs
     """
 
     with open_dict(cfg):
@@ -291,12 +293,13 @@ def configure_per_run_artifacts(
             timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
             run_id = f"{_safe_run_label(run_label)}_{timestamp}_pid{os.getpid()}_{uuid.uuid4().hex[:6]}"
 
-        root_dir = (runs_dir / run_id) if separate_run_dirs else base_root
-        logs_dir = root_dir / "logs"
-        reports_dir = root_dir / "reports"
-        crashes_dir = root_dir / "crashes"
-        default_mini_ckpt_dir = root_dir / "checkpoints" / "mini_patch_vae"
-        default_big_ckpt_dir = root_dir / "checkpoints" / "weight_quantile_vae"
+        run_root_dir = (runs_dir / run_id) if separate_run_dirs else base_root
+        root_dir = base_root
+        logs_dir = run_root_dir / "logs"
+        reports_dir = base_root / "reports"
+        crashes_dir = base_root / "crashes"
+        default_mini_ckpt_dir = base_root / "checkpoints" / "mini_patch_vae"
+        default_big_ckpt_dir = base_root / "checkpoints" / "weight_quantile_vae"
         mini_ckpt_dir = Path(str(ta.get("mini_vae_checkpoint_dir", default_mini_ckpt_dir)))
         big_ckpt_dir = Path(str(ta.get("big_vae_checkpoint_dir", default_big_ckpt_dir)))
 
@@ -305,6 +308,7 @@ def configure_per_run_artifacts(
         ta["runs_dir"] = str(runs_dir)
         ta["run_id"] = run_id
         ta["root_dir"] = str(root_dir)
+        ta["run_root_dir"] = str(run_root_dir)
         ta["logs_dir"] = str(logs_dir)
         ta["reports_dir"] = str(reports_dir)
         ta["crashes_dir"] = str(crashes_dir)
@@ -321,12 +325,13 @@ def configure_per_run_artifacts(
         if isinstance(cfg.get("mini_train"), (dict, DictConfig)) and str(cfg["mini_train"].get("checkpoint_dir", "")).strip():
             cfg["mini_train"]["checkpoint_dir"] = str(mini_ckpt_dir)
 
-    for path in (root_dir, logs_dir, reports_dir, crashes_dir, mini_ckpt_dir, big_ckpt_dir):
+    for path in (root_dir, run_root_dir, logs_dir, reports_dir, crashes_dir, mini_ckpt_dir, big_ckpt_dir):
         path.mkdir(parents=True, exist_ok=True)
 
     return {
         "run_id": run_id,
         "root_dir": str(root_dir),
+        "run_root_dir": str(run_root_dir),
         "logs_dir": str(logs_dir),
         "reports_dir": str(reports_dir),
         "crashes_dir": str(crashes_dir),
