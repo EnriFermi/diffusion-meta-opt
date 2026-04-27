@@ -825,6 +825,7 @@ class OfflineBigVAELatentDiffusionDataset(torch.utils.data.IterableDataset):
         self.chunk_cache_size = max(1, int(chunk_cache_size))
         self.logger = logging.getLogger(self.__class__.__name__)
         self._chunk_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._record_schema_cache: dict[str, int | bool] | None = None
         self._manifest = self._load_manifest()
         self._stats = self._load_stats()
         self._chunk_paths = sorted(self.chunks_dir.glob("*.pt"))
@@ -857,10 +858,23 @@ class OfflineBigVAELatentDiffusionDataset(torch.utils.data.IterableDataset):
 
     def summary(self) -> dict[str, Any]:
         payload = dict(self._manifest)
-        payload["z_dim"] = max(int(payload.get("z_dim", 0)), int(self._stats.get("z_dim", 0)))
+        record_schema = self._infer_record_schema()
+        payload["z_dim"] = max(
+            int(payload.get("z_dim", 0)),
+            int(self._stats.get("z_dim", 0)),
+            int(record_schema.get("z_dim", 0)),
+        )
+        payload["cond_dim"] = max(
+            int(payload.get("cond_dim", 0)),
+            int(record_schema.get("cond_dim", 0)),
+        )
         payload["cond_global_dim"] = max(
             int(payload.get("cond_global_dim", 0)),
             int(self._stats.get("cond_global_dim", 0)),
+            int(record_schema.get("cond_global_dim", 0)),
+        )
+        payload["has_decoder_aux_tensors"] = bool(
+            payload.get("has_decoder_aux_tensors", False) or bool(record_schema.get("has_decoder_aux_tensors", False))
         )
         payload["latent_stats_count"] = int(self._stats.get("count", 0))
         return payload
@@ -911,6 +925,43 @@ class OfflineBigVAELatentDiffusionDataset(torch.utils.data.IterableDataset):
         while len(self._chunk_cache) > self.chunk_cache_size:
             self._chunk_cache.popitem(last=False)
         return payload
+
+    def _infer_record_schema(self) -> dict[str, int | bool]:
+        if self._record_schema_cache is not None:
+            return dict(self._record_schema_cache)
+
+        inferred = {
+            "z_dim": 0,
+            "cond_dim": 0,
+            "cond_global_dim": 0,
+            "has_decoder_aux_tensors": False,
+        }
+        for chunk_idx in range(len(self._chunk_paths)):
+            payload = self._load_chunk(chunk_idx)
+            records = payload.get("records", [])
+            if not isinstance(records, list) or not records:
+                continue
+            record = records[0]
+            if not isinstance(record, dict):
+                continue
+            latent_mu = record.get("latent_mu")
+            cond_patch = record.get("cond_patch")
+            cond_global = record.get("cond_global")
+            inferred["z_dim"] = int(latent_mu.numel()) if torch.is_tensor(latent_mu) else 0
+            inferred["cond_dim"] = int(cond_patch.shape[1]) if torch.is_tensor(cond_patch) and cond_patch.ndim == 2 else 0
+            inferred["cond_global_dim"] = (
+                int(cond_global.numel()) if torch.is_tensor(cond_global) and cond_global.ndim == 1 else 0
+            )
+            inferred["has_decoder_aux_tensors"] = bool(
+                torch.is_tensor(record.get("X"))
+                and torch.is_tensor(record.get("W"))
+                and torch.is_tensor(record.get("x_mask"))
+                and torch.is_tensor(record.get("d_in_mask"))
+                and torch.is_tensor(record.get("d_out_mask"))
+            )
+            break
+        self._record_schema_cache = dict(inferred)
+        return dict(inferred)
 
 
 def collate_big_vae_latent_diffusion_batch(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
