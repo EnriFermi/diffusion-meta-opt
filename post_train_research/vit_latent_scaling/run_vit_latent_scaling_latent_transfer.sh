@@ -10,8 +10,8 @@ CONDA_ENV_NAME="onerec"
 STAGE1_CONFIG_NAME="vit_latent_scaling/config_ae_diffusion_prior"
 STAGE2_CONFIG_NAME="vit_latent_scaling/config_ae_diffusion_prior"
 
-STAGE1_PRESET="mnist_tiny"
-STAGE2_PRESET="cifar10_tiny"
+STAGE1_PRESET="cifar_mili"
+STAGE2_PRESET="mnist_mili"
 
 EXPERIMENT_ROOT="./post_train_research/vit_latent_scaling/artifacts/latent_transfer"
 STAGE1_OUTPUT_DIR="$EXPERIMENT_ROOT/stage1_source"

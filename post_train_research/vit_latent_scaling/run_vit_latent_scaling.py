@@ -48,6 +48,16 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+def _repeat_channel_stats(values: tuple[float, ...], *, count: int) -> tuple[float, ...]:
+    if count <= 0:
+        raise ValueError(f"channel count must be positive, got {count}")
+    if len(values) == count:
+        return tuple(float(item) for item in values)
+    if len(values) == 1:
+        return tuple(float(values[0]) for _ in range(int(count)))
+    raise ValueError(f"cannot adapt stats of length {len(values)} to channel count {count}")
+
+
 @dataclass(slots=True)
 class ScalingRunConfig:
     output_dir: str
@@ -327,8 +337,15 @@ def build_mnist_loaders(cfg: ScalingRunConfig, device: torch.device, vit_cfg: Vi
     if int(vit_cfg.image_size) != 28:
         train_steps.append(transforms.Resize((int(vit_cfg.image_size), int(vit_cfg.image_size))))
         eval_steps.append(transforms.Resize((int(vit_cfg.image_size), int(vit_cfg.image_size))))
-    train_steps.extend([transforms.ToTensor(), transforms.Normalize(MNIST_MEAN, MNIST_STD)])
-    eval_steps.extend([transforms.ToTensor(), transforms.Normalize(MNIST_MEAN, MNIST_STD)])
+    if int(vit_cfg.in_channels) not in {1, 3}:
+        raise ValueError(f"MNIST presets support only in_channels in {{1,3}}, got {vit_cfg.in_channels}")
+    if int(vit_cfg.in_channels) == 3:
+        train_steps.append(transforms.Grayscale(num_output_channels=3))
+        eval_steps.append(transforms.Grayscale(num_output_channels=3))
+    mean = _repeat_channel_stats(MNIST_MEAN, count=int(vit_cfg.in_channels))
+    std = _repeat_channel_stats(MNIST_STD, count=int(vit_cfg.in_channels))
+    train_steps.extend([transforms.ToTensor(), transforms.Normalize(mean, std)])
+    eval_steps.extend([transforms.ToTensor(), transforms.Normalize(mean, std)])
 
     train_set = datasets.MNIST(
         root=str(cfg.data_dir),
@@ -360,11 +377,18 @@ def build_cifar10_loaders(
         transforms.RandomHorizontalFlip(),
     ]
     eval_steps = []
+    if int(vit_cfg.in_channels) not in {1, 3}:
+        raise ValueError(f"CIFAR-10 presets support only in_channels in {{1,3}}, got {vit_cfg.in_channels}")
+    if int(vit_cfg.in_channels) == 1:
+        train_steps.append(transforms.Grayscale(num_output_channels=1))
+        eval_steps.append(transforms.Grayscale(num_output_channels=1))
     if int(vit_cfg.image_size) != 32:
         train_steps.append(transforms.Resize((int(vit_cfg.image_size), int(vit_cfg.image_size))))
         eval_steps.append(transforms.Resize((int(vit_cfg.image_size), int(vit_cfg.image_size))))
-    train_steps.extend([transforms.ToTensor(), transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD)])
-    eval_steps.extend([transforms.ToTensor(), transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD)])
+    mean = _repeat_channel_stats(CIFAR10_MEAN, count=int(vit_cfg.in_channels))
+    std = _repeat_channel_stats(CIFAR10_STD, count=int(vit_cfg.in_channels))
+    train_steps.extend([transforms.ToTensor(), transforms.Normalize(mean, std)])
+    eval_steps.extend([transforms.ToTensor(), transforms.Normalize(mean, std)])
 
     train_set = datasets.CIFAR10(
         root=str(cfg.data_dir),
