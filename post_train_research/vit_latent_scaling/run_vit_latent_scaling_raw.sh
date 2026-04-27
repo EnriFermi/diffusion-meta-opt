@@ -6,7 +6,7 @@ PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 cd "$PROJECT_ROOT"
 
 CONDA_ENV_NAME="onerec"
-PRESET="cifar10_small"
+PRESET="cifar10_tiny"
 OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
 
 run_python() {
