@@ -7,7 +7,7 @@ cd "$PROJECT_ROOT"
 
 CONDA_ENV_NAME="onerec"
 PRESET="cifar10_small"
-OUTPUT_ROOT="./artifacts/training/post_train_research/vit_latent_scaling"
+OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
 RAW_CHECKPOINT=""
 BIG_VAE_CHECKPOINT=""
 

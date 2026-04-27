@@ -96,11 +96,12 @@ class ScalingRunConfig:
 def validate_scaling_run_config(cfg: ScalingRunConfig) -> None:
     setup = str(cfg.setup).strip().lower()
     if setup == "latent":
-        if not str(cfg.raw_checkpoint).strip():
-            raise ValueError("--raw-checkpoint is required for setup=latent")
         if not str(cfg.big_vae_checkpoint).strip():
             raise ValueError("--big-vae-checkpoint is required for setup=latent")
-        if str(cfg.big_vae_latent_init).strip().lower() == "diffusion_prior" and not str(
+        latent_init = str(cfg.big_vae_latent_init).strip().lower()
+        if latent_init == "encoded" and not str(cfg.raw_checkpoint).strip():
+            raise ValueError("--raw-checkpoint is required when --big-vae-latent-init=encoded")
+        if latent_init == "diffusion_prior" and not str(
             cfg.big_vae_diffusion_prior_checkpoint
         ).strip():
             raise ValueError(
@@ -396,7 +397,12 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
 
     init_checkpoint_steps = 0
     if cfg.setup == "latent":
-        initial_tensors, init_checkpoint_steps = load_raw_checkpoint(cfg.raw_checkpoint, vit_cfg)
+        if str(cfg.raw_checkpoint).strip():
+            initial_tensors, init_checkpoint_steps = load_raw_checkpoint(cfg.raw_checkpoint, vit_cfg)
+            print(f"[latent] loaded raw checkpoint init: {cfg.raw_checkpoint}", flush=True)
+        else:
+            initial_tensors = make_initial_tensors(vit_cfg, seed=int(cfg.seed))
+            print("[latent] no raw checkpoint provided; using fresh ViT initialization from seed", flush=True)
     else:
         initial_tensors = make_initial_tensors(vit_cfg, seed=int(cfg.seed))
 
