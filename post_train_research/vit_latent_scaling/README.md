@@ -78,6 +78,17 @@ imagenet_small: image=224 patch=16 hidden=384 depth=12 heads=6
 imagenet_base:  image=224 patch=16 hidden=768 depth=12 heads=12
 ```
 
+Transfer-friendly matched presets:
+
+```text
+mnist_mili: image=32 patch=4 in_channels=3 hidden=128 depth=3 heads=4 classes=10
+cifar_mili: image=32 patch=4 in_channels=3 hidden=128 depth=3 heads=4 classes=10
+```
+
+These two are intended for latent transfer runs where the source and target ViT
+architecture must stay identical. The MNIST preset is resized to `32x32` and
+converted to RGB so it matches the CIFAR preset exactly.
+
 Outputs are written under:
 
 ```text
