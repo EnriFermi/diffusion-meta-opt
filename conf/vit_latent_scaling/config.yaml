@@ -15,7 +15,7 @@ vit_latent_scaling:
   experiment_name: ${vit_latent_scaling.setup_name}
   output_dir: ${vit_latent_scaling.output_root}/${vit_latent_scaling.dataset}/${vit_latent_scaling.model_size}/${vit_latent_scaling.experiment_name}
   dataset: cifar10
-  model_size: small
+  model_size: tiny
   data_dir: ${oc.env:CIFAR10_DATA_DIR,./data/cifar10}
   download: true
   device: ${oc.env:DEVICE,auto}
@@ -27,8 +27,8 @@ vit_latent_scaling:
   num_workers: 4
   train_subset: 0
   test_subset: 0
-  lr: 1e-3
-  weight_decay: 0.05
+  lr: 1e-0
+  weight_decay: 0.0
   latent_weight_decay: 0.0
   adam_beta1: 0.9
   adam_beta2: 0.999
@@ -48,8 +48,8 @@ vit_latent_scaling:
   big_vae_diffusion_prior_sampler: ddim
   big_vae_diffusion_prior_eta: 0.0
   big_vae_decode: all
-  big_vae_tile_T_patches: 16
-  big_vae_tile_d_out: 8
+  big_vae_tile_T_patches: 4
+  big_vae_tile_d_out: 64
   big_vae_encoder_context_rows: 64
   big_vae_encoder_context_std: 1.0
   big_vae_encoder_batch_size: 16

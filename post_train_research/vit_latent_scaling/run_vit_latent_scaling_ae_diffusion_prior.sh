@@ -6,7 +6,7 @@ PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 cd "$PROJECT_ROOT"
 
 CONDA_ENV_NAME="diff-meta-opt312"
-PRESET="cifar10_small"
+PRESET="cifar10_tiny"
 OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
 BIG_VAE_CHECKPOINT="./artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt"
 BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/checkpoints/big_vae_latent_diffusion_prior_AE/stage_1/latest.pt"
