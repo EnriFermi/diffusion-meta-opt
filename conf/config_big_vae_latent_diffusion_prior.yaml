@@ -26,19 +26,19 @@ train:
   compile_disable_cudagraphs: true
   optimizer_name: adamw
   scheduler_name: cosine
-  lr: 1e-4
+  lr: 3e-4
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1e-8
-  warmup_steps: 1000
+  warmup_steps: 0
   min_lr_ratio: 0.1
-  max_steps: 100000
-  batch_size: 32
+  max_steps: 1000000
+  batch_size: 128
   grad_accum_steps: 1
   grad_clip_norm: 1.0
   checkpoint_every: 5000
   log_every: 100
-  checkpoint_dir: ${training_artifacts.base_root_dir}/checkpoints/big_vae_latent_diffusion_prior
+  checkpoint_dir: artifacts/training/checkpoints/big_vae_latent_diffusion_prior
   dataset:
     root_dir: ${latent_diffusion_dataset.root_dir}
     shuffle_chunks: true
@@ -94,8 +94,8 @@ model:
     use_cross_conditioning: false
     prediction_type: v
     latent_normalization: diagonal
-    use_decoder_aux: false
-    decoder_aux_lambda: 0.1
+    use_decoder_aux: true
+    decoder_aux_lambda: 0.2
     decoder_aux_max_sigma: 0.2
     decoder_aux_behavioral_coef: 1.0
     decoder_aux_behavioral_lambda_operator: 1.0
