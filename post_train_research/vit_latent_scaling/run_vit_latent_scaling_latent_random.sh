@@ -29,7 +29,7 @@ run_python() {
 
 run_python \
   "$SCRIPT_DIR/run_vit_latent_scaling_hydra.py" \
-  --config-name config_vit_latent_scaling_latent_random \
+  --config-name vit_latent_scaling/config_latent_random \
   "vit_latent_scaling/preset=$PRESET" \
   "vit_latent_scaling.output_root=$OUTPUT_ROOT" \
   "vit_latent_scaling.big_vae_checkpoint=$BIG_VAE_CHECKPOINT"

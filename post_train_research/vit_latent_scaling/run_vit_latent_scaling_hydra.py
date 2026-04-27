@@ -86,7 +86,7 @@ def build_vit_latent_scaling_configs(cfg: DictConfig) -> tuple[ScalingRunConfig,
     return run_cfg, vit_cfg
 
 
-@hydra.main(version_base=None, config_path="../../conf", config_name="config_vit_latent_scaling")
+@hydra.main(version_base=None, config_path="../../conf", config_name="vit_latent_scaling/config")
 def main(cfg: DictConfig) -> None:
     run_cfg, vit_cfg = build_vit_latent_scaling_configs(cfg)
     print(
