@@ -7,12 +7,10 @@ cd "$PROJECT_ROOT"
 
 CONDA_ENV_NAME="diff-meta-opt312"
 PRESET="cifar10_small"
-OUTPUT_ROOT="./artifacts/training/post_train_research/vit_latent_scaling"
-RAW_CHECKPOINT=""
+OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
 BIG_VAE_CHECKPOINT="./artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt"
 BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/checkpoints/big_vae_latent_diffusion_prior_AE/stage_1/latest.pt"
 
-: "${RAW_CHECKPOINT:?Edit RAW_CHECKPOINT in this script before running}"
 : "${BIG_VAE_CHECKPOINT:?Edit BIG_VAE_CHECKPOINT in this script before running}"
 : "${BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT:?Edit BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT in this script before running}"
 
@@ -36,6 +34,5 @@ run_python \
   --config-name config_vit_latent_scaling_ae_diffusion_prior \
   "vit_latent_scaling/preset=$PRESET" \
   "vit_latent_scaling.output_root=$OUTPUT_ROOT" \
-  "vit_latent_scaling.raw_checkpoint=$RAW_CHECKPOINT" \
   "vit_latent_scaling.big_vae_checkpoint=$BIG_VAE_CHECKPOINT" \
   "vit_latent_scaling.big_vae_diffusion_prior_checkpoint=$BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT"

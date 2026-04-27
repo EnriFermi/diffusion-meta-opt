@@ -124,9 +124,10 @@ latent_random       -> setup=latent, big_vae_latent_init=random
 ae_diffusion_prior  -> setup=latent, big_vae_latent_init=diffusion_prior
 ```
 
-There are also three self-contained shell wrappers next to this README:
+There are also self-contained shell wrappers next to this README:
 
 ```text
+run_vit_latent_scaling_raw.sh
 run_vit_latent_scaling_ae_encoded.sh
 run_vit_latent_scaling_latent_random.sh
 run_vit_latent_scaling_ae_diffusion_prior.sh
@@ -140,6 +141,22 @@ OUTPUT_ROOT
 RAW_CHECKPOINT
 BIG_VAE_CHECKPOINT
 BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT
+```
+
+For the fair from-scratch comparison, use:
+
+```text
+run_vit_latent_scaling_raw.sh
+run_vit_latent_scaling_latent_random.sh
+run_vit_latent_scaling_ae_diffusion_prior.sh
+```
+
+`RAW_CHECKPOINT` is only needed by the optional `ae_encoded` path, because that mode initializes latents by encoding an already existing raw ViT solution.
+
+By default the Hydra runner and these wrappers write outputs under:
+
+```text
+post_train_research/vit_latent_scaling/artifacts/
 ```
 
 You can also use the general config and switch groups explicitly:

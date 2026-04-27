@@ -9,7 +9,7 @@ hydra:
     name: run_vit_latent_scaling
 
 vit_latent_scaling:
-  output_root: ${training_artifacts.base_root_dir}/post_train_research/vit_latent_scaling
+  output_root: ./post_train_research/vit_latent_scaling/artifacts
   experiment_name: ${vit_latent_scaling.setup_name}
   output_dir: ${vit_latent_scaling.output_root}/${vit_latent_scaling.dataset}/${vit_latent_scaling.model_size}/${vit_latent_scaling.experiment_name}
   dataset: cifar10

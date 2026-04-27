@@ -8,11 +8,6 @@ cd "$PROJECT_ROOT"
 CONDA_ENV_NAME="onerec"
 PRESET="cifar10_small"
 OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
-RAW_CHECKPOINT=""
-BIG_VAE_CHECKPOINT=""
-
-: "${RAW_CHECKPOINT:?Edit RAW_CHECKPOINT in this script before running}"
-: "${BIG_VAE_CHECKPOINT:?Edit BIG_VAE_CHECKPOINT in this script before running}"
 
 run_python() {
   if [ -n "${CONDA_PREFIX:-}" ]; then
@@ -31,8 +26,6 @@ run_python() {
 
 run_python \
   "$SCRIPT_DIR/run_vit_latent_scaling_hydra.py" \
-  --config-name config_vit_latent_scaling_ae_encoded \
+  --config-name config_vit_latent_scaling_raw \
   "vit_latent_scaling/preset=$PRESET" \
-  "vit_latent_scaling.output_root=$OUTPUT_ROOT" \
-  "vit_latent_scaling.raw_checkpoint=$RAW_CHECKPOINT" \
-  "vit_latent_scaling.big_vae_checkpoint=$BIG_VAE_CHECKPOINT"
+  "vit_latent_scaling.output_root=$OUTPUT_ROOT"
