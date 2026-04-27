@@ -84,6 +84,7 @@ class ScalingRunConfig:
     eval_every_steps: int
     save_checkpoints: bool
     raw_checkpoint: str
+    latent_checkpoint: str
     big_vae_checkpoint: str
     big_vae_latent_init: str
     big_vae_diffusion_prior_checkpoint: str
@@ -103,18 +104,22 @@ class ScalingRunConfig:
 
 def validate_scaling_run_config(cfg: ScalingRunConfig) -> None:
     setup = str(cfg.setup).strip().lower()
+    has_latent_checkpoint = bool(str(cfg.latent_checkpoint).strip())
+    if setup == "raw" and str(cfg.latent_checkpoint).strip():
+        raise ValueError("--latent-checkpoint is only valid for setup=latent")
     if setup == "latent":
         if not str(cfg.big_vae_checkpoint).strip():
             raise ValueError("--big-vae-checkpoint is required for setup=latent")
-        latent_init = str(cfg.big_vae_latent_init).strip().lower()
-        if latent_init == "encoded" and not str(cfg.raw_checkpoint).strip():
-            raise ValueError("--raw-checkpoint is required when --big-vae-latent-init=encoded")
-        if latent_init == "diffusion_prior" and not str(
-            cfg.big_vae_diffusion_prior_checkpoint
-        ).strip():
-            raise ValueError(
-                "--big-vae-diffusion-prior-checkpoint is required when --big-vae-latent-init=diffusion_prior"
-            )
+        if not has_latent_checkpoint:
+            latent_init = str(cfg.big_vae_latent_init).strip().lower()
+            if latent_init == "encoded" and not str(cfg.raw_checkpoint).strip():
+                raise ValueError("--raw-checkpoint is required when --big-vae-latent-init=encoded")
+            if latent_init == "diffusion_prior" and not str(
+                cfg.big_vae_diffusion_prior_checkpoint
+            ).strip():
+                raise ValueError(
+                    "--big-vae-diffusion-prior-checkpoint is required when --big-vae-latent-init=diffusion_prior"
+                )
     latent_lr_scheduler = str(cfg.latent_lr_scheduler).strip().lower()
     if latent_lr_scheduler not in {"constant", "cosine_decay_to_floor"}:
         raise ValueError(
@@ -482,6 +487,64 @@ def load_raw_checkpoint(path: str, vit_cfg: ViTTinyConfig) -> tuple[dict[str, to
     return loaded, int(payload.get("step", 0))
 
 
+def load_latent_checkpoint(path: str) -> dict[str, Any]:
+    checkpoint_path = Path(path).expanduser()
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"latent checkpoint not found: {checkpoint_path}")
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise TypeError(f"latent checkpoint payload must be a dict: {checkpoint_path}")
+    if str(payload.get("setup", "latent")).strip().lower() != "latent":
+        raise ValueError(f"latent checkpoint must have setup='latent': {checkpoint_path}")
+    latent_slots = payload.get("latent_slots")
+    if not isinstance(latent_slots, dict):
+        raise KeyError(f"latent checkpoint must contain latent_slots dict: {checkpoint_path}")
+    return payload
+
+
+def load_latent_slots_from_checkpoint(
+    latent_slots: nn.ParameterDict,
+    checkpoint_payload: dict[str, Any],
+) -> dict[str, Any]:
+    source_state = checkpoint_payload.get("latent_slots", {})
+    if not isinstance(source_state, dict):
+        raise TypeError("checkpoint_payload['latent_slots'] must be a dict")
+
+    current_state = latent_slots.state_dict()
+    compatible_state: dict[str, torch.Tensor] = {}
+    missing_keys: list[str] = []
+    unexpected_keys: list[str] = []
+    skipped_shape_keys: list[str] = []
+
+    for key, source_value in source_state.items():
+        if key not in current_state:
+            unexpected_keys.append(str(key))
+            continue
+        current_value = current_state[key]
+        source_tensor = source_value.detach().cpu().to(dtype=current_value.dtype)
+        if tuple(source_tensor.shape) != tuple(current_value.shape):
+            skipped_shape_keys.append(str(key))
+            continue
+        compatible_state[str(key)] = source_tensor.contiguous()
+
+    missing_keys = sorted(key for key in current_state.keys() if key not in compatible_state)
+    if not compatible_state:
+        raise RuntimeError(
+            "latent checkpoint did not match any current latent slots; "
+            "check model architecture, decode mode, and BigVAE tiling config"
+        )
+
+    latent_slots.load_state_dict(compatible_state, strict=False)
+    return {
+        "loaded_keys": sorted(compatible_state.keys()),
+        "missing_keys": missing_keys,
+        "unexpected_keys": sorted(unexpected_keys),
+        "skipped_shape_keys": sorted(skipped_shape_keys),
+        "checkpoint_step": int(checkpoint_payload.get("step", 0)),
+        "checkpoint_path": str(checkpoint_payload.get("_checkpoint_path", "")),
+    }
+
+
 def build_model(
     cfg: ScalingRunConfig,
     vit_cfg: ViTTinyConfig,
@@ -543,8 +606,20 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
 
     seed_everything(int(cfg.seed))
     train_loader, test_loader = build_loaders(cfg, device, vit_cfg)
+    latent_checkpoint_path = str(cfg.latent_checkpoint).strip()
+    use_latent_checkpoint_init = cfg.setup == "latent" and bool(latent_checkpoint_path)
+    latent_checkpoint_payload: dict[str, Any] | None = None
     calibration_images = None
-    if cfg.setup == "latent" and str(cfg.big_vae_latent_init).strip().lower() == "diffusion_prior":
+    if use_latent_checkpoint_init:
+        latent_checkpoint_payload = load_latent_checkpoint(latent_checkpoint_path)
+        latent_checkpoint_payload["_checkpoint_path"] = latent_checkpoint_path
+        print(f"[latent] will initialize latent slots from checkpoint: {latent_checkpoint_path}", flush=True)
+    use_diffusion_prior_init = (
+        cfg.setup == "latent"
+        and str(cfg.big_vae_latent_init).strip().lower() == "diffusion_prior"
+        and not use_latent_checkpoint_init
+    )
+    if use_diffusion_prior_init:
         calibration_images = collect_calibration_images(
             train_loader,
             num_batches=int(cfg.big_vae_init_calibration_batches),
@@ -572,7 +647,7 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
     if cfg.setup == "latent":
         print(f"[latent] loading frozen BigVAE decoder: {cfg.big_vae_checkpoint}", flush=True)
         big_vae_decoder = load_frozen_big_vae_decoder(cfg.big_vae_checkpoint, device=device)
-        if str(cfg.big_vae_latent_init).strip().lower() == "diffusion_prior":
+        if use_diffusion_prior_init:
             print(
                 f"[latent] loading frozen latent diffusion prior: {cfg.big_vae_diffusion_prior_checkpoint}",
                 flush=True,
@@ -599,7 +674,7 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         big_vae_decoder=big_vae_decoder,
         big_vae_diffusion_prior=big_vae_diffusion_prior,
     ).to(device)
-    if cfg.setup == "latent" and str(cfg.big_vae_latent_init).strip().lower() == "diffusion_prior":
+    if use_diffusion_prior_init:
         target_model = getattr(model, "_orig_mod", model)
         if not hasattr(target_model, "initialize_bigvae_diffusion_prior"):
             raise TypeError("diffusion_prior init requires FunctionalViTTiny.initialize_bigvae_diffusion_prior")
@@ -609,6 +684,24 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
 
     target = getattr(model, "_orig_mod", model)
     store = getattr(target, "store")
+    init_latent_steps = 0
+    init_latent_loaded_keys = 0
+    if use_latent_checkpoint_init:
+        if not isinstance(store, BigVAELatentTensorStore):
+            raise TypeError("latent checkpoint init requires BigVAELatentTensorStore")
+        assert latent_checkpoint_payload is not None
+        load_report = load_latent_slots_from_checkpoint(store.latent_slots, latent_checkpoint_payload)
+        init_latent_steps = int(load_report["checkpoint_step"])
+        init_latent_loaded_keys = int(len(load_report["loaded_keys"]))
+        print(
+            "[latent] loaded latent checkpoint "
+            f"keys={init_latent_loaded_keys} "
+            f"missing={len(load_report['missing_keys'])} "
+            f"unexpected={len(load_report['unexpected_keys'])} "
+            f"shape_skipped={len(load_report['skipped_shape_keys'])} "
+            f"source_step={init_latent_steps}",
+            flush=True,
+        )
     trainable_parameters = [param for param in model.parameters() if param.requires_grad]
     optimizer = build_optimizer(trainable_parameters, cfg=cfg, setup=str(cfg.setup))
     planned_train_steps = resolve_planned_train_steps(cfg, steps_per_epoch=len(train_loader))
@@ -697,6 +790,7 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                     "base_lr": float(cfg.lr),
                     "step": int(global_step),
                     "total_steps_with_raw_init": int(total_steps_with_raw_init),
+                    "total_steps_with_latent_transfer_init": int(global_step + init_latent_steps),
                     "epoch": int(epoch_idx + 1),
                     "train_loss": float(avg_train_loss),
                     "test_loss": float(final_eval.loss),
@@ -748,6 +842,8 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                     "step": int(global_step),
                     "init_raw_checkpoint": str(cfg.raw_checkpoint),
                     "init_raw_steps": int(init_checkpoint_steps),
+                    "init_latent_checkpoint": str(cfg.latent_checkpoint),
+                    "init_latent_steps": int(init_latent_steps),
                     "latent_slots": target.store.latent_slots.state_dict(),
                     "vit_config": asdict(vit_cfg),
                     "run_config": asdict(cfg),
@@ -764,6 +860,10 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         "steps": int(global_step),
         "init_raw_steps": int(init_checkpoint_steps if cfg.setup == "latent" else 0),
         "total_steps_with_raw_init": int(global_step + (init_checkpoint_steps if cfg.setup == "latent" else 0)),
+        "init_latent_checkpoint": str(cfg.latent_checkpoint) if cfg.setup == "latent" else "",
+        "init_latent_steps": int(init_latent_steps if cfg.setup == "latent" else 0),
+        "init_latent_loaded_keys": int(init_latent_loaded_keys if cfg.setup == "latent" else 0),
+        "total_steps_with_latent_transfer_init": int(global_step + (init_latent_steps if cfg.setup == "latent" else 0)),
         "final_test_loss": float(final_eval.loss),
         "final_test_accuracy": float(final_eval.accuracy),
         "best_test_accuracy": float(best_accuracy),
@@ -844,6 +944,7 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
     parser.add_argument("--eval-every-steps", type=int, default=500)
     parser.add_argument("--save-checkpoints", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--raw-checkpoint", default="")
+    parser.add_argument("--latent-checkpoint", default="")
     parser.add_argument("--big-vae-checkpoint", default="")
     parser.add_argument(
         "--big-vae-latent-init",
@@ -912,6 +1013,7 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         eval_every_steps=int(args.eval_every_steps),
         save_checkpoints=bool(args.save_checkpoints),
         raw_checkpoint=str(args.raw_checkpoint),
+        latent_checkpoint=str(args.latent_checkpoint),
         big_vae_checkpoint=str(args.big_vae_checkpoint),
         big_vae_latent_init=str(args.big_vae_latent_init),
         big_vae_diffusion_prior_checkpoint=str(args.big_vae_diffusion_prior_checkpoint),
