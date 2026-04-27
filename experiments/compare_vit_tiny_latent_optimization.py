@@ -17,6 +17,8 @@ from torch.utils.data import DataLoader, Subset
 
 from models.weight_quantile_vae import BigWeightVAE
 from training.big_vae_latent_diffusion import (
+    build_cond_global_from_dist_var_pooled,
+    build_layer_metadata_condition_vector,
     load_distribution_encoder_state_from_latent_diffusion_prior_checkpoint,
     load_frozen_big_vae_from_checkpoint,
     load_frozen_layer_latent_diffusion_prior,
@@ -509,9 +511,11 @@ class BigVAELatentTensorStore(nn.Module):
                     W = torch.zeros(batch, int(d_in), int(d_out), device=device, dtype=dtype)
                     d_in_mask = torch.zeros(batch, int(d_in), device=device, dtype=torch.bool)
                     d_out_mask = torch.zeros(batch, int(d_out), device=device, dtype=torch.bool)
+                    batch_layer_names: list[str] = []
 
                     for item_idx, key in enumerate(batch_keys):
                         tile = self._tile_specs[key]
+                        batch_layer_names.append(str(tile.segments[0].tensor_name) if tile.segments else str(key))
                         for segment in tile.segments:
                             matrix = matrix_cache.get(segment.tensor_name)
                             if matrix is None:
@@ -589,9 +593,11 @@ class BigVAELatentTensorStore(nn.Module):
                     W = torch.zeros(batch, int(d_in), int(d_out), device=device, dtype=dtype)
                     d_in_mask = torch.zeros(batch, int(d_in), device=device, dtype=torch.bool)
                     d_out_mask = torch.zeros(batch, int(d_out), device=device, dtype=torch.bool)
+                    batch_layer_names: list[str] = []
 
                     for item_idx, key in enumerate(batch_keys):
                         tile = self._tile_specs[key]
+                        batch_layer_names.append(str(tile.segments[0].tensor_name) if tile.segments else str(key))
                         for segment in tile.segments:
                             matrix = matrix_cache.get(segment.tensor_name)
                             if matrix is None:
@@ -634,8 +640,37 @@ class BigVAELatentTensorStore(nn.Module):
                         )
                     if dist_patch_by_patch is None:
                         raise RuntimeError("distribution encoder must provide dist_patch_by_patch for diffusion prior")
+                    cond_global = build_cond_global_from_dist_var_pooled(
+                        dist_var_pooled=_dist_var_pooled,
+                        patch_mask=patch_mask,
+                    )
+                    metadata_cond = build_layer_metadata_condition_vector(
+                        device=device,
+                        dtype=dtype,
+                        use_layer_type_conditioning=bool(
+                            self.latent_diffusion_prior.cfg.use_layer_type_conditioning
+                        ),
+                        use_layer_depth_conditioning=bool(
+                            self.latent_diffusion_prior.cfg.use_layer_depth_conditioning
+                        ),
+                        depth_fourier_dim=int(self.latent_diffusion_prior.cfg.layer_depth_fourier_dim),
+                        depth_scale=float(self.latent_diffusion_prior.cfg.layer_depth_scale),
+                        layer_names=batch_layer_names,
+                    )
+                    if metadata_cond is not None:
+                        if cond_global is None:
+                            cond_global = metadata_cond
+                        else:
+                            cond_global = torch.cat(
+                                [
+                                    cond_global.to(device=device, dtype=dtype),
+                                    metadata_cond.to(device=device, dtype=dtype),
+                                ],
+                                dim=-1,
+                            )
                     sampled = self.latent_diffusion_prior.sample_latents(
                         cond_patch=dist_patch_by_patch,
+                        cond_global=cond_global,
                         patch_mask=patch_mask,
                         num_steps=self.latent_diffusion_prior_steps,
                         sampler_type=self.latent_diffusion_prior_sampler,

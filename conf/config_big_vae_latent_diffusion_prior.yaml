@@ -86,6 +86,10 @@ model:
     num_latent_tokens: 8
     cond_dim: 0
     cond_global_dim: 0
+    use_layer_type_conditioning: true
+    use_layer_depth_conditioning: true
+    layer_depth_fourier_dim: 16
+    layer_depth_scale: 64.0
     d_model: 256
     n_layers: 6
     n_heads: 8

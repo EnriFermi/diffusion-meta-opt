@@ -17,7 +17,11 @@ from omegaconf import DictConfig, OmegaConf
 
 from dataset.big_vae_offline import OfflineBigVAEDataset, infer_layer_depth, infer_layer_type
 from dataset.shared.types import SharedSample
-from training.big_vae_latent_diffusion import encode_big_vae_layer_batch
+from training.big_vae_latent_diffusion import (
+    build_cond_global_from_dist_var_pooled,
+    encode_big_vae_layer_batch,
+    latent_diffusion_layer_type_to_id,
+)
 
 
 OFFLINE_BIG_VAE_LATENT_DIFFUSION_FORMAT_VERSION = 1
@@ -625,6 +629,7 @@ class BigVAELatentDiffusionOfflineWriter:
         self._closed = False
         self._z_dim: int | None = None
         self._cond_dim: int | None = None
+        self._cond_global_dim: int | None = None
         self._latent_sum: torch.Tensor | None = None
         self._latent_sumsq: torch.Tensor | None = None
         self._prepare_root(overwrite_existing=bool(overwrite_existing))
@@ -634,6 +639,7 @@ class BigVAELatentDiffusionOfflineWriter:
             raise RuntimeError("writer is already closed")
         latent_mu = record.get("latent_mu")
         cond_patch = record.get("cond_patch")
+        cond_global = record.get("cond_global")
         patch_mask = record.get("patch_mask")
         if not torch.is_tensor(latent_mu) or latent_mu.ndim != 1:
             raise TypeError(f"record.latent_mu must be rank-1 tensor, got {type(latent_mu)!r}")
@@ -648,6 +654,11 @@ class BigVAELatentDiffusionOfflineWriter:
 
         latent_mu_cpu = _prepare_cpu_tensor(latent_mu)
         cond_patch_cpu = _prepare_cpu_tensor(cond_patch)
+        cond_global_cpu: torch.Tensor | None = None
+        if cond_global is not None:
+            if not torch.is_tensor(cond_global) or cond_global.ndim != 1:
+                raise TypeError(f"record.cond_global must be rank-1 tensor when provided, got {type(cond_global)!r}")
+            cond_global_cpu = _prepare_cpu_tensor(cond_global)
         patch_mask_cpu = patch_mask.detach().to(device="cpu", dtype=torch.bool).contiguous()
         target_X = record.get("X")
         target_W = record.get("W")
@@ -657,16 +668,21 @@ class BigVAELatentDiffusionOfflineWriter:
 
         z_dim = int(latent_mu_cpu.numel())
         cond_dim = int(cond_patch_cpu.shape[1])
+        cond_global_dim = int(cond_global_cpu.numel()) if cond_global_cpu is not None else 0
         if self._z_dim is None:
             self._z_dim = z_dim
             self._latent_sum = torch.zeros(z_dim, dtype=torch.float64)
             self._latent_sumsq = torch.zeros(z_dim, dtype=torch.float64)
         if self._cond_dim is None:
             self._cond_dim = cond_dim
+        if self._cond_global_dim is None:
+            self._cond_global_dim = cond_global_dim
         if z_dim != int(self._z_dim):
             raise ValueError(f"inconsistent z_dim: expected {self._z_dim}, got {z_dim}")
         if cond_dim != int(self._cond_dim):
             raise ValueError(f"inconsistent cond_dim: expected {self._cond_dim}, got {cond_dim}")
+        if cond_global_dim != int(self._cond_global_dim):
+            raise ValueError(f"inconsistent cond_global_dim: expected {self._cond_global_dim}, got {cond_global_dim}")
 
         assert self._latent_sum is not None
         assert self._latent_sumsq is not None
@@ -677,6 +693,8 @@ class BigVAELatentDiffusionOfflineWriter:
         payload = dict(record)
         payload["latent_mu"] = latent_mu_cpu
         payload["cond_patch"] = cond_patch_cpu
+        if cond_global_cpu is not None:
+            payload["cond_global"] = cond_global_cpu
         payload["patch_mask"] = patch_mask_cpu
         latent_logvar = payload.get("latent_logvar")
         if torch.is_tensor(latent_logvar):
@@ -752,6 +770,7 @@ class BigVAELatentDiffusionOfflineWriter:
                 "count": int(count),
                 "z_dim": int(self._z_dim),
                 "cond_dim": int(self._cond_dim or 0),
+                "cond_global_dim": int(self._cond_global_dim or 0),
             },
             self.stats_path,
         )
@@ -765,6 +784,7 @@ class BigVAELatentDiffusionOfflineWriter:
             "num_chunks": int(self._chunk_index),
             "z_dim": int(self._z_dim or 0),
             "cond_dim": int(self._cond_dim or 0),
+            "cond_global_dim": int(self._cond_global_dim or 0),
             "actual_size_bytes": int(_directory_size_bytes(self.root_dir)),
             "actual_size_gb": float(_directory_size_bytes(self.root_dir)) / (1024.0 ** 3),
             "has_decoder_aux_tensors": bool(self.store_decoder_aux_tensors),
@@ -845,6 +865,7 @@ class OfflineBigVAELatentDiffusionDataset(torch.utils.data.IterableDataset):
             "latent_mean": self._stats["latent_mean"].clone(),
             "latent_std": self._stats["latent_std"].clone(),
             "count": int(self._stats.get("count", 0)),
+            "cond_global_dim": int(self._stats.get("cond_global_dim", 0)),
         }
 
     def close(self) -> None:
@@ -905,12 +926,23 @@ def collate_big_vae_latent_diffusion_batch(items: Sequence[Mapping[str, Any]]) -
     latent_logvar = torch.zeros(batch, z_dim, dtype=torch.float32)
     cond_patch = torch.zeros(batch, max_t, cond_dim, dtype=torch.float32)
     patch_mask = torch.zeros(batch, max_t, dtype=torch.bool)
+    has_cond_global = any(torch.is_tensor(item.get("cond_global")) for item in items)
+    cond_global: torch.Tensor | None = None
+    if has_cond_global:
+        if not all(torch.is_tensor(item.get("cond_global")) for item in items):
+            raise ValueError("cond_global must be present for every item in the batch or none")
+        first_cond_global = items[0].get("cond_global")
+        assert torch.is_tensor(first_cond_global)
+        cond_global_dim = int(first_cond_global.numel())
+        cond_global = torch.zeros(batch, cond_global_dim, dtype=torch.float32)
     model_names: list[str] = []
     layer_names: list[str] = []
     source_keys: list[str] = []
     metas: list[dict[str, Any]] = []
     d_in_list: list[int] = []
     d_out_list: list[int] = []
+    layer_type_ids: list[int] = []
+    layer_depths: list[float] = []
     has_decoder_aux_tensors = any(torch.is_tensor(item.get("W")) or torch.is_tensor(item.get("X")) for item in items)
     X: torch.Tensor | None = None
     W: torch.Tensor | None = None
@@ -954,12 +986,26 @@ def collate_big_vae_latent_diffusion_batch(items: Sequence[Mapping[str, Any]]) -
             latent_logvar[idx] = _prepare_cpu_tensor(item_logvar)
         cond_patch[idx, :current_t] = _prepare_cpu_tensor(item_cond_patch)
         patch_mask[idx, :current_t] = True
+        if has_cond_global:
+            item_cond_global = item.get("cond_global")
+            assert cond_global is not None
+            if not torch.is_tensor(item_cond_global) or item_cond_global.ndim != 1 or int(item_cond_global.numel()) != int(cond_global.shape[1]):
+                raise ValueError(
+                    f"cond_global shape mismatch at item {idx}: expected {(int(cond_global.shape[1]),)}, "
+                    f"got {tuple(item_cond_global.shape) if torch.is_tensor(item_cond_global) else type(item_cond_global)!r}"
+                )
+            cond_global[idx] = _prepare_cpu_tensor(item_cond_global)
         model_names.append(str(item.get("model_name", "")))
-        layer_names.append(str(item.get("layer_name", "")))
+        layer_name = str(item.get("layer_name", ""))
+        layer_names.append(layer_name)
         source_keys.append(str(item.get("source_key", "")))
         metas.append(dict(item.get("meta", {}) or {}))
         d_in_list.append(int(item.get("d_in", 0)))
         d_out_list.append(int(item.get("d_out", 0)))
+        layer_type_name = str(item.get("layer_type", "")).strip() or infer_layer_type(layer_name)
+        layer_depth_value = item.get("layer_depth", infer_layer_depth(layer_name))
+        layer_type_ids.append(latent_diffusion_layer_type_to_id(layer_type_name))
+        layer_depths.append(float(layer_depth_value) if layer_depth_value is not None else -1.0)
         if has_decoder_aux_tensors:
             item_X = _prepare_cpu_tensor(item["X"])
             item_W = _prepare_cpu_tensor(item["W"])
@@ -987,7 +1033,11 @@ def collate_big_vae_latent_diffusion_batch(items: Sequence[Mapping[str, Any]]) -
         "meta": metas,
         "d_in": torch.tensor(d_in_list, dtype=torch.long),
         "d_out": torch.tensor(d_out_list, dtype=torch.long),
+        "layer_type_ids": torch.tensor(layer_type_ids, dtype=torch.long),
+        "layer_depths": torch.tensor(layer_depths, dtype=torch.float32),
     }
+    if cond_global is not None:
+        batch_payload["cond_global"] = cond_global
     if has_decoder_aux_tensors:
         assert X is not None and W is not None and x_mask is not None and d_in_mask is not None and d_out_mask is not None
         batch_payload["X"] = X
@@ -1114,6 +1164,7 @@ def build_big_vae_latent_diffusion_offline_dataset(
                 d_out_mask=batch_payload["d_out_mask"].to(device=model_device),
             )
         cond_patch = encoded["cond_patch"]
+        dist_var_pooled = encoded.get("dist_var_pooled")
         patch_mask = encoded["patch_mask"]
         latent_mu = encoded["latent_mu"]
         latent_logvar = encoded["latent_logvar"]
@@ -1134,6 +1185,14 @@ def build_big_vae_latent_diffusion_offline_dataset(
             valid_rows = int(batch_payload["x_mask"][idx].to(dtype=torch.long).sum().item())
             valid_d_in = int(batch_payload["d_in_mask"][idx].to(dtype=torch.long).sum().item())
             valid_d_out = int(batch_payload["d_out_mask"][idx].to(dtype=torch.long).sum().item())
+            cond_global = None
+            if torch.is_tensor(dist_var_pooled):
+                cond_global_full = build_cond_global_from_dist_var_pooled(
+                    dist_var_pooled=dist_var_pooled[idx : idx + 1],
+                    patch_mask=patch_mask[idx : idx + 1],
+                )
+                if cond_global_full is not None:
+                    cond_global = cond_global_full[0]
             record = {
                 "source_key": _source_key(batch_payload["model_names"][idx], batch_payload["layer_names"][idx]),
                 "model_name": batch_payload["model_names"][idx],
@@ -1144,6 +1203,7 @@ def build_big_vae_latent_diffusion_offline_dataset(
                 "d_out": valid_d_out,
                 "cond_patch": cond_patch[idx, :valid_t],
                 "patch_mask": torch.ones(valid_t, dtype=torch.bool),
+                "cond_global": cond_global,
                 "latent_mu": latent_mu[idx],
                 "latent_logvar": latent_logvar[idx],
                 "meta": batch_payload["meta"][idx],

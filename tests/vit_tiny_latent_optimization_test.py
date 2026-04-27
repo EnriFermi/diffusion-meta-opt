@@ -13,6 +13,7 @@ from experiments.compare_vit_tiny_latent_optimization import (
 )
 from models.layer_latent_diffusion_prior import LayerLatentDiffusionPrior, LayerLatentDiffusionPriorConfig
 from models.weight_quantile_vae import BigVAEConfig, BigWeightVAE, DistributionConfig, EncoderConfig, MiniVAEConfig, ModelConfig
+from training.big_vae_latent_diffusion import latent_diffusion_layer_metadata_cond_dim
 
 
 def _small_vit_cfg() -> ViTTinyConfig:
@@ -250,6 +251,16 @@ def test_bigvae_latent_diffusion_prior_init_decodes_weights_and_keeps_prior_froz
             z_dim=24,
             num_latent_tokens=2,
             cond_dim=16,
+            cond_global_dim=16
+            + latent_diffusion_layer_metadata_cond_dim(
+                use_layer_type_conditioning=True,
+                use_layer_depth_conditioning=True,
+                depth_fourier_dim=8,
+            ),
+            use_layer_type_conditioning=True,
+            use_layer_depth_conditioning=True,
+            layer_depth_fourier_dim=8,
+            layer_depth_scale=32.0,
             d_model=16,
             n_layers=2,
             n_heads=2,

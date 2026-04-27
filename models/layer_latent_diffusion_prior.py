@@ -29,6 +29,10 @@ class LayerLatentDiffusionPriorConfig:
     num_latent_tokens: int = 8
     cond_dim: int = 128
     cond_global_dim: int = 0
+    use_layer_type_conditioning: bool = False
+    use_layer_depth_conditioning: bool = False
+    layer_depth_fourier_dim: int = 16
+    layer_depth_scale: float = 64.0
     d_model: int = 256
     n_layers: int = 6
     n_heads: int = 8
@@ -71,6 +75,10 @@ def build_layer_latent_diffusion_prior_config(raw_cfg: Mapping[str, Any]) -> Lay
         num_latent_tokens=int(raw_cfg.get("num_latent_tokens", 8)),
         cond_dim=int(raw_cfg.get("cond_dim", 128)),
         cond_global_dim=int(raw_cfg.get("cond_global_dim", 0)),
+        use_layer_type_conditioning=bool(raw_cfg.get("use_layer_type_conditioning", False)),
+        use_layer_depth_conditioning=bool(raw_cfg.get("use_layer_depth_conditioning", False)),
+        layer_depth_fourier_dim=int(raw_cfg.get("layer_depth_fourier_dim", 16)),
+        layer_depth_scale=float(raw_cfg.get("layer_depth_scale", 64.0)),
         d_model=int(raw_cfg.get("d_model", 256)),
         n_layers=int(raw_cfg.get("n_layers", 6)),
         n_heads=int(raw_cfg.get("n_heads", 8)),
@@ -577,6 +585,12 @@ class LayerLatentDiffusionPrior(nn.Module):
             raise ValueError(f"decoder_aux_lambda must be >= 0, got {cfg.decoder_aux_lambda}")
         if float(cfg.decoder_aux_max_sigma) <= 0.0:
             raise ValueError(f"decoder_aux_max_sigma must be > 0, got {cfg.decoder_aux_max_sigma}")
+        if bool(cfg.use_layer_depth_conditioning) and int(cfg.layer_depth_fourier_dim) <= 0:
+            raise ValueError(
+                f"layer_depth_fourier_dim must be > 0 when use_layer_depth_conditioning=True, got {cfg.layer_depth_fourier_dim}"
+            )
+        if float(cfg.layer_depth_scale) <= 0.0:
+            raise ValueError(f"layer_depth_scale must be > 0, got {cfg.layer_depth_scale}")
 
         self.cfg = cfg
         self.z_dim = int(cfg.z_dim)

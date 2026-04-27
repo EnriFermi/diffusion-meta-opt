@@ -32,7 +32,10 @@ from models.layer_latent_diffusion_prior import (
 )
 from training.optim import build_adamw_optimizer, build_cosine_scheduler
 from training.big_vae_latent_diffusion import (
+    build_cond_global_from_dist_var_pooled,
+    build_layer_metadata_condition_vector,
     encode_big_vae_distribution_context_batch,
+    latent_diffusion_layer_metadata_cond_dim,
     load_big_vae_with_trainable_distribution_encoder,
     load_frozen_big_vae_from_checkpoint,
 )
@@ -255,7 +258,40 @@ def _resolve_prior_cfg(cfg: DictConfig, *, dataset_summary: dict[str, Any]) -> D
             cfg.model.latent_diffusion_prior.z_dim = int(dataset_summary.get("z_dim", 0))
         if int(prior_cfg.get("cond_dim", 0)) <= 0:
             cfg.model.latent_diffusion_prior.cond_dim = int(dataset_summary.get("cond_dim", 0))
+        metadata_cond_dim = latent_diffusion_layer_metadata_cond_dim(
+            use_layer_type_conditioning=bool(prior_cfg.get("use_layer_type_conditioning", False)),
+            use_layer_depth_conditioning=bool(prior_cfg.get("use_layer_depth_conditioning", False)),
+            depth_fourier_dim=int(prior_cfg.get("layer_depth_fourier_dim", 16)),
+        )
+        if int(prior_cfg.get("cond_global_dim", 0)) <= 0:
+            cfg.model.latent_diffusion_prior.cond_global_dim = int(dataset_summary.get("cond_global_dim", 0)) + int(
+                metadata_cond_dim
+            )
     return cfg.model.latent_diffusion_prior
+
+
+def _concat_optional_condition_vectors(
+    lhs: torch.Tensor | None,
+    rhs: torch.Tensor | None,
+    *,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if lhs is None and rhs is None:
+        return None
+    pieces: list[torch.Tensor] = []
+    for item in (lhs, rhs):
+        if item is None:
+            continue
+        if item.ndim != 2 or int(item.shape[0]) != int(batch_size):
+            raise ValueError(f"Condition vector must be [B,D] with batch={batch_size}, got {tuple(item.shape)}")
+        pieces.append(item.to(device=device, dtype=dtype))
+    if not pieces:
+        return None
+    if len(pieces) == 1:
+        return pieces[0]
+    return torch.cat(pieces, dim=-1)
 
 
 def _resolve_checkpoint_layout(cfg: DictConfig) -> int:
@@ -531,6 +567,9 @@ def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[s
         "latent_mu",
         "latent_logvar",
         "cond_patch",
+        "cond_global",
+        "layer_type_ids",
+        "layer_depths",
         "patch_mask",
         "d_in",
         "d_out",
@@ -573,18 +612,23 @@ def main(cfg: DictConfig) -> None:
         prior_cfg = build_layer_latent_diffusion_prior_config(prior_cfg_raw)
 
         logger.info(
-            "Latent dataset summary: root=%s accepted_records=%s z_dim=%s cond_dim=%s has_decoder_aux_tensors=%s",
+            "Latent dataset summary: root=%s accepted_records=%s z_dim=%s cond_dim=%s cond_global_dim=%s has_decoder_aux_tensors=%s",
             dataset_summary.get("root_dir", ""),
             int(dataset_summary.get("accepted_records", 0)),
             int(dataset_summary.get("z_dim", 0)),
             int(dataset_summary.get("cond_dim", 0)),
+            int(dataset_summary.get("cond_global_dim", 0)),
             bool(dataset_summary.get("has_decoder_aux_tensors", False)),
         )
         logger.info(
-            "Model config: z_dim=%s num_latent_tokens=%s cond_dim=%s d_model=%s n_layers=%s n_heads=%s prediction_type=%s",
+            "Model config: z_dim=%s num_latent_tokens=%s cond_dim=%s cond_global_dim=%s "
+            "layer_type_conditioning=%s layer_depth_conditioning=%s d_model=%s n_layers=%s n_heads=%s prediction_type=%s",
             prior_cfg.z_dim,
             prior_cfg.num_latent_tokens,
             prior_cfg.cond_dim,
+            prior_cfg.cond_global_dim,
+            bool(prior_cfg.use_layer_type_conditioning),
+            bool(prior_cfg.use_layer_depth_conditioning),
             prior_cfg.d_model,
             prior_cfg.n_layers,
             prior_cfg.n_heads,
@@ -734,6 +778,7 @@ def main(cfg: DictConfig) -> None:
 
                 with autocast_context(amp_enabled, amp_dtype):
                     cond_patch = batch["cond_patch"]
+                    cond_global = batch.get("cond_global")
                     patch_mask = batch["patch_mask"]
                     offline_cond_patch_alignment_mse = None
                     if conditioning_big_vae is not None:
@@ -751,6 +796,10 @@ def main(cfg: DictConfig) -> None:
                         patch_mask = cond_payload["patch_mask"]
                         if not torch.is_tensor(cond_patch) or not torch.is_tensor(patch_mask):
                             raise RuntimeError("Distribution encoder fine-tuning expected tensor cond_patch and patch_mask")
+                        cond_global = build_cond_global_from_dist_var_pooled(
+                            dist_var_pooled=cond_payload.get("dist_var_pooled"),
+                            patch_mask=patch_mask,
+                        )
                         valid_mask = patch_mask.unsqueeze(-1).to(dtype=cond_patch.dtype)
                         denom = valid_mask.sum().clamp_min(1.0)
                         offline_cond_patch_alignment_mse = (
@@ -765,12 +814,30 @@ def main(cfg: DictConfig) -> None:
                         patch_lengths = patch_mask.to(dtype=torch.long).sum(dim=1)
                         step_patch_tokens += float(patch_lengths.float().mean().item())
                         step_patch_tokens_max = max(step_patch_tokens_max, float(patch_lengths.max().item()))
+                    metadata_cond = build_layer_metadata_condition_vector(
+                        device=cond_patch.device,
+                        dtype=cond_patch.dtype,
+                        use_layer_type_conditioning=bool(prior_cfg.use_layer_type_conditioning),
+                        use_layer_depth_conditioning=bool(prior_cfg.use_layer_depth_conditioning),
+                        depth_fourier_dim=int(prior_cfg.layer_depth_fourier_dim),
+                        depth_scale=float(prior_cfg.layer_depth_scale),
+                        layer_type_ids=batch.get("layer_type_ids"),
+                        layer_depths=batch.get("layer_depths"),
+                    )
+                    cond_global = _concat_optional_condition_vectors(
+                        cond_global,
+                        metadata_cond,
+                        batch_size=int(cond_patch.shape[0]),
+                        device=cond_patch.device,
+                        dtype=cond_patch.dtype,
+                    )
                     loss_payload = compute_layer_latent_diffusion_loss(
                         model,
                         clean_latents=batch["latent_mu"],
                         cond_patch=cond_patch,
                         timesteps=timesteps,
                         patch_mask=patch_mask,
+                        cond_global=cond_global,
                         decoder_aux_model=decoder_aux_model,
                         decoder_aux_W=batch.get("W"),
                         decoder_aux_X=batch.get("X"),
@@ -834,6 +901,8 @@ def main(cfg: DictConfig) -> None:
                 "data/decoder_aux_applied_fraction": step_decoder_aux_applied_fraction / float(grad_accum_steps),
                 "data/decoder_aux_weight_mean": step_decoder_aux_weight_mean / float(grad_accum_steps),
                 "conditioning/live_enabled": 1.0 if conditioning_big_vae is not None else 0.0,
+                "conditioning/layer_type_enabled": 1.0 if prior_cfg.use_layer_type_conditioning else 0.0,
+                "conditioning/layer_depth_enabled": 1.0 if prior_cfg.use_layer_depth_conditioning else 0.0,
                 "conditioning/offline_alignment_mse": step_live_cond_alignment / float(grad_accum_steps),
                 "latent/clean_std": step_clean_std / float(grad_accum_steps),
                 "latent/pred_std": step_pred_std / float(grad_accum_steps),
