@@ -18,6 +18,9 @@ ADAM_EPS="1e-10"
 LATENT_LR_SCHEDULER="cosine_decay_to_floor"
 LATENT_LR_FLOOR_RATIO="1.0"
 LATENT_LR_DECAY_STEPS="700"
+LATENT_DEBUG_LOG_DELTAS="true"
+LATENT_DEBUG_JACOBIAN_EPS="1e-3"
+LATENT_DEBUG_JACOBIAN_PROBES="16"
 
 : "${BIG_VAE_CHECKPOINT:?Edit BIG_VAE_CHECKPOINT in this script before running}"
 : "${BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT:?Edit BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT in this script before running}"
@@ -51,4 +54,7 @@ run_python \
   "vit_latent_scaling.big_vae_init_calibration_batches=$BIG_VAE_INIT_CALIBRATION_BATCHES" \
   "vit_latent_scaling.latent_lr_scheduler=$LATENT_LR_SCHEDULER" \
   "vit_latent_scaling.latent_lr_floor_ratio=$LATENT_LR_FLOOR_RATIO" \
-  "vit_latent_scaling.latent_lr_decay_steps=$LATENT_LR_DECAY_STEPS"
+  "vit_latent_scaling.latent_lr_decay_steps=$LATENT_LR_DECAY_STEPS" \
+  "vit_latent_scaling.latent_debug_log_deltas=$LATENT_DEBUG_LOG_DELTAS" \
+  "vit_latent_scaling.latent_debug_jacobian_eps=$LATENT_DEBUG_JACOBIAN_EPS" \
+  "vit_latent_scaling.latent_debug_jacobian_probes=$LATENT_DEBUG_JACOBIAN_PROBES"
