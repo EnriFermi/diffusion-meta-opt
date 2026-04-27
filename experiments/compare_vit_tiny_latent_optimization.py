@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, Subset
 
 from models.weight_quantile_vae import BigWeightVAE
 from training.big_vae_latent_diffusion import (
+    load_distribution_encoder_state_from_latent_diffusion_prior_checkpoint,
     load_frozen_big_vae_from_checkpoint,
     load_frozen_layer_latent_diffusion_prior,
 )
@@ -1626,6 +1627,16 @@ def main() -> None:
                 cfg.big_vae_diffusion_prior_checkpoint,
                 device=device,
             )
+            if big_vae_decoder is not None:
+                loaded_dist_encoder = load_distribution_encoder_state_from_latent_diffusion_prior_checkpoint(
+                    cfg.big_vae_diffusion_prior_checkpoint,
+                    big_vae=big_vae_decoder,
+                )
+                if loaded_dist_encoder:
+                    print(
+                        "[bigvae_latent] loaded finetuned distribution encoder state from latent diffusion prior checkpoint",
+                        flush=True,
+                    )
 
     summaries = []
     for setup in setups:

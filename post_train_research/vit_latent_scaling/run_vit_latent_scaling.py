@@ -32,7 +32,10 @@ from experiments.compare_vit_tiny_latent_optimization import (
     seed_everything,
 )
 from models.weight_quantile_vae import BigWeightVAE
-from training.big_vae_latent_diffusion import load_frozen_layer_latent_diffusion_prior
+from training.big_vae_latent_diffusion import (
+    load_distribution_encoder_state_from_latent_diffusion_prior_checkpoint,
+    load_frozen_layer_latent_diffusion_prior,
+)
 
 
 MNIST_MEAN = (0.1307,)
@@ -394,6 +397,16 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                 cfg.big_vae_diffusion_prior_checkpoint,
                 device=device,
             )
+            if big_vae_decoder is not None:
+                loaded_dist_encoder = load_distribution_encoder_state_from_latent_diffusion_prior_checkpoint(
+                    cfg.big_vae_diffusion_prior_checkpoint,
+                    big_vae=big_vae_decoder,
+                )
+                if loaded_dist_encoder:
+                    print(
+                        "[latent] loaded finetuned distribution encoder state from latent diffusion prior checkpoint",
+                        flush=True,
+                    )
 
     model = build_model(
         cfg,

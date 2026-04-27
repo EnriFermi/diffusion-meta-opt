@@ -39,6 +39,10 @@ train:
   checkpoint_every: 5000
   log_every: 100
   checkpoint_dir: artifacts/training/checkpoints/big_vae_latent_diffusion_prior
+  distribution_encoder_finetune:
+    enabled: false
+    lr: ${train.lr}
+    weight_decay: ${train.weight_decay}
   dataset:
     root_dir: ${latent_diffusion_dataset.root_dir}
     shuffle_chunks: true
