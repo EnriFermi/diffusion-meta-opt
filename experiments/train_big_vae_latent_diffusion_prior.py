@@ -604,7 +604,9 @@ def main(cfg: DictConfig) -> None:
     _promote_run_profile_to_root(cfg)
     artifacts = configure_per_run_artifacts(cfg, run_label="train_big_vae_latent_diffusion_prior")
     with open_dict(cfg):
-        cfg.train.checkpoint_dir = str(Path(artifacts["root_dir"]) / "checkpoints" / "big_vae_latent_diffusion_prior")
+        cfg.train.checkpoint_dir = str(
+            Path(str(cfg.training_artifacts.base_root_dir)) / "checkpoints" / "big_vae_latent_diffusion_prior"
+        )
 
     log_path = configure_process_logging(cfg=cfg, role="train_big_vae_latent_diffusion_prior", rank=0, force=True)
     logger = LOGGER
