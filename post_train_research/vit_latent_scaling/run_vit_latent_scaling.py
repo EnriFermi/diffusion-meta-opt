@@ -67,7 +67,7 @@ class ScalingRunConfig:
     lr: float
     latent_lr_scheduler: str
     latent_lr_floor_ratio: float
-    latent_lr_decay_fraction: float
+    latent_lr_decay_steps: int
     weight_decay: float
     adam_beta1: float
     adam_beta2: float
@@ -119,8 +119,8 @@ def validate_scaling_run_config(cfg: ScalingRunConfig) -> None:
         )
     if not (0.0 < float(cfg.latent_lr_floor_ratio) <= 1.0):
         raise ValueError("--latent-lr-floor-ratio must be in the interval (0, 1]")
-    if not (0.0 < float(cfg.latent_lr_decay_fraction) <= 1.0):
-        raise ValueError("--latent-lr-decay-fraction must be in the interval (0, 1]")
+    if int(cfg.latent_lr_decay_steps) <= 0:
+        raise ValueError("--latent-lr-decay-steps must be a positive integer")
     if str(cfg.dataset).strip().lower() == "imagenet" and bool(cfg.download):
         cfg.download = False
 
@@ -204,8 +204,8 @@ def build_lr_scheduler(
         raise ValueError(f"Unsupported latent lr scheduler: {cfg.latent_lr_scheduler}")
 
     floor_ratio = float(cfg.latent_lr_floor_ratio)
-    decay_fraction = float(cfg.latent_lr_decay_fraction)
-    decay_steps = max(1, min(int(planned_train_steps), math.ceil(float(planned_train_steps) * decay_fraction)))
+    configured_decay_steps = int(cfg.latent_lr_decay_steps)
+    decay_steps = max(1, min(int(planned_train_steps), configured_decay_steps))
 
     def _lr_lambda(step_index: int) -> float:
         progress = min(1.0, max(0.0, float(step_index) / float(decay_steps)))
@@ -216,7 +216,7 @@ def build_lr_scheduler(
     description = (
         "cosine_decay_to_floor("
         f"floor_ratio={floor_ratio:g}, "
-        f"decay_fraction={decay_fraction:g}, "
+        f"configured_decay_steps={configured_decay_steps}, "
         f"decay_steps={decay_steps}/{int(planned_train_steps)})"
     )
     return scheduler, description
@@ -685,7 +685,7 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         "final_lr": float(optimizer.param_groups[0]["lr"]),
         "latent_lr_scheduler": str(cfg.latent_lr_scheduler),
         "latent_lr_floor_ratio": float(cfg.latent_lr_floor_ratio),
-        "latent_lr_decay_fraction": float(cfg.latent_lr_decay_fraction),
+        "latent_lr_decay_steps": int(cfg.latent_lr_decay_steps),
         "lr_schedule": str(lr_schedule_description),
         "weight_decay": float(cfg.latent_weight_decay if cfg.setup == "latent" else cfg.weight_decay),
         "trainable_params": int(trainable_params),
@@ -735,7 +735,7 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         default="cosine_decay_to_floor",
     )
     parser.add_argument("--latent-lr-floor-ratio", type=float, default=0.1)
-    parser.add_argument("--latent-lr-decay-fraction", type=float, default=0.7)
+    parser.add_argument("--latent-lr-decay-steps", type=int, default=5250)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--latent-weight-decay", type=float, default=0.0)
     parser.add_argument("--adam-beta1", type=float, default=0.9)
@@ -802,7 +802,7 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         lr=float(args.lr),
         latent_lr_scheduler=str(args.latent_lr_scheduler),
         latent_lr_floor_ratio=float(args.latent_lr_floor_ratio),
-        latent_lr_decay_fraction=float(args.latent_lr_decay_fraction),
+        latent_lr_decay_steps=int(args.latent_lr_decay_steps),
         weight_decay=float(args.weight_decay),
         adam_beta1=float(args.adam_beta1),
         adam_beta2=float(args.adam_beta2),
