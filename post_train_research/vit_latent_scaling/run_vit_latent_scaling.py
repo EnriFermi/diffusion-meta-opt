@@ -89,6 +89,7 @@ class ScalingRunConfig:
     big_vae_encoder_context_rows: int
     big_vae_encoder_context_std: float
     big_vae_encoder_batch_size: int
+    big_vae_init_calibration_batches: int
     latent_weight_decay: float
     raw_init_steps: int
 
@@ -380,6 +381,20 @@ def build_model(
     )
 
 
+def collect_calibration_images(train_loader: DataLoader, *, num_batches: int) -> torch.Tensor | None:
+    batch_limit = max(0, int(num_batches))
+    if batch_limit <= 0:
+        return None
+    images: list[torch.Tensor] = []
+    for batch_idx, (batch_images, _batch_labels) in enumerate(train_loader):
+        images.append(batch_images.detach().cpu())
+        if batch_idx + 1 >= batch_limit:
+            break
+    if not images:
+        return None
+    return torch.cat(images, dim=0).contiguous()
+
+
 def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
     output_dir = Path(cfg.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -394,6 +409,18 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
 
     seed_everything(int(cfg.seed))
     train_loader, test_loader = build_loaders(cfg, device, vit_cfg)
+    calibration_images = None
+    if cfg.setup == "latent" and str(cfg.big_vae_latent_init).strip().lower() == "diffusion_prior":
+        calibration_images = collect_calibration_images(
+            train_loader,
+            num_batches=int(cfg.big_vae_init_calibration_batches),
+        )
+        if calibration_images is None:
+            raise RuntimeError("failed to collect calibration images for diffusion_prior initialization")
+        print(
+            f"[latent] collected {int(calibration_images.shape[0])} calibration images for autoregressive diffusion prior init",
+            flush=True,
+        )
 
     init_checkpoint_steps = 0
     if cfg.setup == "latent":
@@ -438,6 +465,11 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         big_vae_decoder=big_vae_decoder,
         big_vae_diffusion_prior=big_vae_diffusion_prior,
     ).to(device)
+    if cfg.setup == "latent" and str(cfg.big_vae_latent_init).strip().lower() == "diffusion_prior":
+        target_model = getattr(model, "_orig_mod", model)
+        if not hasattr(target_model, "initialize_bigvae_diffusion_prior"):
+            raise TypeError("diffusion_prior init requires FunctionalViTTiny.initialize_bigvae_diffusion_prior")
+        target_model.initialize_bigvae_diffusion_prior(calibration_images)
     if bool(cfg.compile):
         model = torch.compile(model)
 
@@ -659,6 +691,7 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
     parser.add_argument("--big-vae-encoder-context-rows", type=int, default=64)
     parser.add_argument("--big-vae-encoder-context-std", type=float, default=1.0)
     parser.add_argument("--big-vae-encoder-batch-size", type=int, default=16)
+    parser.add_argument("--big-vae-init-calibration-batches", type=int, default=1)
     parser.add_argument("--raw-init-steps", type=int, default=0)
 
     parser.add_argument("--image-size", type=int, required=True)
@@ -717,6 +750,7 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         big_vae_encoder_context_rows=int(args.big_vae_encoder_context_rows),
         big_vae_encoder_context_std=float(args.big_vae_encoder_context_std),
         big_vae_encoder_batch_size=int(args.big_vae_encoder_batch_size),
+        big_vae_init_calibration_batches=int(args.big_vae_init_calibration_batches),
         latent_weight_decay=float(args.latent_weight_decay),
         raw_init_steps=int(args.raw_init_steps),
     )

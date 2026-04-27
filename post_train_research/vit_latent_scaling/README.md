@@ -141,6 +141,7 @@ OUTPUT_ROOT
 RAW_CHECKPOINT
 BIG_VAE_CHECKPOINT
 BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT
+BIG_VAE_INIT_CALIBRATION_BATCHES
 ```
 
 For the fair from-scratch comparison, use:
@@ -152,6 +153,7 @@ run_vit_latent_scaling_ae_diffusion_prior.sh
 ```
 
 `RAW_CHECKPOINT` is only needed by the optional `ae_encoded` path, because that mode initializes latents by encoding an already existing raw ViT solution.
+`BIG_VAE_INIT_CALIBRATION_BATCHES` controls how many train batches are used to build real activation contexts for autoregressive diffusion-prior initialization.
 
 By default the Hydra runner and these wrappers write outputs under:
 

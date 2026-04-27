@@ -66,6 +66,7 @@ def build_vit_latent_scaling_configs(cfg: DictConfig) -> tuple[ScalingRunConfig,
         big_vae_encoder_context_rows=int(run_cfg_raw.get("big_vae_encoder_context_rows", 64)),
         big_vae_encoder_context_std=float(run_cfg_raw.get("big_vae_encoder_context_std", 1.0)),
         big_vae_encoder_batch_size=int(run_cfg_raw.get("big_vae_encoder_batch_size", 16)),
+        big_vae_init_calibration_batches=int(run_cfg_raw.get("big_vae_init_calibration_batches", 1)),
         latent_weight_decay=float(run_cfg_raw.get("latent_weight_decay", 0.0)),
         raw_init_steps=int(run_cfg_raw.get("raw_init_steps", 0)),
     )

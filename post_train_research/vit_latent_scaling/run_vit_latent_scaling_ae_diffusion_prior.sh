@@ -10,6 +10,7 @@ PRESET="cifar10_small"
 OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
 BIG_VAE_CHECKPOINT=""
 BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT=""
+BIG_VAE_INIT_CALIBRATION_BATCHES="1"
 
 : "${BIG_VAE_CHECKPOINT:?Edit BIG_VAE_CHECKPOINT in this script before running}"
 : "${BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT:?Edit BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT in this script before running}"
@@ -35,4 +36,5 @@ run_python \
   "vit_latent_scaling/preset=$PRESET" \
   "vit_latent_scaling.output_root=$OUTPUT_ROOT" \
   "vit_latent_scaling.big_vae_checkpoint=$BIG_VAE_CHECKPOINT" \
-  "vit_latent_scaling.big_vae_diffusion_prior_checkpoint=$BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT"
+  "vit_latent_scaling.big_vae_diffusion_prior_checkpoint=$BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT" \
+  "vit_latent_scaling.big_vae_init_calibration_batches=$BIG_VAE_INIT_CALIBRATION_BATCHES"
