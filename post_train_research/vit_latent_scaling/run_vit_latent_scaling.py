@@ -81,6 +81,9 @@ class ScalingRunConfig:
     latent_lr_scheduler: str
     latent_lr_floor_ratio: float
     latent_lr_decay_steps: int
+    latent_debug_log_deltas: bool
+    latent_debug_jacobian_eps: float
+    latent_debug_jacobian_probes: int
     weight_decay: float
     adam_beta1: float
     adam_beta2: float
@@ -139,6 +142,10 @@ def validate_scaling_run_config(cfg: ScalingRunConfig) -> None:
         raise ValueError("--latent-lr-floor-ratio must be in the interval (0, 1]")
     if latent_lr_scheduler == "cosine_decay_to_floor" and int(cfg.latent_lr_decay_steps) <= 0:
         raise ValueError("--latent-lr-decay-steps must be a positive integer")
+    if float(cfg.latent_debug_jacobian_eps) <= 0.0:
+        raise ValueError("--latent-debug-jacobian-eps must be > 0")
+    if int(cfg.latent_debug_jacobian_probes) <= 0:
+        raise ValueError("--latent-debug-jacobian-probes must be a positive integer")
     if not str(cfg.optimizer_name).strip():
         raise ValueError("--optimizer-name must be non-empty")
     if not isinstance(cfg.optimizer_kwargs, dict):
@@ -280,6 +287,70 @@ def build_optimizer(
             )
     optimizer_kwargs.update(explicit_kwargs)
     return optimizer_cls(parameters, **optimizer_kwargs)
+
+
+def _sorted_latent_slot_keys(store: BigVAELatentTensorStore) -> list[str]:
+    return sorted(str(key) for key in store.latent_slots.keys())
+
+
+@torch.no_grad()
+def flatten_latent_slots(store: BigVAELatentTensorStore) -> torch.Tensor:
+    keys = _sorted_latent_slot_keys(store)
+    if not keys:
+        return torch.zeros(0, device=store.big_vae.latent_base.device, dtype=store.big_vae.latent_base.dtype)
+    return torch.cat([store.latent_slots[key].detach().reshape(-1) for key in keys], dim=0)
+
+
+@torch.no_grad()
+def load_flat_latent_slots_(store: BigVAELatentTensorStore, flat_latents: torch.Tensor) -> None:
+    keys = _sorted_latent_slot_keys(store)
+    offset = 0
+    for key in keys:
+        target = store.latent_slots[key]
+        numel = int(target.numel())
+        value = flat_latents[offset : offset + numel].view_as(target).to(device=target.device, dtype=target.dtype)
+        target.copy_(value)
+        offset += numel
+    if offset != int(flat_latents.numel()):
+        raise ValueError(
+            f"flat latent vector length mismatch: consumed {offset}, total {int(flat_latents.numel())}"
+        )
+
+
+@torch.no_grad()
+def flatten_decoded_bigvae_weights(store: BigVAELatentTensorStore) -> torch.Tensor:
+    decoded = store.decode_all_matrices()
+    if not decoded:
+        return torch.zeros(0, device=store.big_vae.latent_base.device, dtype=store.big_vae.latent_base.dtype)
+    return torch.cat([decoded[name].detach().reshape(-1) for name in sorted(decoded.keys())], dim=0)
+
+
+@torch.no_grad()
+def estimate_decoder_effective_jacobian_norm(
+    store: BigVAELatentTensorStore,
+    *,
+    eps: float,
+    num_probes: int,
+) -> dict[str, float]:
+    z0 = flatten_latent_slots(store)
+    if int(z0.numel()) == 0:
+        return {"mean": 0.0, "std": 0.0, "max": 0.0}
+    w0 = flatten_decoded_bigvae_weights(store)
+    norms: list[float] = []
+    tiny = torch.finfo(z0.dtype).tiny
+    for _ in range(int(num_probes)):
+        v = torch.randn_like(z0)
+        v = v / v.norm().clamp_min(tiny)
+        load_flat_latent_slots_(store, z0 + float(eps) * v)
+        w1 = flatten_decoded_bigvae_weights(store)
+        norms.append(float((w1 - w0).norm().item() / float(eps)))
+    load_flat_latent_slots_(store, z0)
+    values = np.asarray(norms, dtype=np.float64)
+    return {
+        "mean": float(values.mean()) if values.size else 0.0,
+        "std": float(values.std()) if values.size else 0.0,
+        "max": float(values.max()) if values.size else 0.0,
+    }
 
 
 def resolve_planned_train_steps(cfg: ScalingRunConfig, *, steps_per_epoch: int) -> int:
@@ -794,6 +865,22 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
             global_step += 1
             images = images.to(device=device, non_blocking=True)
             labels = labels.to(device=device, non_blocking=True)
+            max_steps = int(cfg.max_steps)
+            should_log = global_step == 1 or global_step % max(1, int(cfg.log_every_steps)) == 0
+            should_eval = global_step == 1 or global_step % max(1, int(cfg.eval_every_steps)) == 0
+            if max_steps > 0 and global_step >= max_steps:
+                should_eval = True
+            latent_debug_this_step = bool(
+                cfg.setup == "latent"
+                and isinstance(store, BigVAELatentTensorStore)
+                and bool(cfg.latent_debug_log_deltas)
+                and (should_log or should_eval)
+            )
+            pre_step_latent = None
+            pre_step_decoded = None
+            if latent_debug_this_step:
+                pre_step_latent = flatten_latent_slots(store)
+                pre_step_decoded = flatten_decoded_bigvae_weights(store)
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, bool(cfg.amp)):
@@ -816,12 +903,29 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
             batch_examples = int(labels.numel())
             train_loss_window += float(loss.detach().cpu().item()) * batch_examples
             train_count_window += batch_examples
-
-            should_log = global_step == 1 or global_step % max(1, int(cfg.log_every_steps)) == 0
-            should_eval = global_step == 1 or global_step % max(1, int(cfg.eval_every_steps)) == 0
-            max_steps = int(cfg.max_steps)
-            if max_steps > 0 and global_step >= max_steps:
-                should_eval = True
+            delta_z_norm = float("nan")
+            delta_w_norm = float("nan")
+            delta_w_over_delta_z = float("nan")
+            jacobian_fd_mean = float("nan")
+            jacobian_fd_std = float("nan")
+            jacobian_fd_max = float("nan")
+            if latent_debug_this_step:
+                assert pre_step_latent is not None and pre_step_decoded is not None
+                post_step_latent = flatten_latent_slots(store)
+                post_step_decoded = flatten_decoded_bigvae_weights(store)
+                delta_z_norm = float((post_step_latent - pre_step_latent).norm().item())
+                delta_w_norm = float((post_step_decoded - pre_step_decoded).norm().item())
+                delta_w_over_delta_z = float(
+                    delta_w_norm / max(delta_z_norm, torch.finfo(post_step_latent.dtype).tiny)
+                )
+                jacobian_stats = estimate_decoder_effective_jacobian_norm(
+                    store,
+                    eps=float(cfg.latent_debug_jacobian_eps),
+                    num_probes=int(cfg.latent_debug_jacobian_probes),
+                )
+                jacobian_fd_mean = float(jacobian_stats["mean"])
+                jacobian_fd_std = float(jacobian_stats["std"])
+                jacobian_fd_max = float(jacobian_stats["max"])
 
             if should_eval:
                 final_eval = evaluate(model, test_loader, device=device, amp_enabled=bool(cfg.amp))
@@ -851,15 +955,30 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                     "decoded_params": int(decoded_params),
                     "latent_params": int(latent_params),
                     "elapsed_s": float(elapsed_s),
+                    "delta_z_norm": float(delta_z_norm),
+                    "delta_w_norm": float(delta_w_norm),
+                    "delta_w_over_delta_z": float(delta_w_over_delta_z),
+                    "decoder_jacobian_fd_mean": float(jacobian_fd_mean),
+                    "decoder_jacobian_fd_std": float(jacobian_fd_std),
+                    "decoder_jacobian_fd_max": float(jacobian_fd_max),
                 }
                 append_csv_row(metrics_path, row)
-                print(
+                message = (
                     f"[{cfg.setup}] step={global_step} total_step={total_steps_with_raw_init} "
                     f"epoch={epoch_idx + 1} lr={step_lr:.6g} train_loss={avg_train_loss:.4f} "
                     f"test_loss={final_eval.loss:.4f} test_acc={final_eval.accuracy:.4f} "
-                    f"best={best_accuracy:.4f}",
-                    flush=True,
+                    f"best={best_accuracy:.4f}"
                 )
+                if latent_debug_this_step:
+                    message += (
+                        f" ||Δz||={delta_z_norm:.6e}"
+                        f" ||ΔW||={delta_w_norm:.6e}"
+                        f" ||ΔW||/||Δz||={delta_w_over_delta_z:.6e}"
+                        f" J_fd_mean={jacobian_fd_mean:.6e}"
+                        f" J_fd_std={jacobian_fd_std:.6e}"
+                        f" J_fd_max={jacobian_fd_max:.6e}"
+                    )
+                print(message, flush=True)
                 train_loss_window = 0.0
                 train_count_window = 0
 
@@ -925,6 +1044,9 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         "latent_lr_scheduler": str(cfg.latent_lr_scheduler),
         "latent_lr_floor_ratio": float(cfg.latent_lr_floor_ratio),
         "latent_lr_decay_steps": int(cfg.latent_lr_decay_steps),
+        "latent_debug_log_deltas": bool(cfg.latent_debug_log_deltas),
+        "latent_debug_jacobian_eps": float(cfg.latent_debug_jacobian_eps),
+        "latent_debug_jacobian_probes": int(cfg.latent_debug_jacobian_probes),
         "lr_schedule": str(lr_schedule_description),
         "weight_decay": float(cfg.latent_weight_decay if cfg.setup == "latent" else cfg.weight_decay),
         "trainable_params": int(trainable_params),
@@ -983,6 +1105,9 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
     )
     parser.add_argument("--latent-lr-floor-ratio", type=float, default=0.1)
     parser.add_argument("--latent-lr-decay-steps", type=int, default=5250)
+    parser.add_argument("--latent-debug-log-deltas", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--latent-debug-jacobian-eps", type=float, default=1e-3)
+    parser.add_argument("--latent-debug-jacobian-probes", type=int, default=16)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--latent-weight-decay", type=float, default=0.0)
     parser.add_argument("--adam-beta1", type=float, default=0.9)
@@ -1053,6 +1178,9 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         latent_lr_scheduler=str(args.latent_lr_scheduler),
         latent_lr_floor_ratio=float(args.latent_lr_floor_ratio),
         latent_lr_decay_steps=int(args.latent_lr_decay_steps),
+        latent_debug_log_deltas=bool(args.latent_debug_log_deltas),
+        latent_debug_jacobian_eps=float(args.latent_debug_jacobian_eps),
+        latent_debug_jacobian_probes=int(args.latent_debug_jacobian_probes),
         weight_decay=float(args.weight_decay),
         adam_beta1=float(args.adam_beta1),
         adam_beta2=float(args.adam_beta2),

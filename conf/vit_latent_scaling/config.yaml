@@ -33,6 +33,9 @@ vit_latent_scaling:
   latent_lr_scheduler: cosine_decay_to_floor
   latent_lr_floor_ratio: 0.1
   latent_lr_decay_steps: 5250
+  latent_debug_log_deltas: false
+  latent_debug_jacobian_eps: 1e-3
+  latent_debug_jacobian_probes: 16
   weight_decay: 0.05
   latent_weight_decay: 0.0
   adam_beta1: 0.9
