@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
 import sys
 import time
@@ -64,6 +65,9 @@ class ScalingRunConfig:
     train_subset: int
     test_subset: int
     lr: float
+    latent_lr_scheduler: str
+    latent_lr_floor_ratio: float
+    latent_lr_decay_fraction: float
     weight_decay: float
     adam_beta1: float
     adam_beta2: float
@@ -108,6 +112,15 @@ def validate_scaling_run_config(cfg: ScalingRunConfig) -> None:
             raise ValueError(
                 "--big-vae-diffusion-prior-checkpoint is required when --big-vae-latent-init=diffusion_prior"
             )
+    latent_lr_scheduler = str(cfg.latent_lr_scheduler).strip().lower()
+    if latent_lr_scheduler not in {"constant", "cosine_decay_to_floor"}:
+        raise ValueError(
+            "--latent-lr-scheduler must be one of {'constant', 'cosine_decay_to_floor'}"
+        )
+    if not (0.0 < float(cfg.latent_lr_floor_ratio) <= 1.0):
+        raise ValueError("--latent-lr-floor-ratio must be in the interval (0, 1]")
+    if not (0.0 < float(cfg.latent_lr_decay_fraction) <= 1.0):
+        raise ValueError("--latent-lr-decay-fraction must be in the interval (0, 1]")
     if str(cfg.dataset).strip().lower() == "imagenet" and bool(cfg.download):
         cfg.download = False
 
@@ -169,6 +182,44 @@ def build_optimizer(
         eps=float(cfg.adam_eps),
         weight_decay=weight_decay,
     )
+
+
+def resolve_planned_train_steps(cfg: ScalingRunConfig, *, steps_per_epoch: int) -> int:
+    if int(cfg.max_steps) > 0:
+        return max(1, int(cfg.max_steps))
+    return max(1, int(cfg.epochs) * max(1, int(steps_per_epoch)))
+
+
+def build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    cfg: ScalingRunConfig,
+    setup: str,
+    planned_train_steps: int,
+) -> tuple[torch.optim.lr_scheduler.LRScheduler | None, str]:
+    scheduler_name = str(cfg.latent_lr_scheduler).strip().lower()
+    if str(setup).strip().lower() != "latent" or scheduler_name == "constant":
+        return None, "constant"
+    if scheduler_name != "cosine_decay_to_floor":
+        raise ValueError(f"Unsupported latent lr scheduler: {cfg.latent_lr_scheduler}")
+
+    floor_ratio = float(cfg.latent_lr_floor_ratio)
+    decay_fraction = float(cfg.latent_lr_decay_fraction)
+    decay_steps = max(1, min(int(planned_train_steps), math.ceil(float(planned_train_steps) * decay_fraction)))
+
+    def _lr_lambda(step_index: int) -> float:
+        progress = min(1.0, max(0.0, float(step_index) / float(decay_steps)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return float(floor_ratio + (1.0 - floor_ratio) * cosine)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+    description = (
+        "cosine_decay_to_floor("
+        f"floor_ratio={floor_ratio:g}, "
+        f"decay_fraction={decay_fraction:g}, "
+        f"decay_steps={decay_steps}/{int(planned_train_steps)})"
+    )
+    return scheduler, description
 
 
 def maybe_subset(dataset: Any, limit: int) -> Any:
@@ -477,6 +528,13 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
     store = getattr(target, "store")
     trainable_parameters = [param for param in model.parameters() if param.requires_grad]
     optimizer = build_optimizer(trainable_parameters, cfg=cfg, setup=str(cfg.setup))
+    planned_train_steps = resolve_planned_train_steps(cfg, steps_per_epoch=len(train_loader))
+    lr_scheduler, lr_schedule_description = build_lr_scheduler(
+        optimizer,
+        cfg=cfg,
+        setup=str(cfg.setup),
+        planned_train_steps=planned_train_steps,
+    )
     scaler = torch.amp.GradScaler(device.type, enabled=(device.type == "cuda" and bool(cfg.amp)))
 
     trainable_params = count_trainable_parameters(model)
@@ -485,7 +543,8 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
     decoded_big_vae_params = store.big_vae_decoded_numel() if isinstance(store, BigVAELatentTensorStore) else 0
     tile_count = store.decoded_tile_count() if isinstance(store, BigVAELatentTensorStore) else 0
     print(
-        f"[{cfg.setup}] dataset={cfg.dataset} model={cfg.model_size} lr={float(cfg.lr):g} "
+        f"[{cfg.setup}] dataset={cfg.dataset} model={cfg.model_size} base_lr={float(cfg.lr):g} "
+        f"lr_schedule={lr_schedule_description} "
         f"trainable_params={trainable_params} decoded_params={decoded_params} "
         f"latent_params={latent_params} bigvae_decoded_params={decoded_big_vae_params} tiles={tile_count}",
         flush=True,
@@ -522,6 +581,9 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                 torch.nn.utils.clip_grad_norm_(trainable_parameters, float(cfg.grad_clip_norm))
             scaler.step(optimizer)
             scaler.update()
+            step_lr = float(optimizer.param_groups[0]["lr"])
+            if lr_scheduler is not None:
+                lr_scheduler.step()
 
             batch_examples = int(labels.numel())
             train_loss_window += float(loss.detach().cpu().item()) * batch_examples
@@ -546,7 +608,8 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                     "dataset": str(cfg.dataset),
                     "model_size": str(cfg.model_size),
                     "setup": str(cfg.setup),
-                    "lr": float(cfg.lr),
+                    "lr": float(step_lr),
+                    "base_lr": float(cfg.lr),
                     "step": int(global_step),
                     "total_steps_with_raw_init": int(total_steps_with_raw_init),
                     "epoch": int(epoch_idx + 1),
@@ -562,7 +625,7 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                 append_csv_row(metrics_path, row)
                 print(
                     f"[{cfg.setup}] step={global_step} total_step={total_steps_with_raw_init} "
-                    f"epoch={epoch_idx + 1} train_loss={avg_train_loss:.4f} "
+                    f"epoch={epoch_idx + 1} lr={step_lr:.6g} train_loss={avg_train_loss:.4f} "
                     f"test_loss={final_eval.loss:.4f} test_acc={final_eval.accuracy:.4f} "
                     f"best={best_accuracy:.4f}",
                     flush=True,
@@ -618,7 +681,12 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         "final_test_accuracy": float(final_eval.accuracy),
         "best_test_accuracy": float(best_accuracy),
         "best_step": int(best_step),
-        "lr": float(cfg.lr),
+        "base_lr": float(cfg.lr),
+        "final_lr": float(optimizer.param_groups[0]["lr"]),
+        "latent_lr_scheduler": str(cfg.latent_lr_scheduler),
+        "latent_lr_floor_ratio": float(cfg.latent_lr_floor_ratio),
+        "latent_lr_decay_fraction": float(cfg.latent_lr_decay_fraction),
+        "lr_schedule": str(lr_schedule_description),
         "weight_decay": float(cfg.latent_weight_decay if cfg.setup == "latent" else cfg.weight_decay),
         "trainable_params": int(trainable_params),
         "decoded_params": int(decoded_params),
@@ -661,6 +729,13 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
     parser.add_argument("--train-subset", type=int, default=0)
     parser.add_argument("--test-subset", type=int, default=0)
     parser.add_argument("--lr", type=float, required=True)
+    parser.add_argument(
+        "--latent-lr-scheduler",
+        choices=("constant", "cosine_decay_to_floor"),
+        default="cosine_decay_to_floor",
+    )
+    parser.add_argument("--latent-lr-floor-ratio", type=float, default=0.1)
+    parser.add_argument("--latent-lr-decay-fraction", type=float, default=0.7)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--latent-weight-decay", type=float, default=0.0)
     parser.add_argument("--adam-beta1", type=float, default=0.9)
@@ -725,6 +800,9 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         train_subset=int(args.train_subset),
         test_subset=int(args.test_subset),
         lr=float(args.lr),
+        latent_lr_scheduler=str(args.latent_lr_scheduler),
+        latent_lr_floor_ratio=float(args.latent_lr_floor_ratio),
+        latent_lr_decay_fraction=float(args.latent_lr_decay_fraction),
         weight_decay=float(args.weight_decay),
         adam_beta1=float(args.adam_beta1),
         adam_beta2=float(args.adam_beta2),

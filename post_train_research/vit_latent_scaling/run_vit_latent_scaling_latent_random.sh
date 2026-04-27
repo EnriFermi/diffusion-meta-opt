@@ -9,6 +9,9 @@ CONDA_ENV_NAME="onerec"
 PRESET="cifar10_small"
 OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
 BIG_VAE_CHECKPOINT=""
+LATENT_LR_SCHEDULER="cosine_decay_to_floor"
+LATENT_LR_FLOOR_RATIO="0.1"
+LATENT_LR_DECAY_FRACTION="0.7"
 
 : "${BIG_VAE_CHECKPOINT:?Edit BIG_VAE_CHECKPOINT in this script before running}"
 
@@ -32,4 +35,7 @@ run_python \
   --config-name vit_latent_scaling/config_latent_random \
   "vit_latent_scaling/preset=$PRESET" \
   "vit_latent_scaling.output_root=$OUTPUT_ROOT" \
-  "vit_latent_scaling.big_vae_checkpoint=$BIG_VAE_CHECKPOINT"
+  "vit_latent_scaling.big_vae_checkpoint=$BIG_VAE_CHECKPOINT" \
+  "vit_latent_scaling.latent_lr_scheduler=$LATENT_LR_SCHEDULER" \
+  "vit_latent_scaling.latent_lr_floor_ratio=$LATENT_LR_FLOOR_RATIO" \
+  "vit_latent_scaling.latent_lr_decay_fraction=$LATENT_LR_DECAY_FRACTION"
