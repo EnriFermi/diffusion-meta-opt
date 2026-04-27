@@ -1,0 +1,8 @@
+# @package _global_
+
+vit_latent_scaling:
+  setup: latent
+  setup_name: ae_encoded
+  big_vae_latent_init: encoded
+  require_big_vae_checkpoint: true
+  require_diffusion_prior_checkpoint: false

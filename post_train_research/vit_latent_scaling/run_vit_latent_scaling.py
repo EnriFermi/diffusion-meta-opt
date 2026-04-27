@@ -93,6 +93,23 @@ class ScalingRunConfig:
     raw_init_steps: int
 
 
+def validate_scaling_run_config(cfg: ScalingRunConfig) -> None:
+    setup = str(cfg.setup).strip().lower()
+    if setup == "latent":
+        if not str(cfg.raw_checkpoint).strip():
+            raise ValueError("--raw-checkpoint is required for setup=latent")
+        if not str(cfg.big_vae_checkpoint).strip():
+            raise ValueError("--big-vae-checkpoint is required for setup=latent")
+        if str(cfg.big_vae_latent_init).strip().lower() == "diffusion_prior" and not str(
+            cfg.big_vae_diffusion_prior_checkpoint
+        ).strip():
+            raise ValueError(
+                "--big-vae-diffusion-prior-checkpoint is required when --big-vae-latent-init=diffusion_prior"
+            )
+    if str(cfg.dataset).strip().lower() == "imagenet" and bool(cfg.download):
+        cfg.download = False
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -651,19 +668,6 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
 
     args = parser.parse_args()
     setup = str(args.setup).strip().lower()
-    if setup == "latent":
-        if not str(args.raw_checkpoint).strip():
-            raise ValueError("--raw-checkpoint is required for setup=latent")
-        if not str(args.big_vae_checkpoint).strip():
-            raise ValueError("--big-vae-checkpoint is required for setup=latent")
-        if str(args.big_vae_latent_init).strip().lower() == "diffusion_prior" and not str(
-            args.big_vae_diffusion_prior_checkpoint
-        ).strip():
-            raise ValueError(
-                "--big-vae-diffusion-prior-checkpoint is required when --big-vae-latent-init=diffusion_prior"
-            )
-    if str(args.dataset).strip().lower() == "imagenet" and bool(args.download):
-        args.download = False
 
     run_cfg = ScalingRunConfig(
         output_dir=str(args.output_dir),
@@ -710,6 +714,7 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         latent_weight_decay=float(args.latent_weight_decay),
         raw_init_steps=int(args.raw_init_steps),
     )
+    validate_scaling_run_config(run_cfg)
     vit_cfg = ViTTinyConfig(
         image_size=int(args.image_size),
         patch_size=int(args.patch_size),

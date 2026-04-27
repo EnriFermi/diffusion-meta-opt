@@ -1,0 +1,21 @@
+# @package _global_
+
+vit_latent_scaling:
+  dataset: cifar10
+  model_size: tiny
+  data_dir: ${oc.env:CIFAR10_DATA_DIR,./data/cifar10}
+  epochs: 30
+  max_steps: 5000
+  batch_size: 128
+  eval_batch_size: 256
+  num_workers: 4
+  eval_every_steps: 250
+vit_model:
+  image_size: 32
+  patch_size: 4
+  in_channels: 3
+  num_classes: 10
+  hidden_dim: 192
+  depth: 6
+  num_heads: 3
+  mlp_ratio: 4.0

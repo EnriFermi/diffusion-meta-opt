@@ -1,0 +1,3 @@
+defaults:
+  - config_vit_latent_scaling
+  - override /vit_latent_scaling/setup: raw

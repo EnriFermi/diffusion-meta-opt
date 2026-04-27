@@ -1,0 +1,66 @@
+defaults:
+  - /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
+  - _self_
+  - vit_latent_scaling/preset: cifar10_small
+  - vit_latent_scaling/setup: ae_encoded
+
+hydra:
+  job:
+    name: run_vit_latent_scaling
+
+vit_latent_scaling:
+  output_root: ${training_artifacts.base_root_dir}/post_train_research/vit_latent_scaling
+  experiment_name: ${vit_latent_scaling.setup_name}
+  output_dir: ${vit_latent_scaling.output_root}/${vit_latent_scaling.dataset}/${vit_latent_scaling.model_size}/${vit_latent_scaling.experiment_name}
+  dataset: cifar10
+  model_size: small
+  data_dir: ${oc.env:CIFAR10_DATA_DIR,./data/cifar10}
+  download: true
+  device: ${oc.env:DEVICE,auto}
+  seed: 42
+  epochs: 30
+  max_steps: 7500
+  batch_size: 128
+  eval_batch_size: 256
+  num_workers: 4
+  train_subset: 0
+  test_subset: 0
+  lr: 1e-3
+  weight_decay: 0.05
+  latent_weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 1e-8
+  label_smoothing: 0.0
+  grad_clip_norm: 0.0
+  amp: true
+  tf32: true
+  compile: false
+  log_every_steps: 50
+  eval_every_steps: 375
+  save_checkpoints: true
+  raw_checkpoint: ${oc.env:RAW_VIT_CHECKPOINT,""}
+  big_vae_checkpoint: ${oc.env:BIG_VAE_CHECKPOINT,""}
+  big_vae_diffusion_prior_checkpoint: ${oc.env:BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT,""}
+  big_vae_diffusion_prior_steps: 50
+  big_vae_diffusion_prior_sampler: ddim
+  big_vae_diffusion_prior_eta: 0.0
+  big_vae_decode: all
+  big_vae_tile_T_patches: 16
+  big_vae_tile_d_out: 8
+  big_vae_encoder_context_rows: 64
+  big_vae_encoder_context_std: 1.0
+  big_vae_encoder_batch_size: 16
+  raw_init_steps: 0
+
+vit_model:
+  image_size: 32
+  patch_size: 4
+  in_channels: 3
+  num_classes: 10
+  hidden_dim: 256
+  depth: 8
+  num_heads: 4
+  mlp_ratio: 4.0
+  dropout: 0.0
+  attention_dropout: 0.0
