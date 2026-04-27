@@ -278,6 +278,7 @@ class BigVAELatentTensorStore(nn.Module):
         *,
         big_vae: BigWeightVAE,
         latent_init: str,
+        latent_space: str | None = None,
         latent_noise_std: float,
         decode_policy: str,
         tile_T_patches: int,
@@ -321,7 +322,17 @@ class BigVAELatentTensorStore(nn.Module):
         self.latent_slots = nn.ParameterDict()
         self.direct_tensors = nn.ModuleDict()
         self.latent_init_mode = init_mode
-        self.latent_space = "decoder_z" if init_mode == "diffusion_prior" else "encoder_slots"
+        resolved_latent_space = str(latent_space).strip().lower() if latent_space is not None else ""
+        if not resolved_latent_space:
+            resolved_latent_space = "decoder_z" if init_mode == "diffusion_prior" else "encoder_slots"
+        if resolved_latent_space not in {"encoder_slots", "decoder_z"}:
+            raise ValueError(
+                "latent_space must be one of {'encoder_slots', 'decoder_z'}, "
+                f"got {latent_space!r}"
+            )
+        if init_mode == "diffusion_prior" and resolved_latent_space != "decoder_z":
+            raise ValueError("big_vae_latent_init='diffusion_prior' requires latent_space='decoder_z'")
+        self.latent_space = resolved_latent_space
         self.patch_size = int(self.big_vae.cfg.patch_size)
         self.tile_T_patches = int(tile_T_patches)
         self.tile_d_in = int(self.patch_size) * int(self.tile_T_patches)
@@ -962,6 +973,7 @@ class FunctionalViTTiny(nn.Module):
         latent_factor_init_std: float = 0.02,
         big_vae: BigWeightVAE | None = None,
         big_vae_latent_init: str = "random",
+        big_vae_latent_space: str | None = None,
         big_vae_diffusion_prior: Any | None = None,
         big_vae_diffusion_prior_steps: int = 50,
         big_vae_diffusion_prior_sampler: str = "ddim",
@@ -983,6 +995,7 @@ class FunctionalViTTiny(nn.Module):
                 initial_tensors,
                 big_vae=big_vae,
                 latent_init=big_vae_latent_init,
+                latent_space=big_vae_latent_space,
                 latent_noise_std=big_vae_latent_noise_std,
                 decode_policy=big_vae_decode,
                 tile_T_patches=int(big_vae_tile_T_patches),

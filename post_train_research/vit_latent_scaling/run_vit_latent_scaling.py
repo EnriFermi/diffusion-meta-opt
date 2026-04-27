@@ -137,7 +137,7 @@ def validate_scaling_run_config(cfg: ScalingRunConfig) -> None:
         )
     if not (0.0 < float(cfg.latent_lr_floor_ratio) <= 1.0):
         raise ValueError("--latent-lr-floor-ratio must be in the interval (0, 1]")
-    if int(cfg.latent_lr_decay_steps) <= 0:
+    if latent_lr_scheduler == "cosine_decay_to_floor" and int(cfg.latent_lr_decay_steps) <= 0:
         raise ValueError("--latent-lr-decay-steps must be a positive integer")
     if not str(cfg.optimizer_name).strip():
         raise ValueError("--optimizer-name must be non-empty")
@@ -526,6 +526,21 @@ def load_latent_checkpoint(path: str) -> dict[str, Any]:
     return payload
 
 
+def infer_latent_space_from_checkpoint_payload(payload: dict[str, Any]) -> str:
+    explicit = str(payload.get("latent_space", "") or "").strip().lower()
+    if explicit in {"encoder_slots", "decoder_z"}:
+        return explicit
+    run_cfg = payload.get("run_config", {})
+    if isinstance(run_cfg, dict):
+        run_latent_space = str(run_cfg.get("big_vae_latent_space", "") or "").strip().lower()
+        if run_latent_space in {"encoder_slots", "decoder_z"}:
+            return run_latent_space
+        run_latent_init = str(run_cfg.get("big_vae_latent_init", "") or "").strip().lower()
+        if run_latent_init == "diffusion_prior":
+            return "decoder_z"
+    return "encoder_slots"
+
+
 def load_latent_slots_from_checkpoint(
     latent_slots: nn.ParameterDict,
     checkpoint_payload: dict[str, Any],
@@ -576,6 +591,8 @@ def build_model(
     *,
     big_vae_decoder: BigWeightVAE | None,
     big_vae_diffusion_prior: Any | None,
+    big_vae_latent_init_override: str | None = None,
+    big_vae_latent_space_override: str | None = None,
 ) -> nn.Module:
     if cfg.setup == "raw":
         return FunctionalViTTiny(vit_cfg, initial_tensors, parameter_mode="direct")
@@ -588,7 +605,10 @@ def build_model(
         initial_tensors,
         parameter_mode="bigvae_latent",
         big_vae=big_vae_decoder,
-        big_vae_latent_init=str(cfg.big_vae_latent_init),
+        big_vae_latent_init=str(
+            big_vae_latent_init_override if big_vae_latent_init_override is not None else cfg.big_vae_latent_init
+        ),
+        big_vae_latent_space=big_vae_latent_space_override,
         big_vae_diffusion_prior=big_vae_diffusion_prior,
         big_vae_diffusion_prior_steps=int(cfg.big_vae_diffusion_prior_steps),
         big_vae_diffusion_prior_sampler=str(cfg.big_vae_diffusion_prior_sampler),
@@ -638,6 +658,11 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         latent_checkpoint_payload = load_latent_checkpoint(latent_checkpoint_path)
         latent_checkpoint_payload["_checkpoint_path"] = latent_checkpoint_path
         print(f"[latent] will initialize latent slots from checkpoint: {latent_checkpoint_path}", flush=True)
+    latent_checkpoint_space = (
+        infer_latent_space_from_checkpoint_payload(latent_checkpoint_payload)
+        if latent_checkpoint_payload is not None
+        else None
+    )
     use_diffusion_prior_init = (
         cfg.setup == "latent"
         and str(cfg.big_vae_latent_init).strip().lower() == "diffusion_prior"
@@ -697,6 +722,8 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         initial_tensors,
         big_vae_decoder=big_vae_decoder,
         big_vae_diffusion_prior=big_vae_diffusion_prior,
+        big_vae_latent_init_override=("random" if use_latent_checkpoint_init else None),
+        big_vae_latent_space_override=latent_checkpoint_space,
     ).to(device)
     if use_diffusion_prior_init:
         target_model = getattr(model, "_orig_mod", model)
@@ -868,6 +895,7 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                     "init_raw_steps": int(init_checkpoint_steps),
                     "init_latent_checkpoint": str(cfg.latent_checkpoint),
                     "init_latent_steps": int(init_latent_steps),
+                    "latent_space": str(getattr(target.store, "latent_space", "")),
                     "latent_slots": target.store.latent_slots.state_dict(),
                     "vit_config": asdict(vit_cfg),
                     "run_config": asdict(cfg),
@@ -907,6 +935,7 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         "raw_checkpoint": str(cfg.raw_checkpoint) if cfg.setup == "latent" else "",
         "big_vae_checkpoint": str(cfg.big_vae_checkpoint) if cfg.setup == "latent" else "",
         "big_vae_latent_init": str(cfg.big_vae_latent_init) if cfg.setup == "latent" else "",
+        "big_vae_latent_space": str(getattr(store, "latent_space", "")) if cfg.setup == "latent" else "",
         "big_vae_diffusion_prior_checkpoint": (
             str(cfg.big_vae_diffusion_prior_checkpoint) if cfg.setup == "latent" else ""
         ),

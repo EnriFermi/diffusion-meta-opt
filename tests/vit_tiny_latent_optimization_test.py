@@ -211,6 +211,53 @@ def test_bigvae_latent_encoded_init_can_optimize_only_latent_slots() -> None:
     assert frozen_decoder_grad_sum == 0.0
 
 
+def test_bigvae_latent_decoder_z_space_can_run_without_diffusion_prior_model() -> None:
+    cfg = _small_vit_cfg()
+    initial = make_initial_tensors(cfg, seed=303)
+    big_vae = BigWeightVAE(
+        ModelConfig(
+            patch_size=8,
+            distribution=DistributionConfig(k_s=4, Kq=4, d_var=16, d_dist=16, use_covariance=False),
+            mini_vae=MiniVAEConfig(z_dim=8, d_e=16, num_attn_layers_encoder=1, num_layers_decoder=1, n_heads=2, d_patch=8),
+            big_vae=BigVAEConfig(
+                d_model=24,
+                d_lat=12,
+                num_latents=2,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                n_heads=3,
+                ffn_mult=2.0,
+                pos_fourier_dim=12,
+                use_latent_sampling=True,
+                disable_distribution_encoder=False,
+                disable_z_shortcut=True,
+                encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
+            ),
+        )
+    )
+    model = FunctionalViTTiny(
+        cfg,
+        initial,
+        parameter_mode="bigvae_latent",
+        big_vae=big_vae,
+        big_vae_latent_init="random",
+        big_vae_latent_space="decoder_z",
+        big_vae_decode="all",
+    )
+
+    assert model.store.latent_space == "decoder_z"
+    x = torch.randn(2, 3, 32, 32)
+    y = torch.tensor([0, 1], dtype=torch.long)
+    loss = F.cross_entropy(model(x), y)
+    loss.backward()
+
+    latent_grad_sum = 0.0
+    for name, param in model.named_parameters():
+        if param.grad is not None and "latent_slots" in name:
+            latent_grad_sum += float(param.grad.detach().abs().sum().item())
+    assert latent_grad_sum > 0.0
+
+
 def test_build_optimizer_supports_adamw_and_sgd() -> None:
     cfg = ExperimentConfig()
     param = torch.nn.Parameter(torch.ones(2))
