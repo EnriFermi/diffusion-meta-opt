@@ -95,3 +95,60 @@ checkpoints/latent_final.pt
 ```
 
 Set `FORCE=true` to rerun an output directory that already has `summary.json`.
+
+## Hydra Runner
+
+There is now an additional Hydra entrypoint for single targeted runs:
+
+```bash
+python post_train_research/vit_latent_scaling/run_vit_latent_scaling_hydra.py \
+  --config-name config_vit_latent_scaling_ae_encoded \
+  vit_latent_scaling/preset=cifar10_small \
+  vit_latent_scaling.raw_checkpoint=/path/to/raw_final.pt \
+  vit_latent_scaling.big_vae_checkpoint=/path/to/big_vae.pt
+```
+
+The three convenience configs are:
+
+```text
+config_vit_latent_scaling_ae_encoded
+config_vit_latent_scaling_latent_random
+config_vit_latent_scaling_ae_diffusion_prior
+```
+
+They correspond to:
+
+```text
+ae_encoded          -> setup=latent, big_vae_latent_init=encoded
+latent_random       -> setup=latent, big_vae_latent_init=random
+ae_diffusion_prior  -> setup=latent, big_vae_latent_init=diffusion_prior
+```
+
+There are also three self-contained shell wrappers next to this README:
+
+```text
+run_vit_latent_scaling_ae_encoded.sh
+run_vit_latent_scaling_latent_random.sh
+run_vit_latent_scaling_ae_diffusion_prior.sh
+```
+
+Each script has editable variables at the top for:
+
+```text
+PRESET
+OUTPUT_ROOT
+RAW_CHECKPOINT
+BIG_VAE_CHECKPOINT
+BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT
+```
+
+You can also use the general config and switch groups explicitly:
+
+```bash
+python post_train_research/vit_latent_scaling/run_vit_latent_scaling_hydra.py \
+  vit_latent_scaling/preset=cifar10_small \
+  vit_latent_scaling/setup=ae_diffusion_prior \
+  vit_latent_scaling.raw_checkpoint=/path/to/raw_final.pt \
+  vit_latent_scaling.big_vae_checkpoint=/path/to/big_vae.pt \
+  vit_latent_scaling.big_vae_diffusion_prior_checkpoint=/path/to/prior.pt
+```

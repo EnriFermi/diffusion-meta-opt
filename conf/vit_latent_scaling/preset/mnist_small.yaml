@@ -1,0 +1,21 @@
+# @package _global_
+
+vit_latent_scaling:
+  dataset: mnist
+  model_size: small
+  data_dir: ${oc.env:MNIST_DATA_DIR,./data/mnist}
+  epochs: 20
+  max_steps: 3000
+  batch_size: 256
+  eval_batch_size: 512
+  num_workers: 4
+  eval_every_steps: 150
+vit_model:
+  image_size: 28
+  patch_size: 4
+  in_channels: 1
+  num_classes: 10
+  hidden_dim: 128
+  depth: 6
+  num_heads: 4
+  mlp_ratio: 4.0
