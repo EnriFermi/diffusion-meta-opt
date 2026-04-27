@@ -8,29 +8,30 @@ cd "$PROJECT_ROOT"
 CONDA_ENV_NAME="onerec"
 
 STAGE1_CONFIG_NAME="vit_latent_scaling/config_ae_diffusion_prior"
-STAGE2_CONFIG_NAME="vit_latent_scaling/config_latent_random"
+STAGE2_CONFIG_NAME="vit_latent_scaling/config_ae_diffusion_prior"
 
-STAGE1_PRESET="cifar10_small"
-STAGE2_PRESET="mnist_small"
+STAGE1_PRESET="mnist_tiny"
+STAGE2_PRESET="cifar10_tiny"
 
 EXPERIMENT_ROOT="./post_train_research/vit_latent_scaling/artifacts/latent_transfer"
 STAGE1_OUTPUT_DIR="$EXPERIMENT_ROOT/stage1_source"
 STAGE2_OUTPUT_DIR="$EXPERIMENT_ROOT/stage2_target"
 
-BIG_VAE_CHECKPOINT=""
-BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT=""
-BIG_VAE_INIT_CALIBRATION_BATCHES="1"
+
+BIG_VAE_CHECKPOINT="./artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt"
+BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/checkpoints/big_vae_latent_diffusion_prior_AE/stage_1/latest.pt"
+BIG_VAE_INIT_CALIBRATION_BATCHES="4"
 
 STAGE1_OPTIMIZER_NAME="AdamW"
 STAGE2_OPTIMIZER_NAME="AdamW"
 
 STAGE1_LATENT_LR_SCHEDULER="cosine_decay_to_floor"
-STAGE1_LATENT_LR_FLOOR_RATIO="0.1"
-STAGE1_LATENT_LR_DECAY_STEPS="5250"
+STAGE1_LATENT_LR_FLOOR_RATIO="1.0"
+STAGE1_LATENT_LR_DECAY_STEPS="0"
 
 STAGE2_LATENT_LR_SCHEDULER="cosine_decay_to_floor"
-STAGE2_LATENT_LR_FLOOR_RATIO="0.1"
-STAGE2_LATENT_LR_DECAY_STEPS="5250"
+STAGE2_LATENT_LR_FLOOR_RATIO="1.0"
+STAGE2_LATENT_LR_DECAY_STEPS="0"
 
 : "${BIG_VAE_CHECKPOINT:?Edit BIG_VAE_CHECKPOINT in this script before running}"
 
