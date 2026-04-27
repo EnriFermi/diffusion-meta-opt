@@ -53,6 +53,7 @@ vit_latent_scaling:
   big_vae_encoder_context_rows: 64
   big_vae_encoder_context_std: 1.0
   big_vae_encoder_batch_size: 16
+  big_vae_init_calibration_batches: 1
   raw_init_steps: 0
 
 vit_model:

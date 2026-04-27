@@ -424,8 +424,6 @@ class BigVAELatentTensorStore(nn.Module):
 
         if init_mode == "encoded":
             self._initialize_latents_from_encoder(initial_tensors)
-        elif init_mode == "diffusion_prior":
-            self._initialize_latents_from_diffusion_prior(initial_tensors)
 
     @staticmethod
     def _should_decode_with_big_vae(*, name: str, tensor: torch.Tensor, policy: str) -> bool:
@@ -494,6 +492,181 @@ class BigVAELatentTensorStore(nn.Module):
         batch_phase = torch.arange(int(batch_size), device=device, dtype=torch.float32).view(-1, 1, 1) * 0.173
         context = torch.sin((rows + 1.0) * (cols + 1.0) * 0.017 + batch_phase)
         return (context * float(self.encoder_context_std)).to(dtype=dtype)
+
+    @staticmethod
+    def _decoded_tensor_order_key(name: str) -> tuple[int, int, str]:
+        raw = str(name)
+        if raw == "patch_embed.weight":
+            return (0, 0, raw)
+        if raw == "patch_embed.bias":
+            return (0, 1, raw)
+        if raw == "cls_token":
+            return (0, 2, raw)
+        if raw == "pos_embed":
+            return (0, 3, raw)
+        if raw.startswith("blocks."):
+            parts = raw.split(".")
+            if len(parts) >= 4 and parts[1].isdigit():
+                block_idx = int(parts[1])
+                suffix = ".".join(parts[2:])
+                within_block_order = {
+                    "norm1.weight": 0,
+                    "norm1.bias": 1,
+                    "attn.qkv.weight": 2,
+                    "attn.qkv.bias": 3,
+                    "attn.proj.weight": 4,
+                    "attn.proj.bias": 5,
+                    "norm2.weight": 6,
+                    "norm2.bias": 7,
+                    "mlp.fc1.weight": 8,
+                    "mlp.fc1.bias": 9,
+                    "mlp.fc2.weight": 10,
+                    "mlp.fc2.bias": 11,
+                }
+                return (1 + block_idx, within_block_order.get(suffix, 100), raw)
+        final_order = {
+            "norm.weight": 0,
+            "norm.bias": 1,
+            "head.weight": 2,
+            "head.bias": 3,
+        }
+        if raw in final_order:
+            return (10_000, final_order[raw], raw)
+        return (20_000, 0, raw)
+
+    def decoded_tensor_execution_order(self) -> list[str]:
+        return sorted(self._name_to_key.keys(), key=self._decoded_tensor_order_key)
+
+    def _subsample_activation_rows(self, activation_matrix: torch.Tensor) -> torch.Tensor:
+        if activation_matrix.ndim != 2:
+            raise ValueError(f"activation_matrix must be [R,d], got {tuple(activation_matrix.shape)}")
+        row_count = int(activation_matrix.shape[0])
+        if row_count <= int(self.encoder_context_rows):
+            return activation_matrix.contiguous()
+        indices = torch.linspace(
+            0,
+            row_count - 1,
+            steps=int(self.encoder_context_rows),
+            device=activation_matrix.device,
+            dtype=torch.float32,
+        ).round().to(dtype=torch.long)
+        return activation_matrix.index_select(0, indices).contiguous()
+
+    @staticmethod
+    def _tile_d_out_mask(tile: BigVAEDecodeTileSpec, *, device: torch.device) -> torch.Tensor:
+        d_out_mask = torch.zeros(int(tile.d_out), device=device, dtype=torch.bool)
+        used_cols = 0
+        for segment in tile.segments:
+            used_cols = max(used_cols, int(segment.col_len))
+        d_out_mask[:used_cols] = True
+        return d_out_mask
+
+    def initialize_from_diffusion_prior_autoregressive(
+        self,
+        model: nn.Module,
+        *,
+        calibration_images: torch.Tensor,
+    ) -> None:
+        if self.latent_init_mode != "diffusion_prior":
+            return
+        if self.latent_diffusion_prior is None:
+            raise RuntimeError("latent_diffusion_prior is required for diffusion_prior initialization")
+        if calibration_images.ndim != 4:
+            raise ValueError(f"calibration_images must be [B,C,H,W], got {tuple(calibration_images.shape)}")
+        if not self._name_to_key:
+            return
+
+        first_latent = next(iter(self.latent_slots.values()))
+        device = first_latent.device
+        dtype = first_latent.dtype
+        images = calibration_images.to(device=device, dtype=dtype, non_blocking=False)
+
+        with torch.no_grad():
+            for tensor_name in self.decoded_tensor_execution_order():
+                X_full = getattr(model, "_orig_mod", model).collect_parameter_input_matrix(tensor_name, images)
+                X_full = self._subsample_activation_rows(X_full.to(device=device, dtype=dtype))
+                tensor_key = self._name_to_key[tensor_name]
+                tile_keys = self._tensor_key_to_tile_keys.get(tensor_key, [])
+                if not tile_keys:
+                    continue
+
+                tile_batch = len(tile_keys)
+                X = torch.zeros(tile_batch, int(X_full.shape[0]), int(self.tile_d_in), device=device, dtype=dtype)
+                x_mask = torch.ones(tile_batch, int(X_full.shape[0]), device=device, dtype=torch.bool)
+                d_in_mask = torch.zeros(tile_batch, int(self.tile_d_in), device=device, dtype=torch.bool)
+                batch_layer_names = [str(tensor_name)] * tile_batch
+
+                for item_idx, key in enumerate(tile_keys):
+                    tile = self._tile_specs[key]
+                    for segment in tile.segments:
+                        tile_row_start = int(segment.tile_row_start)
+                        tile_row_end = tile_row_start + int(segment.row_len)
+                        row_start = int(segment.row_start)
+                        row_end = row_start + int(segment.row_len)
+                        X[item_idx, :, tile_row_start:tile_row_end] = X_full[:, row_start:row_end]
+                        d_in_mask[item_idx, tile_row_start:tile_row_end] = True
+
+                (
+                    T,
+                    _d_in_pad,
+                    patch_mask,
+                    _structural_patch_mask,
+                    _dist_var_by_patch,
+                    dist_patch_by_patch,
+                    dist_var_pooled,
+                ) = self.big_vae._encode_distribution_context(
+                    X,
+                    x_mask=x_mask,
+                    d_in_mask=d_in_mask,
+                )
+                expected_T = int(self.tile_T_patches)
+                if int(T) != expected_T:
+                    raise RuntimeError(
+                        f"BigVAE encoder T mismatch for tensor {tensor_name}: expected T={expected_T}, got T={T}"
+                    )
+                if dist_patch_by_patch is None:
+                    raise RuntimeError("distribution encoder must provide dist_patch_by_patch for diffusion prior")
+
+                cond_global = build_cond_global_from_dist_var_pooled(
+                    dist_var_pooled=dist_var_pooled,
+                    patch_mask=patch_mask,
+                )
+                metadata_cond = build_layer_metadata_condition_vector(
+                    device=device,
+                    dtype=dtype,
+                    use_layer_type_conditioning=bool(self.latent_diffusion_prior.cfg.use_layer_type_conditioning),
+                    use_layer_depth_conditioning=bool(self.latent_diffusion_prior.cfg.use_layer_depth_conditioning),
+                    depth_fourier_dim=int(self.latent_diffusion_prior.cfg.layer_depth_fourier_dim),
+                    depth_scale=float(self.latent_diffusion_prior.cfg.layer_depth_scale),
+                    layer_names=batch_layer_names,
+                )
+                if metadata_cond is not None:
+                    if cond_global is None:
+                        cond_global = metadata_cond
+                    else:
+                        cond_global = torch.cat(
+                            [
+                                cond_global.to(device=device, dtype=dtype),
+                                metadata_cond.to(device=device, dtype=dtype),
+                            ],
+                            dim=-1,
+                        )
+
+                sampled = self.latent_diffusion_prior.sample_latents(
+                    cond_patch=dist_patch_by_patch,
+                    cond_global=cond_global,
+                    patch_mask=patch_mask,
+                    num_steps=self.latent_diffusion_prior_steps,
+                    sampler_type=self.latent_diffusion_prior_sampler,
+                    eta=self.latent_diffusion_prior_eta,
+                )
+                sampled = sampled.view(tile_batch, *first_latent.shape)
+                for item_idx, key in enumerate(tile_keys):
+                    sampled_item = sampled[item_idx].detach().to(device=device, dtype=dtype)
+                    self._tile_cond_patch[key] = dist_patch_by_patch[item_idx].detach().to(device=device, dtype=dtype)
+                    if self.latent_noise_std > 0.0:
+                        sampled_item = sampled_item + torch.randn_like(sampled_item) * self.latent_noise_std
+                    self.latent_slots[key].data.copy_(sampled_item)
 
     def _initialize_latents_from_encoder(self, initial_tensors: dict[str, torch.Tensor]) -> None:
         if not self.latent_slots:
@@ -916,6 +1089,149 @@ class FunctionalViTTiny(nn.Module):
         h = F.linear(h, self.w(f"{prefix}.mlp.fc2.weight"), self.w(f"{prefix}.mlp.fc2.bias"))
         h = F.dropout(h, p=cfg.dropout, training=self.training)
         return x + h
+
+    @torch.no_grad()
+    def initialize_bigvae_diffusion_prior(self, calibration_images: torch.Tensor) -> None:
+        if isinstance(self.store, BigVAELatentTensorStore):
+            self.store.initialize_from_diffusion_prior_autoregressive(
+                self,
+                calibration_images=calibration_images,
+            )
+
+    @torch.no_grad()
+    def collect_parameter_input_matrix(self, tensor_name: str, images: torch.Tensor) -> torch.Tensor:
+        if not isinstance(self.store, BigVAELatentTensorStore):
+            raise TypeError("parameter activation collection is only defined for BigVAELatentTensorStore-backed models")
+
+        cfg = self.cfg
+        device = next(self.parameters()).device
+        images = images.to(device=device, non_blocking=False)
+        hidden_dim = int(cfg.hidden_dim)
+        mlp_dim = int(round(cfg.hidden_dim * cfg.mlp_ratio))
+        target = str(tensor_name)
+
+        was_training = self.training
+        if was_training:
+            self.eval()
+        if isinstance(self.store, BigVAELatentTensorStore):
+            self._decoded_tensor_cache = self.store.decode_all_tensors()
+        else:
+            self._decoded_tensor_cache = None
+
+        try:
+            patch_weight = self.w("patch_embed.weight")
+            patch_bias = self.w("patch_embed.bias")
+            patch_tokens = F.unfold(images, kernel_size=cfg.patch_size, stride=cfg.patch_size).transpose(1, 2).contiguous()
+            if target == "patch_embed.weight":
+                return patch_tokens.reshape(-1, patch_tokens.shape[-1]).contiguous()
+
+            patch_pre = F.conv2d(images, patch_weight, None, stride=cfg.patch_size)
+            x = patch_pre.flatten(2).transpose(1, 2).contiguous()
+            if target == "patch_embed.bias":
+                return x.reshape(-1, hidden_dim).contiguous()
+            x = x + patch_bias.view(1, 1, -1)
+
+            batch = int(x.shape[0])
+            cls = self.w("cls_token").expand(batch, -1, -1)
+            if target == "cls_token":
+                return cls.reshape(batch, hidden_dim).contiguous()
+            x = torch.cat((cls, x), dim=1)
+
+            if target == "pos_embed":
+                return x.reshape(batch, -1).contiguous()
+            x = x + self.w("pos_embed")
+            x = F.dropout(x, p=cfg.dropout, training=self.training)
+
+            for layer_idx in range(cfg.depth):
+                prefix = f"blocks.{layer_idx}"
+
+                if target == f"{prefix}.norm1.weight" or target == f"{prefix}.norm1.bias":
+                    return x.reshape(-1, hidden_dim).contiguous()
+                h = F.layer_norm(
+                    x,
+                    (cfg.hidden_dim,),
+                    weight=self.w(f"{prefix}.norm1.weight"),
+                    bias=self.w(f"{prefix}.norm1.bias"),
+                    eps=cfg.layer_norm_eps,
+                )
+
+                if target == f"{prefix}.attn.qkv.weight":
+                    return h.reshape(-1, hidden_dim).contiguous()
+                qkv_pre = F.linear(h, self.w(f"{prefix}.attn.qkv.weight"), None)
+                if target == f"{prefix}.attn.qkv.bias":
+                    return qkv_pre.reshape(-1, 3 * hidden_dim).contiguous()
+                qkv = qkv_pre + self.w(f"{prefix}.attn.qkv.bias").view(1, 1, -1)
+                tokens = int(qkv.shape[1])
+                head_dim = hidden_dim // cfg.num_heads
+                qkv = qkv.view(batch, tokens, 3, cfg.num_heads, head_dim).permute(2, 0, 3, 1, 4)
+                q, k, v = qkv.unbind(dim=0)
+                attn = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    dropout_p=cfg.attention_dropout if self.training else 0.0,
+                    is_causal=False,
+                )
+                attn = attn.transpose(1, 2).contiguous().view(batch, tokens, hidden_dim)
+
+                if target == f"{prefix}.attn.proj.weight":
+                    return attn.reshape(-1, hidden_dim).contiguous()
+                proj_pre = F.linear(attn, self.w(f"{prefix}.attn.proj.weight"), None)
+                if target == f"{prefix}.attn.proj.bias":
+                    return proj_pre.reshape(-1, hidden_dim).contiguous()
+                attn_out = proj_pre + self.w(f"{prefix}.attn.proj.bias").view(1, 1, -1)
+                attn_out = F.dropout(attn_out, p=cfg.dropout, training=self.training)
+                x = x + attn_out
+
+                if target == f"{prefix}.norm2.weight" or target == f"{prefix}.norm2.bias":
+                    return x.reshape(-1, hidden_dim).contiguous()
+                h = F.layer_norm(
+                    x,
+                    (cfg.hidden_dim,),
+                    weight=self.w(f"{prefix}.norm2.weight"),
+                    bias=self.w(f"{prefix}.norm2.bias"),
+                    eps=cfg.layer_norm_eps,
+                )
+
+                if target == f"{prefix}.mlp.fc1.weight":
+                    return h.reshape(-1, hidden_dim).contiguous()
+                fc1_pre = F.linear(h, self.w(f"{prefix}.mlp.fc1.weight"), None)
+                if target == f"{prefix}.mlp.fc1.bias":
+                    return fc1_pre.reshape(-1, mlp_dim).contiguous()
+                h = fc1_pre + self.w(f"{prefix}.mlp.fc1.bias").view(1, 1, -1)
+                h = F.gelu(h)
+                h = F.dropout(h, p=cfg.dropout, training=self.training)
+
+                if target == f"{prefix}.mlp.fc2.weight":
+                    return h.reshape(-1, mlp_dim).contiguous()
+                fc2_pre = F.linear(h, self.w(f"{prefix}.mlp.fc2.weight"), None)
+                if target == f"{prefix}.mlp.fc2.bias":
+                    return fc2_pre.reshape(-1, hidden_dim).contiguous()
+                h = fc2_pre + self.w(f"{prefix}.mlp.fc2.bias").view(1, 1, -1)
+                h = F.dropout(h, p=cfg.dropout, training=self.training)
+                x = x + h
+
+            if target == "norm.weight" or target == "norm.bias":
+                return x.reshape(-1, hidden_dim).contiguous()
+            x = F.layer_norm(
+                x,
+                (cfg.hidden_dim,),
+                weight=self.w("norm.weight"),
+                bias=self.w("norm.bias"),
+                eps=cfg.layer_norm_eps,
+            )
+            cls_out = x[:, 0]
+            if target == "head.weight":
+                return cls_out.contiguous()
+            logits_pre = F.linear(cls_out, self.w("head.weight"), None)
+            if target == "head.bias":
+                return logits_pre.contiguous()
+        finally:
+            self._decoded_tensor_cache = None
+            if was_training:
+                self.train(True)
+
+        raise KeyError(f"Unsupported tensor name for activation-conditioned diffusion prior init: {tensor_name}")
 
 
 def _normal(shape: Iterable[int], *, generator: torch.Generator, std: float) -> torch.Tensor:
