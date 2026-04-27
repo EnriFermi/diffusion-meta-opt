@@ -30,7 +30,7 @@ vit_latent_scaling:
   lr: 1e-3
   latent_lr_scheduler: cosine_decay_to_floor
   latent_lr_floor_ratio: 0.1
-  latent_lr_decay_fraction: 0.7
+  latent_lr_decay_steps: 5250
   weight_decay: 0.05
   latent_weight_decay: 0.0
   adam_beta1: 0.9
