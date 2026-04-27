@@ -27,7 +27,7 @@ vit_latent_scaling:
   num_workers: 4
   train_subset: 0
   test_subset: 0
-  lr: 1e-0
+  lr: 3e-4
   weight_decay: 0.0
   latent_weight_decay: 0.0
   adam_beta1: 0.9
