@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 
+from dataset.big_vae_offline import infer_layer_depth, infer_layer_type
 from models.layer_latent_diffusion_prior import (
     LayerLatentDiffusionPrior,
     build_layer_latent_diffusion_prior_config,
 )
+from models.vae_shared import sinusoidal_embedding
 from models.weight_quantile_vae import (
     BigVAEConfig,
     BigWeightVAE,
@@ -23,6 +26,24 @@ from models.weight_quantile_vae import (
 
 LOGGER = logging.getLogger(__name__)
 _VAE_POSTERIOR_HEAD_PREFIXES = ("to_mu.", "to_logvar.")
+LATENT_DIFFUSION_LAYER_TYPE_VOCAB: tuple[str, ...] = (
+    "<unknown>",
+    "attn_query",
+    "attn_key",
+    "attn_value",
+    "attn_output",
+    "attn_other",
+    "ffn_up",
+    "ffn_down",
+    "pooler",
+    "embedding",
+    "conv",
+    "head",
+    "other_linear",
+)
+_LATENT_DIFFUSION_LAYER_TYPE_TO_ID = {
+    name: idx for idx, name in enumerate(LATENT_DIFFUSION_LAYER_TYPE_VOCAB)
+}
 
 
 def _strip_state_prefix(name: str) -> str:
@@ -44,6 +65,129 @@ def _normalize_state_dict_keys(state_dict: Mapping[str, Any]) -> dict[str, Any]:
     for raw_key, value in state_dict.items():
         normalized[_strip_state_prefix(str(raw_key))] = value
     return normalized
+
+
+def latent_diffusion_layer_type_to_id(layer_type: str) -> int:
+    normalized = str(layer_type).strip().lower()
+    return int(_LATENT_DIFFUSION_LAYER_TYPE_TO_ID.get(normalized, 0))
+
+
+def latent_diffusion_layer_metadata_cond_dim(
+    *,
+    use_layer_type_conditioning: bool,
+    use_layer_depth_conditioning: bool,
+    depth_fourier_dim: int,
+) -> int:
+    dim = 0
+    if bool(use_layer_type_conditioning):
+        dim += int(len(LATENT_DIFFUSION_LAYER_TYPE_VOCAB))
+    if bool(use_layer_depth_conditioning):
+        dim += max(1, int(depth_fourier_dim)) + 1
+    return int(dim)
+
+
+def build_layer_metadata_condition_vector(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    use_layer_type_conditioning: bool,
+    use_layer_depth_conditioning: bool,
+    depth_fourier_dim: int,
+    depth_scale: float,
+    layer_names: Sequence[str] | None = None,
+    layer_type_ids: torch.Tensor | Sequence[int] | None = None,
+    layer_depths: torch.Tensor | Sequence[float | int | None] | None = None,
+) -> torch.Tensor | None:
+    use_type = bool(use_layer_type_conditioning)
+    use_depth = bool(use_layer_depth_conditioning)
+    if not use_type and not use_depth:
+        return None
+    if float(depth_scale) <= 0.0:
+        raise ValueError(f"depth_scale must be > 0, got {depth_scale}")
+
+    batch_size = 0
+    if layer_names is not None:
+        batch_size = len(layer_names)
+    elif torch.is_tensor(layer_type_ids):
+        batch_size = int(layer_type_ids.shape[0])
+    elif isinstance(layer_type_ids, Sequence):
+        batch_size = len(layer_type_ids)
+    elif torch.is_tensor(layer_depths):
+        batch_size = int(layer_depths.shape[0])
+    elif isinstance(layer_depths, Sequence):
+        batch_size = len(layer_depths)
+    if batch_size <= 0:
+        raise ValueError("metadata conditioning requires at least one layer item")
+
+    resolved_layer_type_ids: torch.Tensor
+    if layer_type_ids is None:
+        if layer_names is None:
+            resolved_layer_type_ids = torch.zeros(batch_size, device=device, dtype=torch.long)
+        else:
+            resolved_layer_type_ids = torch.tensor(
+                [latent_diffusion_layer_type_to_id(infer_layer_type(name)) for name in layer_names],
+                device=device,
+                dtype=torch.long,
+            )
+    elif torch.is_tensor(layer_type_ids):
+        if layer_type_ids.ndim != 1 or int(layer_type_ids.shape[0]) != batch_size:
+            raise ValueError(f"layer_type_ids must be [{batch_size}], got {tuple(layer_type_ids.shape)}")
+        resolved_layer_type_ids = layer_type_ids.to(device=device, dtype=torch.long)
+    else:
+        if len(layer_type_ids) != batch_size:
+            raise ValueError(f"layer_type_ids must have length {batch_size}, got {len(layer_type_ids)}")
+        resolved_layer_type_ids = torch.tensor([int(item) for item in layer_type_ids], device=device, dtype=torch.long)
+
+    resolved_layer_depths: torch.Tensor
+    if layer_depths is None:
+        if layer_names is None:
+            resolved_layer_depths = torch.full((batch_size,), -1.0, device=device, dtype=torch.float32)
+        else:
+            resolved_layer_depths = torch.tensor(
+                [
+                    float(depth) if depth is not None else -1.0
+                    for depth in (infer_layer_depth(name) for name in layer_names)
+                ],
+                device=device,
+                dtype=torch.float32,
+            )
+    elif torch.is_tensor(layer_depths):
+        if layer_depths.ndim != 1 or int(layer_depths.shape[0]) != batch_size:
+            raise ValueError(f"layer_depths must be [{batch_size}], got {tuple(layer_depths.shape)}")
+        resolved_layer_depths = layer_depths.to(device=device, dtype=torch.float32)
+    else:
+        if len(layer_depths) != batch_size:
+            raise ValueError(f"layer_depths must have length {batch_size}, got {len(layer_depths)}")
+        resolved_layer_depths = torch.tensor(
+            [float(item) if item is not None else -1.0 for item in layer_depths],
+            device=device,
+            dtype=torch.float32,
+        )
+
+    features: list[torch.Tensor] = []
+    if use_type:
+        type_ids = resolved_layer_type_ids.clamp(min=0, max=len(LATENT_DIFFUSION_LAYER_TYPE_VOCAB) - 1)
+        type_features = F.one_hot(type_ids, num_classes=len(LATENT_DIFFUSION_LAYER_TYPE_VOCAB)).to(dtype=dtype)
+        features.append(type_features)
+
+    if use_depth:
+        depth_dim = max(1, int(depth_fourier_dim))
+        present = (resolved_layer_depths >= 0.0).to(device=device, dtype=dtype).unsqueeze(-1)
+        depth_values = torch.where(
+            resolved_layer_depths >= 0.0,
+            resolved_layer_depths,
+            torch.zeros_like(resolved_layer_depths),
+        )
+        scaled_depth = (depth_values + 0.5) / float(depth_scale)
+        depth_features = sinusoidal_embedding(scaled_depth.to(dtype=torch.float32), depth_dim).to(
+            device=device,
+            dtype=dtype,
+        )
+        features.append(torch.cat([depth_features * present, present], dim=-1))
+
+    if not features:
+        return None
+    return torch.cat(features, dim=-1)
 
 
 def _model_uses_latent_sampling(model: torch.nn.Module) -> bool:
@@ -290,8 +434,29 @@ def load_distribution_encoder_state_from_latent_diffusion_prior_checkpoint(
         raise RuntimeError(
             "Diffusion prior distribution_encoder_state mismatch: "
             f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
-        )
+    )
     return True
+
+
+def build_cond_global_from_dist_var_pooled(
+    *,
+    dist_var_pooled: torch.Tensor | None,
+    patch_mask: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if dist_var_pooled is None:
+        return None
+    if dist_var_pooled.ndim != 3:
+        raise ValueError(f"dist_var_pooled must be [B,T,d_var], got {tuple(dist_var_pooled.shape)}")
+    batch, seq_len, _dim = dist_var_pooled.shape
+    if patch_mask is None:
+        patch_mask = torch.ones((batch, seq_len), device=dist_var_pooled.device, dtype=torch.bool)
+    else:
+        if patch_mask.ndim != 2 or tuple(patch_mask.shape) != (batch, seq_len):
+            raise ValueError(f"patch_mask must be {(batch, seq_len)}, got {tuple(patch_mask.shape)}")
+        patch_mask = patch_mask.to(device=dist_var_pooled.device, dtype=torch.bool)
+    weights = patch_mask.unsqueeze(-1).to(dtype=dist_var_pooled.dtype)
+    denom = weights.sum(dim=1).clamp_min(1.0)
+    return (dist_var_pooled * weights).sum(dim=1) / denom
 
 
 def encode_big_vae_distribution_context_batch(
@@ -397,6 +562,7 @@ def encode_big_vae_layer_batch(
         "latent_mu": latent_mu.squeeze(0) if squeeze_batch else latent_mu,
         "latent_logvar": latent_logvar.squeeze(0) if squeeze_batch else latent_logvar,
         "cond_patch": dist_patch_by_patch.squeeze(0) if squeeze_batch and dist_patch_by_patch is not None else dist_patch_by_patch,
+        "dist_var_pooled": dist_var_pooled.squeeze(0) if squeeze_batch and dist_var_pooled is not None else dist_var_pooled,
         "patch_mask": patch_mask.squeeze(0) if squeeze_batch else patch_mask,
         "structural_patch_mask": structural_patch_mask.squeeze(0) if squeeze_batch else structural_patch_mask,
         "d_in_mask": validated_d_in_mask.squeeze(0) if squeeze_batch else validated_d_in_mask,
@@ -416,9 +582,14 @@ def load_checkpoint_config(path: str | Path) -> Any:
 
 
 __all__ = [
+    "build_cond_global_from_dist_var_pooled",
+    "build_layer_metadata_condition_vector",
     "build_big_vae_model_cfg",
     "encode_big_vae_distribution_context_batch",
     "encode_big_vae_layer_batch",
+    "LATENT_DIFFUSION_LAYER_TYPE_VOCAB",
+    "latent_diffusion_layer_metadata_cond_dim",
+    "latent_diffusion_layer_type_to_id",
     "load_checkpoint_config",
     "load_big_vae_with_trainable_distribution_encoder",
     "load_distribution_encoder_state_from_latent_diffusion_prior_checkpoint",
