@@ -27,6 +27,8 @@ vit_latent_scaling:
   num_workers: 4
   train_subset: 0
   test_subset: 0
+  optimizer_name: AdamW
+  optimizer_kwargs: {}
   lr: 1e-3
   latent_lr_scheduler: cosine_decay_to_floor
   latent_lr_floor_ratio: 0.1

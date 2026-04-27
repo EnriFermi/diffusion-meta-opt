@@ -8,6 +8,7 @@ cd "$PROJECT_ROOT"
 CONDA_ENV_NAME="onerec"
 PRESET="cifar10_small"
 OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
+OPTIMIZER_NAME="AdamW"
 
 run_python() {
   if [ -n "${CONDA_PREFIX:-}" ]; then
@@ -28,4 +29,5 @@ run_python \
   "$SCRIPT_DIR/run_vit_latent_scaling_hydra.py" \
   --config-name vit_latent_scaling/config_raw \
   "vit_latent_scaling/preset=$PRESET" \
-  "vit_latent_scaling.output_root=$OUTPUT_ROOT"
+  "vit_latent_scaling.output_root=$OUTPUT_ROOT" \
+  "vit_latent_scaling.optimizer_name=$OPTIMIZER_NAME"

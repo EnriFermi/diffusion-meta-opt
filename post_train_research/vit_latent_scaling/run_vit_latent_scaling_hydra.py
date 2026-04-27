@@ -23,6 +23,13 @@ def _as_mapping(section: Any, *, name: str) -> Mapping[str, Any]:
 def build_vit_latent_scaling_configs(cfg: DictConfig) -> tuple[ScalingRunConfig, ViTTinyConfig]:
     run_cfg_raw = _as_mapping(cfg.get("vit_latent_scaling"), name="vit_latent_scaling")
     model_cfg_raw = _as_mapping(cfg.get("vit_model"), name="vit_model")
+    optimizer_kwargs_raw = run_cfg_raw.get("optimizer_kwargs", {})
+    if optimizer_kwargs_raw is None:
+        optimizer_kwargs = {}
+    elif isinstance(optimizer_kwargs_raw, DictConfig):
+        optimizer_kwargs = OmegaConf.to_container(optimizer_kwargs_raw, resolve=True)
+    else:
+        optimizer_kwargs = dict(optimizer_kwargs_raw)
 
     run_cfg = ScalingRunConfig(
         output_dir=str(run_cfg_raw.get("output_dir", "")),
@@ -40,6 +47,8 @@ def build_vit_latent_scaling_configs(cfg: DictConfig) -> tuple[ScalingRunConfig,
         num_workers=int(run_cfg_raw.get("num_workers", 4)),
         train_subset=int(run_cfg_raw.get("train_subset", 0)),
         test_subset=int(run_cfg_raw.get("test_subset", 0)),
+        optimizer_name=str(run_cfg_raw.get("optimizer_name", "AdamW")),
+        optimizer_kwargs=dict(optimizer_kwargs),
         lr=float(run_cfg_raw.get("lr", 1e-3)),
         latent_lr_scheduler=str(run_cfg_raw.get("latent_lr_scheduler", "cosine_decay_to_floor")),
         latent_lr_floor_ratio=float(run_cfg_raw.get("latent_lr_floor_ratio", 0.1)),

@@ -11,6 +11,7 @@ OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
 BIG_VAE_CHECKPOINT=""
 BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT=""
 BIG_VAE_INIT_CALIBRATION_BATCHES="1"
+OPTIMIZER_NAME="AdamW"
 LATENT_LR_SCHEDULER="cosine_decay_to_floor"
 LATENT_LR_FLOOR_RATIO="0.1"
 LATENT_LR_DECAY_STEPS="5250"
@@ -38,6 +39,7 @@ run_python \
   --config-name vit_latent_scaling/config_ae_diffusion_prior \
   "vit_latent_scaling/preset=$PRESET" \
   "vit_latent_scaling.output_root=$OUTPUT_ROOT" \
+  "vit_latent_scaling.optimizer_name=$OPTIMIZER_NAME" \
   "vit_latent_scaling.big_vae_checkpoint=$BIG_VAE_CHECKPOINT" \
   "vit_latent_scaling.big_vae_diffusion_prior_checkpoint=$BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT" \
   "vit_latent_scaling.big_vae_init_calibration_batches=$BIG_VAE_INIT_CALIBRATION_BATCHES" \
