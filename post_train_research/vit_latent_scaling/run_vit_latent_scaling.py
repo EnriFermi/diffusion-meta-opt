@@ -906,6 +906,10 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
             delta_z_norm = float("nan")
             delta_w_norm = float("nan")
             delta_w_over_delta_z = float("nan")
+            latent_z_norm = float("nan")
+            delta_z_cosine_with_z = float("nan")
+            delta_z_parallel_ratio = float("nan")
+            delta_z_tangent_ratio = float("nan")
             jacobian_fd_mean = float("nan")
             jacobian_fd_std = float("nan")
             jacobian_fd_max = float("nan")
@@ -913,11 +917,29 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                 assert pre_step_latent is not None and pre_step_decoded is not None
                 post_step_latent = flatten_latent_slots(store)
                 post_step_decoded = flatten_decoded_bigvae_weights(store)
-                delta_z_norm = float((post_step_latent - pre_step_latent).norm().item())
+                delta_z = post_step_latent - pre_step_latent
+                delta_z_norm = float(delta_z.norm().item())
                 delta_w_norm = float((post_step_decoded - pre_step_decoded).norm().item())
                 delta_w_over_delta_z = float(
                     delta_w_norm / max(delta_z_norm, torch.finfo(post_step_latent.dtype).tiny)
                 )
+                latent_z_norm = float(post_step_latent.norm().item())
+                tiny = torch.finfo(post_step_latent.dtype).tiny
+                if delta_z_norm > 0.0 and latent_z_norm > 0.0:
+                    z_unit = post_step_latent / post_step_latent.norm().clamp_min(tiny)
+                    parallel_component = torch.dot(delta_z, z_unit)
+                    delta_z_parallel = parallel_component * z_unit
+                    delta_z_tangent = delta_z - delta_z_parallel
+                    delta_z_cosine_with_z = float(
+                        torch.dot(delta_z, post_step_latent).item()
+                        / max(delta_z_norm * latent_z_norm, float(tiny))
+                    )
+                    delta_z_parallel_ratio = float(
+                        delta_z_parallel.norm().item() / max(delta_z_norm, float(tiny))
+                    )
+                    delta_z_tangent_ratio = float(
+                        delta_z_tangent.norm().item() / max(delta_z_norm, float(tiny))
+                    )
                 jacobian_stats = estimate_decoder_effective_jacobian_norm(
                     store,
                     eps=float(cfg.latent_debug_jacobian_eps),
@@ -955,9 +977,13 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                     "decoded_params": int(decoded_params),
                     "latent_params": int(latent_params),
                     "elapsed_s": float(elapsed_s),
+                    "latent_z_norm": float(latent_z_norm),
                     "delta_z_norm": float(delta_z_norm),
                     "delta_w_norm": float(delta_w_norm),
                     "delta_w_over_delta_z": float(delta_w_over_delta_z),
+                    "delta_z_cosine_with_z": float(delta_z_cosine_with_z),
+                    "delta_z_parallel_ratio": float(delta_z_parallel_ratio),
+                    "delta_z_tangent_ratio": float(delta_z_tangent_ratio),
                     "decoder_jacobian_fd_mean": float(jacobian_fd_mean),
                     "decoder_jacobian_fd_std": float(jacobian_fd_std),
                     "decoder_jacobian_fd_max": float(jacobian_fd_max),
@@ -971,7 +997,11 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                 )
                 if latent_debug_this_step:
                     message += (
+                        f" ||z||={latent_z_norm:.6e}"
                         f" ||Δz||={delta_z_norm:.6e}"
+                        f" cos(Δz,z)={delta_z_cosine_with_z:.6e}"
+                        f" ||Δz_parallel||/||Δz||={delta_z_parallel_ratio:.6e}"
+                        f" ||Δz_tangent||/||Δz||={delta_z_tangent_ratio:.6e}"
                         f" ||ΔW||={delta_w_norm:.6e}"
                         f" ||ΔW||/||Δz||={delta_w_over_delta_z:.6e}"
                         f" J_fd_mean={jacobian_fd_mean:.6e}"
