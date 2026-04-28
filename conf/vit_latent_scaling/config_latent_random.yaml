@@ -2,4 +2,5 @@
 
 defaults:
   - config
-  - override /vit_latent_scaling/setup: latent_random
+  - override /vit_latent_scaling/setup: latent
+  - override /vit_latent_scaling/init: random

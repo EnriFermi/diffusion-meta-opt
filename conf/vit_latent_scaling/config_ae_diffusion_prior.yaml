@@ -2,4 +2,5 @@
 
 defaults:
   - config
-  - override /vit_latent_scaling/setup: ae_diffusion_prior
+  - override /vit_latent_scaling/setup: latent
+  - override /vit_latent_scaling/init: diffusion_prior

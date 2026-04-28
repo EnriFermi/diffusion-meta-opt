@@ -4,15 +4,19 @@ defaults:
   - /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
   - _self_
   - /vit_latent_scaling/preset: cifar10_small
-  - /vit_latent_scaling/setup: ae_encoded
+  - /vit_latent_scaling/setup: latent
+  - /vit_latent_scaling/init: encoded
 
 hydra:
   job:
     name: run_vit_latent_scaling
 
 vit_latent_scaling:
+  setup_name: latent
+  init_name: encoded
+  run_name: ae_encoded
   output_root: ./post_train_research/vit_latent_scaling/artifacts
-  experiment_name: ${vit_latent_scaling.setup_name}
+  experiment_name: ${vit_latent_scaling.run_name}
   output_dir: ${vit_latent_scaling.output_root}/${vit_latent_scaling.dataset}/${vit_latent_scaling.model_size}/${vit_latent_scaling.experiment_name}
   dataset: cifar10
   model_size: tiny
@@ -52,6 +56,10 @@ vit_latent_scaling:
   raw_checkpoint: ${oc.env:RAW_VIT_CHECKPOINT,""}
   latent_checkpoint: ""
   big_vae_checkpoint: ${oc.env:BIG_VAE_CHECKPOINT,""}
+  require_big_vae_checkpoint: false
+  require_raw_checkpoint: false
+  require_diffusion_prior_checkpoint: false
+  require_latent_checkpoint: false
   big_vae_latent_parameterization: euclidean
   big_vae_diffusion_prior_checkpoint: ${oc.env:BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT,""}
   big_vae_diffusion_prior_steps: 50
