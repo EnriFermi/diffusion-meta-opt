@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import contextlib
 import json
 import math
 import random
@@ -83,6 +84,26 @@ def _get_pyplot():
     return plt
 
 
+def _higher_order_sdpa_context():
+    # Higher-order autograd is not implemented for some efficient SDPA kernels on CUDA.
+    # Force the math kernel only for Hessian/HVP-style paths.
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        return sdpa_kernel([SDPBackend.MATH])
+    except Exception:
+        pass
+    try:
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=False,
+            enable_math=True,
+            enable_mem_efficient=False,
+            enable_cudnn=False,
+        )
+    except Exception:
+        return contextlib.nullcontext()
+
+
 @dataclass(slots=True)
 class LandscapeConfig:
     data_dir: str
@@ -157,6 +178,36 @@ def append_csv_row(path: Path, row: dict[str, Any]) -> None:
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+
+
+def maybe_unlink(path: Path) -> None:
+    if path.exists() and path.is_file():
+        path.unlink()
+
+
+def load_training_cache_if_compatible(
+    cache_path: Path,
+    *,
+    cfg: LandscapeConfig,
+    seed: int,
+) -> dict[str, Any] | None:
+    if not cache_path.exists():
+        return None
+    payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("seed", -1)) != int(seed):
+        return None
+    expected_cfg = asdict(cfg)
+    if payload.get("config") != expected_cfg:
+        return None
+    checkpoints = payload.get("checkpoints")
+    summary = payload.get("summary")
+    if not isinstance(checkpoints, dict) or not isinstance(summary, dict):
+        return None
+    if "final" not in checkpoints or "init" not in checkpoints or "after_step_1" not in checkpoints:
+        return None
+    return payload
 
 
 def build_cifar10_datasets(cfg: LandscapeConfig):
@@ -529,29 +580,31 @@ def gradient_and_optional_weight_gradients(
     return_weight_grads: bool,
 ) -> tuple[torch.Tensor, float, torch.Tensor, torch.Tensor | None]:
     latent_state = unflatten_latent_state(store, flat_z)
-    logits, _decoded_matrices, decoded_tensors = forward_from_latent_state(model, latent_state, images)
-    loss = F.cross_entropy(logits, labels)
-    acc = float((logits.argmax(dim=-1) == labels).float().mean().detach().cpu().item())
-    weight_grads = None
-    if return_weight_grads:
-        weight_tensors = [decoded_tensors[name] for name in sorted(decoded_tensors.keys())]
-        grads = torch.autograd.grad(
-            loss,
-            [flat_z, *weight_tensors],
-            create_graph=create_graph,
-            retain_graph=True,
-            allow_unused=False,
-        )
-        grad_z = grads[0]
-        weight_grads = torch.cat([grad.reshape(-1) for grad in grads[1:]], dim=0)
-    else:
-        (grad_z,) = torch.autograd.grad(
-            loss,
-            flat_z,
-            create_graph=create_graph,
-            retain_graph=create_graph,
-            allow_unused=False,
-        )
+    autocast_ctx = _higher_order_sdpa_context() if create_graph else contextlib.nullcontext()
+    with autocast_ctx:
+        logits, _decoded_matrices, decoded_tensors = forward_from_latent_state(model, latent_state, images)
+        loss = F.cross_entropy(logits, labels)
+        acc = float((logits.argmax(dim=-1) == labels).float().mean().detach().cpu().item())
+        weight_grads = None
+        if return_weight_grads:
+            weight_tensors = [decoded_tensors[name] for name in sorted(decoded_tensors.keys())]
+            grads = torch.autograd.grad(
+                loss,
+                [flat_z, *weight_tensors],
+                create_graph=create_graph,
+                retain_graph=True,
+                allow_unused=False,
+            )
+            grad_z = grads[0]
+            weight_grads = torch.cat([grad.reshape(-1) for grad in grads[1:]], dim=0)
+        else:
+            (grad_z,) = torch.autograd.grad(
+                loss,
+                flat_z,
+                create_graph=create_graph,
+                retain_graph=create_graph,
+                allow_unused=False,
+            )
     return loss, acc, grad_z, weight_grads
 
 
@@ -1185,6 +1238,7 @@ def run_training_for_seed(
     diagnostics_dir = run_dir / "diagnostics"
     plots_dir = diagnostics_dir / "plots"
     checkpoints_file = run_dir / "checkpoints.pt"
+    train_cache_file = run_dir / "train_cache.pt"
     train_log_csv = run_dir / "train_log.csv"
     write_json(
         run_dir / "config.json",
@@ -1196,169 +1250,203 @@ def run_training_for_seed(
         },
     )
 
-    checkpoints: dict[str, dict[str, Any]] = {}
-    checkpoints["init"] = capture_checkpoint_state(store, name="init", step=0, update_direction=None)
+    cached_training = load_training_cache_if_compatible(
+        train_cache_file,
+        cfg=cfg,
+        seed=int(seed),
+    )
+    if cached_training is not None:
+        print(
+            f"[latent_landscape][seed={seed}] reusing cached training state from {train_cache_file}",
+            flush=True,
+        )
+        checkpoints = cached_training["checkpoints"]
+        summary = cached_training["summary"]
+        torch.save({"seed": int(seed), "checkpoints": checkpoints}, checkpoints_file)
+    else:
+        checkpoints: dict[str, dict[str, Any]] = {}
+        checkpoints["init"] = capture_checkpoint_state(store, name="init", step=0, update_direction=None)
 
-    train_rows: list[dict[str, Any]] = []
-    best_acc = -float("inf")
-    best_step = 0
-    plateau_name: str | None = None
-    last_scheduled_name: str | None = None
-    max_steps = max(1, int(cfg.steps))
-    global_step = 0
-    start_time = time.time()
-    window_loss_sum = 0.0
-    window_examples = 0
+        train_rows: list[dict[str, Any]] = []
+        best_acc = -float("inf")
+        best_step = 0
+        plateau_name: str | None = None
+        last_scheduled_name: str | None = None
+        last_test_loss = float("nan")
+        last_test_acc = float("nan")
+        max_steps = max(1, int(cfg.steps))
+        global_step = 0
+        start_time = time.time()
+        window_loss_sum = 0.0
+        window_examples = 0
 
-    for epoch_idx in range(max(1, int(cfg.epochs))):
-        model.train()
-        for images, labels in train_loader:
-            global_step += 1
-            images = images.to(device=device, non_blocking=True)
-            labels = labels.to(device=device, non_blocking=True)
+        maybe_unlink(train_log_csv)
+        for epoch_idx in range(max(1, int(cfg.epochs))):
+            model.train()
+            for images, labels in train_loader:
+                global_step += 1
+                images = images.to(device=device, non_blocking=True)
+                labels = labels.to(device=device, non_blocking=True)
 
-            pre_step_z = flatten_materialized_latents(store)
-            pre_step_w = flatten_current_decoded_tensors(store)
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(images)
-            loss = F.cross_entropy(logits, labels)
-            loss.backward()
-            if float(cfg.grad_clip_norm) > 0.0:
-                torch.nn.utils.clip_grad_norm_(store.latent_slots.parameters(), float(cfg.grad_clip_norm))
-            optimizer.step()
+                pre_step_z = flatten_materialized_latents(store)
+                pre_step_w = flatten_current_decoded_tensors(store)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(images)
+                loss = F.cross_entropy(logits, labels)
+                loss.backward()
+                if float(cfg.grad_clip_norm) > 0.0:
+                    torch.nn.utils.clip_grad_norm_(store.latent_slots.parameters(), float(cfg.grad_clip_norm))
+                optimizer.step()
 
-            post_step_z = flatten_materialized_latents(store)
-            post_step_w = flatten_current_decoded_tensors(store)
-            delta_z = post_step_z - pre_step_z
-            delta_w = post_step_w - pre_step_w
-            delta_z_norm = float(delta_z.norm().detach().cpu().item())
-            delta_w_norm = float(delta_w.norm().detach().cpu().item())
-            z_norm = float(post_step_z.norm().detach().cpu().item())
-            tiny = max(float(torch.finfo(post_step_z.dtype).eps), 1e-12)
-            delta_w_over_delta_z = float(delta_w_norm / max(delta_z_norm, tiny))
-            delta_parallel, delta_tangent = project_parallel_and_tangent(delta_z, post_step_z)
-            cos_delta_z = (
-                float(torch.dot(delta_z, post_step_z).detach().cpu().item() / max(delta_z_norm * z_norm, tiny))
-                if delta_z_norm > 0.0 and z_norm > 0.0
-                else float("nan")
-            )
-            delta_parallel_ratio = float(delta_parallel.norm().detach().cpu().item() / max(delta_z_norm, tiny))
-            delta_tangent_ratio = float(delta_tangent.norm().detach().cpu().item() / max(delta_z_norm, tiny))
-
-            batch_examples = int(labels.numel())
-            window_loss_sum += float(loss.detach().cpu().item()) * batch_examples
-            window_examples += batch_examples
-
-            should_log = global_step == 1 or global_step % max(1, int(cfg.log_every)) == 0
-            should_eval = global_step == 1 or global_step % max(1, int(cfg.eval_every)) == 0 or global_step >= max_steps
-
-            grad_z_norm = float("nan")
-            if should_log or should_eval:
-                z_for_grad = post_step_z.detach().clone().requires_grad_(True)
-                _loss_now, _acc_now, grad_z_now, _ = gradient_and_optional_weight_gradients(
-                    model,
-                    store,
-                    z_for_grad,
-                    images,
-                    labels,
-                    create_graph=False,
-                    return_weight_grads=False,
+                post_step_z = flatten_materialized_latents(store)
+                post_step_w = flatten_current_decoded_tensors(store)
+                delta_z = post_step_z - pre_step_z
+                delta_w = post_step_w - pre_step_w
+                delta_z_norm = float(delta_z.norm().detach().cpu().item())
+                delta_w_norm = float(delta_w.norm().detach().cpu().item())
+                z_norm = float(post_step_z.norm().detach().cpu().item())
+                tiny = max(float(torch.finfo(post_step_z.dtype).eps), 1e-12)
+                delta_w_over_delta_z = float(delta_w_norm / max(delta_z_norm, tiny))
+                delta_parallel, delta_tangent = project_parallel_and_tangent(delta_z, post_step_z)
+                cos_delta_z = (
+                    float(torch.dot(delta_z, post_step_z).detach().cpu().item() / max(delta_z_norm * z_norm, tiny))
+                    if delta_z_norm > 0.0 and z_norm > 0.0
+                    else float("nan")
                 )
-                grad_z_norm = float(grad_z_now.norm().detach().cpu().item())
+                delta_parallel_ratio = float(delta_parallel.norm().detach().cpu().item() / max(delta_z_norm, tiny))
+                delta_tangent_ratio = float(delta_tangent.norm().detach().cpu().item() / max(delta_z_norm, tiny))
 
-            test_loss = float("nan")
-            test_acc = float("nan")
-            if should_eval:
-                test_loss, test_acc = evaluate_model(model, test_loader, device=device)
-                if test_acc > best_acc:
-                    best_acc = float(test_acc)
-                    best_step = int(global_step)
-                    checkpoints["best_val"] = capture_checkpoint_state(
+                batch_examples = int(labels.numel())
+                window_loss_sum += float(loss.detach().cpu().item()) * batch_examples
+                window_examples += batch_examples
+
+                should_log = global_step == 1 or global_step % max(1, int(cfg.log_every)) == 0
+                should_eval = global_step == 1 or global_step % max(1, int(cfg.eval_every)) == 0 or global_step >= max_steps
+
+                grad_z_norm = float("nan")
+                if should_log or should_eval:
+                    z_for_grad = post_step_z.detach().clone().requires_grad_(True)
+                    _loss_now, _acc_now, grad_z_now, _ = gradient_and_optional_weight_gradients(
+                        model,
                         store,
-                        name="best_val",
+                        z_for_grad,
+                        images,
+                        labels,
+                        create_graph=False,
+                        return_weight_grads=False,
+                    )
+                    grad_z_norm = float(grad_z_now.norm().detach().cpu().item())
+
+                if should_eval:
+                    last_test_loss, last_test_acc = evaluate_model(model, test_loader, device=device)
+                    if last_test_acc > best_acc:
+                        best_acc = float(last_test_acc)
+                        best_step = int(global_step)
+                        checkpoints["best_val"] = capture_checkpoint_state(
+                            store,
+                            name="best_val",
+                            step=global_step,
+                            update_direction=delta_z,
+                        )
+
+                if global_step == 1:
+                    checkpoints["after_step_1"] = capture_checkpoint_state(
+                        store,
+                        name="after_step_1",
                         step=global_step,
                         update_direction=delta_z,
                     )
+                if global_step in set(int(step) for step in cfg.checkpoint_steps):
+                    checkpoint_name = f"step_{global_step}"
+                    checkpoints[checkpoint_name] = capture_checkpoint_state(
+                        store,
+                        name=checkpoint_name,
+                        step=global_step,
+                        update_direction=delta_z,
+                    )
+                    last_scheduled_name = checkpoint_name
 
-            if global_step == 1:
-                checkpoints["after_step_1"] = capture_checkpoint_state(
-                    store,
-                    name="after_step_1",
-                    step=global_step,
-                    update_direction=delta_z,
-                )
-            if global_step in set(int(step) for step in cfg.checkpoint_steps):
-                checkpoint_name = f"step_{global_step}"
-                checkpoints[checkpoint_name] = capture_checkpoint_state(
-                    store,
-                    name=checkpoint_name,
-                    step=global_step,
-                    update_direction=delta_z,
-                )
-                last_scheduled_name = checkpoint_name
+                if should_log or should_eval:
+                    avg_train_loss = window_loss_sum / max(1, window_examples)
+                    row = {
+                        "seed": int(seed),
+                        "step": int(global_step),
+                        "epoch": int(epoch_idx + 1),
+                        "train_loss": float(avg_train_loss),
+                        "test_loss": float(last_test_loss),
+                        "test_acc": float(last_test_acc),
+                        "best_acc": float(best_acc if best_acc > -float("inf") else float("nan")),
+                        "z_norm": float(z_norm),
+                        "grad_z_norm": float(grad_z_norm),
+                        "delta_z_norm": float(delta_z_norm),
+                        "delta_w_norm": float(delta_w_norm),
+                        "delta_w_over_delta_z": float(delta_w_over_delta_z),
+                        "cos_delta_z_z": float(cos_delta_z),
+                        "delta_z_parallel_ratio": float(delta_parallel_ratio),
+                        "delta_z_tangent_ratio": float(delta_tangent_ratio),
+                        "elapsed_s": float(time.time() - start_time),
+                    }
+                    train_rows.append(row)
+                    append_csv_row(train_log_csv, row)
+                    print(
+                        f"[latent_landscape][seed={seed}] step={global_step} "
+                        f"train_loss={avg_train_loss:.4f} test_loss={last_test_loss:.4f} test_acc={last_test_acc:.4f} "
+                        f"best={best_acc:.4f} ||z||={z_norm:.6e} ||grad_z||={grad_z_norm:.6e} "
+                        f"||Δz||={delta_z_norm:.6e} ||ΔW||={delta_w_norm:.6e} "
+                        f"||ΔW||/||Δz||={delta_w_over_delta_z:.6e} cos(Δz,z)={cos_delta_z:.6e} "
+                        f"||Δz_parallel||/||Δz||={delta_parallel_ratio:.6e} "
+                        f"||Δz_tangent||/||Δz||={delta_tangent_ratio:.6e}",
+                        flush=True,
+                    )
+                    window_loss_sum = 0.0
+                    window_examples = 0
 
-            if should_log or should_eval:
-                avg_train_loss = window_loss_sum / max(1, window_examples)
-                row = {
-                    "seed": int(seed),
-                    "step": int(global_step),
-                    "epoch": int(epoch_idx + 1),
-                    "train_loss": float(avg_train_loss),
-                    "test_loss": float(test_loss),
-                    "test_acc": float(test_acc),
-                    "best_acc": float(best_acc if best_acc > -float("inf") else float("nan")),
-                    "z_norm": float(z_norm),
-                    "grad_z_norm": float(grad_z_norm),
-                    "delta_z_norm": float(delta_z_norm),
-                    "delta_w_norm": float(delta_w_norm),
-                    "delta_w_over_delta_z": float(delta_w_over_delta_z),
-                    "cos_delta_z_z": float(cos_delta_z),
-                    "delta_z_parallel_ratio": float(delta_parallel_ratio),
-                    "delta_z_tangent_ratio": float(delta_tangent_ratio),
-                    "elapsed_s": float(time.time() - start_time),
-                }
-                train_rows.append(row)
-                append_csv_row(train_log_csv, row)
-                print(
-                    f"[latent_landscape][seed={seed}] step={global_step} "
-                    f"train_loss={avg_train_loss:.4f} test_loss={test_loss:.4f} test_acc={test_acc:.4f} "
-                    f"best={best_acc:.4f} ||z||={z_norm:.6e} ||grad_z||={grad_z_norm:.6e} "
-                    f"||Δz||={delta_z_norm:.6e} ||ΔW||={delta_w_norm:.6e} "
-                    f"||ΔW||/||Δz||={delta_w_over_delta_z:.6e} cos(Δz,z)={cos_delta_z:.6e} "
-                    f"||Δz_parallel||/||Δz||={delta_parallel_ratio:.6e} "
-                    f"||Δz_tangent||/||Δz||={delta_tangent_ratio:.6e}",
-                    flush=True,
-                )
-                window_loss_sum = 0.0
-                window_examples = 0
-
+                if global_step >= max_steps:
+                    break
             if global_step >= max_steps:
                 break
-        if global_step >= max_steps:
-            break
 
-    final_test_loss, final_test_acc = evaluate_model(model, test_loader, device=device)
-    checkpoints["final"] = capture_checkpoint_state(
-        store,
-        name="final",
-        step=global_step,
-        update_direction=None,
-    )
-    if last_scheduled_name is not None and last_scheduled_name in checkpoints:
-        checkpoints["plateau_candidate"] = {
-            **checkpoints[last_scheduled_name],
-            "name": "plateau_candidate",
-        }
-        plateau_name = last_scheduled_name
-    else:
-        checkpoints["plateau_candidate"] = {
-            **checkpoints["final"],
-            "name": "plateau_candidate",
-        }
-        plateau_name = "final"
+        final_test_loss, final_test_acc = evaluate_model(model, test_loader, device=device)
+        checkpoints["final"] = capture_checkpoint_state(
+            store,
+            name="final",
+            step=global_step,
+            update_direction=None,
+        )
+        if last_scheduled_name is not None and last_scheduled_name in checkpoints:
+            checkpoints["plateau_candidate"] = {
+                **checkpoints[last_scheduled_name],
+                "name": "plateau_candidate",
+            }
+            plateau_name = last_scheduled_name
+        else:
+            checkpoints["plateau_candidate"] = {
+                **checkpoints["final"],
+                "name": "plateau_candidate",
+            }
+            plateau_name = "final"
 
-    torch.save({"seed": int(seed), "checkpoints": checkpoints}, checkpoints_file)
-    plot_training_curves(train_rows, plots_dir / "training_curves.png")
+        torch.save({"seed": int(seed), "checkpoints": checkpoints}, checkpoints_file)
+        plot_training_curves(train_rows, plots_dir / "training_curves.png")
+        summary = {
+            "seed": int(seed),
+            "best_step": int(best_step),
+            "best_test_acc": float(best_acc if best_acc > -float("inf") else float("nan")),
+            "final_test_loss": float(final_test_loss),
+            "final_test_acc": float(final_test_acc),
+            "saved_checkpoints": sorted(checkpoints.keys()),
+            "plateau_source": str(plateau_name),
+        }
+        write_json(run_dir / "summary.json", summary)
+        torch.save(
+            {
+                "seed": int(seed),
+                "config": asdict(cfg),
+                "summary": summary,
+                "checkpoints": checkpoints,
+            },
+            train_cache_file,
+        )
 
     radial_rows: list[dict[str, Any]] = []
     angular_rows: list[dict[str, Any]] = []
@@ -1368,6 +1456,18 @@ def run_training_for_seed(
     hessian_rows: list[dict[str, Any]] = []
     slice_rows: list[dict[str, Any]] = []
     aggregate_rows: list[dict[str, Any]] = []
+
+    maybe_unlink(run_dir / "aggregate_summary_seed.csv")
+    for filename in [
+        "gradient_decomp.csv",
+        "radial.csv",
+        "angular.csv",
+        "decoder_jacobian_fd.csv",
+        "accessibility.csv",
+        "hessian.csv",
+        "slice2d.csv",
+    ]:
+        maybe_unlink(diagnostics_dir / filename)
 
     diag_generator = torch.Generator(device=device)
     diag_generator.manual_seed(int(seed) + 1000)
@@ -1567,16 +1667,6 @@ def run_training_for_seed(
             }
         )
 
-    summary = {
-        "seed": int(seed),
-        "best_step": int(best_step),
-        "best_test_acc": float(best_acc if best_acc > -float("inf") else float("nan")),
-        "final_test_loss": float(final_test_loss),
-        "final_test_acc": float(final_test_acc),
-        "saved_checkpoints": sorted(checkpoints.keys()),
-        "plateau_source": str(plateau_name),
-    }
-    write_json(run_dir / "summary.json", summary)
     for row in aggregate_rows:
         append_csv_row(run_dir / "aggregate_summary_seed.csv", row)
     return {
@@ -1748,6 +1838,7 @@ def main() -> None:
 
     write_json(output_dir / "config.json", {"config": asdict(cfg), "device": str(device)})
     aggregate_summary_path = output_dir / "aggregate_summary.csv"
+    maybe_unlink(aggregate_summary_path)
     all_summaries: list[dict[str, Any]] = []
     for seed in cfg.seeds:
         print(
