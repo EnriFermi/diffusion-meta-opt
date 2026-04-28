@@ -17,6 +17,7 @@ RAW_CHECKPOINT=""
 LATENT_CHECKPOINT=""
 
 BIG_VAE_LATENT_PARAMETERIZATION="sphere"
+BIG_VAE_RANDOM_INIT_STD="0.02"
 BIG_VAE_INIT_CALIBRATION_BATCHES="1"
 BIG_VAE_DECODE="weights"
 BIG_VAE_TILE_T_PATCHES="4"
@@ -92,6 +93,7 @@ set -- \
   "vit_latent_scaling.latent_checkpoint=$LATENT_CHECKPOINT" \
   "vit_latent_scaling.big_vae_checkpoint=$BIG_VAE_CHECKPOINT" \
   "vit_latent_scaling.big_vae_latent_parameterization=$BIG_VAE_LATENT_PARAMETERIZATION" \
+  "vit_latent_scaling.big_vae_random_init_std=$BIG_VAE_RANDOM_INIT_STD" \
   "vit_latent_scaling.big_vae_diffusion_prior_checkpoint=$BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT" \
   "vit_latent_scaling.big_vae_init_calibration_batches=$BIG_VAE_INIT_CALIBRATION_BATCHES" \
   "vit_latent_scaling.big_vae_decode=$BIG_VAE_DECODE" \

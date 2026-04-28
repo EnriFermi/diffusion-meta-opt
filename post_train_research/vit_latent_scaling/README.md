@@ -152,11 +152,19 @@ For latent runs the init group controls how the first latent state is built:
 
 ```text
 base             -> copy frozen BigVAE latent base into every decoded tile
-random           -> Gaussian latent initialization
+random           -> frozen BigVAE latent base plus Gaussian noise
 encoded          -> encode a raw ViT checkpoint through the frozen BigVAE encoder
 diffusion_prior  -> autoregressive activation-conditioned prior sample
 from_checkpoint  -> load latent slots from a previous latent checkpoint
 ```
+
+For `random`, the Gaussian noise standard deviation is controlled by:
+
+```text
+vit_latent_scaling.big_vae_random_init_std
+```
+
+The shell wrappers expose it as `BIG_VAE_RANDOM_INIT_STD`.
 
 There are also self-contained shell wrappers next to this README:
 

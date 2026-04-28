@@ -65,6 +65,7 @@ vit_latent_scaling:
   big_vae_diffusion_prior_steps: 50
   big_vae_diffusion_prior_sampler: ddim
   big_vae_diffusion_prior_eta: 0.0
+  big_vae_random_init_std: 0.02
   big_vae_decode: all
   big_vae_tile_T_patches: 16
   big_vae_tile_d_out: 8
