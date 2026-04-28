@@ -4,9 +4,11 @@ from pathlib import Path
 import tempfile
 
 import pytest
+import torch
 from hydra import compose, initialize_config_dir
 
 from post_train_research.tinyvit_latent_h1.config import build_run_config
+from post_train_research.tinyvit_latent_h1.experiment import _checkpoint_payload_json_view
 from post_train_research.tinyvit_latent_h1.source import build_train_schedule, resolve_source_checkpoint_for_experiment
 
 
@@ -66,3 +68,17 @@ def test_build_train_schedule_is_deterministic() -> None:
     right = build_train_schedule(10, batch_size=4, steps=5, seed=123)
     assert len(left) == 5
     assert all(l.equal(r) for l, r in zip(left, right, strict=True))
+
+
+def test_checkpoint_payload_json_view_strips_tensor_values() -> None:
+    payload = {
+        "branch": "latent",
+        "named_tensors": {"head.weight": torch.zeros(10, 64)},
+        "latent_slots": {"p0001_t0000": torch.zeros(32, 256)},
+    }
+    view = _checkpoint_payload_json_view(payload)
+
+    assert view["named_tensor_count"] == 1
+    assert view["latent_slot_count"] == 1
+    assert view["named_tensors"]["head.weight"]["shape"] == [10, 64]
+    assert view["latent_slots"]["p0001_t0000"]["shape"] == [32, 256]
