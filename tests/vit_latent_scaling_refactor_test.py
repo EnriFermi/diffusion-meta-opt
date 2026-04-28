@@ -9,6 +9,7 @@ from hydra import compose, initialize_config_dir
 
 from post_train_research.vit_latent_scaling.config import build_run_config
 from post_train_research.vit_latent_scaling.init import adapt_named_tensors, resolve_source_checkpoint_path
+from post_train_research.vit_latent_scaling.runtime import prepare_run_paths
 from post_train_research.vit_latent_scaling.train import build_lr_scheduler
 
 
@@ -25,6 +26,7 @@ def test_single_config_builds_cifar10_50k_raw_profile() -> None:
     cfg = _compose(
         [
             "experiment.profile=cifar10_50k",
+            "experiment.run_label=my_cifar_run",
             "setup.kind=raw",
             "init.kind=fresh",
             "data.download=true",
@@ -33,6 +35,8 @@ def test_single_config_builds_cifar10_50k_raw_profile() -> None:
     run_cfg, _ = build_run_config(cfg)
 
     assert run_cfg.profile.name == "cifar10_50k"
+    assert run_cfg.run_label == "my_cifar_run"
+    assert run_cfg.shared_checkpoint_label == "my_cifar_run"
     assert run_cfg.data.dataset == "cifar10"
     assert run_cfg.model.hidden_dim == 64
     assert run_cfg.model.depth == 1
@@ -72,12 +76,35 @@ def test_adapt_named_tensors_resizes_patch_embed_and_pos_embed() -> None:
 def test_resolve_source_checkpoint_path_accepts_run_dir_and_checkpoint_alias() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         root = Path(tmp_dir)
-        run_dir = root / "runs" / "abc123"
+        run_dir = root / "runs" / "demo-label" / "abc123"
         checkpoints_dir = run_dir / "checkpoints"
         checkpoints_dir.mkdir(parents=True, exist_ok=True)
         (checkpoints_dir / "best.pt").write_bytes(b"x")
         resolved = resolve_source_checkpoint_path(root, source_run_dir="abc123", checkpoint_name="best")
         assert resolved == (checkpoints_dir / "best.pt").resolve()
+
+
+def test_prepare_run_paths_creates_shared_checkpoint_dir_from_config_label() -> None:
+    cfg = _compose(
+        [
+            "experiment.profile=cifar10_50k",
+            "experiment.run_label=my_cifar_run",
+            "storage.root_dir=/tmp/vit_latent_scaling_test_artifacts",
+            "storage.shared_checkpoint_label=shared_model_v1",
+            "setup.kind=raw",
+            "init.kind=fresh",
+        ]
+    )
+    run_cfg, _ = build_run_config(cfg)
+    paths = prepare_run_paths(run_cfg)
+    try:
+        assert paths.run_label_dir.name == "my_cifar_run"
+        assert paths.shared_checkpoints_dir.name == "shared_model_v1"
+        assert paths.shared_checkpoints_dir.parent.name == "checkpoints"
+    finally:
+        import shutil
+
+        shutil.rmtree(paths.root_dir, ignore_errors=True)
 
 
 def test_latent_scheduler_decays_to_floor() -> None:
