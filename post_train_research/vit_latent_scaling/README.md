@@ -73,6 +73,7 @@ mnist_medium:   image=28 patch=4  hidden=192 depth=8  heads=6
 cifar10_tiny:   image=32 patch=4  hidden=192 depth=6  heads=3
 cifar10_small:  image=32 patch=4  hidden=256 depth=8  heads=4
 cifar10_medium: image=32 patch=4  hidden=384 depth=12 heads=6
+cifar10_50k:    image=32 patch=8  hidden=64  depth=1  heads=4
 imagenet_tiny:  image=224 patch=16 hidden=192 depth=12 heads=3
 imagenet_small: image=224 patch=16 hidden=384 depth=12 heads=6
 imagenet_base:  image=224 patch=16 hidden=768 depth=12 heads=12
@@ -119,20 +120,42 @@ python post_train_research/vit_latent_scaling/run_vit_latent_scaling_hydra.py \
   vit_latent_scaling.big_vae_checkpoint=/path/to/big_vae.pt
 ```
 
-The three convenience configs are:
+The convenience configs are:
 
 ```text
+vit_latent_scaling/config_latent_base
 vit_latent_scaling/config_ae_encoded
 vit_latent_scaling/config_latent_random
+vit_latent_scaling/config_latent_from_checkpoint
 vit_latent_scaling/config_ae_diffusion_prior
+vit_latent_scaling/config_cifar10_50k
 ```
 
 They correspond to:
 
 ```text
+latent_base         -> setup=latent, big_vae_latent_init=base
 ae_encoded          -> setup=latent, big_vae_latent_init=encoded
 latent_random       -> setup=latent, big_vae_latent_init=random
+latent_from_checkpoint -> setup=latent, load latent slots from vit_latent_scaling.latent_checkpoint
 ae_diffusion_prior  -> setup=latent, big_vae_latent_init=diffusion_prior
+```
+
+Hydra composition is now split into:
+
+```text
+vit_latent_scaling/setup : raw | latent
+vit_latent_scaling/init  : noop | base | random | encoded | diffusion_prior | from_checkpoint
+```
+
+For latent runs the init group controls how the first latent state is built:
+
+```text
+base             -> copy frozen BigVAE latent base into every decoded tile
+random           -> Gaussian latent initialization
+encoded          -> encode a raw ViT checkpoint through the frozen BigVAE encoder
+diffusion_prior  -> autoregressive activation-conditioned prior sample
+from_checkpoint  -> load latent slots from a previous latent checkpoint
 ```
 
 There are also self-contained shell wrappers next to this README:
@@ -142,6 +165,7 @@ run_vit_latent_scaling_raw.sh
 run_vit_latent_scaling_ae_encoded.sh
 run_vit_latent_scaling_latent_random.sh
 run_vit_latent_scaling_ae_diffusion_prior.sh
+run_vit_latent_scaling_cifar10_50k.sh
 run_vit_latent_scaling_latent_transfer.sh
 ```
 
@@ -166,6 +190,15 @@ run_vit_latent_scaling_ae_diffusion_prior.sh
 
 `RAW_CHECKPOINT` is only needed by the optional `ae_encoded` path, because that mode initializes latents by encoding an already existing raw ViT solution.
 `BIG_VAE_INIT_CALIBRATION_BATCHES` controls how many train batches are used to build real activation contexts for autoregressive diffusion-prior initialization.
+
+`run_vit_latent_scaling_cifar10_50k.sh` is the compact launcher for the
+`cifar10_50k` preset. It uses `vit_latent_scaling/config_cifar10_50k` and
+switches initialization through:
+
+```text
+SETUP_GROUP
+INIT_GROUP
+```
 
 ## Latent Transfer
 
@@ -211,8 +244,9 @@ You can also use the general config and switch groups explicitly:
 ```bash
 python post_train_research/vit_latent_scaling/run_vit_latent_scaling_hydra.py \
   --config-name vit_latent_scaling/config \
-  preset=cifar10_small \
-  setup=ae_diffusion_prior \
+  vit_latent_scaling/preset=cifar10_small \
+  vit_latent_scaling/setup=latent \
+  vit_latent_scaling/init=diffusion_prior \
   vit_latent_scaling.big_vae_checkpoint=/path/to/big_vae.pt \
   vit_latent_scaling.big_vae_diffusion_prior_checkpoint=/path/to/prior.pt
 ```

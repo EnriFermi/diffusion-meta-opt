@@ -64,6 +64,8 @@ class ScalingRunConfig:
     dataset: str
     model_size: str
     setup: str
+    setup_name: str
+    init_name: str
     data_dir: str
     download: bool
     device: str
@@ -99,6 +101,10 @@ class ScalingRunConfig:
     raw_checkpoint: str
     latent_checkpoint: str
     big_vae_checkpoint: str
+    require_big_vae_checkpoint: bool
+    require_raw_checkpoint: bool
+    require_diffusion_prior_checkpoint: bool
+    require_latent_checkpoint: bool
     big_vae_latent_init: str
     big_vae_latent_parameterization: str
     big_vae_diffusion_prior_checkpoint: str
@@ -122,21 +128,19 @@ def validate_scaling_run_config(cfg: ScalingRunConfig) -> None:
     if setup == "raw" and str(cfg.latent_checkpoint).strip():
         raise ValueError("--latent-checkpoint is only valid for setup=latent")
     if setup == "latent":
-        if not str(cfg.big_vae_checkpoint).strip():
+        if bool(cfg.require_big_vae_checkpoint) and not str(cfg.big_vae_checkpoint).strip():
             raise ValueError("--big-vae-checkpoint is required for setup=latent")
         latent_parameterization = str(cfg.big_vae_latent_parameterization).strip().lower()
         if latent_parameterization not in {"euclidean", "sphere"}:
             raise ValueError("--big-vae-latent-parameterization must be one of {'euclidean', 'sphere'}")
-        if not has_latent_checkpoint:
-            latent_init = str(cfg.big_vae_latent_init).strip().lower()
-            if latent_init == "encoded" and not str(cfg.raw_checkpoint).strip():
-                raise ValueError("--raw-checkpoint is required when --big-vae-latent-init=encoded")
-            if latent_init == "diffusion_prior" and not str(
-                cfg.big_vae_diffusion_prior_checkpoint
-            ).strip():
-                raise ValueError(
-                    "--big-vae-diffusion-prior-checkpoint is required when --big-vae-latent-init=diffusion_prior"
-                )
+        if bool(cfg.require_latent_checkpoint) and not has_latent_checkpoint:
+            raise ValueError("--latent-checkpoint is required for the selected latent initialization")
+        if bool(cfg.require_raw_checkpoint) and not str(cfg.raw_checkpoint).strip():
+            raise ValueError("--raw-checkpoint is required for the selected latent initialization")
+        if bool(cfg.require_diffusion_prior_checkpoint) and not str(
+            cfg.big_vae_diffusion_prior_checkpoint
+        ).strip():
+            raise ValueError("--big-vae-diffusion-prior-checkpoint is required for the selected latent initialization")
     latent_lr_scheduler = str(cfg.latent_lr_scheduler).strip().lower()
     if latent_lr_scheduler not in {"constant", "cosine_decay_to_floor"}:
         raise ValueError(
@@ -886,6 +890,7 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
     tile_count = store.decoded_tile_count() if isinstance(store, BigVAELatentTensorStore) else 0
     print(
         f"[{cfg.setup}] dataset={cfg.dataset} model={cfg.model_size} base_lr={float(cfg.lr):g} "
+        f"setup_name={cfg.setup_name} init_name={cfg.init_name} "
         f"optimizer={cfg.optimizer_name} "
         f"lr_schedule={lr_schedule_description} "
         f"trainable_params={trainable_params} decoded_params={decoded_params} "
@@ -1102,6 +1107,8 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         "dataset": str(cfg.dataset),
         "model_size": str(cfg.model_size),
         "setup": str(cfg.setup),
+        "setup_name": str(cfg.setup_name),
+        "init_name": str(cfg.init_name),
         "optimizer_name": str(cfg.optimizer_name),
         "optimizer_kwargs": dict(cfg.optimizer_kwargs),
         "steps": int(global_step),
@@ -1145,6 +1152,10 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
             str(cfg.big_vae_diffusion_prior_sampler) if cfg.setup == "latent" else ""
         ),
         "big_vae_diffusion_prior_eta": float(cfg.big_vae_diffusion_prior_eta) if cfg.setup == "latent" else 0.0,
+        "require_big_vae_checkpoint": bool(cfg.require_big_vae_checkpoint),
+        "require_raw_checkpoint": bool(cfg.require_raw_checkpoint),
+        "require_diffusion_prior_checkpoint": bool(cfg.require_diffusion_prior_checkpoint),
+        "require_latent_checkpoint": bool(cfg.require_latent_checkpoint),
     }
     write_json(output_dir / "summary.json", summary)
     return summary
@@ -1245,6 +1256,8 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         dataset=str(args.dataset),
         model_size=str(args.model_size),
         setup=setup,
+        setup_name=setup,
+        init_name=("raw" if setup == "raw" else (str(args.big_vae_latent_init).strip().lower() or "encoded")),
         data_dir=str(args.data_dir),
         download=bool(args.download),
         device=str(args.device),
@@ -1280,6 +1293,12 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         raw_checkpoint=str(args.raw_checkpoint),
         latent_checkpoint=str(args.latent_checkpoint),
         big_vae_checkpoint=str(args.big_vae_checkpoint),
+        require_big_vae_checkpoint=bool(setup == "latent"),
+        require_raw_checkpoint=bool(setup == "latent" and str(args.big_vae_latent_init).strip().lower() == "encoded"),
+        require_diffusion_prior_checkpoint=bool(
+            setup == "latent" and str(args.big_vae_latent_init).strip().lower() == "diffusion_prior"
+        ),
+        require_latent_checkpoint=False,
         big_vae_latent_init=str(args.big_vae_latent_init),
         big_vae_latent_parameterization=str(args.big_vae_latent_parameterization),
         big_vae_diffusion_prior_checkpoint=str(args.big_vae_diffusion_prior_checkpoint),

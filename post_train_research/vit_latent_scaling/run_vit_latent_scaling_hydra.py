@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Mapping
+import sys
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from post_train_research.vit_latent_scaling.run_vit_latent_scaling import (
     ScalingRunConfig,
@@ -36,6 +41,8 @@ def build_vit_latent_scaling_configs(cfg: DictConfig) -> tuple[ScalingRunConfig,
         dataset=str(run_cfg_raw.get("dataset", "")),
         model_size=str(run_cfg_raw.get("model_size", "")),
         setup=str(run_cfg_raw.get("setup", "")),
+        setup_name=str(run_cfg_raw.get("setup_name", run_cfg_raw.get("setup", ""))),
+        init_name=str(run_cfg_raw.get("init_name", run_cfg_raw.get("big_vae_latent_init", ""))),
         data_dir=str(run_cfg_raw.get("data_dir", "")),
         download=bool(run_cfg_raw.get("download", True)),
         device=str(run_cfg_raw.get("device", "auto")),
@@ -71,6 +78,10 @@ def build_vit_latent_scaling_configs(cfg: DictConfig) -> tuple[ScalingRunConfig,
         raw_checkpoint=str(run_cfg_raw.get("raw_checkpoint", "")),
         latent_checkpoint=str(run_cfg_raw.get("latent_checkpoint", "")),
         big_vae_checkpoint=str(run_cfg_raw.get("big_vae_checkpoint", "")),
+        require_big_vae_checkpoint=bool(run_cfg_raw.get("require_big_vae_checkpoint", False)),
+        require_raw_checkpoint=bool(run_cfg_raw.get("require_raw_checkpoint", False)),
+        require_diffusion_prior_checkpoint=bool(run_cfg_raw.get("require_diffusion_prior_checkpoint", False)),
+        require_latent_checkpoint=bool(run_cfg_raw.get("require_latent_checkpoint", False)),
         big_vae_latent_init=str(run_cfg_raw.get("big_vae_latent_init", "encoded")),
         big_vae_latent_parameterization=str(run_cfg_raw.get("big_vae_latent_parameterization", "euclidean")),
         big_vae_diffusion_prior_checkpoint=str(run_cfg_raw.get("big_vae_diffusion_prior_checkpoint", "")),
@@ -110,7 +121,8 @@ def main(cfg: DictConfig) -> None:
     print(
         "[run_vit_latent_scaling_hydra] "
         f"dataset={run_cfg.dataset} model_size={run_cfg.model_size} setup={run_cfg.setup} "
-        f"latent_init={run_cfg.big_vae_latent_init} output_dir={Path(run_cfg.output_dir).expanduser()}",
+        f"init={run_cfg.init_name} latent_init={run_cfg.big_vae_latent_init} "
+        f"output_dir={Path(run_cfg.output_dir).expanduser()}",
         flush=True,
     )
     train_once(run_cfg, vit_cfg)

@@ -3,3 +3,4 @@
 defaults:
   - config
   - override /vit_latent_scaling/setup: raw
+  - override /vit_latent_scaling/init: noop

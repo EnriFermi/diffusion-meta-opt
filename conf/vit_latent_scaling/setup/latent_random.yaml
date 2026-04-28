@@ -3,6 +3,10 @@
 vit_latent_scaling:
   setup: latent
   setup_name: latent_random
+  init_name: random
+  run_name: latent_random
   big_vae_latent_init: random
   require_big_vae_checkpoint: true
+  require_raw_checkpoint: false
   require_diffusion_prior_checkpoint: false
+  require_latent_checkpoint: false

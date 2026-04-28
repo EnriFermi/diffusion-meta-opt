@@ -3,4 +3,4 @@
 defaults:
   - config
   - override /vit_latent_scaling/setup: latent
-  - override /vit_latent_scaling/init: encoded
+  - override /vit_latent_scaling/init: from_checkpoint

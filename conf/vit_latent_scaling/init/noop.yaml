@@ -1,12 +1,8 @@
 # @package _global_
 
 vit_latent_scaling:
-  setup: raw
-  setup_name: raw
+  init_name: noop
   run_name: raw
-  raw_checkpoint: ""
-  big_vae_latent_init: encoded
-  require_big_vae_checkpoint: false
   require_raw_checkpoint: false
   require_diffusion_prior_checkpoint: false
   require_latent_checkpoint: false
