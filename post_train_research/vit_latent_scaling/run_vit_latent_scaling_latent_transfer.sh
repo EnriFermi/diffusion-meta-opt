@@ -10,8 +10,8 @@ CONDA_ENV_NAME="onerec"
 STAGE1_CONFIG_NAME="vit_latent_scaling/config_ae_diffusion_prior"
 STAGE2_CONFIG_NAME="vit_latent_scaling/config_ae_diffusion_prior"
 
-STAGE1_PRESET="cifar_mili"
-STAGE2_PRESET="mnist_mili"
+STAGE1_PRESET="mnist_mili"
+STAGE2_PRESET="cifar_mili"
 
 EXPERIMENT_ROOT="./post_train_research/vit_latent_scaling/artifacts/latent_transfer"
 STAGE1_OUTPUT_DIR="$EXPERIMENT_ROOT/stage1_source"
@@ -27,11 +27,11 @@ STAGE2_OPTIMIZER_NAME="AdamW"
 
 STAGE1_LATENT_LR_SCHEDULER="cosine_decay_to_floor"
 STAGE1_LATENT_LR_FLOOR_RATIO="1.0"
-STAGE1_LATENT_LR_DECAY_STEPS="0"
+STAGE1_LATENT_LR_DECAY_STEPS="1"
 
 STAGE2_LATENT_LR_SCHEDULER="cosine_decay_to_floor"
 STAGE2_LATENT_LR_FLOOR_RATIO="1.0"
-STAGE2_LATENT_LR_DECAY_STEPS="0"
+STAGE2_LATENT_LR_DECAY_STEPS="1"
 
 : "${BIG_VAE_CHECKPOINT:?Edit BIG_VAE_CHECKPOINT in this script before running}"
 
