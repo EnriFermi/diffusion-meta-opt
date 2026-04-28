@@ -5,19 +5,19 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 cd "$PROJECT_ROOT"
 
-CONDA_ENV_NAME="onerec"
+CONDA_ENV_NAME="diff-meta-opt312"
 CONFIG_NAME="vit_latent_scaling/config_cifar10_50k"
 SETUP_GROUP="latent"
 INIT_GROUP="diffusion_prior"
 OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
 
-BIG_VAE_CHECKPOINT=""
-BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT=""
+BIG_VAE_CHECKPOINT="./artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt"
+BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/checkpoints/big_vae_latent_diffusion_prior_AE/stage_1/latest.pt"
 RAW_CHECKPOINT=""
 LATENT_CHECKPOINT=""
 
-BIG_VAE_LATENT_PARAMETERIZATION="sphere"
-BIG_VAE_INIT_CALIBRATION_BATCHES="1"
+BIG_VAE_LATENT_PARAMETERIZATION="euclidean"
+BIG_VAE_INIT_CALIBRATION_BATCHES="4"
 BIG_VAE_DECODE="weights"
 BIG_VAE_TILE_T_PATCHES="4"
 BIG_VAE_TILE_D_OUT="64"
@@ -27,8 +27,8 @@ ADAM_BETA1="0.9"
 ADAM_BETA2="0.95"
 ADAM_EPS="1e-9"
 LATENT_LR_SCHEDULER="cosine_decay_to_floor"
-LATENT_LR_FLOOR_RATIO="0.1"
-LATENT_LR_DECAY_STEPS="2100"
+LATENT_LR_FLOOR_RATIO="1.0"
+LATENT_LR_DECAY_STEPS="1"
 
 run_python() {
   if [ -n "${CONDA_PREFIX:-}" ]; then
