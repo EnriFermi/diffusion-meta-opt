@@ -1,261 +1,118 @@
-# ViT Latent Scaling Experiments
+# ViT Latent Scaling
 
-This experiment compares two optimization parameterizations for ViT classifiers:
+Новый пайплайн здесь намеренно простой:
 
-- `raw`: optimize ViT parameters directly with AdamW.
-- `latent`: load a raw AdamW checkpoint, encode its named tensors with a frozen BigVAE encoder, decode latent slots back into ViT tensors on every forward pass, freeze BigVAE, and optimize only latent slots with AdamW.
+- один Hydra-конфиг: [conf/vit_latent_scaling/config.yaml](/Users/enrifermi/Projects/diff-meta-opt/conf/vit_latent_scaling/config.yaml)
+- один launcher: [run_vit_latent_scaling.sh](/Users/enrifermi/Projects/diff-meta-opt/post_train_research/vit_latent_scaling/run_vit_latent_scaling.sh)
+- единое хранилище запусков: `post_train_research/vit_latent_scaling/artifacts/runs/<run_label>/<run_id>/`
+- shared checkpoint store: `post_train_research/vit_latent_scaling/artifacts/checkpoints/<shared_checkpoint_label>/`
 
-The latent runs use the LR grid:
+## Что умеет
+
+- `raw` и `latent` setup
+- latent init:
+  - `fresh` + `base|random`
+  - `source` из любого предыдущего run-а
+  - `diffusion_prior`
+- smart source transplant:
+  - head mismatch не валит запуск
+  - patch embedding и `pos_embed` адаптируются под новый shape
+  - если latent-layout совпал, можно напрямую поднять exact latent state
+- checkpoints:
+  - `init.pt`
+  - `latest.pt`
+  - `best.pt`
+  - `final.pt`
+  - `step_XXXXXX.pt`
+- локальный лог `run.log`
+- `metrics.csv`
+- `summary.json`
+- Comet logging
+
+## Структура run-dir
+
+Каждый запуск пишет сюда:
 
 ```text
-1e-4 1e-3 1e-2 1e-1 1e0
+artifacts/runs/<run_label>/<run_id>/
+  config_resolved.yaml
+  config_resolved.json
+  run.log
+  metrics.csv
+  summary.json
+  checkpoints/
+
+artifacts/checkpoints/<shared_checkpoint_label>/
+  init.pt
+  latest.pt
+  best.pt
+  final.pt
+  step_XXXXXX.pt
 ```
 
-The same grid is also run for raw baselines. `RAW_INIT_LR=1e-3` selects the raw checkpoint used to initialize latent slots. Metrics include both `step` and `total_steps_with_raw_init`, so the latent-only continuation and the end-to-end raw+latent budget are both visible.
+Пути не перезатираются: каждый run получает новый `run_id` внутри директории своего `run_label`.
+При этом checkpoints дополнительно зеркалятся в shared директорию с отдельным именем, чтобы не искать модель по per-run путям.
 
-## Runner
+## Как запускать
 
-Use the POSIX shell runner:
+Редактируй переменные вверху:
+
+[run_vit_latent_scaling.sh](/Users/enrifermi/Projects/diff-meta-opt/post_train_research/vit_latent_scaling/run_vit_latent_scaling.sh)
+
+Для shared checkpoint store редактируй:
+
+```text
+SHARED_CHECKPOINT_LABEL="my_model"
+SHARED_CHECKPOINT_ROOT=""
+```
+
+Если `SHARED_CHECKPOINT_ROOT=""`, то используется дефолт:
+
+```text
+post_train_research/vit_latent_scaling/artifacts/checkpoints/<shared_checkpoint_label>/
+```
+
+И потом:
 
 ```bash
-BIG_VAE_CHECKPOINT=artifacts/training/checkpoints/weight_quantile_vae/stage_1/latest.pt \
-post_train_research/vit_latent_scaling/run_vit_latent_scaling_grid_presets.sh cifar10_small
+./post_train_research/vit_latent_scaling/run_vit_latent_scaling.sh
 ```
 
-The single positional mode chooses what to run:
+## Source init
+
+Чтобы дообучить новый запуск из старого:
 
 ```text
-all
-mnist, cifar10, imagenet
-mnist_tiny, mnist_small, mnist_medium
-cifar10_tiny, cifar10_small, cifar10_medium
-imagenet_tiny, imagenet_small, imagenet_base
-<config>_raw
-<config>_latent
-<config>_pipeline
+INIT_KIND="source"
+SOURCE_RUN_DIR="<run_id или path/to/run_dir>"
+SOURCE_CHECKPOINT="best"
 ```
 
-Examples:
+Для latent setup логика такая:
 
-```bash
-post_train_research/vit_latent_scaling/run_vit_latent_scaling_grid_presets.sh mnist_tiny_raw
-BIG_VAE_CHECKPOINT=... post_train_research/vit_latent_scaling/run_vit_latent_scaling_grid_presets.sh mnist_tiny_latent
-BIG_VAE_CHECKPOINT=... post_train_research/vit_latent_scaling/run_vit_latent_scaling_grid_presets.sh cifar10
-```
+- если exact latent layout совпал и `SOURCE_PREFER_DIRECT_LATENT=true`, грузится прямой latent state
+- иначе берутся `named_tensors` из source checkpoint и smart-перекладываются в новую архитектуру
+- после этого latent-модель стартует через encode от этих source weights
 
-`*_latent` automatically runs the raw init checkpoint first if it does not exist.
+То есть chain из многих запусков делается без отдельного zoo из shell-скриптов.
 
-## Defaults
+## Профили
 
-Data roots:
+Сейчас profiles живут в коде, а не в россыпи yaml:
+
+[config.py](/Users/enrifermi/Projects/diff-meta-opt/post_train_research/vit_latent_scaling/config.py)
+
+Например:
+
+- `cifar10_50k`
+- `cifar10_small`
+- `mnist_tiny`
+- `mnist_mili`
+- `cifar_mili`
+- `imagenet_small`
+
+Выбирается через:
 
 ```text
-MNIST_DATA_DIR=$PROJECT_ROOT/data/mnist
-CIFAR10_DATA_DIR=$PROJECT_ROOT/data/cifar10
-IMAGENET_DATA_DIR=$PROJECT_ROOT/data/imagenet
-```
-
-ImageNet expects either an ImageFolder layout:
-
-```text
-$IMAGENET_DATA_DIR/train/<class>/*
-$IMAGENET_DATA_DIR/val/<class>/*
-```
-
-or a torchvision `ImageNet` root with the required metadata.
-
-Model grid:
-
-```text
-mnist_tiny:     image=28 patch=4  hidden=64  depth=4  heads=4
-mnist_small:    image=28 patch=4  hidden=128 depth=6  heads=4
-mnist_medium:   image=28 patch=4  hidden=192 depth=8  heads=6
-cifar10_tiny:   image=32 patch=4  hidden=192 depth=6  heads=3
-cifar10_small:  image=32 patch=4  hidden=256 depth=8  heads=4
-cifar10_medium: image=32 patch=4  hidden=384 depth=12 heads=6
-cifar10_50k:    image=32 patch=8  hidden=64  depth=1  heads=4
-imagenet_tiny:  image=224 patch=16 hidden=192 depth=12 heads=3
-imagenet_small: image=224 patch=16 hidden=384 depth=12 heads=6
-imagenet_base:  image=224 patch=16 hidden=768 depth=12 heads=12
-```
-
-Transfer-friendly matched presets:
-
-```text
-mnist_mili: image=32 patch=4 in_channels=3 hidden=128 depth=3 heads=4 classes=10
-cifar_mili: image=32 patch=4 in_channels=3 hidden=128 depth=3 heads=4 classes=10
-```
-
-These two are intended for latent transfer runs where the source and target ViT
-architecture must stay identical. The MNIST preset is resized to `32x32` and
-converted to RGB so it matches the CIFAR preset exactly.
-
-Outputs are written under:
-
-```text
-post_train_research/vit_latent_scaling/artifacts/<dataset>/<size>/<setup>_lr_<lr_tag>/
-```
-
-Important files:
-
-```text
-config.json
-metrics.csv
-summary.json
-checkpoints/raw_final.pt
-checkpoints/latent_final.pt
-```
-
-Set `FORCE=true` to rerun an output directory that already has `summary.json`.
-
-## Hydra Runner
-
-There is now an additional Hydra entrypoint for single targeted runs:
-
-```bash
-python post_train_research/vit_latent_scaling/run_vit_latent_scaling_hydra.py \
-  --config-name vit_latent_scaling/config_ae_encoded \
-  preset=cifar10_small \
-  vit_latent_scaling.raw_checkpoint=/path/to/raw_final.pt \
-  vit_latent_scaling.big_vae_checkpoint=/path/to/big_vae.pt
-```
-
-The convenience configs are:
-
-```text
-vit_latent_scaling/config_latent_base
-vit_latent_scaling/config_ae_encoded
-vit_latent_scaling/config_latent_random
-vit_latent_scaling/config_latent_from_checkpoint
-vit_latent_scaling/config_ae_diffusion_prior
-vit_latent_scaling/config_cifar10_50k
-```
-
-They correspond to:
-
-```text
-latent_base         -> setup=latent, big_vae_latent_init=base
-ae_encoded          -> setup=latent, big_vae_latent_init=encoded
-latent_random       -> setup=latent, big_vae_latent_init=random
-latent_from_checkpoint -> setup=latent, load latent slots from vit_latent_scaling.latent_checkpoint
-ae_diffusion_prior  -> setup=latent, big_vae_latent_init=diffusion_prior
-```
-
-Hydra composition is now split into:
-
-```text
-vit_latent_scaling/setup : raw | latent
-vit_latent_scaling/init  : noop | base | random | encoded | diffusion_prior | from_checkpoint
-```
-
-For latent runs the init group controls how the first latent state is built:
-
-```text
-base             -> copy frozen BigVAE latent base into every decoded tile
-random           -> frozen BigVAE latent base plus Gaussian noise
-encoded          -> encode a raw ViT checkpoint through the frozen BigVAE encoder
-diffusion_prior  -> autoregressive activation-conditioned prior sample
-from_checkpoint  -> load latent slots from a previous latent checkpoint
-```
-
-For `random`, the Gaussian noise standard deviation is controlled by:
-
-```text
-vit_latent_scaling.big_vae_random_init_std
-```
-
-The shell wrappers expose it as `BIG_VAE_RANDOM_INIT_STD`.
-
-There are also self-contained shell wrappers next to this README:
-
-```text
-run_vit_latent_scaling_grid_presets.sh
-run_vit_latent_scaling_raw_weights.sh
-run_vit_latent_scaling_latent_init_encoded.sh
-run_vit_latent_scaling_latent_init_random.sh
-run_vit_latent_scaling_latent_init_diffusion_prior.sh
-run_vit_latent_scaling_cifar10_50k_compact.sh
-run_vit_latent_scaling_latent_transfer_two_stage.sh
-```
-
-Each script has editable variables at the top for:
-
-```text
-PRESET
-OUTPUT_ROOT
-RAW_CHECKPOINT
-BIG_VAE_CHECKPOINT
-BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT
-BIG_VAE_INIT_CALIBRATION_BATCHES
-```
-
-For the fair from-scratch comparison, use:
-
-```text
-run_vit_latent_scaling_raw_weights.sh
-run_vit_latent_scaling_latent_init_random.sh
-run_vit_latent_scaling_latent_init_diffusion_prior.sh
-```
-
-`RAW_CHECKPOINT` is only needed by the optional `ae_encoded` path, because that mode initializes latents by encoding an already existing raw ViT solution.
-`BIG_VAE_INIT_CALIBRATION_BATCHES` controls how many train batches are used to build real activation contexts for autoregressive diffusion-prior initialization.
-
-`run_vit_latent_scaling_cifar10_50k_compact.sh` is the compact launcher for the
-`cifar10_50k` preset. It uses `vit_latent_scaling/config_cifar10_50k` and
-switches initialization through:
-
-```text
-SETUP_GROUP
-INIT_GROUP
-```
-
-## Latent Transfer
-
-There is also a two-stage latent-transfer wrapper:
-
-```text
-run_vit_latent_scaling_latent_transfer_two_stage.sh
-```
-
-It does:
-
-```text
-task A latent training -> save stage1 latent_final.pt
-task B latent training -> initialize from stage1 latent slots
-```
-
-The second stage loads compatible latent slots from the first-stage checkpoint via
-`vit_latent_scaling.latent_checkpoint`. If the target task changes the classifier
-head shape, incompatible head latents are skipped and the target run keeps its
-freshly initialized head latents.
-
-Editable variables at the top of the transfer script:
-
-```text
-STAGE1_CONFIG_NAME
-STAGE2_CONFIG_NAME
-STAGE1_PRESET
-STAGE2_PRESET
-STAGE1_OUTPUT_DIR
-STAGE2_OUTPUT_DIR
-BIG_VAE_CHECKPOINT
-BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT
-```
-
-By default the Hydra runner and these wrappers write outputs under:
-
-```text
-post_train_research/vit_latent_scaling/artifacts/
-```
-
-You can also use the general config and switch groups explicitly:
-
-```bash
-python post_train_research/vit_latent_scaling/run_vit_latent_scaling_hydra.py \
-  --config-name vit_latent_scaling/config \
-  vit_latent_scaling/preset=cifar10_small \
-  vit_latent_scaling/setup=latent \
-  vit_latent_scaling/init=diffusion_prior \
-  vit_latent_scaling.big_vae_checkpoint=/path/to/big_vae.pt \
-  vit_latent_scaling.big_vae_diffusion_prior_checkpoint=/path/to/prior.pt
+PROFILE="cifar10_50k"
 ```

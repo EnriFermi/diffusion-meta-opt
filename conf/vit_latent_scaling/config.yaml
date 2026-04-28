@@ -1,88 +1,104 @@
-# @package _global_
-
-defaults:
-  - /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
-  - _self_
-  - /vit_latent_scaling/preset: cifar10_small
-  - /vit_latent_scaling/setup: latent
-  - /vit_latent_scaling/init: encoded
-
 hydra:
+  run:
+    dir: .
+  output_subdir: null
   job:
-    name: run_vit_latent_scaling
+    name: vit_latent_scaling
 
-vit_latent_scaling:
-  setup_name: latent
-  init_name: encoded
-  run_name: ae_encoded
-  output_root: ./post_train_research/vit_latent_scaling/artifacts
-  experiment_name: ${vit_latent_scaling.run_name}
-  output_dir: ${vit_latent_scaling.output_root}/${vit_latent_scaling.dataset}/${vit_latent_scaling.model_size}/${vit_latent_scaling.experiment_name}
-  dataset: cifar10
-  model_size: tiny
-  data_dir: ${oc.env:CIFAR10_DATA_DIR,./data/cifar10}
+experiment:
+  profile: cifar10_50k
+  run_label: ""
+  notes: ""
+  tags: []
+
+storage:
+  root_dir: ./post_train_research/vit_latent_scaling/artifacts
+  shared_checkpoint_root_dir: ""
+  shared_checkpoint_label: ""
+  checkpoint_every_steps: 250
+  save_best: true
+  save_latest: true
+  save_final: true
+
+data:
+  data_dir: ""
+  dataset: ""
   download: true
-  device: ${oc.env:DEVICE,auto}
-  seed: 42
-  epochs: 5000
-  max_steps: 3000
-  batch_size: 128
-  eval_batch_size: 256
-  num_workers: 4
   train_subset: 0
   test_subset: 0
-  lr: 5e-3
-  optimizer_name: Adam
+  batch_size: 0
+  eval_batch_size: 0
+  num_workers: 4
+
+model:
+  image_size: 0
+  patch_size: 0
+  in_channels: 0
+  num_classes: 0
+  hidden_dim: 0
+  depth: 0
+  num_heads: 0
+  mlp_ratio: 0.0
+  dropout: 0.0
+  attention_dropout: 0.0
+
+setup:
+  kind: latent
+  big_vae_checkpoint: ""
+  big_vae_decode: weights
+  big_vae_tile_T_patches: 4
+  big_vae_tile_d_out: 64
+  big_vae_latent_parameterization: sphere
+  big_vae_latent_noise_std: 0.0
+
+init:
+  kind: diffusion_prior
+  fresh_latent_mode: random
+  random_init_std: 0.02
+  source_run_dir: ""
+  source_checkpoint: best
+  source_prefer_direct_latent: true
+  diffusion_prior_checkpoint: ""
+  diffusion_prior_steps: 50
+  diffusion_prior_sampler: ddim
+  diffusion_prior_eta: 0.0
+  calibration_batches: 1
+
+train:
+  device: ${oc.env:DEVICE,auto}
+  seed: 42
+  epochs: 1000
+  max_steps: 3000
+  optimizer_name: AdamW
   optimizer_kwargs: {}
-  latent_lr_scheduler: cosine_decay_to_floor
-  latent_lr_floor_ratio: 0.1
-  latent_lr_decay_steps: 700
-  latent_debug_log_deltas: false
-  latent_debug_jacobian_eps: 1e-3
-  latent_debug_jacobian_probes: 16
+  lr: 1e-3
   weight_decay: 0.0
-  latent_weight_decay: 0.0
   adam_beta1: 0.9
-  adam_beta2: 0.999
+  adam_beta2: 0.95
   adam_eps: 1e-9
-  label_smoothing: 0.0
   grad_clip_norm: 0.0
+  label_smoothing: 0.0
   amp: true
   tf32: true
   compile: false
-  log_every_steps: 50
-  eval_every_steps: 375
-  save_checkpoints: true
-  raw_checkpoint: ${oc.env:RAW_VIT_CHECKPOINT,""}
-  latent_checkpoint: ""
-  big_vae_checkpoint: ${oc.env:BIG_VAE_CHECKPOINT,""}
-  require_big_vae_checkpoint: false
-  require_raw_checkpoint: false
-  require_diffusion_prior_checkpoint: false
-  require_latent_checkpoint: false
-  big_vae_latent_parameterization: euclidean
-  big_vae_diffusion_prior_checkpoint: ${oc.env:BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT,""}
-  big_vae_diffusion_prior_steps: 50
-  big_vae_diffusion_prior_sampler: ddim
-  big_vae_diffusion_prior_eta: 0.0
-  big_vae_random_init_std: 0.02
-  big_vae_decode: all
-  big_vae_tile_T_patches: 4
-  big_vae_tile_d_out: 64
-  big_vae_encoder_context_rows: 64
-  big_vae_encoder_context_std: 1.0
-  big_vae_encoder_batch_size: 16
-  big_vae_init_calibration_batches: 1
-  raw_init_steps: 0
+  latent_lr_scheduler: constant
+  latent_lr_floor_ratio: 0.1
+  latent_lr_decay_steps: 0
 
-vit_model:
-  image_size: 32
-  patch_size: 4
-  in_channels: 3
-  num_classes: 10
-  hidden_dim: 256
-  depth: 8
-  num_heads: 4
-  mlp_ratio: 4.0
-  dropout: 0.0
-  attention_dropout: 0.0
+logging:
+  log_every_steps: 50
+  eval_every_steps: 150
+  latent_debug_metrics: true
+  latent_jacobian_eps: 1e-3
+  latent_jacobian_probes: 16
+
+telemetry:
+  comet:
+    enabled: false
+    api_key: ${oc.env:COMET_API_KEY,""}
+    workspace: ${oc.env:COMET_WORKSPACE,""}
+    project_name: vit_latent_scaling
+    experiment_name: ""
+    offline_directory: ""
+    log_code: false
+    tags: []

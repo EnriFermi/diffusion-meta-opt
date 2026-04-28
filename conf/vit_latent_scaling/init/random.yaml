@@ -1,9 +1,0 @@
-# @package _global_
-
-vit_latent_scaling:
-  init_name: random
-  run_name: latent_random
-  big_vae_latent_init: random
-  require_raw_checkpoint: false
-  require_diffusion_prior_checkpoint: false
-  require_latent_checkpoint: false

@@ -1,6 +1,0 @@
-# @package _global_
-
-defaults:
-  - config
-  - override /vit_latent_scaling/setup: latent
-  - override /vit_latent_scaling/init: base
