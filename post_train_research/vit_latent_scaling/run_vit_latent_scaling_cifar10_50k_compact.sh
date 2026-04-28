@@ -11,25 +11,25 @@ SETUP_GROUP="latent"
 INIT_GROUP="diffusion_prior"
 OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
 
-BIG_VAE_CHECKPOINT="./artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt"
-BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/checkpoints/big_vae_latent_diffusion_prior_AE/stage_1/latest.pt"
+BIG_VAE_CHECKPOINT="./artifacts/training/checkpoints/weight_quantile_vae_gpu0_square_VAE/stage_1/latest.pt"
+BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/runs/train_big_vae_latent_diffusion_prior_20260427_032313_pid2515158_cdb92e/checkpoints/big_vae_latent_diffusion_prior/stage_1/latest.pt"
 RAW_CHECKPOINT=""
 LATENT_CHECKPOINT=""
 
 BIG_VAE_LATENT_PARAMETERIZATION="euclidean"
-BIG_VAE_RANDOM_INIT_STD="0.02"
+BIG_VAE_RANDOM_INIT_STD="1.0"
 BIG_VAE_INIT_CALIBRATION_BATCHES="4"
 BIG_VAE_DECODE="weights"
 BIG_VAE_TILE_T_PATCHES="4"
 BIG_VAE_TILE_D_OUT="64"
 
-OPTIMIZER_NAME="AdamW"
+OPTIMIZER_NAME="Adam"
 ADAM_BETA1="0.9"
 ADAM_BETA2="0.95"
 ADAM_EPS="1e-9"
 LATENT_LR_SCHEDULER="cosine_decay_to_floor"
 LATENT_LR_FLOOR_RATIO="1.0"
-LATENT_LR_DECAY_STEPS="1"
+LATENT_LR_DECAY_STEPS="2000"
 
 run_python() {
   if [ -n "${CONDA_PREFIX:-}" ]; then

@@ -24,7 +24,7 @@ vit_latent_scaling:
   download: true
   device: ${oc.env:DEVICE,auto}
   seed: 42
-  epochs: 5
+  epochs: 5000
   max_steps: 3000
   batch_size: 128
   eval_batch_size: 256
@@ -43,7 +43,7 @@ vit_latent_scaling:
   weight_decay: 0.0
   latent_weight_decay: 0.0
   adam_beta1: 0.9
-  adam_beta2: 0.95
+  adam_beta2: 0.999
   adam_eps: 1e-9
   label_smoothing: 0.0
   grad_clip_norm: 0.0
