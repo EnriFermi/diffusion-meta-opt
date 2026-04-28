@@ -115,6 +115,43 @@ def _plot_paired_curves(path: Path, latent: BranchResult, raw: BranchResult) -> 
     plt.close(fig)
 
 
+def _tensor_dict_metadata(mapping: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for key, value in mapping.items():
+        if torch.is_tensor(value):
+            metadata[str(key)] = {
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+            }
+        else:
+            metadata[str(key)] = {"type": type(value).__name__}
+    return metadata
+
+
+def _checkpoint_payload_json_view(payload: dict[str, Any]) -> dict[str, Any]:
+    view = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"named_tensors", "latent_slots"}
+    }
+    named_tensors = payload.get("named_tensors")
+    if isinstance(named_tensors, dict):
+        view["named_tensor_count"] = len(named_tensors)
+        view["named_tensors"] = _tensor_dict_metadata(named_tensors)
+    latent_slots = payload.get("latent_slots")
+    if isinstance(latent_slots, dict):
+        view["latent_slot_count"] = len(latent_slots)
+        view["latent_slots"] = _tensor_dict_metadata(latent_slots)
+    return view
+
+
+def _branch_result_json_view(result: BranchResult) -> dict[str, Any]:
+    payload = asdict(result)
+    payload["best_state"] = _checkpoint_payload_json_view(result.best_state)
+    payload["final_state"] = _checkpoint_payload_json_view(result.final_state)
+    return payload
+
+
 def _run_branch_for_lr(
     cfg: RunConfig,
     source: SourceContext,
@@ -278,8 +315,8 @@ def _write_start_artifacts(start_dir: Path, start: StartPoint, latent: BranchRes
                     "train_metrics": asdict(start.train_metrics),
                     "test_metrics": asdict(start.test_metrics),
                 },
-                "latent": asdict(latent),
-                "raw": asdict(raw),
+                "latent": _branch_result_json_view(latent),
+                "raw": _branch_result_json_view(raw),
             },
             indent=2,
             sort_keys=True,
