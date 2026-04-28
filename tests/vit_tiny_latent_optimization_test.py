@@ -258,6 +258,61 @@ def test_bigvae_latent_decoder_z_space_can_run_without_diffusion_prior_model() -
     assert latent_grad_sum > 0.0
 
 
+def test_bigvae_latent_sphere_parameterization_preserves_materialized_norms_after_step() -> None:
+    cfg = _small_vit_cfg()
+    initial = make_initial_tensors(cfg, seed=404)
+    big_vae = BigWeightVAE(
+        ModelConfig(
+            patch_size=8,
+            distribution=DistributionConfig(k_s=4, Kq=4, d_var=16, d_dist=16, use_covariance=False),
+            mini_vae=MiniVAEConfig(z_dim=8, d_e=16, num_attn_layers_encoder=1, num_layers_decoder=1, n_heads=2, d_patch=8),
+            big_vae=BigVAEConfig(
+                d_model=24,
+                d_lat=12,
+                num_latents=2,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                n_heads=3,
+                ffn_mult=2.0,
+                pos_fourier_dim=12,
+                use_latent_sampling=True,
+                disable_distribution_encoder=False,
+                disable_z_shortcut=True,
+                encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
+            ),
+        )
+    )
+    model = FunctionalViTTiny(
+        cfg,
+        initial,
+        parameter_mode="bigvae_latent",
+        big_vae=big_vae,
+        big_vae_latent_init="random",
+        big_vae_latent_space="decoder_z",
+        big_vae_latent_parameterization="sphere",
+        big_vae_decode="all",
+    )
+
+    initial_norms = {
+        str(key): float(model.store.materialize_latent_slot(str(key)).detach().norm().item())
+        for key in model.store.latent_slots.keys()
+    }
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    x = torch.randn(2, 3, 32, 32)
+    y = torch.tensor([0, 1], dtype=torch.long)
+    loss = F.cross_entropy(model(x), y)
+    loss.backward()
+    optimizer.step()
+
+    final_norms = {
+        str(key): float(model.store.materialize_latent_slot(str(key)).detach().norm().item())
+        for key in model.store.latent_slots.keys()
+    }
+    for key, initial_norm in initial_norms.items():
+        assert abs(final_norms[key] - initial_norm) < 1e-5
+
+
 def test_build_optimizer_supports_adamw_and_sgd() -> None:
     cfg = ExperimentConfig()
     param = torch.nn.Parameter(torch.ones(2))

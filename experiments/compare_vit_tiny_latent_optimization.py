@@ -83,6 +83,7 @@ class ExperimentConfig:
     latent_factor_init_std: float = 0.02
     big_vae_checkpoint: str = ""
     big_vae_latent_init: str = "random"
+    big_vae_latent_parameterization: str = "euclidean"
     big_vae_diffusion_prior_checkpoint: str = ""
     big_vae_diffusion_prior_steps: int = 50
     big_vae_diffusion_prior_sampler: str = "ddim"
@@ -113,6 +114,19 @@ class DirectTensor(nn.Module):
 
     def forward(self) -> torch.Tensor:
         return self.value
+
+
+class FrozenBufferTensor(nn.Module):
+    def __init__(self, initial: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("value", initial.detach().clone())
+
+    def forward(self) -> torch.Tensor:
+        return self.value
+
+    @torch.no_grad()
+    def copy_(self, value: torch.Tensor) -> None:
+        self.value.copy_(value.detach().to(device=self.value.device, dtype=self.value.dtype))
 
 
 class LowRankDecodedTensor(nn.Module):
@@ -279,6 +293,7 @@ class BigVAELatentTensorStore(nn.Module):
         big_vae: BigWeightVAE,
         latent_init: str,
         latent_space: str | None = None,
+        latent_parameterization: str = "euclidean",
         latent_noise_std: float,
         decode_policy: str,
         tile_T_patches: int,
@@ -320,8 +335,15 @@ class BigVAELatentTensorStore(nn.Module):
         self._direct_name_to_key: dict[str, str] = {}
         self._tile_cond_patch: dict[str, torch.Tensor] = {}
         self.latent_slots = nn.ParameterDict()
+        self.latent_radii = nn.ModuleDict()
         self.direct_tensors = nn.ModuleDict()
         self.latent_init_mode = init_mode
+        self.latent_parameterization = str(latent_parameterization).strip().lower()
+        if self.latent_parameterization not in {"euclidean", "sphere"}:
+            raise ValueError(
+                "latent_parameterization must be one of {'euclidean', 'sphere'}, "
+                f"got {latent_parameterization!r}"
+            )
         resolved_latent_space = str(latent_space).strip().lower() if latent_space is not None else ""
         if not resolved_latent_space:
             resolved_latent_space = "decoder_z" if init_mode == "diffusion_prior" else "encoder_slots"
@@ -405,7 +427,11 @@ class BigVAELatentTensorStore(nn.Module):
                     latent = torch.randn_like(base_latents) * 0.02
                 if float(latent_noise_std) > 0.0:
                     latent = latent + torch.randn_like(latent) * float(latent_noise_std)
-                self.latent_slots[tile_key] = nn.Parameter(latent)
+                self.latent_slots[tile_key] = nn.Parameter(latent.detach().clone())
+                self.latent_radii[tile_key] = FrozenBufferTensor(
+                    torch.zeros((), device=latent.device, dtype=latent.dtype)
+                )
+                self._load_materialized_latent_slot_(tile_key, latent, update_radius=True)
                 pending_segments = []
 
             current_tile_rows = 0
@@ -459,6 +485,60 @@ class BigVAELatentTensorStore(nn.Module):
     def latent_numel(self) -> int:
         return int(sum(param.numel() for param in self.latent_slots.values()))
 
+    @staticmethod
+    def _stable_norm(value: torch.Tensor) -> torch.Tensor:
+        flat = value.reshape(-1)
+        tiny = max(float(torch.finfo(value.dtype).eps), 1e-12)
+        return flat.norm().clamp_min(tiny)
+
+    def materialize_latent_slot(self, key: str) -> torch.Tensor:
+        latent = self.latent_slots[key]
+        if self.latent_parameterization != "sphere":
+            return latent
+        radius = self.latent_radii[key]().to(device=latent.device, dtype=latent.dtype)
+        return latent * (radius / self._stable_norm(latent))
+
+    @torch.no_grad()
+    def materialized_latent_slots_state_dict(self) -> dict[str, torch.Tensor]:
+        return {
+            str(key): self.materialize_latent_slot(str(key)).detach().cpu().contiguous()
+            for key in self.latent_slots.keys()
+        }
+
+    @torch.no_grad()
+    def _load_materialized_latent_slot_(
+        self,
+        key: str,
+        value: torch.Tensor,
+        *,
+        update_radius: bool,
+    ) -> None:
+        target = self.latent_slots[key]
+        value = value.detach().to(device=target.device, dtype=target.dtype).contiguous()
+        target.copy_(value)
+        if self.latent_parameterization == "sphere" and update_radius:
+            radius = value.reshape(-1).norm()
+            self.latent_radii[key].copy_(radius.reshape(()))
+
+    @torch.no_grad()
+    def load_materialized_latent_slots_state_dict(
+        self,
+        state: dict[str, torch.Tensor],
+        *,
+        strict: bool = True,
+        update_radii: bool = True,
+    ) -> None:
+        missing = [str(key) for key in self.latent_slots.keys() if key not in state]
+        unexpected = [str(key) for key in state.keys() if key not in self.latent_slots]
+        if strict and (missing or unexpected):
+            raise RuntimeError(
+                f"materialized latent slot state mismatch: missing={missing[:8]} unexpected={unexpected[:8]}"
+            )
+        for key, value in state.items():
+            if key not in self.latent_slots:
+                continue
+            self._load_materialized_latent_slot_(str(key), value, update_radius=bool(update_radii))
+
     def decoded_numel(self) -> int:
         total = 0
         for spec in self._specs.values():
@@ -483,7 +563,10 @@ class BigVAELatentTensorStore(nn.Module):
     def latent_init_diversity(self) -> dict[str, float]:
         if not self.latent_slots:
             return {"count": 0.0, "across_layer_std_mean": 0.0, "max_pair_delta": 0.0}
-        stacked = torch.stack([param.detach().float().cpu() for param in self.latent_slots.values()], dim=0)
+        stacked = torch.stack(
+            [self.materialize_latent_slot(str(key)).detach().float().cpu() for key in self.latent_slots.keys()],
+            dim=0,
+        )
         if int(stacked.shape[0]) <= 1:
             return {"count": float(stacked.shape[0]), "across_layer_std_mean": 0.0, "max_pair_delta": 0.0}
         centered = stacked - stacked.mean(dim=0, keepdim=True)
@@ -677,7 +760,7 @@ class BigVAELatentTensorStore(nn.Module):
                     self._tile_cond_patch[key] = dist_patch_by_patch[item_idx].detach().to(device=device, dtype=dtype)
                     if self.latent_noise_std > 0.0:
                         sampled_item = sampled_item + torch.randn_like(sampled_item) * self.latent_noise_std
-                    self.latent_slots[key].data.copy_(sampled_item)
+                    self._load_materialized_latent_slot_(key, sampled_item, update_radius=True)
 
     def _initialize_latents_from_encoder(self, initial_tensors: dict[str, torch.Tensor]) -> None:
         if not self.latent_slots:
@@ -757,7 +840,7 @@ class BigVAELatentTensorStore(nn.Module):
                             self._tile_cond_patch[key] = cond_patch
                         if self.latent_noise_std > 0.0:
                             encoded = encoded + torch.randn_like(encoded) * self.latent_noise_std
-                        self.latent_slots[key].data.copy_(encoded)
+                        self._load_materialized_latent_slot_(key, encoded, update_radius=True)
 
     def _initialize_latents_from_diffusion_prior(self, initial_tensors: dict[str, torch.Tensor]) -> None:
         if not self.latent_slots:
@@ -867,7 +950,7 @@ class BigVAELatentTensorStore(nn.Module):
                         self._tile_cond_patch[key] = cond_patch
                         if self.latent_noise_std > 0.0:
                             sampled_item = sampled_item + torch.randn_like(sampled_item) * self.latent_noise_std
-                        self.latent_slots[key].data.copy_(sampled_item)
+                        self._load_materialized_latent_slot_(key, sampled_item, update_radius=True)
 
     def decoded_matrix(self, name: str) -> torch.Tensor:
         return self.decode_all_matrices()[name]
@@ -887,7 +970,7 @@ class BigVAELatentTensorStore(nn.Module):
             )
 
         for (d_in, d_out, T), keys in self._groups.items():
-            latents = torch.stack([self.latent_slots[key] for key in keys], dim=0)
+            latents = torch.stack([self.materialize_latent_slot(str(key)) for key in keys], dim=0)
             batch = int(latents.shape[0])
             d_in_pad = int(T) * self.patch_size
             device = latents.device
@@ -979,6 +1062,7 @@ class FunctionalViTTiny(nn.Module):
         big_vae_diffusion_prior_sampler: str = "ddim",
         big_vae_diffusion_prior_eta: float = 0.0,
         big_vae_latent_noise_std: float = 0.0,
+        big_vae_latent_parameterization: str = "euclidean",
         big_vae_encoder_context_rows: int = 64,
         big_vae_encoder_context_std: float = 1.0,
         big_vae_encoder_batch_size: int = 16,
@@ -996,6 +1080,7 @@ class FunctionalViTTiny(nn.Module):
                 big_vae=big_vae,
                 latent_init=big_vae_latent_init,
                 latent_space=big_vae_latent_space,
+                latent_parameterization=big_vae_latent_parameterization,
                 latent_noise_std=big_vae_latent_noise_std,
                 decode_policy=big_vae_decode,
                 tile_T_patches=int(big_vae_tile_T_patches),
@@ -1532,6 +1617,7 @@ def train_setup(
         big_vae_diffusion_prior_sampler=str(cfg.big_vae_diffusion_prior_sampler),
         big_vae_diffusion_prior_eta=float(cfg.big_vae_diffusion_prior_eta),
         big_vae_latent_noise_std=float(cfg.big_vae_latent_noise_std),
+        big_vae_latent_parameterization=str(cfg.big_vae_latent_parameterization),
         big_vae_encoder_context_rows=int(cfg.big_vae_encoder_context_rows),
         big_vae_encoder_context_std=float(cfg.big_vae_encoder_context_std),
         big_vae_encoder_batch_size=int(cfg.big_vae_encoder_batch_size),
@@ -1685,8 +1771,9 @@ def train_setup(
         target = getattr(model, "_orig_mod", model)
         if setup == "bigvae_latent":
             model_state = {
-                "latent_slots": target.store.latent_slots.state_dict(),
+                "latent_slots": target.store.materialized_latent_slots_state_dict(),
                 "big_vae_checkpoint": str(cfg.big_vae_checkpoint),
+                "big_vae_latent_parameterization": str(target.store.latent_parameterization),
             }
         else:
             model_state = target.state_dict()
