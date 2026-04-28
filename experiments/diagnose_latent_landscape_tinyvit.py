@@ -658,6 +658,44 @@ def hvp_at_flat_z(
     return hvp.detach()
 
 
+def _robust_symmetric_eigvals(matrix: torch.Tensor) -> tuple[np.ndarray, str]:
+    matrix64 = matrix.detach().to(device="cpu", dtype=torch.float64)
+    matrix64 = 0.5 * (matrix64 + matrix64.transpose(0, 1))
+    matrix_np = matrix64.numpy()
+    if not np.isfinite(matrix_np).all():
+        raise RuntimeError("projected Hessian contains non-finite values")
+
+    # Use a cheap, robust scale estimate; spectral-norm SVD can fail on the
+    # same ill-conditioned matrices that broke eigvalsh.
+    spectral_scale = max(1.0, float(np.max(np.abs(matrix_np))))
+    jitter_schedule = [0.0, 1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2]
+    last_error: Exception | None = None
+    identity = np.eye(matrix_np.shape[0], dtype=np.float64)
+    for jitter_coeff in jitter_schedule:
+        shifted = matrix_np if jitter_coeff == 0.0 else matrix_np + identity * (jitter_coeff * spectral_scale)
+        try:
+            eigvals = np.linalg.eigvalsh(shifted)
+            status = "numpy_eigvalsh" if jitter_coeff == 0.0 else f"numpy_eigvalsh_jitter_{jitter_coeff:g}"
+            return eigvals, status
+        except np.linalg.LinAlgError as exc:
+            last_error = exc
+            try:
+                eigvals_general = np.linalg.eigvals(shifted)
+                imag_abs_max = float(np.max(np.abs(eigvals_general.imag))) if eigvals_general.size else 0.0
+                real_abs_max = float(np.max(np.abs(eigvals_general.real))) if eigvals_general.size else 0.0
+                if imag_abs_max <= max(1e-9, 1e-9 * max(1.0, real_abs_max)):
+                    status = (
+                        "numpy_eigvals_real"
+                        if jitter_coeff == 0.0
+                        else f"numpy_eigvals_real_jitter_{jitter_coeff:g}"
+                    )
+                    return np.sort(eigvals_general.real), status
+            except np.linalg.LinAlgError:
+                pass
+            continue
+    raise RuntimeError(f"failed symmetric eigensolve after jitter retries: {last_error}")
+
+
 def projected_hessian_diagnostics(
     model: FunctionalViTTiny,
     store: BigVAELatentTensorStore,
@@ -682,7 +720,17 @@ def projected_hessian_diagnostics(
     hq = torch.stack(hq_cols, dim=1)
     h_proj = q.transpose(0, 1) @ hq
     h_proj = 0.5 * (h_proj + h_proj.transpose(0, 1))
-    eigvals = torch.linalg.eigvalsh(h_proj).detach().cpu().numpy()
+    eig_solver_status = "ok"
+    try:
+        eigvals, eig_solver_status = _robust_symmetric_eigvals(h_proj)
+    except Exception as exc:
+        print(
+            f"[latent_landscape] warning: projected Hessian eigensolve failed; "
+            f"seeded subspace diagnostics degraded: {exc}",
+            flush=True,
+        )
+        eigvals = np.asarray([], dtype=np.float64)
+        eig_solver_status = f"failed:{type(exc).__name__}"
 
     trace_terms: list[float] = []
     for _ in range(max(1, int(trace_probes))):
@@ -690,9 +738,20 @@ def projected_hessian_diagnostics(
         v = 2.0 * v - 1.0
         hv = hvp_at_flat_z(model, store, z0, v, images, labels)
         trace_terms.append(float(torch.dot(v, hv).detach().cpu().item()))
-    trace_est = float(np.mean(trace_terms)) if trace_terms else 0.0
-    topk = max(1, min(int(topk), len(eigvals)))
+    finite_trace_terms = [value for value in trace_terms if math.isfinite(value)]
+    trace_est = float(np.mean(finite_trace_terms)) if finite_trace_terms else float("nan")
     sorted_eigs = np.sort(eigvals)
+    if len(sorted_eigs) == 0:
+        return {
+            "subspace_dim": int(m),
+            "trace_est": float(trace_est),
+            "negative_fraction": float("nan"),
+            "eigvals": [],
+            "top_eigs": [],
+            "bottom_eigs": [],
+            "eig_solver_status": str(eig_solver_status),
+        }
+    topk = max(1, min(int(topk), len(sorted_eigs)))
     return {
         "subspace_dim": int(m),
         "trace_est": float(trace_est),
@@ -700,6 +759,7 @@ def projected_hessian_diagnostics(
         "eigvals": [float(v) for v in sorted_eigs.tolist()],
         "top_eigs": [float(v) for v in sorted_eigs[-topk:].tolist()[::-1]],
         "bottom_eigs": [float(v) for v in sorted_eigs[:topk].tolist()],
+        "eig_solver_status": str(eig_solver_status),
     }
 
 
@@ -827,11 +887,12 @@ def plot_grouped_profiles(
 
 
 def plot_histogram(values: list[float], *, title: str, xlabel: str, path: Path) -> None:
-    if not values:
+    finite_values = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite_values:
         return
     plt = _get_pyplot()
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.hist(values, bins=24)
+    ax.hist(finite_values, bins=24)
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     fig.tight_layout()
@@ -1596,6 +1657,7 @@ def run_training_for_seed(
                 "subspace_dim": int(hessian_diag["subspace_dim"]),
                 "trace_est": float(hessian_diag["trace_est"]),
                 "negative_fraction": float(hessian_diag["negative_fraction"]),
+                "eig_solver_status": str(hessian_diag.get("eig_solver_status", "unknown")),
                 "top_eigs_json": json.dumps(hessian_diag["top_eigs"]),
                 "bottom_eigs_json": json.dumps(hessian_diag["bottom_eigs"]),
                 "eigvals_json": json.dumps(hessian_diag["eigvals"]),
