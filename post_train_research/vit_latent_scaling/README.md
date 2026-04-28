@@ -19,7 +19,7 @@ Use the POSIX shell runner:
 
 ```bash
 BIG_VAE_CHECKPOINT=artifacts/training/checkpoints/weight_quantile_vae/stage_1/latest.pt \
-post_train_research/vit_latent_scaling/run_vit_latent_scaling.sh cifar10_small
+post_train_research/vit_latent_scaling/run_vit_latent_scaling_grid_presets.sh cifar10_small
 ```
 
 The single positional mode chooses what to run:
@@ -38,9 +38,9 @@ imagenet_tiny, imagenet_small, imagenet_base
 Examples:
 
 ```bash
-post_train_research/vit_latent_scaling/run_vit_latent_scaling.sh mnist_tiny_raw
-BIG_VAE_CHECKPOINT=... post_train_research/vit_latent_scaling/run_vit_latent_scaling.sh mnist_tiny_latent
-BIG_VAE_CHECKPOINT=... post_train_research/vit_latent_scaling/run_vit_latent_scaling.sh cifar10
+post_train_research/vit_latent_scaling/run_vit_latent_scaling_grid_presets.sh mnist_tiny_raw
+BIG_VAE_CHECKPOINT=... post_train_research/vit_latent_scaling/run_vit_latent_scaling_grid_presets.sh mnist_tiny_latent
+BIG_VAE_CHECKPOINT=... post_train_research/vit_latent_scaling/run_vit_latent_scaling_grid_presets.sh cifar10
 ```
 
 `*_latent` automatically runs the raw init checkpoint first if it does not exist.
@@ -161,12 +161,13 @@ from_checkpoint  -> load latent slots from a previous latent checkpoint
 There are also self-contained shell wrappers next to this README:
 
 ```text
-run_vit_latent_scaling_raw.sh
-run_vit_latent_scaling_ae_encoded.sh
-run_vit_latent_scaling_latent_random.sh
-run_vit_latent_scaling_ae_diffusion_prior.sh
-run_vit_latent_scaling_cifar10_50k.sh
-run_vit_latent_scaling_latent_transfer.sh
+run_vit_latent_scaling_grid_presets.sh
+run_vit_latent_scaling_raw_weights.sh
+run_vit_latent_scaling_latent_init_encoded.sh
+run_vit_latent_scaling_latent_init_random.sh
+run_vit_latent_scaling_latent_init_diffusion_prior.sh
+run_vit_latent_scaling_cifar10_50k_compact.sh
+run_vit_latent_scaling_latent_transfer_two_stage.sh
 ```
 
 Each script has editable variables at the top for:
@@ -183,15 +184,15 @@ BIG_VAE_INIT_CALIBRATION_BATCHES
 For the fair from-scratch comparison, use:
 
 ```text
-run_vit_latent_scaling_raw.sh
-run_vit_latent_scaling_latent_random.sh
-run_vit_latent_scaling_ae_diffusion_prior.sh
+run_vit_latent_scaling_raw_weights.sh
+run_vit_latent_scaling_latent_init_random.sh
+run_vit_latent_scaling_latent_init_diffusion_prior.sh
 ```
 
 `RAW_CHECKPOINT` is only needed by the optional `ae_encoded` path, because that mode initializes latents by encoding an already existing raw ViT solution.
 `BIG_VAE_INIT_CALIBRATION_BATCHES` controls how many train batches are used to build real activation contexts for autoregressive diffusion-prior initialization.
 
-`run_vit_latent_scaling_cifar10_50k.sh` is the compact launcher for the
+`run_vit_latent_scaling_cifar10_50k_compact.sh` is the compact launcher for the
 `cifar10_50k` preset. It uses `vit_latent_scaling/config_cifar10_50k` and
 switches initialization through:
 
@@ -205,7 +206,7 @@ INIT_GROUP
 There is also a two-stage latent-transfer wrapper:
 
 ```text
-run_vit_latent_scaling_latent_transfer.sh
+run_vit_latent_scaling_latent_transfer_two_stage.sh
 ```
 
 It does:
