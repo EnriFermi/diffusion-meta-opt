@@ -1289,6 +1289,25 @@ def run_training_for_seed(
     if not isinstance(store, BigVAELatentTensorStore):
         raise TypeError("diagnostic script expects BigVAELatentTensorStore-backed model")
 
+    decoded_params = int(store.decoded_numel())
+    latent_params = int(store.latent_numel())
+    tile_count = int(store.decoded_tile_count())
+    big_vae_decoded_params = int(store.big_vae_decoded_numel())
+    latent_per_tile = (
+        int(next(iter(store.latent_slots.values())).numel())
+        if len(store.latent_slots) > 0
+        else 0
+    )
+    latent_to_decoded_ratio = float(latent_params / max(1, decoded_params))
+
+    print(
+        f"[latent_landscape][seed={seed}] decoded_params={decoded_params} "
+        f"latent_params={latent_params} latent/raw={latent_to_decoded_ratio:.6f} "
+        f"tiles={tile_count} latent_per_tile={latent_per_tile} "
+        f"bigvae_decoded_params={big_vae_decoded_params}",
+        flush=True,
+    )
+
     optimizer = torch.optim.AdamW(
         store.latent_slots.parameters(),
         lr=float(cfg.lr),
@@ -1322,7 +1341,7 @@ def run_training_for_seed(
             flush=True,
         )
         checkpoints = cached_training["checkpoints"]
-        summary = cached_training["summary"]
+        summary = dict(cached_training["summary"])
         torch.save({"seed": int(seed), "checkpoints": checkpoints}, checkpoints_file)
     else:
         checkpoints: dict[str, dict[str, Any]] = {}
@@ -1498,16 +1517,27 @@ def run_training_for_seed(
             "saved_checkpoints": sorted(checkpoints.keys()),
             "plateau_source": str(plateau_name),
         }
-        write_json(run_dir / "summary.json", summary)
-        torch.save(
-            {
-                "seed": int(seed),
-                "config": asdict(cfg),
-                "summary": summary,
-                "checkpoints": checkpoints,
-            },
-            train_cache_file,
-        )
+
+    summary.update(
+        {
+            "decoded_params": int(decoded_params),
+            "latent_params": int(latent_params),
+            "latent_to_decoded_ratio": float(latent_to_decoded_ratio),
+            "tile_count": int(tile_count),
+            "latent_per_tile": int(latent_per_tile),
+            "big_vae_decoded_params": int(big_vae_decoded_params),
+        }
+    )
+    write_json(run_dir / "summary.json", summary)
+    torch.save(
+        {
+            "seed": int(seed),
+            "config": asdict(cfg),
+            "summary": summary,
+            "checkpoints": checkpoints,
+        },
+        train_cache_file,
+    )
 
     radial_rows: list[dict[str, Any]] = []
     angular_rows: list[dict[str, Any]] = []
@@ -1707,6 +1737,12 @@ def run_training_for_seed(
                 "checkpoint_step": int(payload["step"]),
                 "diag_loss": float(center_loss.detach().cpu().item()),
                 "diag_acc": float(center_acc),
+                "decoded_params": int(decoded_params),
+                "latent_params": int(latent_params),
+                "latent_to_decoded_ratio": float(latent_to_decoded_ratio),
+                "tile_count": int(tile_count),
+                "latent_per_tile": int(latent_per_tile),
+                "big_vae_decoded_params": int(big_vae_decoded_params),
                 "latent_norm": float(payload["latent_norm"]),
                 "grad_norm": float(grad_row["grad_norm"]),
                 "grad_parallel_ratio": float(grad_row["grad_parallel_ratio"]),
