@@ -52,6 +52,7 @@ vit_latent_scaling:
   raw_checkpoint: ${oc.env:RAW_VIT_CHECKPOINT,""}
   latent_checkpoint: ""
   big_vae_checkpoint: ${oc.env:BIG_VAE_CHECKPOINT,""}
+  big_vae_latent_parameterization: euclidean
   big_vae_diffusion_prior_checkpoint: ${oc.env:BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT,""}
   big_vae_diffusion_prior_steps: 50
   big_vae_diffusion_prior_sampler: ddim

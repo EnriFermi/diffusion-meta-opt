@@ -101,6 +101,7 @@ class ScalingRunConfig:
     latent_checkpoint: str
     big_vae_checkpoint: str
     big_vae_latent_init: str
+    big_vae_latent_parameterization: str
     big_vae_diffusion_prior_checkpoint: str
     big_vae_diffusion_prior_steps: int
     big_vae_diffusion_prior_sampler: str
@@ -124,6 +125,9 @@ def validate_scaling_run_config(cfg: ScalingRunConfig) -> None:
     if setup == "latent":
         if not str(cfg.big_vae_checkpoint).strip():
             raise ValueError("--big-vae-checkpoint is required for setup=latent")
+        latent_parameterization = str(cfg.big_vae_latent_parameterization).strip().lower()
+        if latent_parameterization not in {"euclidean", "sphere"}:
+            raise ValueError("--big-vae-latent-parameterization must be one of {'euclidean', 'sphere'}")
         if not has_latent_checkpoint:
             latent_init = str(cfg.big_vae_latent_init).strip().lower()
             if latent_init == "encoded" and not str(cfg.raw_checkpoint).strip():
@@ -299,7 +303,7 @@ def flatten_latent_slots(store: BigVAELatentTensorStore) -> torch.Tensor:
     keys = _sorted_latent_slot_keys(store)
     if not keys:
         return torch.zeros(0, device=store.big_vae.latent_base.device, dtype=store.big_vae.latent_base.dtype)
-    return torch.cat([store.latent_slots[key].detach().reshape(-1) for key in keys], dim=0)
+    return torch.cat([store.materialize_latent_slot(str(key)).detach().reshape(-1) for key in keys], dim=0)
 
 
 @torch.no_grad()
@@ -310,7 +314,7 @@ def load_flat_latent_slots_(store: BigVAELatentTensorStore, flat_latents: torch.
         target = store.latent_slots[key]
         numel = int(target.numel())
         value = flat_latents[offset : offset + numel].view_as(target).to(device=target.device, dtype=target.dtype)
-        target.copy_(value)
+        store.load_materialized_latent_slots_state_dict({str(key): value}, strict=False, update_radii=False)
         offset += numel
     if offset != int(flat_latents.numel()):
         raise ValueError(
@@ -333,19 +337,48 @@ def estimate_decoder_effective_jacobian_norm(
     eps: float,
     num_probes: int,
 ) -> dict[str, float]:
-    z0 = flatten_latent_slots(store)
-    if int(z0.numel()) == 0:
+    keys = _sorted_latent_slot_keys(store)
+    if not keys:
         return {"mean": 0.0, "std": 0.0, "max": 0.0}
+    z0 = flatten_latent_slots(store)
     w0 = flatten_decoded_bigvae_weights(store)
     norms: list[float] = []
     tiny = torch.finfo(z0.dtype).tiny
+    materialized_state = {
+        str(key): store.materialize_latent_slot(str(key)).detach().clone() for key in keys
+    }
     for _ in range(int(num_probes)):
-        v = torch.randn_like(z0)
-        v = v / v.norm().clamp_min(tiny)
-        load_flat_latent_slots_(store, z0 + float(eps) * v)
+        if str(getattr(store, "latent_parameterization", "euclidean")).strip().lower() == "sphere":
+            perturbed_state: dict[str, torch.Tensor] = {}
+            for key in keys:
+                z_key = materialized_state[str(key)]
+                radius = z_key.norm().clamp_min(tiny)
+                z_unit = z_key / radius
+                v_key = torch.randn_like(z_key)
+                tangent = v_key - torch.sum(v_key * z_unit) * z_unit
+                tangent_norm = tangent.norm().clamp_min(tiny)
+                z1_key = z_key + float(eps) * (tangent / tangent_norm)
+                z1_key = z1_key * (radius / z1_key.norm().clamp_min(tiny))
+                perturbed_state[str(key)] = z1_key
+            store.load_materialized_latent_slots_state_dict(
+                perturbed_state,
+                strict=False,
+                update_radii=False,
+            )
+        else:
+            v = torch.randn_like(z0)
+            v = v / v.norm().clamp_min(tiny)
+            load_flat_latent_slots_(store, z0 + float(eps) * v)
         w1 = flatten_decoded_bigvae_weights(store)
         norms.append(float((w1 - w0).norm().item() / float(eps)))
-    load_flat_latent_slots_(store, z0)
+    if str(getattr(store, "latent_parameterization", "euclidean")).strip().lower() == "sphere":
+        store.load_materialized_latent_slots_state_dict(
+            materialized_state,
+            strict=False,
+            update_radii=False,
+        )
+    else:
+        load_flat_latent_slots_(store, z0)
     values = np.asarray(norms, dtype=np.float64)
     return {
         "mean": float(values.mean()) if values.size else 0.0,
@@ -614,14 +647,17 @@ def infer_latent_space_from_checkpoint_payload(payload: dict[str, Any]) -> str:
 
 
 def load_latent_slots_from_checkpoint(
-    latent_slots: nn.ParameterDict,
+    latent_target: BigVAELatentTensorStore | nn.ParameterDict,
     checkpoint_payload: dict[str, Any],
 ) -> dict[str, Any]:
     source_state = checkpoint_payload.get("latent_slots", {})
     if not isinstance(source_state, dict):
         raise TypeError("checkpoint_payload['latent_slots'] must be a dict")
 
-    current_state = latent_slots.state_dict()
+    if isinstance(latent_target, BigVAELatentTensorStore):
+        current_state = latent_target.materialized_latent_slots_state_dict()
+    else:
+        current_state = latent_target.state_dict()
     compatible_state: dict[str, torch.Tensor] = {}
     missing_keys: list[str] = []
     unexpected_keys: list[str] = []
@@ -645,7 +681,14 @@ def load_latent_slots_from_checkpoint(
             "check model architecture, decode mode, and BigVAE tiling config"
         )
 
-    latent_slots.load_state_dict(compatible_state, strict=False)
+    if isinstance(latent_target, BigVAELatentTensorStore):
+        latent_target.load_materialized_latent_slots_state_dict(
+            compatible_state,
+            strict=False,
+            update_radii=True,
+        )
+    else:
+        latent_target.load_state_dict(compatible_state, strict=False)
     return {
         "loaded_keys": sorted(compatible_state.keys()),
         "missing_keys": missing_keys,
@@ -681,6 +724,7 @@ def build_model(
             big_vae_latent_init_override if big_vae_latent_init_override is not None else cfg.big_vae_latent_init
         ),
         big_vae_latent_space=big_vae_latent_space_override,
+        big_vae_latent_parameterization=str(cfg.big_vae_latent_parameterization),
         big_vae_diffusion_prior=big_vae_diffusion_prior,
         big_vae_diffusion_prior_steps=int(cfg.big_vae_diffusion_prior_steps),
         big_vae_diffusion_prior_sampler=str(cfg.big_vae_diffusion_prior_sampler),
@@ -813,7 +857,7 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         if not isinstance(store, BigVAELatentTensorStore):
             raise TypeError("latent checkpoint init requires BigVAELatentTensorStore")
         assert latent_checkpoint_payload is not None
-        load_report = load_latent_slots_from_checkpoint(store.latent_slots, latent_checkpoint_payload)
+        load_report = load_latent_slots_from_checkpoint(store, latent_checkpoint_payload)
         init_latent_steps = int(load_report["checkpoint_step"])
         init_latent_loaded_keys = int(len(load_report["loaded_keys"]))
         print(
@@ -846,7 +890,8 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         f"optimizer={cfg.optimizer_name} "
         f"lr_schedule={lr_schedule_description} "
         f"trainable_params={trainable_params} decoded_params={decoded_params} "
-        f"latent_params={latent_params} bigvae_decoded_params={decoded_big_vae_params} tiles={tile_count}",
+        f"latent_params={latent_params} bigvae_decoded_params={decoded_big_vae_params} "
+        f"tiles={tile_count} latent_parameterization={getattr(store, 'latent_parameterization', '')}",
         flush=True,
     )
 
@@ -1046,7 +1091,8 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
                     "init_latent_checkpoint": str(cfg.latent_checkpoint),
                     "init_latent_steps": int(init_latent_steps),
                     "latent_space": str(getattr(target.store, "latent_space", "")),
-                    "latent_slots": target.store.latent_slots.state_dict(),
+                    "latent_parameterization": str(getattr(target.store, "latent_parameterization", "")),
+                    "latent_slots": target.store.materialized_latent_slots_state_dict(),
                     "vit_config": asdict(vit_cfg),
                     "run_config": asdict(cfg),
                 },
@@ -1088,6 +1134,9 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
         "raw_checkpoint": str(cfg.raw_checkpoint) if cfg.setup == "latent" else "",
         "big_vae_checkpoint": str(cfg.big_vae_checkpoint) if cfg.setup == "latent" else "",
         "big_vae_latent_init": str(cfg.big_vae_latent_init) if cfg.setup == "latent" else "",
+        "big_vae_latent_parameterization": (
+            str(getattr(store, "latent_parameterization", "")) if cfg.setup == "latent" else ""
+        ),
         "big_vae_latent_space": str(getattr(store, "latent_space", "")) if cfg.setup == "latent" else "",
         "big_vae_diffusion_prior_checkpoint": (
             str(cfg.big_vae_diffusion_prior_checkpoint) if cfg.setup == "latent" else ""
@@ -1160,6 +1209,11 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         choices=("base", "random", "encoded", "diffusion_prior"),
         default="encoded",
     )
+    parser.add_argument(
+        "--big-vae-latent-parameterization",
+        choices=("euclidean", "sphere"),
+        default="euclidean",
+    )
     parser.add_argument("--big-vae-diffusion-prior-checkpoint", default="")
     parser.add_argument("--big-vae-diffusion-prior-steps", type=int, default=50)
     parser.add_argument("--big-vae-diffusion-prior-sampler", choices=("ddim", "ddpm"), default="ddim")
@@ -1228,6 +1282,7 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         latent_checkpoint=str(args.latent_checkpoint),
         big_vae_checkpoint=str(args.big_vae_checkpoint),
         big_vae_latent_init=str(args.big_vae_latent_init),
+        big_vae_latent_parameterization=str(args.big_vae_latent_parameterization),
         big_vae_diffusion_prior_checkpoint=str(args.big_vae_diffusion_prior_checkpoint),
         big_vae_diffusion_prior_steps=int(args.big_vae_diffusion_prior_steps),
         big_vae_diffusion_prior_sampler=str(args.big_vae_diffusion_prior_sampler),

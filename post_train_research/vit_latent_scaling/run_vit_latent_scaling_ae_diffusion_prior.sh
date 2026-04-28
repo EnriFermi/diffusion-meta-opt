@@ -10,6 +10,7 @@ PRESET="cifar_mili"
 OUTPUT_ROOT="./post_train_research/vit_latent_scaling/artifacts"
 BIG_VAE_CHECKPOINT="./artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt"
 BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/checkpoints/big_vae_latent_diffusion_prior_AE/stage_1/latest.pt"
+BIG_VAE_LATENT_PARAMETERIZATION="sphere"
 BIG_VAE_INIT_CALIBRATION_BATCHES="4"
 OPTIMIZER_NAME="Adam"
 ADAM_BETA1="0.9"
@@ -50,6 +51,7 @@ run_python \
   "vit_latent_scaling.adam_beta2=$ADAM_BETA2" \
   "vit_latent_scaling.adam_eps=$ADAM_EPS" \
   "vit_latent_scaling.big_vae_checkpoint=$BIG_VAE_CHECKPOINT" \
+  "vit_latent_scaling.big_vae_latent_parameterization=$BIG_VAE_LATENT_PARAMETERIZATION" \
   "vit_latent_scaling.big_vae_diffusion_prior_checkpoint=$BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT" \
   "vit_latent_scaling.big_vae_init_calibration_batches=$BIG_VAE_INIT_CALIBRATION_BATCHES" \
   "vit_latent_scaling.latent_lr_scheduler=$LATENT_LR_SCHEDULER" \
