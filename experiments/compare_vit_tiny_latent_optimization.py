@@ -88,6 +88,7 @@ class ExperimentConfig:
     big_vae_diffusion_prior_steps: int = 50
     big_vae_diffusion_prior_sampler: str = "ddim"
     big_vae_diffusion_prior_eta: float = 0.0
+    big_vae_random_init_std: float = 0.02
     big_vae_latent_noise_std: float = 0.0
     big_vae_encoder_context_rows: int = 64
     big_vae_encoder_context_std: float = 1.0
@@ -294,6 +295,7 @@ class BigVAELatentTensorStore(nn.Module):
         latent_init: str,
         latent_space: str | None = None,
         latent_parameterization: str = "euclidean",
+        random_init_std: float,
         latent_noise_std: float,
         decode_policy: str,
         tile_T_patches: int,
@@ -364,6 +366,7 @@ class BigVAELatentTensorStore(nn.Module):
         self.encoder_context_rows = max(1, int(encoder_context_rows))
         self.encoder_context_std = float(encoder_context_std)
         self.encoder_batch_size = max(1, int(encoder_batch_size))
+        self.random_init_std = float(random_init_std)
         self.latent_noise_std = float(latent_noise_std)
         self.latent_diffusion_prior = latent_diffusion_prior
         self.latent_diffusion_prior_steps = max(1, int(latent_diffusion_prior_steps))
@@ -421,10 +424,12 @@ class BigVAELatentTensorStore(nn.Module):
                 group_key = (int(self.tile_d_in), int(self.tile_d_out), int(self.tile_T_patches))
                 self._groups.setdefault(group_key, []).append(tile_key)
 
-                if init_mode in {"base", "encoded"}:
+                if init_mode in {"base", "encoded", "diffusion_prior"}:
                     latent = base_latents.clone()
+                elif init_mode == "random":
+                    latent = base_latents.clone() + torch.randn_like(base_latents) * self.random_init_std
                 else:
-                    latent = torch.randn_like(base_latents) * 0.02
+                    latent = base_latents.clone()
                 if float(latent_noise_std) > 0.0:
                     latent = latent + torch.randn_like(latent) * float(latent_noise_std)
                 self.latent_slots[tile_key] = nn.Parameter(latent.detach().clone())
@@ -1061,6 +1066,7 @@ class FunctionalViTTiny(nn.Module):
         big_vae_diffusion_prior_steps: int = 50,
         big_vae_diffusion_prior_sampler: str = "ddim",
         big_vae_diffusion_prior_eta: float = 0.0,
+        big_vae_random_init_std: float = 0.02,
         big_vae_latent_noise_std: float = 0.0,
         big_vae_latent_parameterization: str = "euclidean",
         big_vae_encoder_context_rows: int = 64,
@@ -1081,6 +1087,7 @@ class FunctionalViTTiny(nn.Module):
                 latent_init=big_vae_latent_init,
                 latent_space=big_vae_latent_space,
                 latent_parameterization=big_vae_latent_parameterization,
+                random_init_std=big_vae_random_init_std,
                 latent_noise_std=big_vae_latent_noise_std,
                 decode_policy=big_vae_decode,
                 tile_T_patches=int(big_vae_tile_T_patches),
@@ -1616,6 +1623,7 @@ def train_setup(
         big_vae_diffusion_prior_steps=int(cfg.big_vae_diffusion_prior_steps),
         big_vae_diffusion_prior_sampler=str(cfg.big_vae_diffusion_prior_sampler),
         big_vae_diffusion_prior_eta=float(cfg.big_vae_diffusion_prior_eta),
+        big_vae_random_init_std=float(cfg.big_vae_random_init_std),
         big_vae_latent_noise_std=float(cfg.big_vae_latent_noise_std),
         big_vae_latent_parameterization=str(cfg.big_vae_latent_parameterization),
         big_vae_encoder_context_rows=int(cfg.big_vae_encoder_context_rows),
@@ -1935,6 +1943,7 @@ def parse_args() -> tuple[ExperimentConfig, ViTTinyConfig]:
         type=float,
         default=default_exp.big_vae_diffusion_prior_eta,
     )
+    parser.add_argument("--big-vae-random-init-std", type=float, default=default_exp.big_vae_random_init_std)
     parser.add_argument("--big-vae-latent-noise-std", type=float, default=default_exp.big_vae_latent_noise_std)
     parser.add_argument(
         "--big-vae-encoder-context-rows",
@@ -2015,6 +2024,7 @@ def parse_args() -> tuple[ExperimentConfig, ViTTinyConfig]:
         big_vae_diffusion_prior_steps=int(args.big_vae_diffusion_prior_steps),
         big_vae_diffusion_prior_sampler=str(args.big_vae_diffusion_prior_sampler),
         big_vae_diffusion_prior_eta=float(args.big_vae_diffusion_prior_eta),
+        big_vae_random_init_std=float(args.big_vae_random_init_std),
         big_vae_latent_noise_std=float(args.big_vae_latent_noise_std),
         big_vae_encoder_context_rows=int(args.big_vae_encoder_context_rows),
         big_vae_encoder_context_std=float(args.big_vae_encoder_context_std),

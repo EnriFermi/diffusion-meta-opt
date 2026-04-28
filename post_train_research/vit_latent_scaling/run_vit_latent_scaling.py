@@ -112,6 +112,7 @@ class ScalingRunConfig:
     big_vae_diffusion_prior_steps: int
     big_vae_diffusion_prior_sampler: str
     big_vae_diffusion_prior_eta: float
+    big_vae_random_init_std: float
     big_vae_decode: str
     big_vae_tile_T_patches: int
     big_vae_tile_d_out: int
@@ -142,6 +143,8 @@ def validate_scaling_run_config(cfg: ScalingRunConfig) -> None:
             cfg.big_vae_diffusion_prior_checkpoint
         ).strip():
             raise ValueError("--big-vae-diffusion-prior-checkpoint is required for the selected latent initialization")
+        if float(cfg.big_vae_random_init_std) < 0.0:
+            raise ValueError("--big-vae-random-init-std must be >= 0")
     latent_lr_scheduler = str(cfg.latent_lr_scheduler).strip().lower()
     if latent_lr_scheduler not in {"constant", "cosine_decay_to_floor"}:
         raise ValueError(
@@ -733,6 +736,7 @@ def build_model(
         big_vae_diffusion_prior_steps=int(cfg.big_vae_diffusion_prior_steps),
         big_vae_diffusion_prior_sampler=str(cfg.big_vae_diffusion_prior_sampler),
         big_vae_diffusion_prior_eta=float(cfg.big_vae_diffusion_prior_eta),
+        big_vae_random_init_std=float(cfg.big_vae_random_init_std),
         big_vae_decode=str(cfg.big_vae_decode),
         big_vae_tile_T_patches=int(cfg.big_vae_tile_T_patches),
         big_vae_tile_d_out=int(cfg.big_vae_tile_d_out),
@@ -1153,6 +1157,7 @@ def train_once(cfg: ScalingRunConfig, vit_cfg: ViTTinyConfig) -> dict[str, Any]:
             str(cfg.big_vae_diffusion_prior_sampler) if cfg.setup == "latent" else ""
         ),
         "big_vae_diffusion_prior_eta": float(cfg.big_vae_diffusion_prior_eta) if cfg.setup == "latent" else 0.0,
+        "big_vae_random_init_std": float(cfg.big_vae_random_init_std) if cfg.setup == "latent" else 0.0,
         "require_big_vae_checkpoint": bool(cfg.require_big_vae_checkpoint),
         "require_raw_checkpoint": bool(cfg.require_raw_checkpoint),
         "require_diffusion_prior_checkpoint": bool(cfg.require_diffusion_prior_checkpoint),
@@ -1229,6 +1234,7 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
     parser.add_argument("--big-vae-diffusion-prior-steps", type=int, default=50)
     parser.add_argument("--big-vae-diffusion-prior-sampler", choices=("ddim", "ddpm"), default="ddim")
     parser.add_argument("--big-vae-diffusion-prior-eta", type=float, default=0.0)
+    parser.add_argument("--big-vae-random-init-std", type=float, default=0.02)
     parser.add_argument("--big-vae-decode", choices=("weights", "all"), default="all")
     parser.add_argument("--big-vae-tile-t-patches", "--big-vae-tile-T-patches", dest="big_vae_tile_T_patches", type=int, default=16)
     parser.add_argument("--big-vae-tile-d-out", type=int, default=8)
@@ -1306,6 +1312,7 @@ def parse_args() -> tuple[ScalingRunConfig, ViTTinyConfig]:
         big_vae_diffusion_prior_steps=int(args.big_vae_diffusion_prior_steps),
         big_vae_diffusion_prior_sampler=str(args.big_vae_diffusion_prior_sampler),
         big_vae_diffusion_prior_eta=float(args.big_vae_diffusion_prior_eta),
+        big_vae_random_init_std=float(args.big_vae_random_init_std),
         big_vae_decode=str(args.big_vae_decode),
         big_vae_tile_T_patches=int(args.big_vae_tile_T_patches),
         big_vae_tile_d_out=int(args.big_vae_tile_d_out),
