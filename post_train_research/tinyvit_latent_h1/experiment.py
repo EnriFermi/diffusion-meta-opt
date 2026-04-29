@@ -18,6 +18,7 @@ from post_train_research.tinyvit_latent_h1.source import (
     build_cifar10_datasets,
     build_eval_loader,
     build_latent_model,
+    build_raw_model,
     build_train_schedule,
     evaluate_train_and_test,
     sanitize_float,
@@ -29,7 +30,7 @@ from post_train_research.tinyvit_latent_h1.branch_training import (
     select_best_branch_result,
     train_anchor_source,
 )
-from post_train_research.vit_latent_scaling.init import resolve_device, seed_everything
+from post_train_research.vit_latent_scaling.init import export_named_tensors, resolve_device, seed_everything
 
 
 def _get_pyplot():
@@ -183,6 +184,59 @@ def _validate_anchor_reconstruction(
             f"stored test_acc={float(source.z_star_test_metrics.accuracy):.4f} rebuilt test_acc={float(test_metrics.accuracy):.4f}"
         )
 
+    rebuilt_named = export_named_tensors(anchor_model, source.all_tensor_names)
+    tensor_gap = max(
+        float((rebuilt_named[name] - source.z_star_named_tensors[name]).abs().max().item())
+        for name in source.all_tensor_names
+    )
+    if tensor_gap > 1e-5:
+        raise RuntimeError(
+            "Anchor tensor reconstruction mismatch before search: "
+            f"max_abs_diff={tensor_gap:.6e}"
+        )
+
+
+def _validate_start_reconstruction(
+    cfg: RunConfig,
+    source: Any,
+    start: StartPoint,
+    *,
+    device: torch.device,
+) -> None:
+    latent_model = build_latent_model(
+        cfg,
+        source,
+        device=device,
+        latent_state=start.latent_state,
+        conditioning_state=source.z_star_conditioning_state,
+    )
+    raw_model = build_latent_model(
+        cfg,
+        source,
+        device=device,
+        latent_state=start.latent_state,
+        conditioning_state=source.z_star_conditioning_state,
+    )
+    latent_named = export_named_tensors(latent_model, source.all_tensor_names)
+    latent_gap = max(
+        float((latent_named[name] - start.named_tensors[name]).abs().max().item())
+        for name in source.all_tensor_names
+    )
+    if latent_gap > 1e-5:
+        raise RuntimeError(
+            f"Latent branch start reconstruction mismatch for {start.start_id}: max_abs_diff={latent_gap:.6e}"
+        )
+    raw_model = build_raw_model(source, device=device, start_named_tensors=start.named_tensors)
+    raw_named = export_named_tensors(raw_model, source.all_tensor_names)
+    raw_gap = max(
+        float((raw_named[name] - start.named_tensors[name]).abs().max().item())
+        for name in source.all_tensor_names
+    )
+    if raw_gap > 1e-6:
+        raise RuntimeError(
+            f"Raw branch start reconstruction mismatch for {start.start_id}: max_abs_diff={raw_gap:.6e}"
+        )
+
 
 def run_experiment(
     cfg: RunConfig,
@@ -270,6 +324,12 @@ def run_experiment(
     )
 
     for start in starts:
+        _validate_start_reconstruction(
+            cfg,
+            source,
+            start,
+            device=device,
+        )
         latent_runs = [
             run_branch_for_lr(
                 cfg,
