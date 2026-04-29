@@ -42,6 +42,7 @@ class SourceContext:
     latent_space: str
     big_vae: Any
     z_star_state: dict[str, torch.Tensor]
+    z_star_conditioning_state: dict[str, torch.Tensor]
     z_star_named_tensors: dict[str, torch.Tensor]
     z_star_train_metrics: EvalMetrics
     z_star_test_metrics: EvalMetrics
@@ -71,6 +72,39 @@ def clone_tensor_dict(mapping: dict[str, torch.Tensor]) -> dict[str, torch.Tenso
 
 def clone_named_tensors(mapping: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {str(name): tensor.detach().cpu().clone() for name, tensor in mapping.items()}
+
+
+def clone_conditioning_state(mapping: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {str(key): value.detach().cpu().clone() for key, value in mapping.items()}
+
+
+def conditioning_state_dict(store: BigVAELatentTensorStore) -> dict[str, torch.Tensor]:
+    return clone_conditioning_state(store._tile_cond_patch)
+
+
+@torch.no_grad()
+def load_conditioning_state(
+    store: BigVAELatentTensorStore,
+    state: dict[str, torch.Tensor] | None,
+    *,
+    strict: bool = True,
+) -> None:
+    if not state:
+        if strict and store._tile_cond_patch:
+            store._tile_cond_patch.clear()
+        return
+    missing = [str(key) for key in store._tile_specs.keys() if key not in state]
+    unexpected = [str(key) for key in state.keys() if key not in store._tile_specs]
+    if strict and unexpected:
+        raise RuntimeError(f"conditioning state mismatch: unexpected={unexpected[:8]}")
+    first_latent = next(iter(store.latent_slots.values()))
+    store._tile_cond_patch = {
+        str(key): value.detach().to(device=first_latent.device, dtype=first_latent.dtype).contiguous()
+        for key, value in state.items()
+        if key in store._tile_specs
+    }
+    if strict and missing and store.use_distribution_encoder:
+        raise RuntimeError(f"conditioning state mismatch: missing={missing[:8]}")
 
 
 def build_cifar10_datasets(cfg: RunConfig):
@@ -242,7 +276,14 @@ def prepare_config_from_source_checkpoint(cfg: RunConfig, logger: logging.Logger
     return checkpoint_path
 
 
-def build_latent_model(cfg: RunConfig, source: SourceContext, *, device: torch.device, latent_state: dict[str, torch.Tensor]) -> nn.Module:
+def build_latent_model(
+    cfg: RunConfig,
+    source: SourceContext,
+    *,
+    device: torch.device,
+    latent_state: dict[str, torch.Tensor],
+    conditioning_state: dict[str, torch.Tensor] | None = None,
+) -> nn.Module:
     model = FunctionalViTTiny(
         source.vit_cfg,
         clone_named_tensors(source.initial_tensors),
@@ -264,6 +305,7 @@ def build_latent_model(cfg: RunConfig, source: SourceContext, *, device: torch.d
     if not isinstance(store, BigVAELatentTensorStore):
         raise TypeError("Expected BigVAELatentTensorStore for latent branch")
     load_materialized_state(store, latent_state)
+    load_conditioning_state(store, conditioning_state, strict=False)
     return model
 
 
@@ -385,17 +427,33 @@ def resolve_source_context(
         latent_space=latent_space,
         big_vae=big_vae,
         z_star_state={},
+        z_star_conditioning_state={},
         z_star_named_tensors={},
         z_star_train_metrics=EvalMetrics(loss=float("nan"), accuracy=0.0, examples=0),
         z_star_test_metrics=EvalMetrics(loss=float("nan"), accuracy=0.0, examples=0),
         latent_param_count=0,
         raw_param_count=0,
     )
-    anchor_model = build_latent_model(cfg, stub, device=device, latent_state=payload["latent_slots"])
+    cond_payload = payload.get("tile_cond_patch")
+    if cond_payload is None:
+        logger.warning(
+            "Source checkpoint %s has no tile_cond_patch; latent reconstruction may drift from the original conditioned decoder state",
+            checkpoint,
+        )
+    elif not isinstance(cond_payload, dict):
+        raise ValueError(f"Source checkpoint tile_cond_patch must be a dict when present: {checkpoint}")
+    anchor_model = build_latent_model(
+        cfg,
+        stub,
+        device=device,
+        latent_state=payload["latent_slots"],
+        conditioning_state=cond_payload if isinstance(cond_payload, dict) else None,
+    )
     store = getattr(anchor_model, "store")
     if not isinstance(store, BigVAELatentTensorStore):
         raise TypeError("Expected BigVAELatentTensorStore for source anchor")
     z_star_state = store.materialized_latent_slots_state_dict()
+    z_star_conditioning_state = conditioning_state_dict(store)
     z_star_named = export_named_tensors(anchor_model, list(initial_tensors.keys()))
     train_metrics, test_metrics = evaluate_train_and_test(anchor_model, train_loader, test_loader, device=device, amp_enabled=bool(cfg.train.amp))
     decoded_names = list(store.decoded_tensor_names())
@@ -410,6 +468,7 @@ def resolve_source_context(
         latent_space=latent_space,
         big_vae=big_vae,
         z_star_state=z_star_state,
+        z_star_conditioning_state=z_star_conditioning_state,
         z_star_named_tensors=z_star_named,
         z_star_train_metrics=train_metrics,
         z_star_test_metrics=test_metrics,

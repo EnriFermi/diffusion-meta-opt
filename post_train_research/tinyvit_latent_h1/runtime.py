@@ -30,6 +30,8 @@ class RunPaths:
     starts_file: Path
     starts_dir: Path
     plots_dir: Path
+    anchor_dir: Path
+    anchor_curve_file: Path
 
 
 def slugify(value: str) -> str:
@@ -69,8 +71,10 @@ def prepare_run_paths(cfg: RunConfig) -> RunPaths:
     run_dir.mkdir(parents=True, exist_ok=False)
     starts_dir = run_dir / "starts"
     plots_dir = run_dir / "plots"
+    anchor_dir = run_dir / "anchor"
     starts_dir.mkdir(parents=True, exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
+    anchor_dir.mkdir(parents=True, exist_ok=True)
     return RunPaths(
         root_dir=root_dir,
         runs_dir=runs_dir,
@@ -86,6 +90,8 @@ def prepare_run_paths(cfg: RunConfig) -> RunPaths:
         starts_file=run_dir / "starts.pt",
         starts_dir=starts_dir,
         plots_dir=plots_dir,
+        anchor_dir=anchor_dir,
+        anchor_curve_file=anchor_dir / "curves.csv",
     )
 
 

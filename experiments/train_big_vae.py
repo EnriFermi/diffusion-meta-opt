@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from dataset import data_pipeline, setup_logging
 from dataset.big_vae_offline import offline_big_vae_data_pipeline
 from dataset.logging_utils import LOG_PATH_ENV, configure_process_logging, resolve_process_log_path
+from experiments.background_prefetch import BackgroundPrefetcher
 from models.weight_quantile_vae import (
     BigVAEConfig,
     DistributionConfig,
@@ -97,6 +98,17 @@ class ConsumedSourceBatch:
     source_pool_missing_model_names: int
     source_pool_remaining_slices_pre: int
     source_pool_remaining_slices_post: int
+
+
+@dataclass(slots=True)
+class PreparedTrainingBatch:
+    W: torch.Tensor
+    x: torch.Tensor
+    x_mask: torch.Tensor
+    d_in_mask: torch.Tensor
+    d_out_mask: torch.Tensor
+    source_diversity: dict[str, float]
+    build_time_s: float
 
 
 def _promote_run_profile_to_root(cfg: DictConfig) -> None:
@@ -347,6 +359,11 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         parsed_max_source_samples = 0
     else:
         parsed_max_source_samples = int(raw_max_source_samples)
+    offline_batch_prefetch_cfg = train_cfg.get("offline_batch_prefetch", {})
+    if offline_batch_prefetch_cfg is None:
+        offline_batch_prefetch_cfg = {}
+    if not isinstance(offline_batch_prefetch_cfg, (dict, DictConfig)):
+        offline_batch_prefetch_cfg = {}
 
     tracking_params: dict[str, Any] = {
         "train.max_steps": int(train_cfg.get("max_steps", 0)),
@@ -379,6 +396,9 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         "train.offline_dataset.enabled": bool(train_cfg.get("offline_dataset", {}).get("enabled", False)),
         "train.offline_dataset.root_dir": str(train_cfg.get("offline_dataset", {}).get("root_dir", "")),
         "train.offline_dataset.shard_by_rank": bool(train_cfg.get("offline_dataset", {}).get("shard_by_rank", True)),
+        "train.offline_batch_prefetch.enabled": bool(offline_batch_prefetch_cfg.get("enabled", True)),
+        "train.offline_batch_prefetch.queue_size": int(offline_batch_prefetch_cfg.get("queue_size", 2)),
+        "train.offline_batch_prefetch.pin_memory": bool(offline_batch_prefetch_cfg.get("pin_memory", True)),
         "model.patch_size": int(model_cfg.get("patch_size", 16)),
         "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
         "model.big_vae.latent_sampling_min_std": float(big_cfg.get("latent_sampling_min_std", 1e-4)),
@@ -2599,6 +2619,27 @@ def _tensor_debug_stats(tensor: torch.Tensor | None) -> dict[str, Any]:
     return payload
 
 
+def _pin_tensor_if_available(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "cpu":
+        return tensor
+    try:
+        return tensor.pin_memory()
+    except RuntimeError:
+        return tensor
+
+
+def _pin_prepared_training_batch(batch: PreparedTrainingBatch) -> PreparedTrainingBatch:
+    return PreparedTrainingBatch(
+        W=_pin_tensor_if_available(batch.W),
+        x=_pin_tensor_if_available(batch.x),
+        x_mask=_pin_tensor_if_available(batch.x_mask),
+        d_in_mask=_pin_tensor_if_available(batch.d_in_mask),
+        d_out_mask=_pin_tensor_if_available(batch.d_out_mask),
+        source_diversity=dict(batch.source_diversity),
+        build_time_s=float(batch.build_time_s),
+    )
+
+
 def _scalar_debug_value(tensor: torch.Tensor) -> float | str:
     value = tensor.detach()
     if value.numel() != 1:
@@ -3322,6 +3363,38 @@ def _run_worker(
                         "Source slice consumption without replacement is enabled: source snapshots remain in the "
                         "local pool until exhausted, and train.steps_per_sample is ignored for refresh decisions"
                     )
+            offline_batch_prefetch_cfg = cfg.train.get("offline_batch_prefetch", {})
+            if offline_batch_prefetch_cfg is None:
+                offline_batch_prefetch_cfg = {}
+            if not isinstance(offline_batch_prefetch_cfg, (dict, DictConfig)):
+                raise TypeError("train.offline_batch_prefetch must be a mapping")
+            offline_batch_prefetch_requested = bool(offline_batch_prefetch_cfg.get("enabled", True))
+            offline_batch_prefetch_queue_size = max(1, int(offline_batch_prefetch_cfg.get("queue_size", 2)))
+            offline_batch_prefetch_pin_memory = bool(offline_batch_prefetch_cfg.get("pin_memory", True))
+            offline_batch_prefetch_reasons: list[str] = []
+            if not offline_batch_prefetch_requested:
+                offline_batch_prefetch_reasons.append("disabled_by_config")
+            if not offline_dataset_enabled:
+                offline_batch_prefetch_reasons.append("offline_dataset_disabled")
+            if fixed_training_batch_enabled:
+                offline_batch_prefetch_reasons.append("fixed_training_batch_enabled")
+            if synthetic_layer_enabled:
+                offline_batch_prefetch_reasons.append("synthetic_layer_enabled")
+            if use_broadcast:
+                offline_batch_prefetch_reasons.append("distributed_broadcast_mode")
+            offline_batch_prefetch_active = len(offline_batch_prefetch_reasons) == 0
+            if rank == 0:
+                if offline_batch_prefetch_active:
+                    logger.info(
+                        "Offline batch prefetch enabled: queue_size=%s pin_memory=%s",
+                        offline_batch_prefetch_queue_size,
+                        offline_batch_prefetch_pin_memory,
+                    )
+                else:
+                    logger.info(
+                        "Offline batch prefetch disabled: reasons=%s",
+                        ",".join(offline_batch_prefetch_reasons) or "none",
+                    )
 
             log_every = max(1, int(cfg.train.get("log_every", 10)))
             log_worker_status_every = max(
@@ -3494,6 +3567,10 @@ def _run_worker(
             struct_scale_window = 0.0
             struct_rec_window = 0.0
             struct_rel_window = 0.0
+            data_build_window_s = 0.0
+            data_wait_window_s = 0.0
+            data_h2d_window_s = 0.0
+            data_prefetch_depth_window = 0.0
             source_diversity_window_unique_models_sum = 0.0
             source_diversity_window_unique_models_min = math.inf
             source_diversity_window_unique_models_max = 0.0
@@ -3530,6 +3607,205 @@ def _run_worker(
             fixed_batch_diversity_stats: dict[str, float] | None = None
             direction_pre_norm_stats_latest: dict[str, Any] | None = None
             source_mixing_shortfall_logged = False
+            prefetch_request_iter = iter(
+                (step_idx, micro_idx)
+                for step_idx in range(resumed_training_step, max_steps)
+                for micro_idx in range(grad_accum_steps)
+            )
+
+            def _prepare_training_micro_batch_cpu(*, step_idx: int, micro_idx: int) -> PreparedTrainingBatch:
+                nonlocal current_source_samples
+                nonlocal current_source_states
+                nonlocal current_source_round_robin_offset
+                nonlocal source_mixing_shortfall_logged
+
+                build_t0 = time.perf_counter()
+                if consume_slices_without_replacement:
+                    current_source_states, current_source_round_robin_offset = _prune_exhausted_source_states_with_offset(
+                        current_source_states,
+                        current_source_round_robin_offset,
+                    )
+                    current_source_states = _ensure_source_state_pool_capacity(
+                        current_source_states=current_source_states,
+                        required_remaining_slices=slice_batch_size,
+                        target_source_pool_size=requested_source_samples_per_refresh,
+                        max_active_source_pool_size=max_active_source_pool_size,
+                        rank=rank,
+                        device=device,
+                        dataset_iter=dataset_iter,
+                        use_broadcast=use_broadcast,
+                        max_x_rows=max_x_rows,
+                        logger=logger,
+                        uniqueness=batch_source_mixing_uniqueness if batch_source_mixing_active else "none",
+                        deferred_samples=deferred_source_samples,
+                        max_deferred_samples=deferred_source_cache_size,
+                        min_d_in=min_mixed_source_d_in,
+                        min_d_out=min_mixed_source_d_out,
+                        max_T_patches=curriculum_max_T,
+                        curriculum_max_d_out=curriculum_max_d_out,
+                        patch_size=patch_size_for_slice,
+                        synthetic_layer_enabled=synthetic_layer_enabled,
+                        synthetic_n_rows=synthetic_n_rows,
+                        synthetic_d_in=synthetic_d_in,
+                        synthetic_d_out=synthetic_d_out,
+                        synthetic_x_std=synthetic_x_std,
+                        synthetic_w_std=synthetic_w_std,
+                    )
+                    if not current_source_states:
+                        raise RuntimeError("training step requires a loaded source sample")
+                    if (
+                        batch_source_mixing_active
+                        and len(current_source_states) < requested_source_samples_per_refresh
+                        and not source_mixing_shortfall_logged
+                        and rank == 0
+                    ):
+                        logger.info(
+                            "Batch source mixing shortfall: requested=%s compatible source samples, fetched=%s. "
+                            "Training continues with reduced diversity for this refresh.",
+                            requested_source_samples_per_refresh,
+                            len(current_source_states),
+                        )
+                        source_mixing_shortfall_logged = True
+                    batch_payload = _build_training_batch_from_source_states(
+                        current_source_states,
+                        batch_size=slice_batch_size,
+                        start_offset=current_source_round_robin_offset,
+                        target_x_rows=stable_batch_target_x_rows,
+                        target_d_in=stable_batch_target_d_in,
+                        target_d_out=stable_batch_target_d_out,
+                    )
+                    current_batch_source_diversity = _compute_consumed_batch_source_diversity_stats(
+                        current_source_states,
+                        used_source_indices=batch_payload.used_source_indices,
+                        source_pool_remaining_slices_pre=batch_payload.source_pool_remaining_slices_pre,
+                        source_pool_remaining_slices_post=batch_payload.source_pool_remaining_slices_post,
+                    )
+                    current_source_states, current_source_round_robin_offset = _prune_exhausted_source_states_with_offset(
+                        current_source_states,
+                        batch_payload.next_start_offset,
+                    )
+                    batch = PreparedTrainingBatch(
+                        W=batch_payload.W,
+                        x=batch_payload.x,
+                        x_mask=batch_payload.x_mask,
+                        d_in_mask=batch_payload.d_in_mask,
+                        d_out_mask=batch_payload.d_out_mask,
+                        source_diversity=current_batch_source_diversity,
+                        build_time_s=time.perf_counter() - build_t0,
+                    )
+                else:
+                    if current_source_samples is None or (
+                        micro_idx == 0 and step_idx % steps_per_sample == 0
+                    ):
+                        if synthetic_layer_enabled:
+                            synthetic_source_device = torch.device("cpu")
+                            current_source_samples = []
+                            for idx in range(requested_source_samples_per_refresh):
+                                x_syn, W_syn = _sample_synthetic_layer(
+                                    device=synthetic_source_device,
+                                    n_rows=synthetic_n_rows,
+                                    d_in=synthetic_d_in,
+                                    d_out=synthetic_d_out,
+                                    x_std=synthetic_x_std,
+                                    w_std=synthetic_w_std,
+                                    max_x_rows=max_x_rows,
+                                )
+                                current_source_samples.append(
+                                    SourceSampleRecord(
+                                        x=x_syn,
+                                        W=W_syn,
+                                        model_name=f"synthetic_{idx}",
+                                    )
+                                )
+                        else:
+                            if batch_source_mixing_active:
+                                current_source_samples = _fetch_source_samples(
+                                    rank=rank,
+                                    device=device,
+                                    dataset_iter=dataset_iter,
+                                    use_broadcast=use_broadcast,
+                                    max_x_rows=max_x_rows,
+                                    logger=logger,
+                                    num_samples=requested_source_samples_per_refresh,
+                                    uniqueness=batch_source_mixing_uniqueness,
+                                    deferred_samples=deferred_source_samples,
+                                    max_deferred_samples=deferred_source_cache_size,
+                                    min_d_in=min_mixed_source_d_in,
+                                    min_d_out=min_mixed_source_d_out,
+                                )
+                            else:
+                                current_source_samples = [
+                                    _fetch_source_sample_record_cpu(
+                                        rank=rank,
+                                        device=device,
+                                        dataset_iter=dataset_iter,
+                                        use_broadcast=use_broadcast,
+                                        max_x_rows=max_x_rows,
+                                        logger=logger,
+                                    )
+                                ]
+                        current_source_round_robin_offset = 0
+                        if (
+                            batch_source_mixing_active
+                            and current_source_samples is not None
+                            and len(current_source_samples) < requested_source_samples_per_refresh
+                            and not source_mixing_shortfall_logged
+                            and rank == 0
+                        ):
+                            logger.info(
+                                "Batch source mixing shortfall: requested=%s compatible source samples, fetched=%s. "
+                                "Training continues with reduced diversity for this refresh.",
+                                requested_source_samples_per_refresh,
+                                len(current_source_samples),
+                            )
+                            source_mixing_shortfall_logged = True
+
+                    if not current_source_samples:
+                        raise RuntimeError("training step requires a loaded source sample")
+                    current_batch_source_diversity = _compute_batch_source_diversity_stats(
+                        current_source_samples,
+                        batch_size=slice_batch_size,
+                        start_offset=current_source_round_robin_offset,
+                    )
+                    W_s, x_s, x_mask_s, d_in_mask_s, d_out_mask_s = _build_training_batch_from_source_samples(
+                        current_source_samples,
+                        max_T_patches=curriculum_max_T,
+                        max_d_out=curriculum_max_d_out,
+                        patch_size=patch_size_for_slice,
+                        batch_size=slice_batch_size,
+                        start_offset=current_source_round_robin_offset,
+                        target_x_rows=stable_batch_target_x_rows,
+                        target_d_in=stable_batch_target_d_in,
+                        target_d_out=stable_batch_target_d_out,
+                    )
+                    current_source_round_robin_offset = (
+                        current_source_round_robin_offset + slice_batch_size
+                    ) % len(current_source_samples)
+                    batch = PreparedTrainingBatch(
+                        W=W_s,
+                        x=x_s,
+                        x_mask=x_mask_s,
+                        d_in_mask=d_in_mask_s,
+                        d_out_mask=d_out_mask_s,
+                        source_diversity=current_batch_source_diversity,
+                        build_time_s=time.perf_counter() - build_t0,
+                    )
+                if offline_batch_prefetch_pin_memory and device.type == "cuda":
+                    batch = _pin_prepared_training_batch(batch)
+                return batch
+
+            def _prepare_training_micro_batch_cpu_for_prefetch() -> PreparedTrainingBatch:
+                step_idx, micro_idx = next(prefetch_request_iter)
+                return _prepare_training_micro_batch_cpu(step_idx=step_idx, micro_idx=micro_idx)
+
+            offline_batch_prefetcher: BackgroundPrefetcher[PreparedTrainingBatch] | None = None
+            if offline_batch_prefetch_active:
+                offline_batch_prefetcher = BackgroundPrefetcher(
+                    build_fn=_prepare_training_micro_batch_cpu_for_prefetch,
+                    queue_size=offline_batch_prefetch_queue_size,
+                    name=f"offline_big_vae_prefetch_rank_{rank}",
+                )
+                offline_batch_prefetcher.start()
 
             for step_idx in range(resumed_training_step, max_steps):
                 global_step = step_idx + 1
@@ -3574,153 +3850,154 @@ def _run_worker(
                 ):
                     dataset.maybe_collect(step_idx)
 
-                should_refresh_source_sample = False
-                if consume_slices_without_replacement:
-                    current_source_states, current_source_round_robin_offset = _prune_exhausted_source_states_with_offset(
-                        current_source_states,
-                        current_source_round_robin_offset,
-                    )
-                    if fixed_training_batch_enabled:
-                        should_refresh_source_sample = (
-                            (
-                                fixed_batch_x is None
-                                or fixed_batch_W is None
-                                or fixed_batch_x_mask is None
-                                or fixed_batch_d_in_mask is None
-                                or fixed_batch_d_out_mask is None
-                            )
-                            and not current_source_states
-                        )
-                    else:
-                        should_refresh_source_sample = current_source_states is None or not current_source_states
-                else:
-                    if fixed_training_batch_enabled:
-                        should_refresh_source_sample = (
-                            (
-                                fixed_batch_x is None
-                                or fixed_batch_W is None
-                                or fixed_batch_x_mask is None
-                                or fixed_batch_d_in_mask is None
-                                or fixed_batch_d_out_mask is None
-                            )
-                            and not current_source_samples
-                        )
-                    else:
-                        should_refresh_source_sample = current_source_samples is None or step_idx % steps_per_sample == 0
-
-                if should_refresh_source_sample:
+                if fixed_training_batch_enabled:
+                    should_refresh_source_sample = False
                     if consume_slices_without_replacement:
-                        current_source_states = _ensure_source_state_pool_capacity(
-                            current_source_states=current_source_states,
-                            required_remaining_slices=slice_batch_size,
-                            target_source_pool_size=requested_source_samples_per_refresh,
-                            max_active_source_pool_size=max_active_source_pool_size,
-                            rank=rank,
-                            device=device,
-                            dataset_iter=dataset_iter,
-                            use_broadcast=use_broadcast,
-                            max_x_rows=max_x_rows,
-                            logger=logger,
-                            uniqueness=batch_source_mixing_uniqueness if batch_source_mixing_active else "none",
-                            deferred_samples=deferred_source_samples,
-                            max_deferred_samples=deferred_source_cache_size,
-                            min_d_in=min_mixed_source_d_in,
-                            min_d_out=min_mixed_source_d_out,
-                            max_T_patches=curriculum_max_T,
-                            curriculum_max_d_out=curriculum_max_d_out,
-                            patch_size=patch_size_for_slice,
-                            synthetic_layer_enabled=synthetic_layer_enabled,
-                            synthetic_n_rows=synthetic_n_rows,
-                            synthetic_d_in=synthetic_d_in,
-                            synthetic_d_out=synthetic_d_out,
-                            synthetic_x_std=synthetic_x_std,
-                            synthetic_w_std=synthetic_w_std,
+                        current_source_states, current_source_round_robin_offset = _prune_exhausted_source_states_with_offset(
+                            current_source_states,
+                            current_source_round_robin_offset,
                         )
-                        current_source_round_robin_offset = (
-                            current_source_round_robin_offset % len(current_source_states)
-                            if current_source_states
-                            else 0
-                        )
-                        if (
-                            batch_source_mixing_active
-                            and current_source_states is not None
-                            and len(current_source_states) < requested_source_samples_per_refresh
-                            and not source_mixing_shortfall_logged
-                            and rank == 0
-                        ):
-                            logger.info(
-                                "Batch source mixing shortfall: requested=%s compatible source samples, fetched=%s. "
-                                "Training continues with reduced diversity for this refresh.",
-                                requested_source_samples_per_refresh,
-                                len(current_source_states),
+                        if fixed_training_batch_enabled:
+                            should_refresh_source_sample = (
+                                (
+                                    fixed_batch_x is None
+                                    or fixed_batch_W is None
+                                    or fixed_batch_x_mask is None
+                                    or fixed_batch_d_in_mask is None
+                                    or fixed_batch_d_out_mask is None
+                                )
+                                and not current_source_states
                             )
-                            source_mixing_shortfall_logged = True
-                    else:
-                        if synthetic_layer_enabled:
-                            synthetic_source_device = torch.device("cpu") if batch_source_mixing_active else device
-                            current_source_samples = []
-                            for idx in range(requested_source_samples_per_refresh):
-                                x_syn, W_syn = _sample_synthetic_layer(
-                                    device=synthetic_source_device,
-                                    n_rows=synthetic_n_rows,
-                                    d_in=synthetic_d_in,
-                                    d_out=synthetic_d_out,
-                                    x_std=synthetic_x_std,
-                                    w_std=synthetic_w_std,
-                                    max_x_rows=max_x_rows,
-                                )
-                                current_source_samples.append(
-                                    SourceSampleRecord(
-                                        x=x_syn,
-                                        W=W_syn,
-                                        model_name=f"synthetic_{idx}",
-                                    )
-                                )
                         else:
-                            if batch_source_mixing_active:
-                                current_source_samples = _fetch_source_samples(
-                                    rank=rank,
-                                    device=device,
-                                    dataset_iter=dataset_iter,
-                                    use_broadcast=use_broadcast,
-                                    max_x_rows=max_x_rows,
-                                    logger=logger,
-                                    num_samples=requested_source_samples_per_refresh,
-                                    uniqueness=batch_source_mixing_uniqueness,
-                                    deferred_samples=deferred_source_samples,
-                                    max_deferred_samples=deferred_source_cache_size,
-                                    min_d_in=min_mixed_source_d_in,
-                                    min_d_out=min_mixed_source_d_out,
+                            should_refresh_source_sample = current_source_states is None or not current_source_states
+                    else:
+                        if fixed_training_batch_enabled:
+                            should_refresh_source_sample = (
+                                (
+                                    fixed_batch_x is None
+                                    or fixed_batch_W is None
+                                    or fixed_batch_x_mask is None
+                                    or fixed_batch_d_in_mask is None
+                                    or fixed_batch_d_out_mask is None
                                 )
-                            else:
-                                current_source_samples = [
-                                    _source_sample_record_to_device(
-                                        _fetch_source_sample_record_cpu(
-                                            rank=rank,
-                                            device=device,
-                                            dataset_iter=dataset_iter,
-                                            use_broadcast=use_broadcast,
-                                            max_x_rows=max_x_rows,
-                                            logger=logger,
-                                        ),
-                                        device=device,
-                                    )
-                                ]
-                        current_source_round_robin_offset = 0
-                        if (
-                            batch_source_mixing_active
-                            and current_source_samples is not None
-                            and len(current_source_samples) < requested_source_samples_per_refresh
-                            and not source_mixing_shortfall_logged
-                            and rank == 0
-                        ):
-                            logger.info(
-                                "Batch source mixing shortfall: requested=%s compatible source samples, fetched=%s. "
-                                "Training continues with reduced diversity for this refresh.",
-                                requested_source_samples_per_refresh,
-                                len(current_source_samples),
+                                and not current_source_samples
                             )
-                            source_mixing_shortfall_logged = True
+                        else:
+                            should_refresh_source_sample = current_source_samples is None or step_idx % steps_per_sample == 0
+
+                    if should_refresh_source_sample:
+                        if consume_slices_without_replacement:
+                            current_source_states = _ensure_source_state_pool_capacity(
+                                current_source_states=current_source_states,
+                                required_remaining_slices=slice_batch_size,
+                                target_source_pool_size=requested_source_samples_per_refresh,
+                                max_active_source_pool_size=max_active_source_pool_size,
+                                rank=rank,
+                                device=device,
+                                dataset_iter=dataset_iter,
+                                use_broadcast=use_broadcast,
+                                max_x_rows=max_x_rows,
+                                logger=logger,
+                                uniqueness=batch_source_mixing_uniqueness if batch_source_mixing_active else "none",
+                                deferred_samples=deferred_source_samples,
+                                max_deferred_samples=deferred_source_cache_size,
+                                min_d_in=min_mixed_source_d_in,
+                                min_d_out=min_mixed_source_d_out,
+                                max_T_patches=curriculum_max_T,
+                                curriculum_max_d_out=curriculum_max_d_out,
+                                patch_size=patch_size_for_slice,
+                                synthetic_layer_enabled=synthetic_layer_enabled,
+                                synthetic_n_rows=synthetic_n_rows,
+                                synthetic_d_in=synthetic_d_in,
+                                synthetic_d_out=synthetic_d_out,
+                                synthetic_x_std=synthetic_x_std,
+                                synthetic_w_std=synthetic_w_std,
+                            )
+                            current_source_round_robin_offset = (
+                                current_source_round_robin_offset % len(current_source_states)
+                                if current_source_states
+                                else 0
+                            )
+                            if (
+                                batch_source_mixing_active
+                                and current_source_states is not None
+                                and len(current_source_states) < requested_source_samples_per_refresh
+                                and not source_mixing_shortfall_logged
+                                and rank == 0
+                            ):
+                                logger.info(
+                                    "Batch source mixing shortfall: requested=%s compatible source samples, fetched=%s. "
+                                    "Training continues with reduced diversity for this refresh.",
+                                    requested_source_samples_per_refresh,
+                                    len(current_source_states),
+                                )
+                                source_mixing_shortfall_logged = True
+                        else:
+                            if synthetic_layer_enabled:
+                                synthetic_source_device = torch.device("cpu") if batch_source_mixing_active else device
+                                current_source_samples = []
+                                for idx in range(requested_source_samples_per_refresh):
+                                    x_syn, W_syn = _sample_synthetic_layer(
+                                        device=synthetic_source_device,
+                                        n_rows=synthetic_n_rows,
+                                        d_in=synthetic_d_in,
+                                        d_out=synthetic_d_out,
+                                        x_std=synthetic_x_std,
+                                        w_std=synthetic_w_std,
+                                        max_x_rows=max_x_rows,
+                                    )
+                                    current_source_samples.append(
+                                        SourceSampleRecord(
+                                            x=x_syn,
+                                            W=W_syn,
+                                            model_name=f"synthetic_{idx}",
+                                        )
+                                    )
+                            else:
+                                if batch_source_mixing_active:
+                                    current_source_samples = _fetch_source_samples(
+                                        rank=rank,
+                                        device=device,
+                                        dataset_iter=dataset_iter,
+                                        use_broadcast=use_broadcast,
+                                        max_x_rows=max_x_rows,
+                                        logger=logger,
+                                        num_samples=requested_source_samples_per_refresh,
+                                        uniqueness=batch_source_mixing_uniqueness,
+                                        deferred_samples=deferred_source_samples,
+                                        max_deferred_samples=deferred_source_cache_size,
+                                        min_d_in=min_mixed_source_d_in,
+                                        min_d_out=min_mixed_source_d_out,
+                                    )
+                                else:
+                                    current_source_samples = [
+                                        _source_sample_record_to_device(
+                                            _fetch_source_sample_record_cpu(
+                                                rank=rank,
+                                                device=device,
+                                                dataset_iter=dataset_iter,
+                                                use_broadcast=use_broadcast,
+                                                max_x_rows=max_x_rows,
+                                                logger=logger,
+                                            ),
+                                            device=device,
+                                        )
+                                    ]
+                            current_source_round_robin_offset = 0
+                            if (
+                                batch_source_mixing_active
+                                and current_source_samples is not None
+                                and len(current_source_samples) < requested_source_samples_per_refresh
+                                and not source_mixing_shortfall_logged
+                                and rank == 0
+                            ):
+                                logger.info(
+                                    "Batch source mixing shortfall: requested=%s compatible source samples, fetched=%s. "
+                                    "Training continues with reduced diversity for this refresh.",
+                                    requested_source_samples_per_refresh,
+                                    len(current_source_samples),
+                                )
+                                source_mixing_shortfall_logged = True
 
                 loss_acc = 0.0
                 behavioral_acc = 0.0
@@ -3740,6 +4017,10 @@ def _run_worker(
 
                 for micro_idx in range(grad_accum_steps):
                     sync_grad = micro_idx == grad_accum_steps - 1
+                    current_batch_build_s = 0.0
+                    current_prefetch_wait_s = 0.0
+                    current_h2d_enqueue_s = 0.0
+                    current_prefetch_depth = 0.0
 
                     if fixed_training_batch_enabled:
                         if (
@@ -3866,89 +4147,26 @@ def _run_worker(
                             fixed_batch_d_out_mask,
                         )
                     else:
-                        if consume_slices_without_replacement:
-                            current_source_states = _ensure_source_state_pool_capacity(
-                                current_source_states=current_source_states,
-                                required_remaining_slices=slice_batch_size,
-                                target_source_pool_size=requested_source_samples_per_refresh,
-                                max_active_source_pool_size=max_active_source_pool_size,
-                                rank=rank,
-                                device=device,
-                                dataset_iter=dataset_iter,
-                                use_broadcast=use_broadcast,
-                                max_x_rows=max_x_rows,
-                                logger=logger,
-                                uniqueness=batch_source_mixing_uniqueness if batch_source_mixing_active else "none",
-                                deferred_samples=deferred_source_samples,
-                                max_deferred_samples=deferred_source_cache_size,
-                                min_d_in=min_mixed_source_d_in,
-                                min_d_out=min_mixed_source_d_out,
-                                max_T_patches=curriculum_max_T,
-                                curriculum_max_d_out=curriculum_max_d_out,
-                                patch_size=patch_size_for_slice,
-                                synthetic_layer_enabled=synthetic_layer_enabled,
-                                synthetic_n_rows=synthetic_n_rows,
-                                synthetic_d_in=synthetic_d_in,
-                                synthetic_d_out=synthetic_d_out,
-                                synthetic_x_std=synthetic_x_std,
-                                synthetic_w_std=synthetic_w_std,
-                            )
-                            if not current_source_states:
-                                raise RuntimeError("training step requires a loaded source sample")
-                            batch_payload = _build_training_batch_from_source_states(
-                                current_source_states,
-                                batch_size=slice_batch_size,
-                                start_offset=current_source_round_robin_offset,
-                                target_x_rows=stable_batch_target_x_rows,
-                                target_d_in=stable_batch_target_d_in,
-                                target_d_out=stable_batch_target_d_out,
-                            )
-                            current_batch_source_diversity = _compute_consumed_batch_source_diversity_stats(
-                                current_source_states,
-                                used_source_indices=batch_payload.used_source_indices,
-                                source_pool_remaining_slices_pre=batch_payload.source_pool_remaining_slices_pre,
-                                source_pool_remaining_slices_post=batch_payload.source_pool_remaining_slices_post,
-                            )
-                            W_s, x_s, x_mask_s, d_in_mask_s, d_out_mask_s = (
-                                batch_payload.W,
-                                batch_payload.x,
-                                batch_payload.x_mask,
-                                batch_payload.d_in_mask,
-                                batch_payload.d_out_mask,
-                            )
-                            current_source_states, current_source_round_robin_offset = (
-                                _prune_exhausted_source_states_with_offset(
-                                    current_source_states,
-                                    batch_payload.next_start_offset,
-                                )
-                            )
+                        if offline_batch_prefetcher is not None:
+                            prefetched = offline_batch_prefetcher.get()
+                            prepared_batch = prefetched.value
+                            current_prefetch_wait_s = float(prefetched.wait_time_s)
+                            current_prefetch_depth = float(offline_batch_prefetcher.qsize)
                         else:
-                            if not current_source_samples:
-                                raise RuntimeError("training step requires a loaded source sample")
-                            current_batch_source_diversity = _compute_batch_source_diversity_stats(
-                                current_source_samples,
-                                batch_size=slice_batch_size,
-                                start_offset=current_source_round_robin_offset,
-                            )
-                            W_s, x_s, x_mask_s, d_in_mask_s, d_out_mask_s = _build_training_batch_from_source_samples(
-                                current_source_samples,
-                                max_T_patches=curriculum_max_T,
-                                max_d_out=curriculum_max_d_out,
-                                patch_size=patch_size_for_slice,
-                                batch_size=slice_batch_size,
-                                start_offset=current_source_round_robin_offset,
-                                target_x_rows=stable_batch_target_x_rows,
-                                target_d_in=stable_batch_target_d_in,
-                                target_d_out=stable_batch_target_d_out,
-                            )
-                            current_source_round_robin_offset = (
-                                current_source_round_robin_offset + slice_batch_size
-                            ) % len(current_source_samples)
-                        W_s = W_s.to(device=device, non_blocking=True)
-                        x_s = x_s.to(device=device, non_blocking=True)
-                        x_mask_s = x_mask_s.to(device=device, non_blocking=True)
-                        d_in_mask_s = d_in_mask_s.to(device=device, non_blocking=True)
-                        d_out_mask_s = d_out_mask_s.to(device=device, non_blocking=True)
+                            prepared_batch = _prepare_training_micro_batch_cpu(step_idx=step_idx, micro_idx=micro_idx)
+                        current_batch_build_s = float(prepared_batch.build_time_s)
+                        current_batch_source_diversity = dict(prepared_batch.source_diversity)
+                        h2d_t0 = time.perf_counter()
+                        W_s = prepared_batch.W.to(device=device, non_blocking=True)
+                        x_s = prepared_batch.x.to(device=device, non_blocking=True)
+                        x_mask_s = prepared_batch.x_mask.to(device=device, non_blocking=True)
+                        d_in_mask_s = prepared_batch.d_in_mask.to(device=device, non_blocking=True)
+                        d_out_mask_s = prepared_batch.d_out_mask.to(device=device, non_blocking=True)
+                        current_h2d_enqueue_s = time.perf_counter() - h2d_t0
+                    data_build_window_s += float(current_batch_build_s)
+                    data_wait_window_s += float(current_prefetch_wait_s)
+                    data_h2d_window_s += float(current_h2d_enqueue_s)
+                    data_prefetch_depth_window += float(current_prefetch_depth)
                     current_batch_source_diversity["target_models"] = float(max(1, requested_source_samples_per_refresh))
                     current_batch_source_diversity["batch_model_target_coverage"] = (
                         current_batch_source_diversity["batch_unique_models"]
@@ -4498,6 +4716,11 @@ def _run_worker(
                     avg_struct_rel = struct_rel_window / max(1, window_steps)
                     lr = float(optimizer.param_groups[0]["lr"])
                     speed = window_steps / dt
+                    window_micro_steps = max(1, window_steps * grad_accum_steps)
+                    avg_data_build_ms = 1000.0 * data_build_window_s / float(window_micro_steps)
+                    avg_data_wait_ms = 1000.0 * data_wait_window_s / float(window_micro_steps)
+                    avg_data_h2d_enqueue_ms = 1000.0 * data_h2d_window_s / float(window_micro_steps)
+                    avg_data_prefetch_depth = data_prefetch_depth_window / float(window_micro_steps)
                     diversity_unique_mean = source_diversity_window_unique_models_sum / max(1, window_steps)
                     diversity_unique_min = (
                         source_diversity_window_unique_models_min
@@ -4523,7 +4746,8 @@ def _run_worker(
                         "step=%s/%s loss=%.6f behav=%.6f struct=%.6f "
                         "b_op=%.6f b_dir=%.6f b_scl=%.6f "
                         "s_dir=%.6f s_scl=%.6f s_rec=%.6f s_rel=%.6f "
-                        "kl=%.6f kl_beta=%.6f latent_gate=%.6f lr=%.6e steps/s=%.2f cache=%s",
+                        "kl=%.6f kl_beta=%.6f latent_gate=%.6f lr=%.6e steps/s=%.2f cache=%s "
+                        "data_build_ms=%.2f data_wait_ms=%.2f data_h2d_enqueue_ms=%.2f prefetch_depth=%.2f",
                         global_step,
                         max_steps,
                         avg_loss,
@@ -4542,6 +4766,10 @@ def _run_worker(
                         lr,
                         speed,
                         cache_metric,
+                        avg_data_build_ms,
+                        avg_data_wait_ms,
+                        avg_data_h2d_enqueue_ms,
+                        avg_data_prefetch_depth,
                     )
                     if encoder_alpha_values:
                         logger.info(
@@ -4626,6 +4854,10 @@ def _run_worker(
                             "train/kl_beta": float(current_kl_beta),
                             "train/latent_sampling_gate": float(current_latent_sampling_gate),
                             "train/steps_per_sec": float(speed),
+                            "data/batch_build_ms": float(avg_data_build_ms),
+                            "data/batch_wait_ms": float(avg_data_wait_ms),
+                            "data/batch_h2d_enqueue_ms": float(avg_data_h2d_enqueue_ms),
+                            "data/prefetch_depth_mean": float(avg_data_prefetch_depth),
                             "data/cache_size": float(cache_metric),
                             "grad/global_norm_before_clip": float(grad_stats.get("grad/global_norm_before_clip", 0.0)),
                             "grad/global_norm_after_clip_est": float(grad_stats.get("grad/global_norm_after_clip_est", 0.0)),
@@ -4817,6 +5049,10 @@ def _run_worker(
                     struct_scale_window = 0.0
                     struct_rec_window = 0.0
                     struct_rel_window = 0.0
+                    data_build_window_s = 0.0
+                    data_wait_window_s = 0.0
+                    data_h2d_window_s = 0.0
+                    data_prefetch_depth_window = 0.0
                     source_diversity_window_unique_models_sum = 0.0
                     source_diversity_window_unique_models_min = math.inf
                     source_diversity_window_unique_models_max = 0.0
@@ -4869,11 +5105,16 @@ def _run_worker(
                         state_dir=resume_state_dir,
                     )
 
+            if offline_batch_prefetcher is not None:
+                offline_batch_prefetcher.close()
             if rank == 0:
                 logger.info("Training completed successfully: steps=%s", max_steps)
 
     except BaseException as exc:
         failed = True
+        prefetcher = locals().get("offline_batch_prefetcher")
+        if isinstance(prefetcher, BackgroundPrefetcher):
+            prefetcher.close()
         traceback_text = traceback.format_exc()
         report_path = emit_fatal_report(
             cfg_dict,

@@ -27,6 +27,10 @@ class SourceConfig:
     checkpoint_name: str
     use_checkpoint_vit_config: bool
     use_checkpoint_setup_config: bool
+    train_anchor: bool
+    anchor_steps: int
+    anchor_lr: float
+    anchor_weight_decay: float
 
 
 @dataclass(slots=True)
@@ -202,6 +206,10 @@ def build_run_config(cfg: DictConfig) -> tuple[RunConfig, dict[str, Any]]:
             checkpoint_name=str(source_raw.get("checkpoint_name", "best")).strip() or "best",
             use_checkpoint_vit_config=bool(source_raw.get("use_checkpoint_vit_config", True)),
             use_checkpoint_setup_config=bool(source_raw.get("use_checkpoint_setup_config", True)),
+            train_anchor=bool(source_raw.get("train_anchor", False)),
+            anchor_steps=max(0, int(source_raw.get("anchor_steps", 0))),
+            anchor_lr=float(source_raw.get("anchor_lr", 0.0)),
+            anchor_weight_decay=float(source_raw.get("anchor_weight_decay", 0.0)),
         ),
         data=DataConfig(
             data_dir=str(data_raw.get("data_dir", "./data/cifar10")).strip() or "./data/cifar10",
@@ -275,6 +283,11 @@ def build_run_config(cfg: DictConfig) -> tuple[RunConfig, dict[str, Any]]:
 def validate_run_config(cfg: RunConfig) -> None:
     if not cfg.source.run_dir:
         raise ValueError("source.run_dir is required")
+    if cfg.source.train_anchor:
+        if int(cfg.source.anchor_steps) <= 0:
+            raise ValueError("source.anchor_steps must be > 0 when source.train_anchor=true")
+        if float(cfg.source.anchor_lr) <= 0.0:
+            raise ValueError("source.anchor_lr must be > 0 when source.train_anchor=true")
     if not cfg.search.epsilons:
         raise ValueError("search.epsilons must be non-empty")
     if not cfg.train.raw_lrs:

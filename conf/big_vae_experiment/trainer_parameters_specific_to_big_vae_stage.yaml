@@ -158,6 +158,10 @@ offline_dataset:
     max_samples_per_source: 512
     max_seen_samples: 0
     log_every_seen_samples: 1000
+offline_batch_prefetch:
+  enabled: true
+  queue_size: 2
+  pin_memory: true
 resume_checkpoint: ""
 
 forensics:
