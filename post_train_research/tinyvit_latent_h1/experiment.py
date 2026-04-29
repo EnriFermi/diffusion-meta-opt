@@ -324,6 +324,14 @@ def run_experiment(
     )
 
     for start in starts:
+        logger.info(
+            "Starting paired run for %s epsilon=%.6f alpha=%.6g start_train_loss=%.6f start_test_acc=%.4f",
+            start.start_id,
+            float(start.epsilon),
+            float(start.alpha),
+            float(start.train_metrics.loss),
+            float(start.test_metrics.accuracy),
+        )
         _validate_start_reconstruction(
             cfg,
             source,
@@ -343,6 +351,7 @@ def run_experiment(
                 test_loader=test_loader,
                 device=device,
                 comet=comet,
+                logger=logger,
             )
             for lr in cfg.train.latent_lrs
         ]
@@ -359,11 +368,22 @@ def run_experiment(
                 test_loader=test_loader,
                 device=device,
                 comet=comet,
+                logger=logger,
             )
             for lr in cfg.train.raw_lrs
         ]
         latent_best = select_best_branch_result(latent_runs)
         raw_best = select_best_branch_result(raw_runs)
+        logger.info(
+            "Start %s selected latent_lr=%.6g raw_lr=%.6g latent_best_train=%.6f raw_best_train=%.6f latent_best_test_acc=%.4f raw_best_test_acc=%.4f",
+            start.start_id,
+            float(latent_best.lr),
+            float(raw_best.lr),
+            float(latent_best.best_train_loss),
+            float(raw_best.best_train_loss),
+            float(latent_best.best_test_acc),
+            float(raw_best.best_test_acc),
+        )
         start_dir = paths.starts_dir / start.start_id
         start_dir.mkdir(parents=True, exist_ok=True)
         _write_start_artifacts(start_dir, start, latent_best, raw_best)
