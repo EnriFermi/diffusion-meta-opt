@@ -7,6 +7,10 @@ from typing import Any
 
 import torch
 
+from post_train_research.tinyvit_latent_h1.bootstrap import (
+    prepare_config_from_source_checkpoint,
+    resolve_source_context_from_config,
+)
 from post_train_research.tinyvit_latent_h1.config import RunConfig
 from post_train_research.tinyvit_latent_h1.runtime import CometTracker, RunPaths, append_csv_row, update_run_index, write_summary
 from post_train_research.tinyvit_latent_h1.source import (
@@ -15,8 +19,6 @@ from post_train_research.tinyvit_latent_h1.source import (
     build_eval_loader,
     build_latent_model,
     build_train_schedule,
-    prepare_config_from_source_checkpoint,
-    resolve_source_context,
     sanitize_float,
     search_start_points,
 )
@@ -173,7 +175,14 @@ def run_experiment(
     train_loader = build_eval_loader(train_dataset, batch_size=int(cfg.data.eval_batch_size), num_workers=int(cfg.data.num_workers), device=device)
     test_loader = build_eval_loader(test_dataset, batch_size=int(cfg.data.eval_batch_size), num_workers=int(cfg.data.num_workers), device=device)
 
-    source = resolve_source_context(cfg, logger, device=device, train_loader=train_loader, test_loader=test_loader, checkpoint_path=source_checkpoint_path)
+    source = resolve_source_context_from_config(
+        cfg,
+        logger,
+        device=device,
+        train_loader=train_loader,
+        test_loader=test_loader,
+        checkpoint_path=source_checkpoint_path,
+    )
     source_init_checkpoint_path = source.checkpoint_path
     if bool(cfg.source.train_anchor):
         source = train_anchor_source(
