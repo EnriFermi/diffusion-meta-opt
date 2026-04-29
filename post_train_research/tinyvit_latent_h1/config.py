@@ -27,6 +27,13 @@ class SourceConfig:
     checkpoint_name: str
     use_checkpoint_vit_config: bool
     use_checkpoint_setup_config: bool
+    bootstrap_kind: str
+    random_init_std: float
+    diffusion_prior_checkpoint: str
+    diffusion_prior_steps: int
+    diffusion_prior_sampler: str
+    diffusion_prior_eta: float
+    calibration_batches: int
     train_anchor: bool
     anchor_steps: int
     anchor_lr: float
@@ -206,6 +213,13 @@ def build_run_config(cfg: DictConfig) -> tuple[RunConfig, dict[str, Any]]:
             checkpoint_name=str(source_raw.get("checkpoint_name", "best")).strip() or "best",
             use_checkpoint_vit_config=bool(source_raw.get("use_checkpoint_vit_config", True)),
             use_checkpoint_setup_config=bool(source_raw.get("use_checkpoint_setup_config", True)),
+            bootstrap_kind=str(source_raw.get("bootstrap_kind", "source")).strip().lower() or "source",
+            random_init_std=float(source_raw.get("random_init_std", 0.02)),
+            diffusion_prior_checkpoint=str(source_raw.get("diffusion_prior_checkpoint", "")).strip(),
+            diffusion_prior_steps=max(1, int(source_raw.get("diffusion_prior_steps", 50))),
+            diffusion_prior_sampler=str(source_raw.get("diffusion_prior_sampler", "ddim")).strip().lower() or "ddim",
+            diffusion_prior_eta=float(source_raw.get("diffusion_prior_eta", 0.0)),
+            calibration_batches=max(0, int(source_raw.get("calibration_batches", 1))),
             train_anchor=bool(source_raw.get("train_anchor", False)),
             anchor_steps=max(0, int(source_raw.get("anchor_steps", 0))),
             anchor_lr=float(source_raw.get("anchor_lr", 0.0)),
@@ -281,8 +295,14 @@ def build_run_config(cfg: DictConfig) -> tuple[RunConfig, dict[str, Any]]:
 
 
 def validate_run_config(cfg: RunConfig) -> None:
-    if not cfg.source.run_dir:
+    if cfg.source.bootstrap_kind not in {"source", "base", "random", "diffusion_prior"}:
+        raise ValueError("source.bootstrap_kind must be one of {'source','base','random','diffusion_prior'}")
+    if cfg.source.bootstrap_kind == "source" and not cfg.source.run_dir:
         raise ValueError("source.run_dir is required")
+    if cfg.source.bootstrap_kind == "diffusion_prior" and not cfg.source.diffusion_prior_checkpoint:
+        raise ValueError("source.diffusion_prior_checkpoint is required when source.bootstrap_kind='diffusion_prior'")
+    if cfg.source.bootstrap_kind == "diffusion_prior" and int(cfg.source.calibration_batches) <= 0:
+        raise ValueError("source.calibration_batches must be > 0 when source.bootstrap_kind='diffusion_prior'")
     if cfg.source.train_anchor:
         if int(cfg.source.anchor_steps) <= 0:
             raise ValueError("source.anchor_steps must be > 0 when source.train_anchor=true")

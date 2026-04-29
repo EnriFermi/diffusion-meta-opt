@@ -15,6 +15,13 @@ SOURCE_RUN_DIR=""
 SOURCE_CHECKPOINT="best"
 USE_CHECKPOINT_VIT_CONFIG="true"
 USE_CHECKPOINT_SETUP_CONFIG="true"
+BOOTSTRAP_KIND="source"            # source | base | random | diffusion_prior
+RANDOM_INIT_STD="0.02"
+DIFFUSION_PRIOR_CHECKPOINT=""
+DIFFUSION_PRIOR_STEPS="50"
+DIFFUSION_PRIOR_SAMPLER="ddim"
+DIFFUSION_PRIOR_ETA="0.0"
+CALIBRATION_BATCHES="1"
 TRAIN_ANCHOR="false"
 ANCHOR_STEPS="0"
 ANCHOR_LR="0.0"
@@ -88,7 +95,9 @@ run_python() {
   python "$@"
 }
 
-: "${SOURCE_RUN_DIR:?Edit SOURCE_RUN_DIR before running}"
+if [ "$BOOTSTRAP_KIND" = "source" ]; then
+  : "${SOURCE_RUN_DIR:?Edit SOURCE_RUN_DIR before running source bootstrap}"
+fi
 
 run_python \
   "$SCRIPT_DIR/main.py" \
@@ -99,6 +108,13 @@ run_python \
   "source.checkpoint_name=$SOURCE_CHECKPOINT" \
   "source.use_checkpoint_vit_config=$USE_CHECKPOINT_VIT_CONFIG" \
   "source.use_checkpoint_setup_config=$USE_CHECKPOINT_SETUP_CONFIG" \
+  "source.bootstrap_kind=$BOOTSTRAP_KIND" \
+  "source.random_init_std=$RANDOM_INIT_STD" \
+  "source.diffusion_prior_checkpoint=$DIFFUSION_PRIOR_CHECKPOINT" \
+  "source.diffusion_prior_steps=$DIFFUSION_PRIOR_STEPS" \
+  "source.diffusion_prior_sampler=$DIFFUSION_PRIOR_SAMPLER" \
+  "source.diffusion_prior_eta=$DIFFUSION_PRIOR_ETA" \
+  "source.calibration_batches=$CALIBRATION_BATCHES" \
   "source.train_anchor=$TRAIN_ANCHOR" \
   "source.anchor_steps=$ANCHOR_STEPS" \
   "source.anchor_lr=$ANCHOR_LR" \

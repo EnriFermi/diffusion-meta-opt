@@ -44,6 +44,18 @@ def test_missing_source_run_dir_is_rejected() -> None:
         build_run_config(cfg)
 
 
+def test_random_bootstrap_allows_empty_source_run_dir() -> None:
+    cfg = _compose(
+        [
+            "source.bootstrap_kind=random",
+            "source.run_dir=",
+        ]
+    )
+    run_cfg, _ = build_run_config(cfg)
+    assert run_cfg.source.bootstrap_kind == "random"
+    assert run_cfg.source.run_dir == ""
+
+
 def test_resolve_source_checkpoint_prefers_shared_checkpoint_store() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         root = Path(tmp_dir)
@@ -90,7 +102,7 @@ def test_checkpoint_payload_json_view_strips_tensor_values() -> None:
 def test_anchor_training_requires_positive_steps_and_lr() -> None:
     cfg = _compose(
         [
-            "source.run_dir=my_source_run",
+            "source.bootstrap_kind=random",
             "source.train_anchor=true",
             "source.anchor_steps=0",
             "source.anchor_lr=0.0",

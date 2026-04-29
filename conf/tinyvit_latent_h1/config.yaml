@@ -19,6 +19,13 @@ source:
   checkpoint_name: best
   use_checkpoint_vit_config: true
   use_checkpoint_setup_config: true
+  bootstrap_kind: source
+  random_init_std: 0.02
+  diffusion_prior_checkpoint: ""
+  diffusion_prior_steps: 50
+  diffusion_prior_sampler: ddim
+  diffusion_prior_eta: 0.0
+  calibration_batches: 1
   train_anchor: false
   anchor_steps: 0
   anchor_lr: 0.0
