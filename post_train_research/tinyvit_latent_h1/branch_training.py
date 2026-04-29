@@ -121,6 +121,7 @@ def train_anchor_source(
         device=device,
         latent_state=source.z_star_state,
         conditioning_state=source.z_star_conditioning_state,
+        freeze_direct=False,
     )
     optimizer = torch.optim.AdamW(
         [param for param in model.parameters() if param.requires_grad],

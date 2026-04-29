@@ -19,6 +19,7 @@ from post_train_research.tinyvit_latent_h1.source import (
     build_eval_loader,
     build_latent_model,
     build_train_schedule,
+    evaluate_train_and_test,
     sanitize_float,
     search_start_points,
 )
@@ -155,6 +156,34 @@ def _aggregate_rows(paired_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return summaries
 
 
+def _validate_anchor_reconstruction(
+    cfg: RunConfig,
+    source: Any,
+    anchor_model: torch.nn.Module,
+    train_loader: Any,
+    test_loader: Any,
+    *,
+    device: torch.device,
+) -> None:
+    train_metrics, test_metrics = evaluate_train_and_test(
+        anchor_model,
+        train_loader,
+        test_loader,
+        device=device,
+        amp_enabled=bool(cfg.train.amp),
+    )
+    train_gap = abs(float(train_metrics.loss) - float(source.z_star_train_metrics.loss))
+    test_gap = abs(float(test_metrics.loss) - float(source.z_star_test_metrics.loss))
+    acc_gap = abs(float(test_metrics.accuracy) - float(source.z_star_test_metrics.accuracy))
+    if train_gap > 1e-2 or test_gap > 1e-2 or acc_gap > 1e-3:
+        raise RuntimeError(
+            "Anchor reconstruction mismatch before search: "
+            f"stored train_loss={float(source.z_star_train_metrics.loss):.6f} rebuilt train_loss={float(train_metrics.loss):.6f}, "
+            f"stored test_loss={float(source.z_star_test_metrics.loss):.6f} rebuilt test_loss={float(test_metrics.loss):.6f}, "
+            f"stored test_acc={float(source.z_star_test_metrics.accuracy):.4f} rebuilt test_acc={float(test_metrics.accuracy):.4f}"
+        )
+
+
 def run_experiment(
     cfg: RunConfig,
     paths: RunPaths,
@@ -206,6 +235,14 @@ def run_experiment(
         device=device,
         latent_state=source.z_star_state,
         conditioning_state=source.z_star_conditioning_state,
+    )
+    _validate_anchor_reconstruction(
+        cfg,
+        source,
+        anchor_model,
+        train_loader,
+        test_loader,
+        device=device,
     )
     starts = search_start_points(cfg, source, anchor_model, train_loader, test_loader, device=device, logger=logger)
     if not starts:
