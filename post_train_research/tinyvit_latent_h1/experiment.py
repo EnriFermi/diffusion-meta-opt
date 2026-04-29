@@ -18,7 +18,9 @@ from post_train_research.tinyvit_latent_h1.source import (
     build_cifar10_datasets,
     build_eval_loader,
     build_latent_model,
+    build_raw_model,
     build_train_schedule,
+    evaluate_train_and_test,
     sanitize_float,
     search_start_points,
 )
@@ -28,7 +30,7 @@ from post_train_research.tinyvit_latent_h1.branch_training import (
     select_best_branch_result,
     train_anchor_source,
 )
-from post_train_research.vit_latent_scaling.init import resolve_device, seed_everything
+from post_train_research.vit_latent_scaling.init import export_named_tensors, resolve_device, seed_everything
 
 
 def _get_pyplot():
@@ -155,6 +157,87 @@ def _aggregate_rows(paired_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return summaries
 
 
+def _validate_anchor_reconstruction(
+    cfg: RunConfig,
+    source: Any,
+    anchor_model: torch.nn.Module,
+    train_loader: Any,
+    test_loader: Any,
+    *,
+    device: torch.device,
+) -> None:
+    train_metrics, test_metrics = evaluate_train_and_test(
+        anchor_model,
+        train_loader,
+        test_loader,
+        device=device,
+        amp_enabled=bool(cfg.train.amp),
+    )
+    train_gap = abs(float(train_metrics.loss) - float(source.z_star_train_metrics.loss))
+    test_gap = abs(float(test_metrics.loss) - float(source.z_star_test_metrics.loss))
+    acc_gap = abs(float(test_metrics.accuracy) - float(source.z_star_test_metrics.accuracy))
+    if train_gap > 1e-2 or test_gap > 1e-2 or acc_gap > 1e-3:
+        raise RuntimeError(
+            "Anchor reconstruction mismatch before search: "
+            f"stored train_loss={float(source.z_star_train_metrics.loss):.6f} rebuilt train_loss={float(train_metrics.loss):.6f}, "
+            f"stored test_loss={float(source.z_star_test_metrics.loss):.6f} rebuilt test_loss={float(test_metrics.loss):.6f}, "
+            f"stored test_acc={float(source.z_star_test_metrics.accuracy):.4f} rebuilt test_acc={float(test_metrics.accuracy):.4f}"
+        )
+
+    rebuilt_named = export_named_tensors(anchor_model, source.all_tensor_names)
+    tensor_gap = max(
+        float((rebuilt_named[name] - source.z_star_named_tensors[name]).abs().max().item())
+        for name in source.all_tensor_names
+    )
+    if tensor_gap > 1e-5:
+        raise RuntimeError(
+            "Anchor tensor reconstruction mismatch before search: "
+            f"max_abs_diff={tensor_gap:.6e}"
+        )
+
+
+def _validate_start_reconstruction(
+    cfg: RunConfig,
+    source: Any,
+    start: StartPoint,
+    *,
+    device: torch.device,
+) -> None:
+    latent_model = build_latent_model(
+        cfg,
+        source,
+        device=device,
+        latent_state=start.latent_state,
+        conditioning_state=source.z_star_conditioning_state,
+    )
+    raw_model = build_latent_model(
+        cfg,
+        source,
+        device=device,
+        latent_state=start.latent_state,
+        conditioning_state=source.z_star_conditioning_state,
+    )
+    latent_named = export_named_tensors(latent_model, source.all_tensor_names)
+    latent_gap = max(
+        float((latent_named[name] - start.named_tensors[name]).abs().max().item())
+        for name in source.all_tensor_names
+    )
+    if latent_gap > 1e-5:
+        raise RuntimeError(
+            f"Latent branch start reconstruction mismatch for {start.start_id}: max_abs_diff={latent_gap:.6e}"
+        )
+    raw_model = build_raw_model(source, device=device, start_named_tensors=start.named_tensors)
+    raw_named = export_named_tensors(raw_model, source.all_tensor_names)
+    raw_gap = max(
+        float((raw_named[name] - start.named_tensors[name]).abs().max().item())
+        for name in source.all_tensor_names
+    )
+    if raw_gap > 1e-6:
+        raise RuntimeError(
+            f"Raw branch start reconstruction mismatch for {start.start_id}: max_abs_diff={raw_gap:.6e}"
+        )
+
+
 def run_experiment(
     cfg: RunConfig,
     paths: RunPaths,
@@ -207,6 +290,14 @@ def run_experiment(
         latent_state=source.z_star_state,
         conditioning_state=source.z_star_conditioning_state,
     )
+    _validate_anchor_reconstruction(
+        cfg,
+        source,
+        anchor_model,
+        train_loader,
+        test_loader,
+        device=device,
+    )
     starts = search_start_points(cfg, source, anchor_model, train_loader, test_loader, device=device, logger=logger)
     if not starts:
         raise RuntimeError("No valid level-set starts were found around z_star")
@@ -233,6 +324,20 @@ def run_experiment(
     )
 
     for start in starts:
+        logger.info(
+            "Starting paired run for %s epsilon=%.6f alpha=%.6g start_train_loss=%.6f start_test_acc=%.4f",
+            start.start_id,
+            float(start.epsilon),
+            float(start.alpha),
+            float(start.train_metrics.loss),
+            float(start.test_metrics.accuracy),
+        )
+        _validate_start_reconstruction(
+            cfg,
+            source,
+            start,
+            device=device,
+        )
         latent_runs = [
             run_branch_for_lr(
                 cfg,
@@ -246,6 +351,7 @@ def run_experiment(
                 test_loader=test_loader,
                 device=device,
                 comet=comet,
+                logger=logger,
             )
             for lr in cfg.train.latent_lrs
         ]
@@ -262,11 +368,22 @@ def run_experiment(
                 test_loader=test_loader,
                 device=device,
                 comet=comet,
+                logger=logger,
             )
             for lr in cfg.train.raw_lrs
         ]
         latent_best = select_best_branch_result(latent_runs)
         raw_best = select_best_branch_result(raw_runs)
+        logger.info(
+            "Start %s selected latent_lr=%.6g raw_lr=%.6g latent_best_train=%.6f raw_best_train=%.6f latent_best_test_acc=%.4f raw_best_test_acc=%.4f",
+            start.start_id,
+            float(latent_best.lr),
+            float(raw_best.lr),
+            float(latent_best.best_train_loss),
+            float(raw_best.best_train_loss),
+            float(latent_best.best_test_acc),
+            float(raw_best.best_test_acc),
+        )
         start_dir = paths.starts_dir / start.start_id
         start_dir.mkdir(parents=True, exist_ok=True)
         _write_start_artifacts(start_dir, start, latent_best, raw_best)

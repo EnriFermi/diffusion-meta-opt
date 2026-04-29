@@ -283,10 +283,11 @@ def build_latent_model(
     device: torch.device,
     latent_state: dict[str, torch.Tensor],
     conditioning_state: dict[str, torch.Tensor] | None = None,
+    freeze_direct: bool = True,
 ) -> nn.Module:
     model = FunctionalViTTiny(
         source.vit_cfg,
-        clone_named_tensors(source.initial_tensors),
+        clone_named_tensors(source.z_star_named_tensors),
         parameter_mode="bigvae_latent",
         big_vae=source.big_vae,
         big_vae_latent_init="base",
@@ -304,6 +305,11 @@ def build_latent_model(
     store = getattr(model, "store")
     if not isinstance(store, BigVAELatentTensorStore):
         raise TypeError("Expected BigVAELatentTensorStore for latent branch")
+    if freeze_direct:
+        for param in model.parameters():
+            param.requires_grad_(False)
+        for param in store.latent_slots.parameters():
+            param.requires_grad_(True)
     load_materialized_state(store, latent_state)
     load_conditioning_state(store, conditioning_state, strict=False)
     return model
@@ -428,7 +434,7 @@ def resolve_source_context(
         big_vae=big_vae,
         z_star_state={},
         z_star_conditioning_state={},
-        z_star_named_tensors={},
+        z_star_named_tensors=clone_named_tensors(initial_tensors),
         z_star_train_metrics=EvalMetrics(loss=float("nan"), accuracy=0.0, examples=0),
         z_star_test_metrics=EvalMetrics(loss=float("nan"), accuracy=0.0, examples=0),
         latent_param_count=0,

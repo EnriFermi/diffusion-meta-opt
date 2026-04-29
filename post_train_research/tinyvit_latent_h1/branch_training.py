@@ -121,6 +121,7 @@ def train_anchor_source(
         device=device,
         latent_state=source.z_star_state,
         conditioning_state=source.z_star_conditioning_state,
+        freeze_direct=False,
     )
     optimizer = torch.optim.AdamW(
         [param for param in model.parameters() if param.requires_grad],
@@ -147,6 +148,15 @@ def train_anchor_source(
     )
     torch.save(best_payload, paths.anchor_dir / "best.pt")
     torch.save(best_payload, paths.anchor_dir / "latest.pt")
+    logger.info(
+        "Anchor step=%s batch_loss=nan train_loss=%.6f test_loss=%.6f test_acc=%.4f best_train=%.6f best_test_acc=%.4f",
+        0,
+        float(start_train.loss),
+        float(start_test.loss),
+        float(start_test.accuracy),
+        float(best_train),
+        float(best_test_acc),
+    )
     append_csv_row(
         paths.anchor_curve_file,
         {
@@ -230,6 +240,16 @@ def train_anchor_source(
                 metrics["anchor.test_loss"] = float(test_loss_value)
                 metrics["anchor.test_accuracy"] = float(test_acc_value)
             comet.log_metrics(metrics, step=int(step_idx))
+            logger.info(
+                "Anchor step=%s batch_loss=%.6f train_loss=%s test_loss=%s test_acc=%s best_train=%.6f best_test_acc=%.4f",
+                int(step_idx),
+                float(loss.detach().cpu().item()),
+                f"{float(train_loss_value):.6f}" if train_loss_value is not None else "na",
+                f"{float(test_loss_value):.6f}" if test_loss_value is not None else "na",
+                f"{float(test_acc_value):.4f}" if test_acc_value is not None else "na",
+                float(best_train),
+                float(best_test_acc),
+            )
         if step_idx % int(cfg.train.eval_every_steps) == 0 or step_idx == int(cfg.source.anchor_steps):
             _save_anchor_checkpoint(
                 paths.anchor_dir / "latest.pt",
@@ -294,6 +314,7 @@ def run_branch_for_lr(
     test_loader: Any,
     device: torch.device,
     comet: CometTracker,
+    logger: Any,
 ) -> BranchResult:
     if branch == "latent":
         model = build_latent_model(
@@ -344,6 +365,17 @@ def run_branch_for_lr(
         lr=lr,
         step=0,
         summary={"train_loss": float(start_train.loss), "test_loss": float(start_test.loss), "test_accuracy": float(start_test.accuracy)},
+    )
+    label = f"{start.start_id}.{branch}.lr={float(lr):g}"
+    logger.info(
+        "Branch %s step=%s batch_loss=nan train_loss=%.6f test_loss=%.6f test_acc=%.4f best_train=%.6f best_test_acc=%.4f",
+        label,
+        0,
+        float(start_train.loss),
+        float(start_test.loss),
+        float(start_test.accuracy),
+        float(best_train),
+        float(best_test_acc),
     )
     for step_idx, batch_indices in enumerate(train_schedule, start=1):
         model.train()
@@ -404,6 +436,17 @@ def run_branch_for_lr(
                 metrics[f"{prefix}.test_loss"] = float(test_loss_value)
                 metrics[f"{prefix}.test_accuracy"] = float(test_acc_value)
             comet.log_metrics(metrics, step=int(step_idx))
+            logger.info(
+                "Branch %s step=%s batch_loss=%.6f train_loss=%s test_loss=%s test_acc=%s best_train=%.6f best_test_acc=%.4f",
+                label,
+                int(step_idx),
+                float(loss.detach().cpu().item()),
+                f"{float(train_loss_value):.6f}" if train_loss_value is not None else "na",
+                f"{float(test_loss_value):.6f}" if test_loss_value is not None else "na",
+                f"{float(test_acc_value):.4f}" if test_acc_value is not None else "na",
+                float(best_train),
+                float(best_test_acc),
+            )
     final_state = branch_checkpoint_payload(
         model,
         source,
@@ -412,6 +455,16 @@ def run_branch_for_lr(
         lr=lr,
         step=int(cfg.train.steps),
         summary={"train_loss": final_train, "test_loss": final_test_loss, "test_accuracy": final_test_acc},
+    )
+    logger.info(
+        "Branch %s finished best_train=%.6f final_train=%.6f best_test_acc=%.4f final_test_acc=%.4f recovered=%s steps_to_recover=%s",
+        label,
+        float(best_train),
+        float(final_train),
+        float(best_test_acc),
+        float(final_test_acc),
+        steps_to_recover >= 0,
+        max(0, int(steps_to_recover)),
     )
     return BranchResult(
         branch=str(branch),
