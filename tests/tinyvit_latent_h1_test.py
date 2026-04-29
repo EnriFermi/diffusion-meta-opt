@@ -75,10 +75,26 @@ def test_checkpoint_payload_json_view_strips_tensor_values() -> None:
         "branch": "latent",
         "named_tensors": {"head.weight": torch.zeros(10, 64)},
         "latent_slots": {"p0001_t0000": torch.zeros(32, 256)},
+        "tile_cond_patch": {"p0001_t0000": torch.zeros(4, 32)},
     }
     view = _checkpoint_payload_json_view(payload)
 
     assert view["named_tensor_count"] == 1
     assert view["latent_slot_count"] == 1
+    assert view["tile_cond_patch_count"] == 1
     assert view["named_tensors"]["head.weight"]["shape"] == [10, 64]
     assert view["latent_slots"]["p0001_t0000"]["shape"] == [32, 256]
+    assert view["tile_cond_patch"]["p0001_t0000"]["shape"] == [4, 32]
+
+
+def test_anchor_training_requires_positive_steps_and_lr() -> None:
+    cfg = _compose(
+        [
+            "source.run_dir=my_source_run",
+            "source.train_anchor=true",
+            "source.anchor_steps=0",
+            "source.anchor_lr=0.0",
+        ]
+    )
+    with pytest.raises(ValueError):
+        build_run_config(cfg)

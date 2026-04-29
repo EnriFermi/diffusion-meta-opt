@@ -19,6 +19,10 @@ source:
   checkpoint_name: best
   use_checkpoint_vit_config: true
   use_checkpoint_setup_config: true
+  train_anchor: false
+  anchor_steps: 0
+  anchor_lr: 0.0
+  anchor_weight_decay: 0.0
 
 data:
   data_dir: ./data/cifar10

@@ -15,6 +15,10 @@ SOURCE_RUN_DIR="/home/coder/project/post_train_research/vit_latent_scaling/artif
 SOURCE_CHECKPOINT="latest"
 USE_CHECKPOINT_VIT_CONFIG="true"
 USE_CHECKPOINT_SETUP_CONFIG="true"
+TRAIN_ANCHOR="false"
+ANCHOR_STEPS="0"
+ANCHOR_LR="0.0"
+ANCHOR_WEIGHT_DECAY="0.0"
 
 DATA_DIR="./data/cifar10"
 DOWNLOAD="true"
@@ -101,6 +105,10 @@ run_python \
   "source.checkpoint_name=$SOURCE_CHECKPOINT" \
   "source.use_checkpoint_vit_config=$USE_CHECKPOINT_VIT_CONFIG" \
   "source.use_checkpoint_setup_config=$USE_CHECKPOINT_SETUP_CONFIG" \
+  "source.train_anchor=$TRAIN_ANCHOR" \
+  "source.anchor_steps=$ANCHOR_STEPS" \
+  "source.anchor_lr=$ANCHOR_LR" \
+  "source.anchor_weight_decay=$ANCHOR_WEIGHT_DECAY" \
   "data.data_dir=$DATA_DIR" \
   "data.download=$DOWNLOAD" \
   "data.train_subset=$TRAIN_SUBSET" \
