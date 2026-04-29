@@ -1,7 +1,7 @@
 max_steps: 5000000
 grad_accum_steps: 1
 distributed: false
-# device: "cuda:0"
+device: "cuda:1"
 num_gpus: 1
 
 amp: true
@@ -21,12 +21,12 @@ predownload_models: true
 
 warmup_steps: 0
 min_lr_ratio: 0.1
-kl_beta: 0.1
+kl_beta: 0.001
 kl_schedule:
   enabled: true
   start_beta: 0.0
-  warmup_steps: 100000
-  ramp_steps: 200000
+  warmup_steps: 150000
+  ramp_steps: 50000
 latent_sampling_gate:
   # Absolute global-step schedule. For AE -> VAE fine-tune, set start_step
   # to the resumed checkpoint step if the gate should start small after resume.
@@ -42,7 +42,7 @@ behavioral_coef: 1.0
 structural_coef: 1.0
 contrastive_coef: 0.0
 behavioral_loss:
-  lambda_operator: 50.0
+  lambda_operator: 10.0
   lambda_dir: 1.0
   lambda_scale: 10.0
   gamma: 0.5
@@ -72,9 +72,9 @@ resume_state:
   save_every: ${train.checkpoint_every}
   dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/resume_state
   load_model_state: true
-  load_optimizer_state: true
-  load_scheduler_state: true
-  load_scaler_state: true
+  load_optimizer_state: false
+  load_scheduler_state: false
+  load_scaler_state: false
   load_step: true
 
 stage: 1
@@ -94,7 +94,7 @@ synthetic_layer_source:
 # When enabled, train loop captures one already-sliced training batch once and
 # reuses it for the full run instead of reslicing on every micro-step.
 fixed_training_batch:
-  enabled: false
+  enabled: true
   # When non-empty, save the exact captured batch for later diagnostics replay.
   dump_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/fixed_training_batch.pt
 # Cap rows in x to reduce rare heavy samples that can stall steps.
