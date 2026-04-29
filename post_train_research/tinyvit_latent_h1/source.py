@@ -304,6 +304,10 @@ def build_latent_model(
     store = getattr(model, "store")
     if not isinstance(store, BigVAELatentTensorStore):
         raise TypeError("Expected BigVAELatentTensorStore for latent branch")
+    for param in model.parameters():
+        param.requires_grad_(False)
+    for param in store.latent_slots.parameters():
+        param.requires_grad_(True)
     load_materialized_state(store, latent_state)
     load_conditioning_state(store, conditioning_state, strict=False)
     return model
