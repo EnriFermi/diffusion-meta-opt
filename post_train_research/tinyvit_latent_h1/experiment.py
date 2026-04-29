@@ -22,7 +22,7 @@ from post_train_research.tinyvit_latent_h1.source import (
     sanitize_float,
     search_start_points,
 )
-from post_train_research.tinyvit_latent_h1.training import (
+from post_train_research.tinyvit_latent_h1.branch_training import (
     BranchResult,
     run_branch_for_lr,
     select_best_branch_result,
