@@ -691,6 +691,9 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
         sampling_window_size: int = 2048,
         sampling_max_records_per_chunk_round: int = 8,
         x_chunk_cache_size: int = 4,
+        runtime_enforce_stage_compatibility: bool = False,
+        runtime_min_d_in: int = 0,
+        runtime_min_d_out: int = 0,
     ) -> None:
         super().__init__()
         self.root_dir = Path(root_dir)
@@ -712,6 +715,9 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
         self.sampling_window_size = max(1, int(sampling_window_size))
         self.sampling_max_records_per_chunk_round = max(1, int(sampling_max_records_per_chunk_round))
         self.x_chunk_cache_size = max(1, int(x_chunk_cache_size))
+        self.runtime_enforce_stage_compatibility = bool(runtime_enforce_stage_compatibility)
+        self.runtime_min_d_in = max(0, int(runtime_min_d_in))
+        self.runtime_min_d_out = max(0, int(runtime_min_d_out))
         self.logger = logging.getLogger(self.__class__.__name__)
 
         self._weight_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
@@ -725,18 +731,32 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
         self._effective_chunk_indices = self._resolve_effective_chunk_indices()
         self._chunk_index_payloads: list[dict[str, Any]] | None = None
         self._balanced_group_to_refs: dict[tuple[str, ...], list[tuple[int, int]]] | None = None
-        if self.sampling_mode == "balanced":
+        self._runtime_filtered_record_count = 0
+        self._runtime_compatible_record_count = 0
+        self._runtime_compatible_record_refs_by_chunk: dict[int, tuple[int, ...]] | None = None
+        if self.runtime_enforce_stage_compatibility:
             self._chunk_index_payloads = self._load_chunk_index_payloads()
+            (
+                self._runtime_compatible_record_refs_by_chunk,
+                self._runtime_compatible_record_count,
+                self._runtime_filtered_record_count,
+            ) = self._build_runtime_compatible_record_refs_by_chunk(self._chunk_index_payloads)
+        if self.sampling_mode == "balanced":
+            if self._chunk_index_payloads is None:
+                self._chunk_index_payloads = self._load_chunk_index_payloads()
             self._balanced_group_to_refs = self._build_balanced_group_index(self._chunk_index_payloads)
 
     def __iter__(self) -> Iterator[SharedSample]:
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = int(worker_info.id) if worker_info is not None else 0
+        worker_count = int(worker_info.num_workers) if worker_info is not None else 1
         epoch = 0
         while True:
             rng = random.Random(self.seed + epoch)
             if self.sampling_mode == "balanced":
-                yield from self._iter_balanced_epoch(rng)
+                yield from self._iter_balanced_epoch(rng, worker_id=worker_id, worker_count=worker_count)
             else:
-                yield from self._iter_random_epoch(rng)
+                yield from self._iter_random_epoch(rng, worker_id=worker_id, worker_count=worker_count)
 
             if not self.repeat:
                 return
@@ -772,12 +792,22 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
             "shard_by_chunk": bool(self.shard_by_chunk),
             "sampling_mode": self.sampling_mode,
             "sampling_group_keys": list(self.sampling_group_keys),
+            "runtime_enforce_stage_compatibility": bool(self.runtime_enforce_stage_compatibility),
+            "runtime_min_d_in": int(self.runtime_min_d_in),
+            "runtime_min_d_out": int(self.runtime_min_d_out),
+            "runtime_compatible_records": int(self._runtime_compatible_record_count),
+            "runtime_filtered_records": int(self._runtime_filtered_record_count),
         }
 
     def summary(self) -> dict[str, Any]:
         payload = dict(self._manifest)
         payload["sampling_mode"] = self.sampling_mode
         payload["sampling_group_keys"] = list(self.sampling_group_keys)
+        payload["runtime_enforce_stage_compatibility"] = bool(self.runtime_enforce_stage_compatibility)
+        payload["runtime_min_d_in"] = int(self.runtime_min_d_in)
+        payload["runtime_min_d_out"] = int(self.runtime_min_d_out)
+        payload["runtime_compatible_records"] = int(self._runtime_compatible_record_count)
+        payload["runtime_filtered_records"] = int(self._runtime_filtered_record_count)
         return payload
 
     def close(self) -> None:
@@ -821,35 +851,73 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
             return chunk_indices
         return list(range(len(self._chunk_paths)))
 
-    def _iter_random_epoch(self, rng: random.Random) -> Iterator[SharedSample]:
-        chunk_indices = list(self._effective_chunk_indices)
+    def _iter_random_epoch(
+        self,
+        rng: random.Random,
+        *,
+        worker_id: int = 0,
+        worker_count: int = 1,
+    ) -> Iterator[SharedSample]:
+        if self._runtime_compatible_record_refs_by_chunk is not None:
+            chunk_indices = [
+                int(chunk_idx)
+                for chunk_idx in self._effective_chunk_indices
+                if self._runtime_compatible_record_refs_by_chunk.get(int(chunk_idx))
+            ]
+        else:
+            chunk_indices = list(self._effective_chunk_indices)
         if self.shuffle_chunks and len(chunk_indices) > 1:
             rng.shuffle(chunk_indices)
+        chunk_indices = self._worker_shard_chunk_indices(chunk_indices, worker_id=worker_id, worker_count=worker_count)
 
         for chunk_idx in chunk_indices:
-            payload = self._load_x_chunk(chunk_idx)
-            records = payload.get("records", [])
-            if not isinstance(records, list):
-                raise TypeError(f"Offline BigVAE chunk {self._chunk_paths[chunk_idx]} has invalid records payload")
-            order = list(range(len(records)))
+            if self._runtime_compatible_record_refs_by_chunk is not None:
+                order = list(self._runtime_compatible_record_refs_by_chunk.get(int(chunk_idx), ()))
+            else:
+                payload = self._load_x_chunk(chunk_idx)
+                records = payload.get("records", [])
+                if not isinstance(records, list):
+                    raise TypeError(f"Offline BigVAE chunk {self._chunk_paths[chunk_idx]} has invalid records payload")
+                order = list(range(len(records)))
             if self.shuffle_records_within_chunk and len(order) > 1:
                 rng.shuffle(order)
             for record_idx in order:
                 yield self._shared_sample_from_record_ref(chunk_idx=chunk_idx, record_idx=record_idx)
 
-    def _iter_balanced_epoch(self, rng: random.Random) -> Iterator[SharedSample]:
+    def _iter_balanced_epoch(
+        self,
+        rng: random.Random,
+        *,
+        worker_id: int = 0,
+        worker_count: int = 1,
+    ) -> Iterator[SharedSample]:
         if self._balanced_group_to_refs is None:
             raise RuntimeError("balanced sampling requested but group index is not initialized")
-        for chunk_idx, record_idx in self._build_balanced_epoch_record_refs(rng):
+        worker_chunk_set = set(
+            self._worker_shard_chunk_indices(
+                list(self._effective_chunk_indices),
+                worker_id=worker_id,
+                worker_count=worker_count,
+            )
+        )
+        for chunk_idx, record_idx in self._build_balanced_epoch_record_refs(rng, worker_chunk_set=worker_chunk_set):
             yield self._shared_sample_from_record_ref(chunk_idx=chunk_idx, record_idx=record_idx)
 
-    def _build_balanced_epoch_record_refs(self, rng: random.Random) -> Iterator[tuple[int, int]]:
+    def _build_balanced_epoch_record_refs(
+        self,
+        rng: random.Random,
+        *,
+        worker_chunk_set: set[int] | None = None,
+    ) -> Iterator[tuple[int, int]]:
         if self._balanced_group_to_refs is None:
             return
 
         group_to_pending: dict[tuple[str, ...], list[tuple[int, int]]] = {}
         for group_key, refs in self._balanced_group_to_refs.items():
-            pending = list(refs)
+            if worker_chunk_set is None:
+                pending = list(refs)
+            else:
+                pending = [ref for ref in refs if int(ref[0]) in worker_chunk_set]
             rng.shuffle(pending)
             if pending:
                 group_to_pending[group_key] = pending
@@ -913,10 +981,61 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
             for record in records:
                 if not isinstance(record, dict):
                     continue
+                if not self._record_index_is_runtime_compatible(record):
+                    continue
                 record_idx = int(record.get("record_idx", 0))
                 group_key = self._balanced_group_key_for_record(record)
                 group_to_refs.setdefault(group_key, []).append((int(self._effective_chunk_indices[chunk_idx]), record_idx))
         return group_to_refs
+
+    def _record_index_is_runtime_compatible(self, record: dict[str, Any]) -> bool:
+        if not self.runtime_enforce_stage_compatibility:
+            return True
+        weight_shape = record.get("weight_shape", [])
+        if not isinstance(weight_shape, Sequence) or len(weight_shape) < 2:
+            return False
+        d_in = int(weight_shape[0])
+        d_out = int(weight_shape[1])
+        if self.runtime_min_d_in > 0 and d_in < self.runtime_min_d_in:
+            return False
+        if self.runtime_min_d_out > 0 and d_out < self.runtime_min_d_out:
+            return False
+        return True
+
+    def _build_runtime_compatible_record_refs_by_chunk(
+        self,
+        chunk_index_payloads: Sequence[dict[str, Any]],
+    ) -> tuple[dict[int, tuple[int, ...]], int, int]:
+        compatible_refs_by_chunk: dict[int, tuple[int, ...]] = {}
+        compatible_count = 0
+        filtered_count = 0
+        for payload_idx, payload in enumerate(chunk_index_payloads):
+            records = payload.get("records", [])
+            if not isinstance(records, list):
+                continue
+            chunk_refs: list[int] = []
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                if self._record_index_is_runtime_compatible(record):
+                    chunk_refs.append(int(record.get("record_idx", 0)))
+                    compatible_count += 1
+                else:
+                    filtered_count += 1
+            if chunk_refs:
+                compatible_refs_by_chunk[int(self._effective_chunk_indices[payload_idx])] = tuple(chunk_refs)
+        return compatible_refs_by_chunk, compatible_count, filtered_count
+
+    @staticmethod
+    def _worker_shard_chunk_indices(
+        chunk_indices: Sequence[int],
+        *,
+        worker_id: int,
+        worker_count: int,
+    ) -> list[int]:
+        if worker_count <= 1:
+            return [int(chunk_idx) for chunk_idx in chunk_indices]
+        return [int(chunk_idx) for idx, chunk_idx in enumerate(chunk_indices) if idx % worker_count == worker_id]
 
     def _balanced_group_key_for_record(self, record: dict[str, Any]) -> tuple[str, ...]:
         components: list[str] = []
@@ -1080,6 +1199,7 @@ def offline_big_vae_data_pipeline(
     if not isinstance(sampling_cfg, (dict, DictConfig)):
         raise TypeError("train.offline_dataset.sampling must be a mapping")
 
+    patch_size, max_T_patches, max_d_out, _max_x_rows = resolve_big_vae_curriculum_targets(cfg)
     root_dir = str(offline_cfg.get("root_dir", "") or "").strip()
     if not root_dir:
         raise ValueError("train.offline_dataset.root_dir must be set when using offline_big_vae_data_pipeline")
@@ -1099,18 +1219,24 @@ def offline_big_vae_data_pipeline(
         sampling_window_size=int(sampling_cfg.get("window_size_records", 2048)),
         sampling_max_records_per_chunk_round=int(sampling_cfg.get("max_records_per_chunk_round", 8)),
         x_chunk_cache_size=int(sampling_cfg.get("x_chunk_cache_size", 4)),
+        runtime_enforce_stage_compatibility=bool(offline_cfg.get("runtime_enforce_stage_compatibility", False)),
+        runtime_min_d_in=int(patch_size) * int(max_T_patches),
+        runtime_min_d_out=int(max_d_out),
     )
     logger_local = logger or logging.getLogger("dataset.big_vae_offline")
     summary = dataset.summary()
     logger_local.info(
         "Offline BigVAE dataset ready: root=%s accepted_records=%s unique_sources=%s actual_size_gb=%.2f "
-        "sampling_mode=%s sampling_group_keys=%s",
+        "sampling_mode=%s sampling_group_keys=%s runtime_stage_filter=%s compatible_records=%s filtered_records=%s",
         summary.get("root_dir", str(dataset.root_dir)),
         int(summary.get("accepted_records", 0)),
         int(summary.get("unique_sources", 0)),
         float(summary.get("actual_size_gb", 0.0)),
         str(summary.get("sampling_mode", "random")),
         list(summary.get("sampling_group_keys", [])),
+        bool(summary.get("runtime_enforce_stage_compatibility", False)),
+        int(summary.get("runtime_compatible_records", 0)),
+        int(summary.get("runtime_filtered_records", 0)),
     )
     try:
         yield dataset, None
