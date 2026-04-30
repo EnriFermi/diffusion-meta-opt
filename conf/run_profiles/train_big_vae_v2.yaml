@@ -1,0 +1,63 @@
+# @package _global_
+defaults:
+  - /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
+  - /data_collection_runtime/data_profiles@data: data_profile_for_big_vae_training
+  - /data_collection_runtime/collector_profiles@collector: collector_profile_async_gpu1
+  - /data_collection_runtime/streaming_profiles@streaming: streaming_profile_none
+
+  - /shared_training_parameters@train: trainer_execution_common
+  - /big_vae_experiment@train: trainer_parameters_specific_to_big_vae_stage_v2
+
+  - /shared_training_parameters@model: model_backbone_distribution_and_mini_vae
+  - /big_vae_experiment@model: model_parameters_specific_to_big_vae_stage_v2
+
+  - _self_
+
+training_artifacts:
+  # Parallel BigVAE copy: keep checkpoints/resume state separate from the
+  # default train_big_vae run, while reusing the default prebuilt offline dataset.
+  big_vae_checkpoint_dir: ${training_artifacts.base_root_dir}/checkpoints/weight_quantile_vae_v2
+  big_vae_offline_dataset_base_dir: ${training_artifacts.base_root_dir}/checkpoints/weight_quantile_vae
+
+# BigVAE speed tuning for explicit model-diverse batches:
+# keep bursts short enough for diversity, but long enough to amortize model loads.
+collector:
+  max_loaded_models: 8
+  jobs_per_selected_model: 1
+  # Allow the same raw image sample to be reused by a few distinct models before
+  # it is retired from the dataset chunk cache. This increases model diversity
+  # without scaling raw worker RAM with the number of models.
+  max_distinct_models_per_raw_sample: 3
+  # Safeguard: if a reused raw sample does not get a new distinct model soon
+  # enough, retire it instead of pinning the chunk forever on single-model data.
+  max_pending_reuse_wait_s: 120.0
+  parallel_inference_workers: 6
+  # Keep a small hot set per worker so four concurrent workers do not thrash on
+  # every model switch, but also do not explode VRAM residency unnecessarily.
+  parallel_model_pool_max_loaded_models: 2
+  # train.predownload_models is enabled for big_vae; keep runtime strictly local
+  # so collector does not keep hitting HF Hub metadata endpoints on every reload.
+  runtime_local_only: true
+  atomizer_process_enabled: false
+  atomizer_queue_max_items: 256
+  in_memory_buffer:
+    capacity_samples: 1024
+    fill_target_samples: 512
+    low_watermark_samples: 128
+  layer_output_splitting:
+    xy_samples_random_slice: 256
+
+train:
+  batch_source_mixing:
+    # Force model diversity at the run-profile level as well, so the active run
+    # does not silently fall back to `none` due to an older trainer config.
+    uniqueness: model
+    max_source_samples: 4
+
+hydra:
+  job:
+    name: train_big_vae_v2
+
+model:
+  # full | simple_direct
+  variant: full

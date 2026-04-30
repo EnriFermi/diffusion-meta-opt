@@ -1,0 +1,44 @@
+patch_size: 16
+beta: 0.001
+
+big_vae:
+  d_model: 128
+  d_lat: 128
+  num_latents: 32
+  # true -> VAE (sampling + KL), false -> AE (deterministic z, KL term forced to 0 in train loop)
+  use_latent_sampling: true
+  # When true, keep a deterministic encoder mu-head active even if use_latent_sampling=false.
+  use_encoder_mu_head: true
+  # gaussian -> standard Normal prior
+  # vamp -> VampPrior-style learned mixture prior in latent space
+  latent_prior_kind: vamp
+  # Number of pseudo-components for latent_prior_kind=vamp.
+  vamp_prior_K: 64
+  # linear -> current single linear projection for decoder query conditioning
+  # mlp -> decoder-only MLP over [positional_query_base, dist_patch_by_patch]
+  decoder_query_conditioning_kind: mlp
+  decoder_query_conditioning_hidden_mult: 2.0
+  # raw -> legacy unnormalized integer coordinates for 2D RoPE
+  # normalized_center -> centered coordinates (i + 0.5) / size for better size stability
+  rope_2d_coord_kind: normalized_center
+  # Posterior std is gate * exp(0.5 * logvar_head(...)); this floor keeps KL finite at gate ~= 0.
+  latent_sampling_min_std: 1e-4
+  latent_sampling_logvar_min: -2
+  latent_sampling_logvar_max: 2
+  num_encoder_layers: 15
+  num_decoder_layers: 6
+  n_heads: 8
+  ffn_mult: 4.0
+  dropout: 0.0
+  pos_fourier_dim: 256
+  disable_z_shortcut: true
+  disable_distribution_encoder: false
+  # residual -> current ResidualPatchTokenizer
+  # conditioned_mlp -> Y-only base patch token + X-conditioned residual MLP stack
+  patch_tokenizer_kind: conditioned_mlp
+  # legacy -> existing pooled-var injection + latent delta
+  # token_adapter -> per-layer gated residual conditioning on dist_patch_by_patch
+  distribution_encoder_conditioning_kind: token_adapter
+  encoder:
+    self_attn_mode: full
+    cross_attend_only_cls: false
