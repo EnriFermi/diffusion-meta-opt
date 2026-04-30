@@ -7,14 +7,14 @@ hydra:
     name: train_big_vae_latent_diffusion_prior
 
 latent_diffusion_prior:
-  big_vae_checkpoint: /home/coder/project/artifacts/training/checkpoints/weight_quantile_vae_gpu0_square_VAE/stage_1/latest.pt
+  big_vae_checkpoint: /home/coder/project/artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt
 
 latent_diffusion_dataset:
-  root_dir: ${oc.env:BIG_VAE_LATENT_DIFFUSION_DATASET_DIR,${training_artifacts.base_root_dir}/datasets/big_vae_latent_diffusion/stage_${train.stage}}
+  root_dir: ${oc.env:BIG_VAE_LATENT_DIFFUSION_DATASET_DIR,${training_artifacts.base_root_dir}/datasets/big_vae_latent_diffusion_AE/stage_${train.stage}}
 
 train:
   stage: 1
-  device: ${oc.env:LATENT_DIFFUSION_DEVICE,${oc.env:DEVICE,cuda:0}}
+  device: cuda:1
   distributed: false
   num_gpus: 1
   amp: auto
@@ -38,7 +38,7 @@ train:
   grad_clip_norm: 1.0
   checkpoint_every: 5000
   log_every: 100
-  checkpoint_dir: artifacts/training/checkpoints/big_vae_latent_diffusion_prior
+  checkpoint_dir: /home/coder/project/artifacts/training/checkpoints/big_vae_latent_diffusion_prior_AE
   distribution_encoder_finetune:
     enabled: true
     lr: ${train.lr}
@@ -99,7 +99,7 @@ model:
     pos_fourier_dim: 64
     time_embed_dim: 256
     use_qk_norm: true
-    use_cross_conditioning: false
+    use_cross_conditioning: true
     prediction_type: v
     latent_normalization: diagonal
     use_decoder_aux: true

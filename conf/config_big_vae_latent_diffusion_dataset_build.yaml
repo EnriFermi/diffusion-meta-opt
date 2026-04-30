@@ -7,11 +7,11 @@ hydra:
     name: build_big_vae_latent_diffusion_dataset
 
 latent_diffusion_prior:
-  big_vae_checkpoint: /home/coder/project/artifacts/training/checkpoints/weight_quantile_vae_gpu0_square_VAE/stage_1/latest.pt
+  big_vae_checkpoint: /home/coder/project/artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt
 latent_diffusion_dataset:
-  root_dir: ${oc.env:BIG_VAE_LATENT_DIFFUSION_DATASET_DIR,${training_artifacts.base_root_dir}/datasets/big_vae_latent_diffusion/stage_1}
+  root_dir: ${oc.env:BIG_VAE_LATENT_DIFFUSION_DATASET_DIR,${training_artifacts.base_root_dir}/datasets/big_vae_latent_diffusion_AE/stage_1}
   source_big_vae_offline_root: /home/coder/project/artifacts/training/checkpoints/weight_quantile_vae/stage_1/offline_dataset
-  device: auto
+  device: cuda:1
   source:
     shuffle_chunks: false
     shuffle_records_within_chunk: false
@@ -27,14 +27,14 @@ latent_diffusion_dataset:
     chunk_size_records: 128
     batch_size: 8
     encode_batch_size: 1
-    target_T_patches: 16
-    target_d_out: 8
-    max_latent_records: 0
+    target_T_patches: 4
+    target_d_out: 64
+    max_latent_records: 250000
     max_slices_per_source_record: 1
     distribution_match:
       mode: source_proportional_joint
       group_keys: [dataset, model, layer_type, layer]
-    store_decoder_aux_tensors: false
+    store_decoder_aux_tensors: true
     seed: 42
     log_every_batches: 100
     max_records: 0

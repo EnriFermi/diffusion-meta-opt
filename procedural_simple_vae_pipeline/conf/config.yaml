@@ -86,10 +86,10 @@ train:
   master_addr: "127.0.0.1"
   master_port: 0
 
-  amp: false
-  tf32: false
-  cudnn_benchmark: false
-  compile: false
+  amp: true
+  tf32: true
+  cudnn_benchmark: true
+  compile: true
   compile_mode: reduce-overhead
   compile_dynamic: true
   compile_disable_cudagraphs: true
@@ -98,7 +98,7 @@ train:
   grad_accum_steps: 1
   warmup_steps: 0
   min_lr_ratio: 0.001
-  lr: 3e-5
+  lr: 5e-6
   weight_decay: 0.0
   betas: [0.9, 0.999]
   eps: 1.0e-8
@@ -123,7 +123,7 @@ train:
     # `patch_stats_teacher`: W itself is generated from patch-wise X statistics.
     # `x_residual_teacher`: encoder sees only W_base, while target is W_base + residual(X).
     # The second mode is the stronger probe for whether encoder conditioning alpha leaves zero.
-    kind: x_residual_teacher
+    kind: masked_ab_from_x
     # X is also sampled from Normal to preserve the same operator loss API as big_vae train.
     batch_size: 16
     n_rows: 256

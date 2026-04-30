@@ -137,7 +137,7 @@ offline_dataset:
   loader_prefetch_factor: 8
   # Optional IPC batching between offline DataLoader workers and the main process.
   # 1 keeps one SharedSample per queue transfer; larger values amortize worker IPC.
-  loader_batch_size: 8
+  loader_batch_size: 4
   loader_persistent_workers: true
   # When distributed, true -> each rank consumes its own chunk shard.
   # false -> only rank0 reads the offline dataset and other ranks receive tensors via broadcast.
@@ -175,10 +175,10 @@ offline_dataset:
     log_every_seen_samples: 1000
 offline_batch_prefetch:
   enabled: true
-  queue_size: 16
+  queue_size: 24
   pin_memory: true
   # 0 -> auto min(16, available_cpu_cores) for CPU-side data assembly ops.
-  cpu_threads: 6
+  cpu_threads: 10
   # 0 -> auto min(16, requested_source_samples_per_refresh) candidates per refill.
   refill_fetch_batch_size: 8
 resume_checkpoint: ""
