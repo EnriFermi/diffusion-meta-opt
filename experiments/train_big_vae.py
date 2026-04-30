@@ -26,7 +26,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 from dataset import data_pipeline, setup_logging
-from dataset.big_vae_offline import offline_big_vae_data_pipeline
+from dataset.big_vae_offline import (
+    ensure_presliced_big_vae_dataset,
+    offline_big_vae_data_pipeline,
+    presliced_big_vae_data_pipeline,
+)
 from dataset.logging_utils import LOG_PATH_ENV, configure_process_logging, resolve_process_log_path
 from experiments.background_prefetch import BackgroundPrefetcher
 from models.weight_quantile_vae import (
@@ -130,6 +134,17 @@ class PreparedTrainingBatch:
     d_out_mask: torch.Tensor
     source_diversity: dict[str, float]
     build_time_s: float
+
+
+@dataclass(slots=True)
+class PreslicedSliceRecord:
+    x: torch.Tensor
+    W: torch.Tensor
+    x_mask: torch.Tensor
+    d_in_mask: torch.Tensor
+    d_out_mask: torch.Tensor
+    model_name: str = ""
+    layer_name: str = ""
 
 
 def _promote_run_profile_to_root(cfg: DictConfig) -> None:
@@ -399,6 +414,11 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         offline_batch_prefetch_cfg = {}
     if not isinstance(offline_batch_prefetch_cfg, (dict, DictConfig)):
         offline_batch_prefetch_cfg = {}
+    preslicing_cfg = train_cfg.get("preslicing", {})
+    if preslicing_cfg is None:
+        preslicing_cfg = {}
+    if not isinstance(preslicing_cfg, (dict, DictConfig)):
+        preslicing_cfg = {}
 
     tracking_params: dict[str, Any] = {
         "train.max_steps": int(train_cfg.get("max_steps", 0)),
@@ -449,6 +469,10 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         "train.offline_batch_prefetch.refill_fetch_batch_size": int(
             offline_batch_prefetch_cfg.get("refill_fetch_batch_size", 0)
         ),
+        "train.preslicing.enabled": bool(preslicing_cfg.get("enabled", False)),
+        "train.preslicing.root_dir": str(preslicing_cfg.get("root_dir", "")),
+        "train.preslicing.num_slices": int(preslicing_cfg.get("num_slices", 0)),
+        "train.preslicing.chunk_size_slices": int(preslicing_cfg.get("chunk_size_slices", 0)),
         "model.patch_size": int(model_cfg.get("patch_size", 16)),
         "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
         "model.big_vae.use_encoder_mu_head": bool(big_cfg.get("use_encoder_mu_head", False)),
@@ -1805,6 +1829,157 @@ def _fetch_source_samples(
     return selected
 
 
+def _prepare_cpu_bool_mask(
+    tensor: Any,
+    *,
+    target_shape: tuple[int, ...],
+    default_true: bool,
+) -> torch.Tensor:
+    if torch.is_tensor(tensor):
+        mask = tensor.detach().to(device="cpu", dtype=torch.bool, copy=True).contiguous()
+        if tuple(mask.shape) != tuple(target_shape):
+            raise ValueError(f"mask shape {tuple(mask.shape)} does not match expected {tuple(target_shape)}")
+        return mask
+    fill_value = bool(default_true)
+    return torch.full(tuple(int(dim) for dim in target_shape), fill_value, dtype=torch.bool)
+
+
+def _next_valid_presliced_slice(
+    dataset_iter: Iterator[Any],
+    logger: logging.Logger,
+) -> PreslicedSliceRecord:
+    attempts = 0
+    while True:
+        sample = next(dataset_iter)
+        x = getattr(sample, "x", None)
+        W = getattr(sample, "weight", None)
+        meta = getattr(sample, "meta", {}) or {}
+        try:
+            valid = (
+                torch.is_tensor(x)
+                and torch.is_tensor(W)
+                and x.ndim == 2
+                and W.ndim == 2
+                and int(x.shape[1]) == int(W.shape[0])
+                and int(x.shape[0]) > 0
+                and int(W.shape[0]) > 0
+                and int(W.shape[1]) > 0
+            )
+            if not valid:
+                raise ValueError("invalid presliced W/x tensor shapes")
+
+            x_cpu = _prepare_cpu_sample_tensor(x)
+            W_cpu = _prepare_cpu_sample_tensor(W)
+            if not isinstance(meta, dict):
+                meta = {}
+            x_mask = _prepare_cpu_bool_mask(
+                meta.get("x_mask"),
+                target_shape=(int(x_cpu.shape[0]),),
+                default_true=True,
+            )
+            d_in_mask = _prepare_cpu_bool_mask(
+                meta.get("d_in_mask"),
+                target_shape=(int(W_cpu.shape[0]),),
+                default_true=True,
+            )
+            d_out_mask = _prepare_cpu_bool_mask(
+                meta.get("d_out_mask"),
+                target_shape=(int(W_cpu.shape[1]),),
+                default_true=True,
+            )
+            return PreslicedSliceRecord(
+                x=x_cpu,
+                W=W_cpu,
+                x_mask=x_mask,
+                d_in_mask=d_in_mask,
+                d_out_mask=d_out_mask,
+                model_name=str(getattr(sample, "model_name", "")).strip(),
+                layer_name=str(getattr(sample, "layer_name", "")).strip(),
+            )
+        except Exception as exc:
+            attempts += 1
+            if attempts % 100 == 0:
+                logger.warning("Skipping invalid presliced samples repeatedly; attempts=%s error=%s", attempts, exc)
+
+
+def _compute_presliced_batch_source_diversity_stats(
+    records: Sequence[PreslicedSliceRecord],
+) -> dict[str, float]:
+    stats: dict[str, float] = {
+        "source_pool_size": float(len(records)),
+        "source_pool_unique_named_models": 0.0,
+        "source_pool_missing_model_names": 0.0,
+        "source_pool_remaining_slices_pre": 0.0,
+        "source_pool_remaining_slices_post": 0.0,
+        "batch_sources_used": float(len(records)),
+        "batch_unique_models": 0.0,
+        "batch_unique_named_models": 0.0,
+        "batch_missing_model_sources": 0.0,
+        "batch_model_entropy": 0.0,
+        "batch_model_perplexity": 0.0,
+    }
+    if not records:
+        return stats
+
+    named_models = {str(record.model_name).strip() for record in records if str(record.model_name).strip()}
+    missing_model_sources = sum(1 for record in records if not str(record.model_name).strip())
+    model_counts: dict[str, int] = {}
+    for idx, record in enumerate(records):
+        model_name = str(record.model_name).strip()
+        label = model_name if model_name else f"__unknown_source_{idx}"
+        model_counts[label] = model_counts.get(label, 0) + 1
+
+    entropy = 0.0
+    total_items = sum(model_counts.values())
+    if total_items > 0:
+        for count in model_counts.values():
+            prob = float(count) / float(total_items)
+            entropy -= prob * math.log(max(prob, 1e-12))
+
+    stats["source_pool_unique_named_models"] = float(len(named_models))
+    stats["source_pool_missing_model_names"] = float(missing_model_sources)
+    stats["batch_unique_models"] = float(len(model_counts))
+    stats["batch_unique_named_models"] = float(len(named_models))
+    stats["batch_missing_model_sources"] = float(missing_model_sources)
+    stats["batch_model_entropy"] = float(entropy)
+    stats["batch_model_perplexity"] = float(math.exp(entropy)) if total_items > 0 else 0.0
+    return stats
+
+
+def _fetch_presliced_training_batch_cpu(
+    *,
+    dataset_iter: Iterator[Any] | None,
+    batch_size: int,
+    logger: logging.Logger,
+) -> PreparedTrainingBatch:
+    if dataset_iter is None:
+        raise RuntimeError("presliced dataset iterator is required")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+
+    build_t0 = time.perf_counter()
+    records = [_next_valid_presliced_slice(dataset_iter, logger) for _ in range(int(batch_size))]
+    first = records[0]
+    target_x_shape = tuple(first.x.shape)
+    target_W_shape = tuple(first.W.shape)
+    for record in records[1:]:
+        if tuple(record.x.shape) != target_x_shape or tuple(record.W.shape) != target_W_shape:
+            raise ValueError(
+                "Presliced records in one batch must have identical fixed shapes, got "
+                f"x={tuple(record.x.shape)} W={tuple(record.W.shape)} expected x={target_x_shape} W={target_W_shape}"
+            )
+
+    return PreparedTrainingBatch(
+        W=torch.stack([record.W for record in records], dim=0).contiguous(),
+        x=torch.stack([record.x for record in records], dim=0).contiguous(),
+        x_mask=torch.stack([record.x_mask for record in records], dim=0).contiguous(),
+        d_in_mask=torch.stack([record.d_in_mask for record in records], dim=0).contiguous(),
+        d_out_mask=torch.stack([record.d_out_mask for record in records], dim=0).contiguous(),
+        source_diversity=_compute_presliced_batch_source_diversity_stats(records),
+        build_time_s=time.perf_counter() - build_t0,
+    )
+
+
 def _sample_synthetic_layer(
     *,
     device: torch.device,
@@ -3102,23 +3277,38 @@ def _run_worker(
     offline_dataset_enabled = bool(offline_dataset_cfg.get("enabled", False))
     offline_dataset_root = str(offline_dataset_cfg.get("root_dir", "") or "").strip()
     offline_dataset_shard_by_rank = bool(offline_dataset_cfg.get("shard_by_rank", True))
+    preslicing_cfg = cfg.train.get("preslicing", {})
+    if preslicing_cfg is None:
+        preslicing_cfg = {}
+    if not isinstance(preslicing_cfg, (dict, DictConfig)):
+        raise TypeError("train.preslicing must be a mapping")
+    preslicing_enabled = bool(preslicing_cfg.get("enabled", False))
+    preslicing_root = str(preslicing_cfg.get("root_dir", "") or "").strip()
+    preslicing_shard_by_rank = bool(preslicing_cfg.get("shard_by_rank", True))
     if synthetic_x_std <= 0.0:
         raise ValueError(f"train.synthetic_layer_source.x_std must be > 0, got {synthetic_x_std}")
     if synthetic_w_std <= 0.0:
         raise ValueError(f"train.synthetic_layer_source.w_std must be > 0, got {synthetic_w_std}")
     if offline_dataset_enabled and not offline_dataset_root:
         raise ValueError("train.offline_dataset.root_dir must be set when train.offline_dataset.enabled=true")
+    if preslicing_enabled and not offline_dataset_enabled:
+        raise ValueError("train.preslicing.enabled=true requires train.offline_dataset.enabled=true")
     if offline_dataset_enabled and synthetic_layer_enabled:
         raise ValueError(
             "train.offline_dataset.enabled=true is incompatible with train.synthetic_layer_source.enabled=true"
         )
+    if preslicing_enabled and fixed_training_batch_enabled:
+        raise ValueError("train.preslicing.enabled=true is not supported together with train.fixed_training_batch.enabled=true")
     if synthetic_layer_enabled:
         dataset_sharding = False
         use_broadcast = False
     elif offline_dataset_enabled:
-        streaming_mode = "offline_big_vae"
-        dataset_sharding = bool(cfg.train.get("use_dataset_sharding", True)) and is_distributed and offline_dataset_shard_by_rank
+        streaming_mode = "presliced_big_vae" if preslicing_enabled else "offline_big_vae"
+        active_offline_shard_by_rank = preslicing_shard_by_rank if preslicing_enabled else offline_dataset_shard_by_rank
+        dataset_sharding = bool(cfg.train.get("use_dataset_sharding", True)) and is_distributed and active_offline_shard_by_rank
         use_broadcast = is_distributed and not dataset_sharding
+    if preslicing_enabled and use_broadcast:
+        raise ValueError("train.preslicing.enabled=true requires sharded loading in distributed mode")
 
     if dataset_sharding and not offline_dataset_enabled:
         cfg.streaming.distributed.enabled = True
@@ -3147,6 +3337,13 @@ def _run_worker(
             offline_dataset_root,
             offline_dataset_shard_by_rank,
             use_broadcast,
+        )
+    if preslicing_enabled:
+        logger.info(
+            "Presliced BigVAE dataset enabled: root=%s num_slices=%s shard_by_rank=%s",
+            preslicing_root or "<default>",
+            int(preslicing_cfg.get("num_slices", 0)),
+            preslicing_shard_by_rank,
         )
     if synthetic_layer_enabled:
         logger.info(
@@ -3184,21 +3381,47 @@ def _run_worker(
                         offline_dataset_cfg = {}
                     if not isinstance(offline_dataset_cfg, (dict, DictConfig)):
                         raise TypeError("train.offline_dataset must be a mapping")
-                    loader_workers = max(0, int(offline_dataset_cfg.get("loader_workers", 0)))
-                    loader_batch_size = max(1, int(offline_dataset_cfg.get("loader_batch_size", 1)))
-                    loader_prefetch_factor = max(1, int(offline_dataset_cfg.get("loader_prefetch_factor", 2)))
-                    loader_persistent_workers = bool(offline_dataset_cfg.get("loader_persistent_workers", True))
+                    preslicing_cfg = cfg.train.get("preslicing", {})
+                    if preslicing_cfg is None:
+                        preslicing_cfg = {}
+                    if not isinstance(preslicing_cfg, (dict, DictConfig)):
+                        raise TypeError("train.preslicing must be a mapping")
+                    active_loader_cfg = preslicing_cfg if preslicing_enabled else offline_dataset_cfg
+                    loader_workers = max(0, int(active_loader_cfg.get("loader_workers", offline_dataset_cfg.get("loader_workers", 0))))
+                    loader_batch_size = max(1, int(active_loader_cfg.get("loader_batch_size", offline_dataset_cfg.get("loader_batch_size", 1))))
+                    loader_prefetch_factor = max(
+                        1,
+                        int(active_loader_cfg.get("loader_prefetch_factor", offline_dataset_cfg.get("loader_prefetch_factor", 2))),
+                    )
+                    loader_persistent_workers = bool(
+                        active_loader_cfg.get("loader_persistent_workers", offline_dataset_cfg.get("loader_persistent_workers", True))
+                    )
+                    if preslicing_enabled:
+                        if rank == 0:
+                            ensure_presliced_big_vae_dataset(cfg, logger=logger)
+                        if is_distributed:
+                            dist.barrier()
                     if rank == 0 or dataset_sharding:
                         offline_rank = rank if dataset_sharding else 0
                         offline_world_size = world_size if dataset_sharding else 1
-                        dataset, collector = stack.enter_context(
-                            offline_big_vae_data_pipeline(
-                                cfg,
-                                logger=logger,
-                                rank=offline_rank,
-                                world_size=offline_world_size,
+                        if preslicing_enabled:
+                            dataset, collector = stack.enter_context(
+                                presliced_big_vae_data_pipeline(
+                                    cfg,
+                                    logger=logger,
+                                    rank=offline_rank,
+                                    world_size=offline_world_size,
+                                )
                             )
-                        )
+                        else:
+                            dataset, collector = stack.enter_context(
+                                offline_big_vae_data_pipeline(
+                                    cfg,
+                                    logger=logger,
+                                    rank=offline_rank,
+                                    world_size=offline_world_size,
+                                )
+                            )
                         if loader_workers > 0:
                             effective_loader_batch_size = int(loader_batch_size)
                             dataset_loader = torch.utils.data.DataLoader(
@@ -3226,8 +3449,9 @@ def _run_worker(
                                 stack.callback(shutdown_workers)
                             if rank == 0:
                                 logger.info(
-                                    "Offline dataset DataLoader enabled: num_workers=%s batch_size=%s "
+                                    "%s DataLoader enabled: num_workers=%s batch_size=%s "
                                     "prefetch_factor=%s persistent_workers=%s",
+                                    "Presliced dataset" if preslicing_enabled else "Offline dataset",
                                     loader_workers,
                                     effective_loader_batch_size,
                                     loader_prefetch_factor,
@@ -3815,7 +4039,13 @@ def _run_worker(
                 nonlocal source_mixing_shortfall_logged
 
                 build_t0 = time.perf_counter()
-                if consume_slices_without_replacement:
+                if preslicing_enabled:
+                    batch = _fetch_presliced_training_batch_cpu(
+                        dataset_iter=dataset_iter,
+                        batch_size=slice_batch_size,
+                        logger=logger,
+                    )
+                elif consume_slices_without_replacement:
                     current_source_states, current_source_round_robin_offset = _prune_exhausted_source_states_with_offset(
                         current_source_states,
                         current_source_round_robin_offset,

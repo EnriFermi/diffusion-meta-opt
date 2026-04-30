@@ -181,6 +181,35 @@ offline_batch_prefetch:
   cpu_threads: 10
   # 0 -> auto min(16, requested_source_samples_per_refresh) candidates per refill.
   refill_fetch_batch_size: 8
+# Optional stage-specific cache of already sliced/padded BigVAE training items.
+# When enabled, train startup checks root_dir/manifest.json against the current
+# preslicing fingerprint. A cache miss builds exactly num_slices items from the
+# regular offline_dataset, then training reads these lightweight fixed-shape
+# records directly.
+preslicing:
+  enabled: false
+  # Keep this under checkpoint_dir so parallel BigVAE configs do not overwrite
+  # each other's presliced caches while sharing the same master offline dataset.
+  root_dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/presliced_offline_dataset
+  # Required when enabled. This is the effective training-set size in slices.
+  num_slices: 0
+  # 0 -> use train.max_x_rows. target_d_in/target_d_out default to the active
+  # curriculum shape: model.patch_size * max_T_patches and max_d_out.
+  target_x_rows: 0
+  target_d_in: 0
+  target_d_out: 0
+  chunk_size_slices: 1024
+  log_every_slices: 10000
+  seed: ${data.seed}
+  shuffle_chunks: true
+  shuffle_slices_within_chunk: true
+  repeat: true
+  shard_by_rank: true
+  chunk_cache_size: 4
+  loader_workers: 8
+  loader_batch_size: 16
+  loader_prefetch_factor: 8
+  loader_persistent_workers: true
 resume_checkpoint: ""
 
 forensics:
