@@ -25,8 +25,8 @@ kl_beta: 0.001
 kl_schedule:
   enabled: true
   start_beta: 0.0
-  warmup_steps: 100000
-  ramp_steps: 50000
+  warmup_steps: 0
+  ramp_steps: 0
 latent_sampling_gate:
   # Absolute global-step schedule. For AE -> VAE fine-tune, set start_step
   # to the resumed checkpoint step if the gate should start small after resume.
@@ -36,7 +36,7 @@ latent_sampling_gate:
   start_value: 1e-4
   end_value: 1.0
 weight_decay: 0.01
-lr: 5e-5
+lr: 3e-4
 
 behavioral_coef: 1.0
 structural_coef: 1.0
@@ -78,8 +78,8 @@ resume_state:
   load_step: true
 
 stage: 1
-stage_base_T_patches: 4
-stage_base_d_out: 64
+stage_base_T_patches: 2
+stage_base_d_out: 8
 stage_scale_factor: 2
 # Optional synthetic data mode for quick smoke/debug runs.
 # When enabled, train loop samples x and W from Normal and does not start collectors.
