@@ -68,8 +68,21 @@ def _identity_sample_collate(sample: Any) -> Any:
     return sample
 
 
+def _sample_list_collate(samples: list[Any]) -> list[Any]:
+    return samples
+
+
 def _offline_loader_worker_init_fn(_worker_id: int) -> None:
     torch.set_num_threads(1)
+
+
+def _flatten_loader_batches(loader_iter: Iterator[Any]) -> Iterator[Any]:
+    for item in loader_iter:
+        if isinstance(item, list):
+            for sample in item:
+                yield sample
+        else:
+            yield item
 
 
 @dataclass(slots=True)
@@ -422,6 +435,7 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
             train_cfg.get("offline_dataset", {}).get("runtime_enforce_stage_compatibility", False)
         ),
         "train.offline_dataset.loader_workers": int(train_cfg.get("offline_dataset", {}).get("loader_workers", 0)),
+        "train.offline_dataset.loader_batch_size": int(train_cfg.get("offline_dataset", {}).get("loader_batch_size", 1)),
         "train.offline_dataset.loader_prefetch_factor": int(
             train_cfg.get("offline_dataset", {}).get("loader_prefetch_factor", 2)
         ),
@@ -3171,6 +3185,7 @@ def _run_worker(
                     if not isinstance(offline_dataset_cfg, (dict, DictConfig)):
                         raise TypeError("train.offline_dataset must be a mapping")
                     loader_workers = max(0, int(offline_dataset_cfg.get("loader_workers", 0)))
+                    loader_batch_size = max(1, int(offline_dataset_cfg.get("loader_batch_size", 1)))
                     loader_prefetch_factor = max(1, int(offline_dataset_cfg.get("loader_prefetch_factor", 2)))
                     loader_persistent_workers = bool(offline_dataset_cfg.get("loader_persistent_workers", True))
                     if rank == 0 or dataset_sharding:
@@ -3185,25 +3200,36 @@ def _run_worker(
                             )
                         )
                         if loader_workers > 0:
+                            effective_loader_batch_size = int(loader_batch_size)
                             dataset_loader = torch.utils.data.DataLoader(
                                 dataset,
-                                batch_size=None,
+                                batch_size=(None if effective_loader_batch_size <= 1 else effective_loader_batch_size),
                                 num_workers=loader_workers,
-                                collate_fn=_identity_sample_collate,
+                                collate_fn=(
+                                    _identity_sample_collate
+                                    if effective_loader_batch_size <= 1
+                                    else _sample_list_collate
+                                ),
                                 prefetch_factor=loader_prefetch_factor,
                                 persistent_workers=loader_persistent_workers,
                                 pin_memory=False,
                                 worker_init_fn=_offline_loader_worker_init_fn,
                             )
-                            dataset_iter = iter(dataset_loader)
-                            shutdown_workers = getattr(dataset_iter, "_shutdown_workers", None)
+                            dataset_loader_iter = iter(dataset_loader)
+                            dataset_iter = (
+                                dataset_loader_iter
+                                if effective_loader_batch_size <= 1
+                                else _flatten_loader_batches(dataset_loader_iter)
+                            )
+                            shutdown_workers = getattr(dataset_loader_iter, "_shutdown_workers", None)
                             if callable(shutdown_workers):
                                 stack.callback(shutdown_workers)
                             if rank == 0:
                                 logger.info(
-                                    "Offline dataset DataLoader enabled: num_workers=%s prefetch_factor=%s "
-                                    "persistent_workers=%s",
+                                    "Offline dataset DataLoader enabled: num_workers=%s batch_size=%s "
+                                    "prefetch_factor=%s persistent_workers=%s",
                                     loader_workers,
+                                    effective_loader_batch_size,
                                     loader_prefetch_factor,
                                     loader_persistent_workers,
                                 )

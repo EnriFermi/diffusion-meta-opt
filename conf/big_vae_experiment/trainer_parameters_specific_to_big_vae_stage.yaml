@@ -135,6 +135,9 @@ offline_dataset:
   # legacy single-process iterator path. Positive values enable multi-process IO.
   loader_workers: 20
   loader_prefetch_factor: 8
+  # Optional IPC batching between offline DataLoader workers and the main process.
+  # 1 keeps one SharedSample per queue transfer; larger values amortize worker IPC.
+  loader_batch_size: 8
   loader_persistent_workers: true
   # When distributed, true -> each rank consumes its own chunk shard.
   # false -> only rank0 reads the offline dataset and other ranks receive tensors via broadcast.
