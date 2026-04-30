@@ -61,7 +61,10 @@ def _load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> tuple
     if not isinstance(cfg_payload, dict):
         raise KeyError(f"Checkpoint does not contain a dict 'config': {checkpoint_path}")
     ckpt_cfg = OmegaConf.create(cfg_payload)
-    model = build_weight_quantile_vae(_build_model_cfg(ckpt_cfg)).to(device)
+    cfg = _build_model_cfg(ckpt_cfg)
+    cfg.big_vae.use_latent_sampling=False
+    print(cfg)
+    model = build_weight_quantile_vae(cfg).to(device)
     state = payload.get("model_state")
     if not isinstance(state, dict):
         raise KeyError(f"Checkpoint does not contain a dict 'model_state': {checkpoint_path}")

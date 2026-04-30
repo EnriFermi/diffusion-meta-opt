@@ -3,8 +3,8 @@ beta: 0.001
 
 big_vae:
   d_model: 128
-  d_lat: 64
-  num_latents: 8
+  d_lat: 128
+  num_latents: 32
   # true -> VAE (sampling + KL), false -> AE (deterministic z, KL term forced to 0 in train loop)
   use_latent_sampling: true
   # Posterior std is gate * exp(0.5 * logvar_head(...)); this floor keeps KL finite at gate ~= 0.
