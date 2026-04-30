@@ -64,6 +64,14 @@ from training.runtime import (
 )
 
 
+def _identity_sample_collate(sample: Any) -> Any:
+    return sample
+
+
+def _offline_loader_worker_init_fn(_worker_id: int) -> None:
+    torch.set_num_threads(1)
+
+
 @dataclass(slots=True)
 class SourceSampleRecord:
     x: torch.Tensor
@@ -410,6 +418,16 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         "train.offline_dataset.enabled": bool(train_cfg.get("offline_dataset", {}).get("enabled", False)),
         "train.offline_dataset.root_dir": str(train_cfg.get("offline_dataset", {}).get("root_dir", "")),
         "train.offline_dataset.shard_by_rank": bool(train_cfg.get("offline_dataset", {}).get("shard_by_rank", True)),
+        "train.offline_dataset.runtime_enforce_stage_compatibility": bool(
+            train_cfg.get("offline_dataset", {}).get("runtime_enforce_stage_compatibility", False)
+        ),
+        "train.offline_dataset.loader_workers": int(train_cfg.get("offline_dataset", {}).get("loader_workers", 0)),
+        "train.offline_dataset.loader_prefetch_factor": int(
+            train_cfg.get("offline_dataset", {}).get("loader_prefetch_factor", 2)
+        ),
+        "train.offline_dataset.loader_persistent_workers": bool(
+            train_cfg.get("offline_dataset", {}).get("loader_persistent_workers", True)
+        ),
         "train.offline_batch_prefetch.enabled": bool(offline_batch_prefetch_cfg.get("enabled", True)),
         "train.offline_batch_prefetch.queue_size": int(offline_batch_prefetch_cfg.get("queue_size", 2)),
         "train.offline_batch_prefetch.pin_memory": bool(offline_batch_prefetch_cfg.get("pin_memory", True)),
@@ -3142,10 +3160,19 @@ def _run_worker(
         collector: Any | None = None
         dataset: Any | None = None
         dataset_iter: Iterator[Any] | None = None
+        dataset_loader: Any | None = None
 
         with contextlib.ExitStack() as stack:
             if not synthetic_layer_enabled:
                 if offline_dataset_enabled:
+                    offline_dataset_cfg = cfg.train.get("offline_dataset", {})
+                    if offline_dataset_cfg is None:
+                        offline_dataset_cfg = {}
+                    if not isinstance(offline_dataset_cfg, (dict, DictConfig)):
+                        raise TypeError("train.offline_dataset must be a mapping")
+                    loader_workers = max(0, int(offline_dataset_cfg.get("loader_workers", 0)))
+                    loader_prefetch_factor = max(1, int(offline_dataset_cfg.get("loader_prefetch_factor", 2)))
+                    loader_persistent_workers = bool(offline_dataset_cfg.get("loader_persistent_workers", True))
                     if rank == 0 or dataset_sharding:
                         offline_rank = rank if dataset_sharding else 0
                         offline_world_size = world_size if dataset_sharding else 1
@@ -3157,7 +3184,31 @@ def _run_worker(
                                 world_size=offline_world_size,
                             )
                         )
-                        dataset_iter = iter(dataset)
+                        if loader_workers > 0:
+                            dataset_loader = torch.utils.data.DataLoader(
+                                dataset,
+                                batch_size=None,
+                                num_workers=loader_workers,
+                                collate_fn=_identity_sample_collate,
+                                prefetch_factor=loader_prefetch_factor,
+                                persistent_workers=loader_persistent_workers,
+                                pin_memory=False,
+                                worker_init_fn=_offline_loader_worker_init_fn,
+                            )
+                            dataset_iter = iter(dataset_loader)
+                            shutdown_workers = getattr(dataset_iter, "_shutdown_workers", None)
+                            if callable(shutdown_workers):
+                                stack.callback(shutdown_workers)
+                            if rank == 0:
+                                logger.info(
+                                    "Offline dataset DataLoader enabled: num_workers=%s prefetch_factor=%s "
+                                    "persistent_workers=%s",
+                                    loader_workers,
+                                    loader_prefetch_factor,
+                                    loader_persistent_workers,
+                                )
+                        else:
+                            dataset_iter = iter(dataset)
                 else:
                     if rank == 0:
                         dataset, collector = stack.enter_context(
