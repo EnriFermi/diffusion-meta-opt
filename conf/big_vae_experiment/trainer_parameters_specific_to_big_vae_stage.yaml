@@ -25,7 +25,7 @@ kl_beta: 0.001
 kl_schedule:
   enabled: true
   start_beta: 0.0
-  warmup_steps: 150000
+  warmup_steps: 100000
   ramp_steps: 50000
 latent_sampling_gate:
   # Absolute global-step schedule. For AE -> VAE fine-tune, set start_step
@@ -94,7 +94,7 @@ synthetic_layer_source:
 # When enabled, train loop captures one already-sliced training batch once and
 # reuses it for the full run instead of reslicing on every micro-step.
 fixed_training_batch:
-  enabled: true
+  enabled: false
   # When non-empty, save the exact captured batch for later diagnostics replay.
   dump_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/fixed_training_batch.pt
 # Cap rows in x to reduce rare heavy samples that can stall steps.
@@ -133,7 +133,7 @@ offline_dataset:
   shuffle_chunks: true
   shuffle_records_within_chunk: true
   repeat: true
-  weight_cache_size: 64
+  weight_cache_size: 256
   sampling:
     # random -> plain shuffled chunk/record traversal
     # balanced -> use each record once per epoch, but reorder epoch traversal to
@@ -142,8 +142,8 @@ offline_dataset:
     mode: balanced
     group_keys: [dataset, model, layer_type, depth]
     window_size_records: 2048
-    max_records_per_chunk_round: 16
-    x_chunk_cache_size: 16
+    max_records_per_chunk_round: 64
+    x_chunk_cache_size: 64
   analysis:
     output_dir: ${train.offline_dataset.root_dir}/analysis
     topk: 20
@@ -163,7 +163,7 @@ offline_dataset:
     log_every_seen_samples: 1000
 offline_batch_prefetch:
   enabled: true
-  queue_size: 2
+  queue_size: 8
   pin_memory: true
 resume_checkpoint: ""
 
