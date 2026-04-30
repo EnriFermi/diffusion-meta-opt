@@ -212,6 +212,11 @@ def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
             dropout=float(big_cfg.get("dropout", 0.0)),
             pos_fourier_dim=int(big_cfg.get("pos_fourier_dim", 64)),
             use_latent_sampling=bool(big_cfg.get("use_latent_sampling", True)),
+            use_encoder_mu_head=bool(big_cfg.get("use_encoder_mu_head", False)),
+            latent_prior_kind=str(big_cfg.get("latent_prior_kind", "gaussian")),
+            vamp_prior_K=int(big_cfg.get("vamp_prior_K", 64)),
+            decoder_query_conditioning_kind=str(big_cfg.get("decoder_query_conditioning_kind", "linear")),
+            decoder_query_conditioning_hidden_mult=float(big_cfg.get("decoder_query_conditioning_hidden_mult", 2.0)),
             latent_sampling_min_std=float(big_cfg.get("latent_sampling_min_std", 1e-4)),
             latent_sampling_logvar_min=float(big_cfg.get("latent_sampling_logvar_min", -20.0)),
             latent_sampling_logvar_max=float(big_cfg.get("latent_sampling_logvar_max", 10.0)),
@@ -319,6 +324,14 @@ def _set_model_latent_sampling_gate(model: torch.nn.Module, gate: float) -> None
         setter(float(gate))
 
 
+def _compute_model_latent_kl(model: torch.nn.Module, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    target = _unwrap_model_for_state_io(model)
+    latent_kl = getattr(target, "latent_kl_loss", None)
+    if callable(latent_kl):
+        return latent_kl(mu, logvar)
+    return WeightQuantileVAE.kl_loss(mu, logvar)
+
+
 def _resolve_amp(cfg: DictConfig, device: torch.device) -> tuple[bool, torch.dtype | None]:
     return runtime_resolve_amp(cfg, device, section="train")
 
@@ -401,6 +414,15 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         "train.offline_batch_prefetch.pin_memory": bool(offline_batch_prefetch_cfg.get("pin_memory", True)),
         "model.patch_size": int(model_cfg.get("patch_size", 16)),
         "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
+        "model.big_vae.use_encoder_mu_head": bool(big_cfg.get("use_encoder_mu_head", False)),
+        "model.big_vae.latent_prior_kind": str(big_cfg.get("latent_prior_kind", "gaussian")),
+        "model.big_vae.vamp_prior_K": int(big_cfg.get("vamp_prior_K", 64)),
+        "model.big_vae.decoder_query_conditioning_kind": str(
+            big_cfg.get("decoder_query_conditioning_kind", "linear")
+        ),
+        "model.big_vae.decoder_query_conditioning_hidden_mult": float(
+            big_cfg.get("decoder_query_conditioning_hidden_mult", 2.0)
+        ),
         "model.big_vae.latent_sampling_min_std": float(big_cfg.get("latent_sampling_min_std", 1e-4)),
         "model.big_vae.latent_sampling_logvar_min": float(big_cfg.get("latent_sampling_logvar_min", -20.0)),
         "model.big_vae.latent_sampling_logvar_max": float(big_cfg.get("latent_sampling_logvar_max", 10.0)),
@@ -694,6 +716,7 @@ def _grad_stat_group_prefixes() -> dict[str, tuple[str, ...]]:
             "enc_dist_to_latent_heads.",
             "encoder_conditioning_adapters.",
             "latent_base",
+            "vamp_prior_base",
             "latent_norm.",
             "to_mu.",
             "to_logvar.",
@@ -2657,8 +2680,25 @@ def _model_uses_latent_sampling(model: torch.nn.Module) -> bool:
     return bool(getattr(big_vae_cfg, "use_latent_sampling", False))
 
 
+def _model_uses_encoder_mu_head(model: torch.nn.Module) -> bool:
+    cfg = getattr(model, "cfg", None)
+    big_vae_cfg = getattr(cfg, "big_vae", None)
+    return bool(getattr(big_vae_cfg, "use_encoder_mu_head", False))
+
+
 def _is_vae_posterior_head_key(key: str) -> bool:
     return any(str(key).startswith(prefix) for prefix in _VAE_POSTERIOR_HEAD_PREFIXES)
+
+
+def _is_allowed_optional_latent_head_key(*, model: torch.nn.Module, key: str) -> bool:
+    key_str = str(key)
+    if key_str.startswith("to_mu."):
+        return _model_uses_latent_sampling(model) or _model_uses_encoder_mu_head(model)
+    if key_str.startswith("to_logvar."):
+        return _model_uses_latent_sampling(model)
+    if key_str.startswith("vamp_prior_base"):
+        return True
+    return False
 
 
 def _load_model_state_allowing_vae_head_migration(
@@ -2676,32 +2716,38 @@ def _load_model_state_allowing_vae_head_migration(
         target.load_state_dict(state_dict, strict=True)
         return False
 
-    allowed_missing = sorted(key for key in missing_keys if _is_vae_posterior_head_key(key))
-    should_migrate_ae_to_vae = (
-        _model_uses_latent_sampling(target)
-        and bool(allowed_missing)
-        and allowed_missing == missing_keys
-        and not unexpected_keys
+    allowed_missing = sorted(key for key in missing_keys if _is_allowed_optional_latent_head_key(model=target, key=key))
+    allowed_unexpected = sorted(
+        key for key in unexpected_keys if _is_allowed_optional_latent_head_key(model=target, key=key)
     )
-    if not should_migrate_ae_to_vae:
+    should_allow_latent_head_migration = (
+        bool(allowed_missing or allowed_unexpected)
+        and allowed_missing == missing_keys
+        and allowed_unexpected == unexpected_keys
+    )
+    if not should_allow_latent_head_migration:
         target.load_state_dict(state_dict, strict=True)
         return False
 
     incompatible = target.load_state_dict(state_dict, strict=False)
     unexpected_after_load = list(getattr(incompatible, "unexpected_keys", []))
     missing_after_load = sorted(getattr(incompatible, "missing_keys", []))
-    disallowed_missing = [key for key in missing_after_load if not _is_vae_posterior_head_key(key)]
-    if unexpected_after_load or disallowed_missing:
+    disallowed_missing = [key for key in missing_after_load if not _is_allowed_optional_latent_head_key(model=target, key=key)]
+    disallowed_unexpected = [
+        key for key in unexpected_after_load if not _is_allowed_optional_latent_head_key(model=target, key=key)
+    ]
+    if disallowed_unexpected or disallowed_missing:
         raise RuntimeError(
-            "Unexpected checkpoint incompatibility while migrating AE checkpoint to VAE heads: "
+            "Unexpected checkpoint incompatibility while migrating optional latent heads: "
             f"source={source} missing={missing_after_load} unexpected={unexpected_after_load}"
         )
 
     logger.warning(
-        "Loaded AE checkpoint into use_latent_sampling=true BigVAE; initialized missing posterior heads "
-        "from current model init. source=%s missing_head_keys=%s",
+        "Loaded BigVAE checkpoint with optional latent-head migration. "
+        "source=%s missing_head_keys=%s dropped_head_keys=%s",
         source,
         missing_after_load,
+        unexpected_after_load,
     )
     return True
 
@@ -3210,6 +3256,7 @@ def _run_worker(
             if not hasattr(cfg_holder, "cfg"):
                 raise AttributeError(f"Model does not expose cfg: type={type(model_unwrapped)}")
             use_latent_sampling = bool(cfg_holder.cfg.big_vae.use_latent_sampling)
+            latent_prior_kind = str(getattr(cfg_holder.cfg.big_vae, "latent_prior_kind", "gaussian"))
             latent_sampling_gate_cfg = cfg.train.get("latent_sampling_gate", {})
             if latent_sampling_gate_cfg is None:
                 latent_sampling_gate_cfg = {}
@@ -3490,10 +3537,11 @@ def _run_worker(
                         )
                 if kl_schedule_enabled:
                     logger.info(
-                        "BigVAE latent mode: %s (use_latent_sampling=%s, kl_beta_target=%s, "
+                        "BigVAE latent mode: %s (use_latent_sampling=%s, prior=%s, kl_beta_target=%s, "
                         "kl_schedule=start@%.6f warmup=%s ramp=%s)",
                         "VAE" if use_latent_sampling else "AE",
                         use_latent_sampling,
+                        latent_prior_kind,
                         kl_beta,
                         kl_schedule_start_beta,
                         kl_schedule_warmup_steps,
@@ -3501,9 +3549,10 @@ def _run_worker(
                     )
                 else:
                     logger.info(
-                        "BigVAE latent mode: %s (use_latent_sampling=%s, kl_beta=%s)",
+                        "BigVAE latent mode: %s (use_latent_sampling=%s, prior=%s, kl_beta=%s)",
                         "VAE" if use_latent_sampling else "AE",
                         use_latent_sampling,
+                        latent_prior_kind,
                         kl_beta,
                     )
                 if use_latent_sampling:
@@ -4245,7 +4294,7 @@ def _run_worker(
                                 d_out_mask=d_out_mask_s,
                             )
                             if use_latent_sampling:
-                                kl_loss = WeightQuantileVAE.kl_loss(mu, logvar)
+                                kl_loss = _compute_model_latent_kl(model, mu, logvar)
                             else:
                                 kl_loss = mu.new_zeros(())
                             total_loss = mu.new_zeros(())

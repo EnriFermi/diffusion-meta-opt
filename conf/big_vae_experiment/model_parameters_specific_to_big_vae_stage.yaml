@@ -7,6 +7,17 @@ big_vae:
   num_latents: 32
   # true -> VAE (sampling + KL), false -> AE (deterministic z, KL term forced to 0 in train loop)
   use_latent_sampling: true
+  # When true, keep a deterministic encoder mu-head active even if use_latent_sampling=false.
+  use_encoder_mu_head: false
+  # gaussian -> standard Normal prior
+  # vamp -> VampPrior-style learned mixture prior in latent space
+  latent_prior_kind: gaussian
+  # Number of pseudo-components for latent_prior_kind=vamp.
+  vamp_prior_K: 64
+  # linear -> current single linear projection for decoder query conditioning
+  # mlp -> decoder-only MLP over [positional_query_base, dist_patch_by_patch]
+  decoder_query_conditioning_kind: linear
+  decoder_query_conditioning_hidden_mult: 2.0
   # Posterior std is gate * exp(0.5 * logvar_head(...)); this floor keeps KL finite at gate ~= 0.
   latent_sampling_min_std: 1e-4
   latent_sampling_logvar_min: -20.0

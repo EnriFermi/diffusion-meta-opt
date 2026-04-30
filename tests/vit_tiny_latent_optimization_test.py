@@ -211,6 +211,117 @@ def test_bigvae_latent_encoded_init_can_optimize_only_latent_slots() -> None:
     assert frozen_decoder_grad_sum == 0.0
 
 
+def test_bigvae_encoder_mu_head_can_run_without_latent_sampling() -> None:
+    big_vae = BigWeightVAE(
+        ModelConfig(
+            patch_size=8,
+            distribution=DistributionConfig(k_s=4, Kq=4, d_var=16, d_dist=16, use_covariance=False),
+            mini_vae=MiniVAEConfig(z_dim=8, d_e=16, num_attn_layers_encoder=1, num_layers_decoder=1, n_heads=2, d_patch=8),
+            big_vae=BigVAEConfig(
+                d_model=24,
+                d_lat=12,
+                num_latents=2,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                n_heads=3,
+                ffn_mult=2.0,
+                pos_fourier_dim=12,
+                use_latent_sampling=False,
+                use_encoder_mu_head=True,
+                disable_distribution_encoder=True,
+                disable_z_shortcut=True,
+                encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
+            ),
+        )
+    )
+
+    assert big_vae.to_mu is not None
+    assert big_vae.to_logvar is None
+
+    with torch.no_grad():
+        big_vae.to_mu.weight.mul_(2.0)
+
+    base_z = torch.randn(3, big_vae.z_dim)
+    decoder_z, mu, logvar = big_vae._sample_latent_posterior(base_z)
+
+    assert torch.allclose(decoder_z, mu)
+    assert torch.allclose(logvar, torch.zeros_like(base_z))
+    assert not torch.allclose(decoder_z, base_z)
+
+
+def test_bigvae_vamp_prior_kl_is_finite() -> None:
+    big_vae = BigWeightVAE(
+        ModelConfig(
+            patch_size=8,
+            distribution=DistributionConfig(k_s=4, Kq=4, d_var=16, d_dist=16, use_covariance=False),
+            mini_vae=MiniVAEConfig(z_dim=8, d_e=16, num_attn_layers_encoder=1, num_layers_decoder=1, n_heads=2, d_patch=8),
+            big_vae=BigVAEConfig(
+                d_model=24,
+                d_lat=12,
+                num_latents=2,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                n_heads=3,
+                ffn_mult=2.0,
+                pos_fourier_dim=12,
+                use_latent_sampling=True,
+                latent_prior_kind="vamp",
+                vamp_prior_K=5,
+                disable_distribution_encoder=True,
+                disable_z_shortcut=True,
+                encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
+            ),
+        )
+    )
+
+    assert big_vae.vamp_prior_base is not None
+    assert tuple(big_vae.vamp_prior_base.shape) == (5, 2, 12)
+
+    mu = torch.randn(4, big_vae.z_dim)
+    logvar = torch.randn(4, big_vae.z_dim).clamp(-2.0, 2.0)
+    kl = big_vae.latent_kl_loss(mu, logvar)
+
+    assert kl.ndim == 0
+    assert torch.isfinite(kl)
+
+
+def test_bigvae_decoder_query_conditioning_mlp_runs() -> None:
+    big_vae = BigWeightVAE(
+        ModelConfig(
+            patch_size=8,
+            distribution=DistributionConfig(k_s=4, Kq=4, d_var=16, d_dist=16, use_covariance=False),
+            mini_vae=MiniVAEConfig(z_dim=8, d_e=16, num_attn_layers_encoder=1, num_layers_decoder=1, n_heads=2, d_patch=8),
+            big_vae=BigVAEConfig(
+                d_model=24,
+                d_lat=12,
+                num_latents=2,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                n_heads=3,
+                ffn_mult=2.0,
+                pos_fourier_dim=12,
+                use_latent_sampling=False,
+                disable_distribution_encoder=False,
+                decoder_query_conditioning_kind="mlp",
+                decoder_query_conditioning_hidden_mult=1.5,
+                disable_z_shortcut=True,
+                encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
+            ),
+        )
+    )
+
+    assert isinstance(big_vae.query_proj, torch.nn.Sequential)
+
+    W = torch.randn(16, 5)
+    X = torch.randn(7, 16)
+    W_hat, mu, logvar, pred_dirs = big_vae(W, X)
+
+    assert W_hat.shape == W.shape
+    assert mu.shape == (big_vae.z_dim,)
+    assert logvar.shape == (big_vae.z_dim,)
+    assert pred_dirs.ndim == 3
+
+
 def test_bigvae_latent_decoder_z_space_can_run_without_diffusion_prior_model() -> None:
     cfg = _small_vit_cfg()
     initial = make_initial_tensors(cfg, seed=303)

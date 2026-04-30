@@ -196,8 +196,25 @@ def _model_uses_latent_sampling(model: torch.nn.Module) -> bool:
     return bool(getattr(big_vae_cfg, "use_latent_sampling", False))
 
 
+def _model_uses_encoder_mu_head(model: torch.nn.Module) -> bool:
+    cfg = getattr(model, "cfg", None)
+    big_vae_cfg = getattr(cfg, "big_vae", None)
+    return bool(getattr(big_vae_cfg, "use_encoder_mu_head", False))
+
+
 def _is_vae_posterior_head_key(key: str) -> bool:
     return any(str(key).startswith(prefix) for prefix in _VAE_POSTERIOR_HEAD_PREFIXES)
+
+
+def _is_allowed_optional_latent_head_key(*, model: torch.nn.Module, key: str) -> bool:
+    key_str = str(key)
+    if key_str.startswith("to_mu."):
+        return _model_uses_latent_sampling(model) or _model_uses_encoder_mu_head(model)
+    if key_str.startswith("to_logvar."):
+        return _model_uses_latent_sampling(model)
+    if key_str.startswith("vamp_prior_base"):
+        return True
+    return False
 
 
 def _load_model_state_allowing_vae_head_migration(
@@ -214,32 +231,38 @@ def _load_model_state_allowing_vae_head_migration(
         target.load_state_dict(state_dict, strict=True)
         return False
 
-    allowed_missing = sorted(key for key in missing_keys if _is_vae_posterior_head_key(key))
-    should_migrate_ae_to_vae = (
-        _model_uses_latent_sampling(target)
-        and bool(allowed_missing)
-        and allowed_missing == missing_keys
-        and not unexpected_keys
+    allowed_missing = sorted(key for key in missing_keys if _is_allowed_optional_latent_head_key(model=target, key=key))
+    allowed_unexpected = sorted(
+        key for key in unexpected_keys if _is_allowed_optional_latent_head_key(model=target, key=key)
     )
-    if not should_migrate_ae_to_vae:
+    should_allow_latent_head_migration = (
+        bool(allowed_missing or allowed_unexpected)
+        and allowed_missing == missing_keys
+        and allowed_unexpected == unexpected_keys
+    )
+    if not should_allow_latent_head_migration:
         target.load_state_dict(state_dict, strict=True)
         return False
 
     incompatible = target.load_state_dict(state_dict, strict=False)
     unexpected_after_load = list(getattr(incompatible, "unexpected_keys", []))
     missing_after_load = sorted(getattr(incompatible, "missing_keys", []))
-    disallowed_missing = [key for key in missing_after_load if not _is_vae_posterior_head_key(key)]
-    if unexpected_after_load or disallowed_missing:
+    disallowed_missing = [key for key in missing_after_load if not _is_allowed_optional_latent_head_key(model=target, key=key)]
+    disallowed_unexpected = [
+        key for key in unexpected_after_load if not _is_allowed_optional_latent_head_key(model=target, key=key)
+    ]
+    if disallowed_unexpected or disallowed_missing:
         raise RuntimeError(
-            "Unexpected checkpoint incompatibility while migrating AE checkpoint to VAE heads: "
+            "Unexpected checkpoint incompatibility while migrating optional latent heads: "
             f"source={source} missing={missing_after_load} unexpected={unexpected_after_load}"
         )
 
     LOGGER.warning(
-        "Loaded AE checkpoint into use_latent_sampling=true BigVAE; initialized missing posterior heads "
-        "from current model init. source=%s missing_head_keys=%s",
+        "Loaded BigVAE checkpoint with optional latent-head migration. "
+        "source=%s missing_head_keys=%s dropped_head_keys=%s",
         source,
         missing_after_load,
+        unexpected_after_load,
     )
     return True
 
@@ -300,6 +323,11 @@ def build_big_vae_model_cfg(raw_cfg: Mapping[str, Any]) -> ModelConfig:
             dropout=float(big_cfg.get("dropout", 0.0)),
             pos_fourier_dim=int(big_cfg.get("pos_fourier_dim", 64)),
             use_latent_sampling=bool(big_cfg.get("use_latent_sampling", True)),
+            use_encoder_mu_head=bool(big_cfg.get("use_encoder_mu_head", False)),
+            latent_prior_kind=str(big_cfg.get("latent_prior_kind", "gaussian")),
+            vamp_prior_K=int(big_cfg.get("vamp_prior_K", 64)),
+            decoder_query_conditioning_kind=str(big_cfg.get("decoder_query_conditioning_kind", "linear")),
+            decoder_query_conditioning_hidden_mult=float(big_cfg.get("decoder_query_conditioning_hidden_mult", 2.0)),
             latent_sampling_min_std=float(big_cfg.get("latent_sampling_min_std", 1e-4)),
             latent_sampling_logvar_min=float(big_cfg.get("latent_sampling_logvar_min", -20.0)),
             latent_sampling_logvar_max=float(big_cfg.get("latent_sampling_logvar_max", 10.0)),
