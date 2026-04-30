@@ -217,6 +217,7 @@ def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
             vamp_prior_K=int(big_cfg.get("vamp_prior_K", 64)),
             decoder_query_conditioning_kind=str(big_cfg.get("decoder_query_conditioning_kind", "linear")),
             decoder_query_conditioning_hidden_mult=float(big_cfg.get("decoder_query_conditioning_hidden_mult", 2.0)),
+            rope_2d_coord_kind=str(big_cfg.get("rope_2d_coord_kind", "normalized_center")),
             latent_sampling_min_std=float(big_cfg.get("latent_sampling_min_std", 1e-4)),
             latent_sampling_logvar_min=float(big_cfg.get("latent_sampling_logvar_min", -20.0)),
             latent_sampling_logvar_max=float(big_cfg.get("latent_sampling_logvar_max", 10.0)),
@@ -423,6 +424,7 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         "model.big_vae.decoder_query_conditioning_hidden_mult": float(
             big_cfg.get("decoder_query_conditioning_hidden_mult", 2.0)
         ),
+        "model.big_vae.rope_2d_coord_kind": str(big_cfg.get("rope_2d_coord_kind", "normalized_center")),
         "model.big_vae.latent_sampling_min_std": float(big_cfg.get("latent_sampling_min_std", 1e-4)),
         "model.big_vae.latent_sampling_logvar_min": float(big_cfg.get("latent_sampling_logvar_min", -20.0)),
         "model.big_vae.latent_sampling_logvar_max": float(big_cfg.get("latent_sampling_logvar_max", 10.0)),

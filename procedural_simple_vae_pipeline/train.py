@@ -472,6 +472,7 @@ def _build_model_cfg(cfg: dict[str, Any]) -> ModelConfig:
             vamp_prior_K=int(big_cfg.get("vamp_prior_K", 64)),
             decoder_query_conditioning_kind=str(big_cfg.get("decoder_query_conditioning_kind", "linear")),
             decoder_query_conditioning_hidden_mult=float(big_cfg.get("decoder_query_conditioning_hidden_mult", 2.0)),
+            rope_2d_coord_kind=str(big_cfg.get("rope_2d_coord_kind", "normalized_center")),
             disable_z_shortcut=bool(big_cfg.get("disable_z_shortcut", False)),
             disable_distribution_encoder=bool(big_cfg.get("disable_distribution_encoder", False)),
             latent_bottleneck_kind=str(big_cfg.get("latent_bottleneck_kind", "ttm")),

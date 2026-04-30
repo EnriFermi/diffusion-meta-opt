@@ -4,7 +4,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.big_weight_vae import LocalOutputSelfAttentionBlock, ModelConfig
+from models.big_weight_vae import (
+    LocalOutputSelfAttentionBlock,
+    ModelConfig,
+    _make_rope_axis_positions,
+    _make_rope_positions,
+    _normalize_rope_2d_coord_kind,
+)
 from models.distribution_encoder import InputDistributionEncodingModule
 from models.vae_shared import (
     CrossAttnBlock,
@@ -319,6 +325,9 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         self.cfg = cfg
+        self.rope_2d_coord_kind = _normalize_rope_2d_coord_kind(
+            getattr(cfg.big_vae, "rope_2d_coord_kind", "normalized_center")
+        )
 
         p = int(cfg.patch_size)
         d_model = int(cfg.big_vae.d_model)
@@ -741,13 +750,23 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             else:
                 if self.latent_resampler_layers is None:
                     raise RuntimeError("perceiver bottleneck modules are not initialized")
+                rope_token_pos_o = _make_rope_positions(
+                    token_pos_o,
+                    axis_size=d_out,
+                    coord_kind=self.rope_2d_coord_kind,
+                )
+                rope_token_pos_t = _make_rope_positions(
+                    token_pos_t,
+                    axis_size=T,
+                    coord_kind=self.rope_2d_coord_kind,
+                )
                 for bottleneck_layer in self.latent_resampler_layers:
                     latents = bottleneck_layer(
                         latents=latents,
                         tokens=patch_flat,
                         latent_pos=latent_pos,
-                        token_pos=token_pos_o,
-                        token_pos2=token_pos_t,
+                        token_pos=rope_token_pos_o,
+                        token_pos2=rope_token_pos_t,
                     )
 
         z = self.latent_norm(latents.reshape(B, self.flat_lat_dim))
@@ -792,8 +811,16 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             q_inputs = q_base_expanded
         q_tokens = self.query_proj(q_inputs).reshape(B, d_out * T, d_model)
         q_pos_emb_flat = q_pos_emb.reshape(1, d_out * T, d_model).expand(B, -1, -1)
-        q_pos_o = o_grid.flatten().to(dtype=torch.float32)
-        q_pos_t = t_grid.flatten().to(dtype=torch.float32)
+        q_pos_o = _make_rope_positions(
+            o_grid.flatten(),
+            axis_size=d_out,
+            coord_kind=self.rope_2d_coord_kind,
+        )
+        q_pos_t = _make_rope_positions(
+            t_grid.flatten(),
+            axis_size=T,
+            coord_kind=self.rope_2d_coord_kind,
+        )
         return q_tokens, q_pos_emb_flat, q_pos_o, q_pos_t
 
     def _apply_debug_query_hint(
@@ -840,7 +867,11 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
         if kv_source == "latents":
             if decoder_latents is None:
                 raise ValueError("decoder_latents are required when debug_decoder_kv_source='latents'")
-            kv_pos = torch.arange(decoder_latents.shape[1], device=decoder_latents.device, dtype=torch.float32)
+            kv_pos = _make_rope_axis_positions(
+                int(decoder_latents.shape[1]),
+                device=decoder_latents.device,
+                coord_kind=self.rope_2d_coord_kind,
+            )
             return decoder_latents, kv_pos, kv_pos, kv_source
 
         encoder_patch_flat, kv_pos_o, kv_pos_t = self._flatten_encoder_patch_tokens(
@@ -848,7 +879,20 @@ class ProceduralSimpleBigWeightVAE(nn.Module):
             d_out=d_out,
             T=T,
         )
-        return encoder_patch_flat, kv_pos_o, kv_pos_t, kv_source
+        return (
+            encoder_patch_flat,
+            _make_rope_positions(
+                kv_pos_o,
+                axis_size=d_out,
+                coord_kind=self.rope_2d_coord_kind,
+            ),
+            _make_rope_positions(
+                kv_pos_t,
+                axis_size=T,
+                coord_kind=self.rope_2d_coord_kind,
+            ),
+            kv_source,
+        )
 
     def _decode_query_tokens_to_output(
         self,

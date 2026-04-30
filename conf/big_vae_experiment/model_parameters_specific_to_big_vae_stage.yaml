@@ -18,6 +18,9 @@ big_vae:
   # mlp -> decoder-only MLP over [positional_query_base, dist_patch_by_patch]
   decoder_query_conditioning_kind: linear
   decoder_query_conditioning_hidden_mult: 2.0
+  # raw -> legacy unnormalized integer coordinates for 2D RoPE
+  # normalized_center -> centered coordinates (i + 0.5) / size for better size stability
+  rope_2d_coord_kind: normalized_center
   # Posterior std is gate * exp(0.5 * logvar_head(...)); this floor keeps KL finite at gate ~= 0.
   latent_sampling_min_std: 1e-4
   latent_sampling_logvar_min: -20.0

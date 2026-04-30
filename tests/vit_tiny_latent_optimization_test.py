@@ -322,6 +322,84 @@ def test_bigvae_decoder_query_conditioning_mlp_runs() -> None:
     assert pred_dirs.ndim == 3
 
 
+def test_bigvae_rope_2d_coord_kind_switches_between_normalized_and_raw() -> None:
+    def _build_model(coord_kind: str) -> BigWeightVAE:
+        return BigWeightVAE(
+            ModelConfig(
+                patch_size=8,
+                distribution=DistributionConfig(k_s=4, Kq=4, d_var=16, d_dist=16, use_covariance=False),
+                mini_vae=MiniVAEConfig(z_dim=8, d_e=16, num_attn_layers_encoder=1, num_layers_decoder=1, n_heads=2, d_patch=8),
+                big_vae=BigVAEConfig(
+                    d_model=24,
+                    d_lat=12,
+                    num_latents=4,
+                    num_encoder_layers=1,
+                    num_decoder_layers=1,
+                    n_heads=3,
+                    ffn_mult=2.0,
+                    pos_fourier_dim=12,
+                    use_latent_sampling=False,
+                    disable_distribution_encoder=True,
+                    rope_2d_coord_kind=coord_kind,
+                    disable_z_shortcut=True,
+                    encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
+                ),
+            )
+        )
+
+    normalized = _build_model("normalized_center")
+    raw = _build_model("raw")
+
+    _, _, q_pos_o_norm, q_pos_t_norm = normalized._build_decoder_query_state(
+        batch_size=2,
+        dist_patch_by_patch=None,
+        d_out=3,
+        T=2,
+    )
+    _, _, q_pos_o_raw, q_pos_t_raw = raw._build_decoder_query_state(
+        batch_size=2,
+        dist_patch_by_patch=None,
+        d_out=3,
+        T=2,
+    )
+
+    expected_o_norm = torch.tensor([1.0 / 6.0, 1.0 / 6.0, 0.5, 0.5, 5.0 / 6.0, 5.0 / 6.0], dtype=torch.float32)
+    expected_t_norm = torch.tensor([0.25, 0.75, 0.25, 0.75, 0.25, 0.75], dtype=torch.float32)
+    expected_o_raw = torch.tensor([0.0, 0.0, 1.0, 1.0, 2.0, 2.0], dtype=torch.float32)
+    expected_t_raw = torch.tensor([0.0, 1.0, 0.0, 1.0, 0.0, 1.0], dtype=torch.float32)
+
+    assert torch.allclose(q_pos_o_norm, expected_o_norm)
+    assert torch.allclose(q_pos_t_norm, expected_t_norm)
+    assert torch.allclose(q_pos_o_raw, expected_o_raw)
+    assert torch.allclose(q_pos_t_raw, expected_t_raw)
+
+    lat = torch.zeros(2, 4, int(normalized.cfg.big_vae.d_model))
+    kv_norm, kv_pos1_norm, kv_pos2_norm, _ = normalized._build_decoder_kv_state(
+        lat=lat,
+        encoder_patch_tokens=None,
+        patch_mask=torch.ones(2, 2, dtype=torch.bool),
+        d_out_mask=torch.ones(2, 3, dtype=torch.bool),
+        d_out=3,
+        T=2,
+        debug_decoder_kv_source="latents",
+    )
+    kv_raw, kv_pos1_raw, kv_pos2_raw, _ = raw._build_decoder_kv_state(
+        lat=lat,
+        encoder_patch_tokens=None,
+        patch_mask=torch.ones(2, 2, dtype=torch.bool),
+        d_out_mask=torch.ones(2, 3, dtype=torch.bool),
+        d_out=3,
+        T=2,
+        debug_decoder_kv_source="latents",
+    )
+
+    assert tuple(kv_norm.shape) == tuple(kv_raw.shape)
+    assert torch.allclose(kv_pos1_norm, torch.tensor([0.125, 0.375, 0.625, 0.875], dtype=torch.float32))
+    assert torch.allclose(kv_pos2_norm, kv_pos1_norm)
+    assert torch.allclose(kv_pos1_raw, torch.tensor([0.0, 1.0, 2.0, 3.0], dtype=torch.float32))
+    assert torch.allclose(kv_pos2_raw, kv_pos1_raw)
+
+
 def test_bigvae_latent_decoder_z_space_can_run_without_diffusion_prior_model() -> None:
     cfg = _small_vit_cfg()
     initial = make_initial_tensors(cfg, seed=303)
