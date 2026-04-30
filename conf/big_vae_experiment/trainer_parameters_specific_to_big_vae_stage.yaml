@@ -165,6 +165,10 @@ offline_batch_prefetch:
   enabled: true
   queue_size: 8
   pin_memory: true
+  # 0 -> auto min(16, available_cpu_cores) for CPU-side data assembly ops.
+  cpu_threads: 0
+  # 0 -> auto min(16, requested_source_samples_per_refresh) candidates per refill.
+  refill_fetch_batch_size: 0
 resume_checkpoint: ""
 
 forensics:

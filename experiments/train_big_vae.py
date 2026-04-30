@@ -413,6 +413,10 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         "train.offline_batch_prefetch.enabled": bool(offline_batch_prefetch_cfg.get("enabled", True)),
         "train.offline_batch_prefetch.queue_size": int(offline_batch_prefetch_cfg.get("queue_size", 2)),
         "train.offline_batch_prefetch.pin_memory": bool(offline_batch_prefetch_cfg.get("pin_memory", True)),
+        "train.offline_batch_prefetch.cpu_threads": int(offline_batch_prefetch_cfg.get("cpu_threads", 0)),
+        "train.offline_batch_prefetch.refill_fetch_batch_size": int(
+            offline_batch_prefetch_cfg.get("refill_fetch_batch_size", 0)
+        ),
         "model.patch_size": int(model_cfg.get("patch_size", 16)),
         "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
         "model.big_vae.use_encoder_mu_head": bool(big_cfg.get("use_encoder_mu_head", False)),
@@ -1948,6 +1952,41 @@ def _pad_d_out_with_mask(
     return torch.cat([W, W_pad], dim=2), d_out_mask
 
 
+def _materialize_padded_slice_batch(
+    raw_slices: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    target_x_rows: int,
+    target_d_in: int,
+    target_d_out: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not raw_slices:
+        raise ValueError("raw_slices must not be empty")
+    batch_size = int(len(raw_slices))
+    first_W, first_x = raw_slices[0]
+    W_batch = first_W.new_zeros((batch_size, int(target_d_in), int(target_d_out)))
+    x_batch = first_x.new_zeros((batch_size, int(target_x_rows), int(target_d_in)))
+    x_mask_batch = torch.zeros((batch_size, int(target_x_rows)), device=first_x.device, dtype=torch.bool)
+    d_in_mask_batch = torch.zeros((batch_size, int(target_d_in)), device=first_W.device, dtype=torch.bool)
+    d_out_mask_batch = torch.zeros((batch_size, int(target_d_out)), device=first_W.device, dtype=torch.bool)
+
+    for batch_idx, (W_i, x_i) in enumerate(raw_slices):
+        x_rows = int(x_i.shape[0])
+        d_in_i, d_out_i = map(int, W_i.shape)
+        if x_rows > int(target_x_rows):
+            raise ValueError(f"target_x_rows ({target_x_rows}) must be >= current_rows ({x_rows})")
+        if d_in_i > int(target_d_in):
+            raise ValueError(f"target_d_in ({target_d_in}) must be >= current_d_in ({d_in_i})")
+        if d_out_i > int(target_d_out):
+            raise ValueError(f"target_d_out ({target_d_out}) must be >= current_d_out ({d_out_i})")
+        W_batch[batch_idx, :d_in_i, :d_out_i] = W_i
+        x_batch[batch_idx, :x_rows, :d_in_i] = x_i
+        x_mask_batch[batch_idx, :x_rows] = True
+        d_in_mask_batch[batch_idx, :d_in_i] = True
+        d_out_mask_batch[batch_idx, :d_out_i] = True
+
+    return W_batch, x_batch, x_mask_batch, d_in_mask_batch, d_out_mask_batch
+
+
 def _build_without_replacement_index_groups(
     *,
     num_items: int,
@@ -2286,11 +2325,6 @@ def _build_training_batch_from_source_states(
     )
 
     raw_slices: list[tuple[torch.Tensor, torch.Tensor]] = []
-    ordered_W: list[torch.Tensor] = []
-    ordered_x: list[torch.Tensor] = []
-    ordered_x_mask: list[torch.Tensor] = []
-    ordered_d_in_mask: list[torch.Tensor] = []
-    ordered_d_out_mask: list[torch.Tensor] = []
     used_source_indices: list[int] = []
     cursor = int(start_offset) % len(source_states)
     stagnant_scans = 0
@@ -2329,22 +2363,19 @@ def _build_training_batch_from_source_states(
         max_d_in = int(target_d_in)
     if target_d_out is not None:
         max_d_out = int(target_d_out)
-    for W_i, x_i in raw_slices:
-        x_i, x_mask_i = _pad_x_rows_with_mask(x_i, max_x_rows)
-        x_i, W_i, d_in_mask_i = _pad_d_in_with_mask(x_i, W_i, max_d_in)
-        W_i, d_out_mask_i = _pad_d_out_with_mask(W_i, max_d_out)
-        ordered_W.append(W_i.unsqueeze(0))
-        ordered_x.append(x_i.unsqueeze(0))
-        ordered_x_mask.append(x_mask_i.unsqueeze(0))
-        ordered_d_in_mask.append(d_in_mask_i.unsqueeze(0))
-        ordered_d_out_mask.append(d_out_mask_i.unsqueeze(0))
+    W_batch, x_batch, x_mask_batch, d_in_mask_batch, d_out_mask_batch = _materialize_padded_slice_batch(
+        raw_slices,
+        target_x_rows=max_x_rows,
+        target_d_in=max_d_in,
+        target_d_out=max_d_out,
+    )
 
     return ConsumedSourceBatch(
-        W=torch.cat(ordered_W, dim=0),
-        x=torch.cat(ordered_x, dim=0),
-        x_mask=torch.cat(ordered_x_mask, dim=0),
-        d_in_mask=torch.cat(ordered_d_in_mask, dim=0),
-        d_out_mask=torch.cat(ordered_d_out_mask, dim=0),
+        W=W_batch,
+        x=x_batch,
+        x_mask=x_mask_batch,
+        d_in_mask=d_in_mask_batch,
+        d_out_mask=d_out_mask_batch,
         used_source_indices=tuple(used_source_indices),
         next_start_offset=int(cursor),
         source_pool_size=int(len(source_states)),
@@ -2418,33 +2449,36 @@ def _build_training_batch_from_source_samples(
         max_batch_d_out = int(target_d_out)
 
     source_offsets = [0] * len(normalized_sources)
-    ordered_W: list[torch.Tensor] = []
-    ordered_x: list[torch.Tensor] = []
-    ordered_x_mask: list[torch.Tensor] = []
-    ordered_d_in_mask: list[torch.Tensor] = []
-    ordered_d_out_mask: list[torch.Tensor] = []
-    for source_idx in assignment:
+    first_batch = next(iter(source_batches.values()), None)
+    if first_batch is None:
+        raise RuntimeError("source_batches must not be empty")
+    first_W_batch, first_x_batch, _first_x_mask_batch = first_batch
+    W_batch = first_W_batch.new_zeros((int(batch_size), int(max_d_in), int(max_batch_d_out)))
+    x_batch = first_x_batch.new_zeros((int(batch_size), int(max_x_rows), int(max_d_in)))
+    x_mask_batch = torch.zeros((int(batch_size), int(max_x_rows)), device=first_x_batch.device, dtype=torch.bool)
+    d_in_mask_batch = torch.zeros((int(batch_size), int(max_d_in)), device=first_W_batch.device, dtype=torch.bool)
+    d_out_mask_batch = torch.zeros((int(batch_size), int(max_batch_d_out)), device=first_W_batch.device, dtype=torch.bool)
+    for batch_idx, source_idx in enumerate(assignment):
         W_part, x_part, x_mask_part = source_batches[source_idx]
         cursor = source_offsets[source_idx]
-        x_i, W_i, d_in_mask_i = _pad_d_in_with_mask(
-            x_part[cursor: cursor + 1],
-            W_part[cursor: cursor + 1],
-            max_d_in,
-        )
-        W_i, d_out_mask_i = _pad_d_out_with_mask(W_i, max_batch_d_out)
-        ordered_W.append(W_i)
-        ordered_x.append(x_i)
-        ordered_x_mask.append(x_mask_part[cursor: cursor + 1])
-        ordered_d_in_mask.append(d_in_mask_i)
-        ordered_d_out_mask.append(d_out_mask_i)
         source_offsets[source_idx] += 1
+        W_i = W_part[cursor]
+        x_i = x_part[cursor]
+        x_mask_i = x_mask_part[cursor]
+        d_in_i = int(W_i.shape[0])
+        d_out_i = int(W_i.shape[1])
+        W_batch[batch_idx, :d_in_i, :d_out_i] = W_i
+        x_batch[batch_idx, :, :d_in_i] = x_i
+        x_mask_batch[batch_idx] = x_mask_i
+        d_in_mask_batch[batch_idx, :d_in_i] = True
+        d_out_mask_batch[batch_idx, :d_out_i] = True
 
     return (
-        torch.cat(ordered_W, dim=0),
-        torch.cat(ordered_x, dim=0),
-        torch.cat(ordered_x_mask, dim=0),
-        torch.cat(ordered_d_in_mask, dim=0),
-        torch.cat(ordered_d_out_mask, dim=0),
+        W_batch,
+        x_batch,
+        x_mask_batch,
+        d_in_mask_batch,
+        d_out_mask_batch,
     )
 
 
@@ -2463,6 +2497,7 @@ def _ensure_source_state_pool_capacity(
     uniqueness: str,
     deferred_samples: deque[SourceSampleRecord] | None,
     max_deferred_samples: int,
+    refill_fetch_batch_size: int,
     min_d_in: int,
     min_d_out: int,
     max_T_patches: int,
@@ -2492,24 +2527,31 @@ def _ensure_source_state_pool_capacity(
 
         existing_uniqueness_keys = _source_states_uniqueness_keys(source_states, uniqueness=uniqueness)
         if synthetic_layer_enabled:
+            room = max(1, int(max_active_source_pool_size) - len(source_states))
+            effective_fetch_batch_size = max(1, min(int(refill_fetch_batch_size), room))
+            fetched_records = []
             next_source_idx = len(source_states)
-            x_syn, W_syn = _sample_synthetic_layer(
-                device=torch.device("cpu"),
-                n_rows=synthetic_n_rows,
-                d_in=synthetic_d_in,
-                d_out=synthetic_d_out,
-                x_std=synthetic_x_std,
-                w_std=synthetic_w_std,
-                max_x_rows=max_x_rows,
-            )
-            fetched_records = [
-                SourceSampleRecord(
-                    x=x_syn,
-                    W=W_syn,
-                    model_name=f"synthetic_{next_source_idx}",
+            for sample_offset in range(effective_fetch_batch_size):
+                x_syn, W_syn = _sample_synthetic_layer(
+                    device=torch.device("cpu"),
+                    n_rows=synthetic_n_rows,
+                    d_in=synthetic_d_in,
+                    d_out=synthetic_d_out,
+                    x_std=synthetic_x_std,
+                    w_std=synthetic_w_std,
+                    max_x_rows=max_x_rows,
                 )
-            ]
+                fetched_records.append(
+                    SourceSampleRecord(
+                        x=x_syn,
+                        W=W_syn,
+                        model_name=f"synthetic_{next_source_idx + sample_offset}",
+                    )
+                )
         else:
+            room = max(1, int(max_active_source_pool_size) - len(source_states))
+            target_gap = max(1, int(target_source_pool_size) - len(source_states))
+            effective_fetch_batch_size = max(1, min(int(refill_fetch_batch_size), room, target_gap))
             fetched_records = _fetch_source_samples(
                 rank=rank,
                 device=device,
@@ -2517,7 +2559,7 @@ def _ensure_source_state_pool_capacity(
                 use_broadcast=use_broadcast,
                 max_x_rows=max_x_rows,
                 logger=logger,
-                num_samples=1,
+                num_samples=effective_fetch_batch_size,
                 uniqueness=uniqueness,
                 deferred_samples=deferred_samples,
                 max_deferred_samples=max_deferred_samples,
@@ -2595,25 +2637,34 @@ def _slice_sample(
     if not need_row_slice and not need_col_slice:
         return W.unsqueeze(0).expand(batch_size, -1, -1), x.unsqueeze(0).expand(batch_size, -1, -1)
 
-    offsets = torch.arange(patch_size, device=dev) if need_row_slice else None
-    W_slices = []
-    x_slices = []
-    for _ in range(batch_size):
-        W_i = W
-        x_i = x
-        if need_row_slice:
-            patch_idx = torch.randperm(T_total, device=dev)[:T_use].sort().values
-            row_idx = (patch_idx.unsqueeze(1) * patch_size + offsets.unsqueeze(0)).flatten()
-            row_idx = row_idx.clamp(max=d_in - 1)
-            W_i = W_i[row_idx, :]
-            x_i = x_i[:, row_idx]
-        if need_col_slice:
-            col_idx = torch.randperm(d_out, device=dev)[:d_out_use].sort().values
-            W_i = W_i[:, col_idx]
-        W_slices.append(W_i)
-        x_slices.append(x_i)
+    n_rows = int(x.shape[0])
+    if need_row_slice:
+        offsets = torch.arange(patch_size, device=dev, dtype=torch.long)
+        row_scores = torch.rand((int(batch_size), int(T_total)), device=dev, dtype=torch.float32)
+        patch_idx = row_scores.topk(k=int(T_use), dim=1, largest=False).indices.sort(dim=1).values
+        row_idx = (patch_idx.unsqueeze(-1) * int(patch_size) + offsets.view(1, 1, -1)).reshape(int(batch_size), -1)
+        row_idx = row_idx.clamp(max=int(d_in) - 1)
+        W_batch = W.unsqueeze(0).expand(int(batch_size), -1, -1).gather(
+            1,
+            row_idx.unsqueeze(-1).expand(-1, -1, int(d_out)),
+        )
+        x_batch = x.unsqueeze(0).expand(int(batch_size), -1, -1).gather(
+            2,
+            row_idx.unsqueeze(1).expand(-1, n_rows, -1),
+        )
+    else:
+        W_batch = W.unsqueeze(0).expand(int(batch_size), -1, -1)
+        x_batch = x.unsqueeze(0).expand(int(batch_size), -1, -1)
 
-    return torch.stack(W_slices), torch.stack(x_slices)
+    if need_col_slice:
+        col_scores = torch.rand((int(batch_size), int(d_out)), device=dev, dtype=torch.float32)
+        col_idx = col_scores.topk(k=int(d_out_use), dim=1, largest=False).indices.sort(dim=1).values
+        W_batch = W_batch.gather(
+            2,
+            col_idx.unsqueeze(1).expand(-1, int(W_batch.shape[1]), -1),
+        )
+
+    return W_batch, x_batch
 def _tensor_debug_stats(tensor: torch.Tensor | None) -> dict[str, Any]:
     if tensor is None:
         return {"is_none": True}
@@ -3420,6 +3471,18 @@ def _run_worker(
             offline_batch_prefetch_requested = bool(offline_batch_prefetch_cfg.get("enabled", True))
             offline_batch_prefetch_queue_size = max(1, int(offline_batch_prefetch_cfg.get("queue_size", 2)))
             offline_batch_prefetch_pin_memory = bool(offline_batch_prefetch_cfg.get("pin_memory", True))
+            raw_offline_batch_prefetch_cpu_threads = int(offline_batch_prefetch_cfg.get("cpu_threads", 0))
+            offline_batch_prefetch_cpu_threads = (
+                max(1, min(16, int(os.cpu_count() or 1)))
+                if raw_offline_batch_prefetch_cpu_threads <= 0
+                else max(1, raw_offline_batch_prefetch_cpu_threads)
+            )
+            raw_refill_fetch_batch_size = int(offline_batch_prefetch_cfg.get("refill_fetch_batch_size", 0))
+            offline_batch_prefetch_refill_fetch_batch_size = (
+                max(1, min(16, int(requested_source_samples_per_refresh)))
+                if raw_refill_fetch_batch_size <= 0
+                else max(1, raw_refill_fetch_batch_size)
+            )
             offline_batch_prefetch_reasons: list[str] = []
             if not offline_batch_prefetch_requested:
                 offline_batch_prefetch_reasons.append("disabled_by_config")
@@ -3432,12 +3495,16 @@ def _run_worker(
             if use_broadcast:
                 offline_batch_prefetch_reasons.append("distributed_broadcast_mode")
             offline_batch_prefetch_active = len(offline_batch_prefetch_reasons) == 0
+            if offline_batch_prefetch_active:
+                torch.set_num_threads(offline_batch_prefetch_cpu_threads)
             if rank == 0:
                 if offline_batch_prefetch_active:
                     logger.info(
-                        "Offline batch prefetch enabled: queue_size=%s pin_memory=%s",
+                        "Offline batch prefetch enabled: queue_size=%s pin_memory=%s cpu_threads=%s refill_fetch_batch_size=%s",
                         offline_batch_prefetch_queue_size,
                         offline_batch_prefetch_pin_memory,
+                        offline_batch_prefetch_cpu_threads,
+                        offline_batch_prefetch_refill_fetch_batch_size,
                     )
                 else:
                     logger.info(
@@ -3690,6 +3757,7 @@ def _run_worker(
                         uniqueness=batch_source_mixing_uniqueness if batch_source_mixing_active else "none",
                         deferred_samples=deferred_source_samples,
                         max_deferred_samples=deferred_source_cache_size,
+                        refill_fetch_batch_size=offline_batch_prefetch_refill_fetch_batch_size,
                         min_d_in=min_mixed_source_d_in,
                         min_d_out=min_mixed_source_d_out,
                         max_T_patches=curriculum_max_T,
@@ -3952,6 +4020,7 @@ def _run_worker(
                                 uniqueness=batch_source_mixing_uniqueness if batch_source_mixing_active else "none",
                                 deferred_samples=deferred_source_samples,
                                 max_deferred_samples=deferred_source_cache_size,
+                                refill_fetch_batch_size=offline_batch_prefetch_refill_fetch_batch_size,
                                 min_d_in=min_mixed_source_d_in,
                                 min_d_out=min_mixed_source_d_out,
                                 max_T_patches=curriculum_max_T,
@@ -4017,6 +4086,7 @@ def _run_worker(
                                         uniqueness=batch_source_mixing_uniqueness,
                                         deferred_samples=deferred_source_samples,
                                         max_deferred_samples=deferred_source_cache_size,
+                                        refill_fetch_batch_size=offline_batch_prefetch_refill_fetch_batch_size,
                                         min_d_in=min_mixed_source_d_in,
                                         min_d_out=min_mixed_source_d_out,
                                     )
@@ -4096,6 +4166,7 @@ def _run_worker(
                                     uniqueness=batch_source_mixing_uniqueness if batch_source_mixing_active else "none",
                                     deferred_samples=deferred_source_samples,
                                     max_deferred_samples=deferred_source_cache_size,
+                                    refill_fetch_batch_size=offline_batch_prefetch_refill_fetch_batch_size,
                                     min_d_in=min_mixed_source_d_in,
                                     min_d_out=min_mixed_source_d_out,
                                     max_T_patches=curriculum_max_T,
