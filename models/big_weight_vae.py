@@ -284,10 +284,12 @@ class LatentEncoderLayer(nn.Module):
         dropout: float,
         self_attn_mode: str,
         use_rope_2d: bool = False,
+        rope_2d_coord_kind: str = "normalized_center",
     ) -> None:
         super().__init__()
         if d_lat % n_heads != 0:
             raise ValueError(f"d_lat ({d_lat}) must be divisible by n_heads ({n_heads})")
+        self.rope_2d_coord_kind = _normalize_rope_2d_coord_kind(rope_2d_coord_kind)
 
         self.local_block = LocalOutputSelfAttentionBlock(
             d_model=d_model,
@@ -343,13 +345,29 @@ class LatentEncoderLayer(nn.Module):
         device = tokens.device
         if cross_attend_only_cls:
             kv = tokens[:, :, 0, :]
-            token_pos_o = torch.arange(d_out, device=device, dtype=torch.float32)
-            token_pos_t = torch.zeros(d_out, device=device, dtype=torch.float32)
+            token_pos_o = _make_rope_axis_positions(
+                d_out,
+                device=device,
+                coord_kind=self.rope_2d_coord_kind,
+            )
+            token_pos_t = _make_rope_positions(
+                torch.zeros(d_out, device=device, dtype=torch.float32),
+                axis_size=L_local,
+                coord_kind=self.rope_2d_coord_kind,
+            )
             kv_mask = output_valid_mask
         else:
             kv = tokens.reshape(B, d_out * L_local, d_model)
-            token_pos_o = torch.arange(d_out, device=device, dtype=torch.float32).repeat_interleave(L_local)
-            token_pos_t = torch.arange(L_local, device=device, dtype=torch.float32).repeat(d_out)
+            token_pos_o = _make_rope_positions(
+                torch.arange(d_out, device=device, dtype=torch.float32).repeat_interleave(L_local),
+                axis_size=d_out,
+                coord_kind=self.rope_2d_coord_kind,
+            )
+            token_pos_t = _make_rope_positions(
+                torch.arange(L_local, device=device, dtype=torch.float32).repeat(d_out),
+                axis_size=L_local,
+                coord_kind=self.rope_2d_coord_kind,
+            )
             kv_mask = None if token_valid_mask is None else token_valid_mask.reshape(B, d_out * L_local)
             if kv_mask is not None and output_valid_mask is not None:
                 kv_mask = kv_mask & output_valid_mask.unsqueeze(-1).expand(-1, -1, L_local).reshape(B, d_out * L_local)
@@ -494,6 +512,7 @@ class BigWeightVAE(nn.Module):
                     dropout=dropout,
                     self_attn_mode=cfg.big_vae.encoder.self_attn_mode,
                     use_rope_2d=True,
+                    rope_2d_coord_kind=getattr(cfg.big_vae, "rope_2d_coord_kind", "normalized_center"),
                 )
                 for _ in range(num_enc_layers)
             ]
@@ -540,6 +559,9 @@ class BigWeightVAE(nn.Module):
         self.latent_prior_kind = self._normalize_latent_prior_kind(cfg.big_vae.latent_prior_kind)
         self.decoder_query_conditioning_kind = self._normalize_decoder_query_conditioning_kind(
             cfg.big_vae.decoder_query_conditioning_kind
+        )
+        self.rope_2d_coord_kind = _normalize_rope_2d_coord_kind(
+            getattr(cfg.big_vae, "rope_2d_coord_kind", "normalized_center")
         )
         if self.latent_prior_kind == "vamp" and bool(cfg.big_vae.use_latent_sampling):
             vamp_prior_K = max(1, int(cfg.big_vae.vamp_prior_K))
@@ -1461,8 +1483,16 @@ class BigWeightVAE(nn.Module):
             q_inputs = q_base_expanded
         q_tokens = self.query_proj(q_inputs).reshape(B, d_out * T, d_model)
         q_pos_emb_flat = q_pos_emb.reshape(1, d_out * T, d_model).expand(B, -1, -1)
-        q_pos_o = o_grid.flatten().to(dtype=torch.float32)
-        q_pos_t = t_grid.flatten().to(dtype=torch.float32)
+        q_pos_o = _make_rope_positions(
+            o_grid.flatten(),
+            axis_size=d_out,
+            coord_kind=self.rope_2d_coord_kind,
+        )
+        q_pos_t = _make_rope_positions(
+            t_grid.flatten(),
+            axis_size=T,
+            coord_kind=self.rope_2d_coord_kind,
+        )
         return q_tokens, q_pos_emb_flat, q_pos_o, q_pos_t
 
     def _apply_debug_query_hint(
@@ -1512,7 +1542,11 @@ class BigWeightVAE(nn.Module):
         kv_source = self._normalize_debug_decoder_kv_source(debug_decoder_kv_source)
         if kv_source == "latents":
             kv = lat
-            kv_pos = torch.arange(lat.shape[1], device=lat.device, dtype=torch.float32)
+            kv_pos = _make_rope_axis_positions(
+                int(lat.shape[1]),
+                device=lat.device,
+                coord_kind=self.rope_2d_coord_kind,
+            )
             return kv, kv_pos, kv_pos, None
 
         if encoder_patch_tokens is None:
@@ -1537,7 +1571,20 @@ class BigWeightVAE(nn.Module):
             encoder_patch_tokens.shape[0],
             d_out * T,
         )
-        return kv, o_grid.flatten().to(dtype=torch.float32), t_grid.flatten().to(dtype=torch.float32), kv_mask
+        return (
+            kv,
+            _make_rope_positions(
+                o_grid.flatten(),
+                axis_size=d_out,
+                coord_kind=self.rope_2d_coord_kind,
+            ),
+            _make_rope_positions(
+                t_grid.flatten(),
+                axis_size=T,
+                coord_kind=self.rope_2d_coord_kind,
+            ),
+            kv_mask,
+        )
 
     def _decode_query_tokens_to_output(
         self,
