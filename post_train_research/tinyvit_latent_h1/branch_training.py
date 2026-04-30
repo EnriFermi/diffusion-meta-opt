@@ -176,6 +176,9 @@ def train_anchor_source(
     final_train = float(start_train.loss)
     final_test_loss = float(start_test.loss)
     final_test_acc = float(start_test.accuracy)
+    last_train_loss = float(start_train.loss)
+    last_test_loss = float(start_test.loss)
+    last_test_acc = float(start_test.accuracy)
     for step_idx, batch_indices in enumerate(train_schedule, start=1):
         model.train()
         images, labels = fetch_batch(train_dataset, batch_indices, device=device)
@@ -205,6 +208,9 @@ def train_anchor_source(
             final_train = float(train_metrics.loss)
             final_test_loss = float(test_metrics.loss)
             final_test_acc = float(test_metrics.accuracy)
+            last_train_loss = final_train
+            last_test_loss = final_test_loss
+            last_test_acc = final_test_acc
             if (float(train_metrics.loss), -float(test_metrics.accuracy)) < (best_train, -best_test_acc):
                 best_train = float(train_metrics.loss)
                 best_train_acc = float(train_metrics.accuracy)
@@ -241,14 +247,15 @@ def train_anchor_source(
                 metrics["anchor.test_accuracy"] = float(test_acc_value)
             comet.log_metrics(metrics, step=int(step_idx))
             logger.info(
-                "Anchor step=%s batch_loss=%.6f train_loss=%s test_loss=%s test_acc=%s best_train=%.6f best_test_acc=%.4f",
+                "Anchor step=%s batch_loss=%.6f train_loss=%.6f test_loss=%.6f test_acc=%.4f best_train=%.6f best_test_acc=%.4f%s",
                 int(step_idx),
                 float(loss.detach().cpu().item()),
-                f"{float(train_loss_value):.6f}" if train_loss_value is not None else "na",
-                f"{float(test_loss_value):.6f}" if test_loss_value is not None else "na",
-                f"{float(test_acc_value):.4f}" if test_acc_value is not None else "na",
+                float(last_train_loss),
+                float(last_test_loss),
+                float(last_test_acc),
                 float(best_train),
                 float(best_test_acc),
+                " [eval]" if should_eval else "",
             )
         if step_idx % int(cfg.train.eval_every_steps) == 0 or step_idx == int(cfg.source.anchor_steps):
             _save_anchor_checkpoint(
@@ -345,6 +352,9 @@ def run_branch_for_lr(
     final_train = float(start_train.loss)
     final_test_loss = float(start_test.loss)
     final_test_acc = float(start_test.accuracy)
+    last_train_loss = float(start_train.loss)
+    last_test_loss = float(start_test.loss)
+    last_test_acc = float(start_test.accuracy)
     steps_to_recover = 0 if float(start_train.loss) <= float(source.z_star_train_metrics.loss + cfg.train.recover_eps) else -1
     curve_rows: list[dict[str, Any]] = [
         {
@@ -400,6 +410,9 @@ def run_branch_for_lr(
             final_train = float(train_metrics.loss)
             final_test_loss = float(test_metrics.loss)
             final_test_acc = float(test_metrics.accuracy)
+            last_train_loss = final_train
+            last_test_loss = final_test_loss
+            last_test_acc = final_test_acc
             if float(train_metrics.loss) < best_train:
                 best_train = float(train_metrics.loss)
                 best_test_loss = float(test_metrics.loss)
@@ -437,15 +450,16 @@ def run_branch_for_lr(
                 metrics[f"{prefix}.test_accuracy"] = float(test_acc_value)
             comet.log_metrics(metrics, step=int(step_idx))
             logger.info(
-                "Branch %s step=%s batch_loss=%.6f train_loss=%s test_loss=%s test_acc=%s best_train=%.6f best_test_acc=%.4f",
+                "Branch %s step=%s batch_loss=%.6f train_loss=%.6f test_loss=%.6f test_acc=%.4f best_train=%.6f best_test_acc=%.4f%s",
                 label,
                 int(step_idx),
                 float(loss.detach().cpu().item()),
-                f"{float(train_loss_value):.6f}" if train_loss_value is not None else "na",
-                f"{float(test_loss_value):.6f}" if test_loss_value is not None else "na",
-                f"{float(test_acc_value):.4f}" if test_acc_value is not None else "na",
+                float(last_train_loss),
+                float(last_test_loss),
+                float(last_test_acc),
                 float(best_train),
                 float(best_test_acc),
+                " [eval]" if should_eval else "",
             )
     final_state = branch_checkpoint_payload(
         model,

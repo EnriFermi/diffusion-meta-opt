@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import torch
@@ -54,6 +55,12 @@ class BigVAEConfig:
     dropout: float = 0.0
     pos_fourier_dim: int = 64
     use_latent_sampling: bool = True
+    use_encoder_mu_head: bool = False
+    latent_prior_kind: str = "gaussian"
+    vamp_prior_K: int = 64
+    decoder_query_conditioning_kind: str = "linear"
+    decoder_query_conditioning_hidden_mult: float = 2.0
+    rope_2d_coord_kind: str = "normalized_center"
     latent_sampling_min_std: float = 1e-4
     latent_sampling_logvar_min: float = -20.0
     latent_sampling_logvar_max: float = 10.0
@@ -79,6 +86,31 @@ class ModelConfig:
     big_vae: BigVAEConfig = field(default_factory=BigVAEConfig)
     beta: float = 1e-3
     variant: str = "full"
+
+
+def _normalize_rope_2d_coord_kind(kind: str) -> str:
+    value = str(kind).strip().lower()
+    if value in {"raw", "legacy"}:
+        return "raw"
+    if value in {"normalized_center", "normalized", "centered"}:
+        return "normalized_center"
+    raise ValueError(
+        "big_vae.rope_2d_coord_kind must be one of "
+        "'raw', 'normalized_center', "
+        f"got {kind!r}"
+    )
+
+
+def _make_rope_positions(indices: torch.Tensor, *, axis_size: int, coord_kind: str) -> torch.Tensor:
+    pos = indices.to(dtype=torch.float32)
+    if _normalize_rope_2d_coord_kind(coord_kind) == "normalized_center":
+        return (pos + 0.5) / max(float(axis_size), 1.0)
+    return pos
+
+
+def _make_rope_axis_positions(length: int, *, device: torch.device, coord_kind: str) -> torch.Tensor:
+    base = torch.arange(int(length), device=device, dtype=torch.float32)
+    return _make_rope_positions(base, axis_size=int(length), coord_kind=coord_kind)
 
 
 class LocalOutputSelfAttentionBlock(nn.Module):
@@ -505,10 +537,21 @@ class BigWeightVAE(nn.Module):
         self.latent_base = nn.Parameter(torch.randn(num_latents, d_lat) * 0.02)
         self.z_dim = self.flat_lat_dim
         self.latent_norm = nn.LayerNorm(self.flat_lat_dim)
+        self.latent_prior_kind = self._normalize_latent_prior_kind(cfg.big_vae.latent_prior_kind)
+        self.decoder_query_conditioning_kind = self._normalize_decoder_query_conditioning_kind(
+            cfg.big_vae.decoder_query_conditioning_kind
+        )
+        if self.latent_prior_kind == "vamp" and bool(cfg.big_vae.use_latent_sampling):
+            vamp_prior_K = max(1, int(cfg.big_vae.vamp_prior_K))
+            self.vamp_prior_base: nn.Parameter | None = nn.Parameter(torch.randn(vamp_prior_K, num_latents, d_lat) * 0.02)
+        else:
+            self.vamp_prior_base = None
         self.register_buffer("latent_sampling_gate", torch.tensor(1.0, dtype=torch.float32), persistent=False)
-        if bool(cfg.big_vae.use_latent_sampling):
+        if bool(cfg.big_vae.use_latent_sampling) or bool(cfg.big_vae.use_encoder_mu_head):
             self.to_mu: nn.Linear | None = nn.Linear(d_lat, d_lat)
-            self.to_logvar: nn.Linear | None = nn.Linear(d_lat, d_lat)
+            self.to_logvar: nn.Linear | None = (
+                nn.Linear(d_lat, d_lat) if bool(cfg.big_vae.use_latent_sampling) else None
+            )
             self._init_latent_sampling_heads()
         else:
             self.to_mu = None
@@ -517,7 +560,18 @@ class BigWeightVAE(nn.Module):
         self.dec_L_latents = num_latents
         self.latent_to_decoder = nn.Linear(d_lat, d_model)
         self.pos_proj = nn.Linear(2 * cfg.big_vae.pos_fourier_dim, d_model)
-        self.query_proj = nn.Linear(query_in_dim, d_model)
+        if self.decoder_query_conditioning_kind == "mlp":
+            query_hidden = max(
+                int(d_model),
+                int(round(float(cfg.big_vae.decoder_query_conditioning_hidden_mult) * float(d_model))),
+            )
+            self.query_proj = nn.Sequential(
+                nn.Linear(query_in_dim, query_hidden),
+                nn.GELU(),
+                nn.Linear(query_hidden, d_model),
+            )
+        else:
+            self.query_proj = nn.Linear(query_in_dim, d_model)
         self.query_pos_proj = nn.Linear(d_model, d_model)
         self.decoder_layers = nn.ModuleList(
             [CrossAttnBlock(d_model=d_model, n_heads=n_heads, dropout=dropout, use_rope_2d=True) for _ in range(num_dec_layers)]
@@ -552,13 +606,14 @@ class BigWeightVAE(nn.Module):
             self.z_shortcut.requires_grad_(False)
 
     def _init_latent_sampling_heads(self) -> None:
-        if self.to_mu is None or self.to_logvar is None:
+        if self.to_mu is None:
             return
         with torch.no_grad():
             nn.init.eye_(self.to_mu.weight)
             self.to_mu.bias.zero_()
-            self.to_logvar.weight.zero_()
-            self.to_logvar.bias.zero_()
+            if self.to_logvar is not None:
+                self.to_logvar.weight.zero_()
+                self.to_logvar.bias.zero_()
 
     def set_latent_sampling_gate(self, gate: float) -> None:
         gate_value = max(0.0, min(1.0, float(gate)))
@@ -592,28 +647,113 @@ class BigWeightVAE(nn.Module):
         return value
 
     @staticmethod
+    def _normalize_latent_prior_kind(kind: str) -> str:
+        value = str(kind).strip().lower()
+        if value not in {"gaussian", "vamp"}:
+            raise ValueError(
+                "big_vae.latent_prior_kind must be one of "
+                "'gaussian', 'vamp', "
+                f"got {kind!r}"
+            )
+        return value
+
+    @staticmethod
+    def _normalize_decoder_query_conditioning_kind(kind: str) -> str:
+        value = str(kind).strip().lower()
+        if value not in {"linear", "mlp"}:
+            raise ValueError(
+                "big_vae.decoder_query_conditioning_kind must be one of "
+                "'linear', 'mlp', "
+                f"got {kind!r}"
+            )
+        return value
+
+    @staticmethod
     def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         mu_f = mu.to(dtype=torch.float32)
         logvar_f = logvar.to(dtype=torch.float32).clamp(-30.0, 20.0)
         kl = 0.5 * torch.sum(torch.exp(logvar_f) + mu_f.pow(2) - 1.0 - logvar_f, dim=-1)
         return kl.mean()
 
+    @staticmethod
+    def _diag_gaussian_log_prob(z: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        z_f = z.to(dtype=torch.float32)
+        mu_f = mu.to(dtype=torch.float32)
+        logvar_f = logvar.to(dtype=torch.float32).clamp(-30.0, 20.0)
+        inv_var = torch.exp(-logvar_f)
+        return -0.5 * (
+            math.log(2.0 * math.pi)
+            + logvar_f
+            + (z_f - mu_f).pow(2) * inv_var
+        ).sum(dim=-1)
+
+    def _vamp_prior_params(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.vamp_prior_base is None:
+            raise RuntimeError("Vamp prior is not initialized for this model")
+        if self.to_mu is None or self.to_logvar is None:
+            raise RuntimeError("Vamp prior requires both to_mu and to_logvar heads")
+
+        K = int(self.vamp_prior_base.shape[0])
+        base_z = self.latent_norm(self.vamp_prior_base.reshape(K, self.flat_lat_dim))
+        base_slots = base_z.view(K, int(self.cfg.big_vae.num_latents), int(self.cfg.big_vae.d_lat))
+        mu_slots = self.to_mu(base_slots)
+        logvar_min = float(self.cfg.big_vae.latent_sampling_logvar_min)
+        logvar_max = float(self.cfg.big_vae.latent_sampling_logvar_max)
+        logvar_slots = self.to_logvar(base_slots).clamp(logvar_min, logvar_max)
+        return mu_slots.reshape(K, self.z_dim), logvar_slots.reshape(K, self.z_dim)
+
+    def latent_kl_loss(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        if not bool(self.cfg.big_vae.use_latent_sampling):
+            return mu.new_zeros(())
+        if self.latent_prior_kind == "gaussian":
+            return self.kl_loss(mu, logvar)
+        if self.latent_prior_kind != "vamp":
+            raise RuntimeError(f"Unsupported latent prior kind: {self.latent_prior_kind!r}")
+
+        mu_f = mu.to(dtype=torch.float32)
+        logvar_f = logvar.to(dtype=torch.float32).clamp(-30.0, 20.0)
+        if self.training:
+            std_f = torch.exp(0.5 * logvar_f)
+            z_sample = mu_f + torch.randn_like(std_f) * std_f
+        else:
+            z_sample = mu_f
+
+        log_q = self._diag_gaussian_log_prob(z_sample, mu_f, logvar_f)
+        prior_mu, prior_logvar = self._vamp_prior_params()
+        prior_mu = prior_mu.to(device=z_sample.device, dtype=z_sample.dtype)
+        prior_logvar = prior_logvar.to(device=z_sample.device, dtype=z_sample.dtype)
+        component_log_probs = self._diag_gaussian_log_prob(
+            z_sample.unsqueeze(1),
+            prior_mu.unsqueeze(0),
+            prior_logvar.unsqueeze(0),
+        )
+        log_p = torch.logsumexp(component_log_probs, dim=1) - math.log(float(prior_mu.shape[0]))
+        return (log_q - log_p).mean()
+
     def _sample_latent_posterior(self, base_z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if base_z.ndim != 2 or int(base_z.shape[1]) != self.z_dim:
             raise ValueError(f"base_z must be [B, {self.z_dim}], got {tuple(base_z.shape)}")
 
         B = int(base_z.shape[0])
-        if not bool(self.cfg.big_vae.use_latent_sampling):
-            return base_z, base_z, base_z.new_zeros(B, self.z_dim)
-        if self.to_mu is None or self.to_logvar is None:
-            raise RuntimeError("Latent sampling is enabled, but posterior heads are not initialized")
-
         num_latents = int(self.cfg.big_vae.num_latents)
         d_lat = int(self.cfg.big_vae.d_lat)
         base_slots = base_z.view(B, num_latents, d_lat)
         gate = self._latent_sampling_gate_tensor(base_z)
+        use_latent_sampling = bool(self.cfg.big_vae.use_latent_sampling)
+        use_encoder_mu_head = bool(self.cfg.big_vae.use_encoder_mu_head)
 
-        mu_slots = (1.0 - gate) * base_slots + gate * self.to_mu(base_slots)
+        if use_latent_sampling or use_encoder_mu_head:
+            if self.to_mu is None:
+                raise RuntimeError("Encoder mu head is enabled, but to_mu is not initialized")
+            mu_slots = (1.0 - gate) * base_slots + gate * self.to_mu(base_slots)
+        else:
+            mu_slots = base_slots
+
+        if not use_latent_sampling:
+            mu_z = mu_slots.reshape(B, self.z_dim)
+            return mu_z, mu_z, base_z.new_zeros(B, self.z_dim)
+        if self.to_logvar is None:
+            raise RuntimeError("Latent sampling is enabled, but to_logvar is not initialized")
 
         logvar_min = float(self.cfg.big_vae.latent_sampling_logvar_min)
         logvar_max = float(self.cfg.big_vae.latent_sampling_logvar_max)

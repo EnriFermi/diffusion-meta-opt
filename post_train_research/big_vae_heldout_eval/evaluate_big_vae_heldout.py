@@ -53,6 +53,13 @@ LOGGER = logging.getLogger("evaluate_big_vae_heldout")
 _LATENT_DUMP_BALANCE_KEY_DEFAULT = "dataset,model,layer_type,depth_label"
 
 
+def _compute_model_latent_kl(model: torch.nn.Module, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    latent_kl = getattr(model, "latent_kl_loss", None)
+    if callable(latent_kl):
+        return latent_kl(mu, logvar)
+    return WeightQuantileVAE.kl_loss(mu, logvar)
+
+
 def _load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn.Module, DictConfig, dict[str, Any]]:
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
@@ -199,7 +206,7 @@ def _compute_loss_metrics(
             + coeffs["struct_lambda_rec"] * struct_rec
             + coeffs["struct_lambda_rel"] * struct_rel
         )
-        kl_loss = WeightQuantileVAE.kl_loss(mu, logvar) if use_latent_sampling else behavioral_operator.new_zeros(())
+        kl_loss = _compute_model_latent_kl(model, mu, logvar) if use_latent_sampling else behavioral_operator.new_zeros(())
         total_loss = (
             coeffs["behavioral_coef"] * behavioral_loss
             + coeffs["structural_coef"] * structural_loss
