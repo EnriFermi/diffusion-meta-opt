@@ -133,8 +133,8 @@ offline_dataset:
   runtime_enforce_stage_compatibility: true
   # Optional DataLoader worker pool for the offline IterableDataset. 0 keeps the
   # legacy single-process iterator path. Positive values enable multi-process IO.
-  loader_workers: 0
-  loader_prefetch_factor: 2
+  loader_workers: 20
+  loader_prefetch_factor: 8
   loader_persistent_workers: true
   # When distributed, true -> each rank consumes its own chunk shard.
   # false -> only rank0 reads the offline dataset and other ranks receive tensors via broadcast.
@@ -172,10 +172,10 @@ offline_dataset:
     log_every_seen_samples: 1000
 offline_batch_prefetch:
   enabled: true
-  queue_size: 8
+  queue_size: 16
   pin_memory: true
   # 0 -> auto min(16, available_cpu_cores) for CPU-side data assembly ops.
-  cpu_threads: 16
+  cpu_threads: 6
   # 0 -> auto min(16, requested_source_samples_per_refresh) candidates per refill.
   refill_fetch_batch_size: 8
 resume_checkpoint: ""
