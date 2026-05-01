@@ -1,10 +1,10 @@
-patch_size: 16
+patch_size: 4
 beta: 0.001
 
 big_vae:
-  d_model: 128
-  d_lat: 128
-  num_latents: 32
+  d_model: 16
+  d_lat: 16
+  num_latents: 4
   # true -> VAE (sampling + KL), false -> AE (deterministic z, KL term forced to 0 in train loop)
   use_latent_sampling: true
   # When true, keep a deterministic encoder mu-head active even if use_latent_sampling=false.
@@ -25,9 +25,9 @@ big_vae:
   latent_sampling_min_std: 1e-4
   latent_sampling_logvar_min: -2
   latent_sampling_logvar_max: 2
-  num_encoder_layers: 15
+  num_encoder_layers: 6
   num_decoder_layers: 6
-  n_heads: 8
+  n_heads: 1
   ffn_mult: 4.0
   dropout: 0.0
   pos_fourier_dim: 256
