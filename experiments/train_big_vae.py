@@ -73,7 +73,9 @@ def _patch_argparse_lazy_help_for_hydra_py314() -> None:
     """Hydra 1.3 passes a lazy help object; Python 3.14 argparse now validates help as a string."""
     if getattr(argparse.ArgumentParser, "_hydra_lazy_help_py314_patch", False):
         return
-    original_check_help = argparse.ArgumentParser._check_help
+    original_check_help = getattr(argparse.ArgumentParser, "_check_help", None)
+    if original_check_help is None:
+        return
 
     def patched_check_help(self: argparse.ArgumentParser, action: argparse.Action) -> None:
         if action.help is not None and not isinstance(action.help, str):
