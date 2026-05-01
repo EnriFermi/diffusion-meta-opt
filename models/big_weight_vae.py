@@ -56,6 +56,7 @@ class BigVAEConfig:
     pos_fourier_dim: int = 64
     use_latent_sampling: bool = True
     use_encoder_mu_head: bool = False
+    normalize_latent_slots_before_mu: bool = True
     latent_prior_kind: str = "gaussian"
     vamp_prior_K: int = 64
     decoder_query_conditioning_kind: str = "linear"
@@ -709,6 +710,14 @@ class BigWeightVAE(nn.Module):
             + (z_f - mu_f).pow(2) * inv_var
         ).sum(dim=-1)
 
+    def _mu_head_input_z(self, latent_slots: torch.Tensor) -> torch.Tensor:
+        if latent_slots.ndim != 3:
+            raise ValueError(f"latent_slots must be [B, num_latents, d_lat], got {tuple(latent_slots.shape)}")
+        flat = latent_slots.reshape(int(latent_slots.shape[0]), self.flat_lat_dim)
+        if bool(self.cfg.big_vae.normalize_latent_slots_before_mu):
+            return self.latent_norm(flat)
+        return flat
+
     def _vamp_prior_params(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.vamp_prior_base is None:
             raise RuntimeError("Vamp prior is not initialized for this model")
@@ -716,12 +725,12 @@ class BigWeightVAE(nn.Module):
             raise RuntimeError("Vamp prior requires both to_mu and to_logvar heads")
 
         K = int(self.vamp_prior_base.shape[0])
-        base_z = self.latent_norm(self.vamp_prior_base.reshape(K, self.flat_lat_dim))
-        base_slots = base_z.view(K, int(self.cfg.big_vae.num_latents), int(self.cfg.big_vae.d_lat))
-        mu_slots = self.to_mu(base_slots)
+        mu_input_z = self._mu_head_input_z(self.vamp_prior_base)
+        mu_input_slots = mu_input_z.view(K, int(self.cfg.big_vae.num_latents), int(self.cfg.big_vae.d_lat))
+        mu_slots = self.to_mu(mu_input_slots)
         logvar_min = float(self.cfg.big_vae.latent_sampling_logvar_min)
         logvar_max = float(self.cfg.big_vae.latent_sampling_logvar_max)
-        logvar_slots = self.to_logvar(base_slots).clamp(logvar_min, logvar_max)
+        logvar_slots = self.to_logvar(mu_input_slots).clamp(logvar_min, logvar_max)
         return mu_slots.reshape(K, self.z_dim), logvar_slots.reshape(K, self.z_dim)
 
     def latent_kl_loss(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -752,14 +761,24 @@ class BigWeightVAE(nn.Module):
         log_p = torch.logsumexp(component_log_probs, dim=1) - math.log(float(prior_mu.shape[0]))
         return (log_q - log_p).mean()
 
-    def _sample_latent_posterior(self, base_z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _sample_latent_posterior(
+        self,
+        base_z: torch.Tensor,
+        *,
+        mu_input_z: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if base_z.ndim != 2 or int(base_z.shape[1]) != self.z_dim:
             raise ValueError(f"base_z must be [B, {self.z_dim}], got {tuple(base_z.shape)}")
+        if mu_input_z is None:
+            mu_input_z = base_z
+        if mu_input_z.ndim != 2 or tuple(mu_input_z.shape) != tuple(base_z.shape):
+            raise ValueError(f"mu_input_z must match base_z shape {tuple(base_z.shape)}, got {tuple(mu_input_z.shape)}")
 
         B = int(base_z.shape[0])
         num_latents = int(self.cfg.big_vae.num_latents)
         d_lat = int(self.cfg.big_vae.d_lat)
         base_slots = base_z.view(B, num_latents, d_lat)
+        mu_input_slots = mu_input_z.view(B, num_latents, d_lat)
         gate = self._latent_sampling_gate_tensor(base_z)
         use_latent_sampling = bool(self.cfg.big_vae.use_latent_sampling)
         use_encoder_mu_head = bool(self.cfg.big_vae.use_encoder_mu_head)
@@ -767,7 +786,7 @@ class BigWeightVAE(nn.Module):
         if use_latent_sampling or use_encoder_mu_head:
             if self.to_mu is None:
                 raise RuntimeError("Encoder mu head is enabled, but to_mu is not initialized")
-            mu_slots = (1.0 - gate) * base_slots + gate * self.to_mu(base_slots)
+            mu_slots = (1.0 - gate) * base_slots + gate * self.to_mu(mu_input_slots)
         else:
             mu_slots = base_slots
 
@@ -784,7 +803,7 @@ class BigWeightVAE(nn.Module):
                 "big_vae.latent_sampling_logvar_min must be <= "
                 "big_vae.latent_sampling_logvar_max"
             )
-        raw_logvar_slots = self.to_logvar(base_slots).clamp(logvar_min, logvar_max)
+        raw_logvar_slots = self.to_logvar(mu_input_slots).clamp(logvar_min, logvar_max)
         raw_std_slots = torch.exp(0.5 * raw_logvar_slots)
 
         min_std = max(0.0, float(self.cfg.big_vae.latent_sampling_min_std))
@@ -1773,7 +1792,8 @@ class BigWeightVAE(nn.Module):
             raise ValueError(f"d_in_pad must equal T*patch_size={expected_d_in_pad}, got {d_in_pad}")
 
         base_z = self.latent_norm(latent_slots.reshape(B, self.flat_lat_dim))
-        decoder_z, mu, logvar = self._sample_latent_posterior(base_z)
+        mu_input_z = self._mu_head_input_z(latent_slots)
+        decoder_z, mu, logvar = self._sample_latent_posterior(base_z, mu_input_z=mu_input_z)
         lat = self.latent_to_decoder(decoder_z.view(B, num_latents, d_lat))
 
         q_tokens_base, q_pos_emb, q_pos_o, q_pos_t = self._build_decoder_query_state(

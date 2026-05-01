@@ -468,6 +468,7 @@ def _build_model_cfg(cfg: dict[str, Any]) -> ModelConfig:
             pos_fourier_dim=int(big_cfg.get("pos_fourier_dim", 64)),
             use_latent_sampling=bool(big_cfg.get("use_latent_sampling", True)),
             use_encoder_mu_head=bool(big_cfg.get("use_encoder_mu_head", False)),
+            normalize_latent_slots_before_mu=bool(big_cfg.get("normalize_latent_slots_before_mu", True)),
             latent_prior_kind=str(big_cfg.get("latent_prior_kind", "gaussian")),
             vamp_prior_K=int(big_cfg.get("vamp_prior_K", 64)),
             decoder_query_conditioning_kind=str(big_cfg.get("decoder_query_conditioning_kind", "linear")),
