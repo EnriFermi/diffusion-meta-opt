@@ -730,22 +730,53 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
         if not self._chunk_paths:
             raise FileNotFoundError(f"No offline BigVAE x chunks found under {self.x_chunks_dir}")
         self._effective_chunk_indices = self._resolve_effective_chunk_indices()
+        self.logger.info(
+            "Opening Offline BigVAE dataset: root=%s chunks=%s effective_chunks=%s shard_rank=%s "
+            "shard_world_size=%s sampling_mode=%s runtime_stage_filter=%s",
+            self.root_dir,
+            len(self._chunk_paths),
+            len(self._effective_chunk_indices),
+            self.shard_rank,
+            self.shard_world_size,
+            self.sampling_mode,
+            self.runtime_enforce_stage_compatibility,
+        )
         self._chunk_index_payloads: list[dict[str, Any]] | None = None
         self._balanced_group_to_refs: dict[tuple[str, ...], list[tuple[int, int]]] | None = None
         self._runtime_filtered_record_count = 0
         self._runtime_compatible_record_count = 0
         self._runtime_compatible_record_refs_by_chunk: dict[int, tuple[int, ...]] | None = None
         if self.runtime_enforce_stage_compatibility:
+            self.logger.info(
+                "Loading Offline BigVAE chunk indexes for runtime stage filter: chunks=%s min_d_in=%s min_d_out=%s",
+                len(self._effective_chunk_indices),
+                self.runtime_min_d_in,
+                self.runtime_min_d_out,
+            )
             self._chunk_index_payloads = self._load_chunk_index_payloads()
             (
                 self._runtime_compatible_record_refs_by_chunk,
                 self._runtime_compatible_record_count,
                 self._runtime_filtered_record_count,
             ) = self._build_runtime_compatible_record_refs_by_chunk(self._chunk_index_payloads)
+            self.logger.info(
+                "Offline BigVAE runtime stage filter ready: compatible_records=%s filtered_records=%s",
+                self._runtime_compatible_record_count,
+                self._runtime_filtered_record_count,
+            )
         if self.sampling_mode == "balanced":
             if self._chunk_index_payloads is None:
+                self.logger.info(
+                    "Loading Offline BigVAE chunk indexes for balanced sampling: chunks=%s group_keys=%s",
+                    len(self._effective_chunk_indices),
+                    list(self.sampling_group_keys),
+                )
                 self._chunk_index_payloads = self._load_chunk_index_payloads()
             self._balanced_group_to_refs = self._build_balanced_group_index(self._chunk_index_payloads)
+            self.logger.info(
+                "Offline BigVAE balanced sampling index ready: groups=%s",
+                len(self._balanced_group_to_refs),
+            )
 
     def __iter__(self) -> Iterator[SharedSample]:
         worker_info = torch.utils.data.get_worker_info()
@@ -1067,8 +1098,22 @@ class OfflineBigVAEDataset(torch.utils.data.IterableDataset):
 
     def _load_chunk_index_payloads(self) -> list[dict[str, Any]]:
         payloads: list[dict[str, Any]] = []
-        for chunk_idx in self._effective_chunk_indices:
+        total = len(self._effective_chunk_indices)
+        t0 = time.perf_counter()
+        last_log_t = t0
+        for offset, chunk_idx in enumerate(self._effective_chunk_indices, start=1):
             payloads.append(self._load_chunk_index_payload(chunk_idx))
+            now = time.perf_counter()
+            if offset == total or offset == 1 or offset % 100 == 0 or now - last_log_t >= 10.0:
+                elapsed = max(1e-6, now - t0)
+                self.logger.info(
+                    "Offline BigVAE chunk index load progress: chunks=%s/%s rate_chunks_per_s=%.2f elapsed_s=%.1f",
+                    offset,
+                    total,
+                    float(offset) / elapsed,
+                    elapsed,
+                )
+                last_log_t = now
         return payloads
 
     def _load_chunk_index_payload(self, chunk_idx: int) -> dict[str, Any]:
@@ -1213,18 +1258,43 @@ def _preslicing_root(cfg: DictConfig) -> str:
     return str(source_root / "presliced" / f"stage_{stage}")
 
 
-def _file_sha1(path: Path) -> str:
+def _file_sha1(path: Path, *, logger: logging.Logger | None = None, label: str | None = None) -> str:
     digest = hashlib.sha1()
+    size_bytes = int(path.stat().st_size)
+    display_label = label or path.name
+    if logger is not None:
+        logger.info(
+            "Hashing offline dataset fingerprint file: label=%s path=%s size_mb=%.1f",
+            display_label,
+            path,
+            float(size_bytes) / (1024.0 ** 2),
+        )
+    read_bytes = 0
+    last_log_t = time.perf_counter()
     with path.open("rb") as handle:
         while True:
             chunk = handle.read(1024 * 1024)
             if not chunk:
                 break
             digest.update(chunk)
+            read_bytes += len(chunk)
+            now = time.perf_counter()
+            if logger is not None and size_bytes >= 512 * 1024 * 1024 and now - last_log_t >= 10.0:
+                logger.info(
+                    "Hashing offline dataset fingerprint file progress: label=%s read_mb=%.1f/%.1f",
+                    display_label,
+                    float(read_bytes) / (1024.0 ** 2),
+                    float(size_bytes) / (1024.0 ** 2),
+                )
+                last_log_t = now
     return digest.hexdigest()
 
 
-def _source_offline_dataset_fingerprint(source_root: str | Path) -> dict[str, Any]:
+def _source_offline_dataset_fingerprint(
+    source_root: str | Path,
+    *,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
     root = Path(source_root)
     manifest_path = root / "manifest.json"
     sources_path = root / "sources.json"
@@ -1233,8 +1303,8 @@ def _source_offline_dataset_fingerprint(source_root: str | Path) -> dict[str, An
     manifest = _load_json_payload(manifest_path)
     payload = {
         "root_dir": str(root),
-        "manifest_sha1": _file_sha1(manifest_path),
-        "sources_sha1": _file_sha1(sources_path) if sources_path.exists() else "",
+        "manifest_sha1": _file_sha1(manifest_path, logger=logger, label="manifest"),
+        "sources_sha1": _file_sha1(sources_path, logger=logger, label="sources") if sources_path.exists() else "",
         "format_version": int(manifest.get("format_version", 0)),
         "accepted_records": int(manifest.get("accepted_records", 0)),
         "unique_sources": int(manifest.get("unique_sources", 0)),
@@ -1243,7 +1313,11 @@ def _source_offline_dataset_fingerprint(source_root: str | Path) -> dict[str, An
     return payload
 
 
-def resolve_presliced_big_vae_spec(cfg: DictConfig) -> dict[str, Any]:
+def resolve_presliced_big_vae_spec(
+    cfg: DictConfig,
+    *,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
     preslicing_cfg = _preslicing_cfg(cfg)
     patch_size, max_T_patches, max_d_out, max_x_rows = resolve_big_vae_curriculum_targets(cfg)
     source_root = _preslicing_source_root(cfg)
@@ -1275,7 +1349,7 @@ def resolve_presliced_big_vae_spec(cfg: DictConfig) -> dict[str, Any]:
         "format_version": PRESLICED_BIG_VAE_FORMAT_VERSION,
         "root_dir": str(root_dir),
         "source_root_dir": str(source_root),
-        "source_dataset": _source_offline_dataset_fingerprint(source_root),
+        "source_dataset": _source_offline_dataset_fingerprint(source_root, logger=logger),
         "num_slices": int(num_slices),
         "stage": max(1, int(cfg.train.get("stage", 1))),
         "patch_size": int(patch_size),
@@ -1726,7 +1800,13 @@ def ensure_presliced_big_vae_dataset(
 ) -> dict[str, Any]:
     logger_local = logger or logging.getLogger("dataset.big_vae_offline")
     preslicing_cfg = _preslicing_cfg(cfg)
-    spec = resolve_presliced_big_vae_spec(cfg)
+    logger_local.info(
+        "Presliced BigVAE dataset check starting: root=%s source_root=%s num_slices=%s",
+        _preslicing_root(cfg),
+        _preslicing_source_root(cfg),
+        int(preslicing_cfg.get("num_slices", 0)),
+    )
+    spec = resolve_presliced_big_vae_spec(cfg, logger=logger_local)
     root_dir = Path(str(spec["root_dir"]))
     ok, manifest, reason = _presliced_manifest_matches(root_dir, spec)
     if ok and manifest is not None:

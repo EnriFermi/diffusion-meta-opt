@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 
 import pytest
@@ -9,6 +10,7 @@ from hydra import compose, initialize_config_dir
 
 from post_train_research.tinyvit_latent_h1.config import build_run_config
 from post_train_research.tinyvit_latent_h1.experiment import _checkpoint_payload_json_view
+from post_train_research.tinyvit_latent_h1 import source as source_mod
 from post_train_research.tinyvit_latent_h1.source import build_train_schedule, resolve_source_checkpoint_for_experiment
 
 
@@ -80,6 +82,73 @@ def test_build_train_schedule_is_deterministic() -> None:
     right = build_train_schedule(10, batch_size=4, steps=5, seed=123)
     assert len(left) == 5
     assert all(l.equal(r) for l, r in zip(left, right, strict=True))
+
+
+def test_levelset_search_returns_payload_at_returned_hi(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeStore:
+        def __init__(self) -> None:
+            self.value = torch.zeros(1)
+            self.latent_slots = {"slot": self.value}
+
+        def materialize_latent_slot(self, key: str) -> torch.Tensor:
+            assert key == "slot"
+            return self.value
+
+        def materialized_latent_slots_state_dict(self) -> dict[str, torch.Tensor]:
+            return {"slot": self.value.detach().clone()}
+
+        def load_materialized_latent_slots_state_dict(
+            self,
+            state: dict[str, torch.Tensor],
+            *,
+            strict: bool = True,
+            update_radii: bool = True,
+        ) -> None:
+            del strict, update_radii
+            self.value = state["slot"].detach().clone()
+            self.latent_slots["slot"] = self.value
+
+    store = FakeStore()
+    model = SimpleNamespace(store=store)
+    source = SimpleNamespace(all_tensor_names=["slot"], z_star_state={"slot": torch.zeros(1)})
+
+    def fake_evaluate_train_and_test(*args, **kwargs):
+        del args, kwargs
+        loss = abs(float(store.value.item()))
+        metrics = source_mod.EvalMetrics(loss=loss, accuracy=0.0, examples=1)
+        return metrics, metrics
+
+    def fake_export_named_tensors(*args, **kwargs):
+        del args, kwargs
+        return {"slot": store.value.detach().clone()}
+
+    monkeypatch.setattr(source_mod, "BigVAELatentTensorStore", FakeStore)
+    monkeypatch.setattr(source_mod, "evaluate_train_and_test", fake_evaluate_train_and_test)
+    monkeypatch.setattr(source_mod, "export_named_tensors", fake_export_named_tensors)
+
+    result = source_mod._find_levelset_alpha(
+        model,
+        source,
+        train_loader=None,
+        test_loader=None,
+        base_flat=torch.zeros(1),
+        base_loss=0.0,
+        direction=torch.ones(1),
+        epsilon=0.8,
+        device=torch.device("cpu"),
+        amp_enabled=False,
+        alpha_min=1.0,
+        alpha_max=1.0,
+        bracket_multiplier=2.0,
+        binary_search_steps=2,
+    )
+
+    assert result is not None
+    alpha, latent_state, train_metrics, _test_metrics, named_tensors = result
+    assert alpha == 1.0
+    assert latent_state["slot"].item() == pytest.approx(alpha)
+    assert train_metrics.loss == pytest.approx(abs(alpha))
+    assert named_tensors["slot"].item() == pytest.approx(alpha)
 
 
 def test_checkpoint_payload_json_view_strips_tensor_values() -> None:

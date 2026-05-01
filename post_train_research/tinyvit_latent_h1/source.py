@@ -376,16 +376,16 @@ def _find_levelset_alpha(
             if payload[0] >= target_loss:
                 lo = prev_alpha
                 hi = alpha
-                chosen = payload
+                hi_payload = payload
                 for _ in range(int(binary_search_steps)):
                     mid = 0.5 * (lo + hi)
                     mid_payload = _evaluate_alpha(sign * mid)
-                    chosen = mid_payload
                     if mid_payload[0] >= target_loss:
                         hi = mid
+                        hi_payload = mid_payload
                     else:
                         lo = mid
-                candidate = (float(sign * hi),) + chosen[1:]
+                candidate = (float(sign * hi),) + hi_payload[1:]
                 if best is None or abs(candidate[0]) < abs(best[0]):
                     best = candidate
                 break

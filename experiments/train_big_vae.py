@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import logging
@@ -66,6 +67,24 @@ from training.runtime import (
     seed_everything as runtime_seed_everything,
     set_speed_optimizations as runtime_set_speed_optimizations,
 )
+
+
+def _patch_argparse_lazy_help_for_hydra_py314() -> None:
+    """Hydra 1.3 passes a lazy help object; Python 3.14 argparse now validates help as a string."""
+    if getattr(argparse.ArgumentParser, "_hydra_lazy_help_py314_patch", False):
+        return
+    original_check_help = argparse.ArgumentParser._check_help
+
+    def patched_check_help(self: argparse.ArgumentParser, action: argparse.Action) -> None:
+        if action.help is not None and not isinstance(action.help, str):
+            action.help = str(action.help)
+        original_check_help(self, action)
+
+    argparse.ArgumentParser._check_help = patched_check_help  # type: ignore[method-assign]
+    argparse.ArgumentParser._hydra_lazy_help_py314_patch = True  # type: ignore[attr-defined]
+
+
+_patch_argparse_lazy_help_for_hydra_py314()
 
 
 def _identity_sample_collate(sample: Any) -> Any:
@@ -249,6 +268,7 @@ def _build_model_cfg(cfg: DictConfig) -> ModelConfig:
             pos_fourier_dim=int(big_cfg.get("pos_fourier_dim", 64)),
             use_latent_sampling=bool(big_cfg.get("use_latent_sampling", True)),
             use_encoder_mu_head=bool(big_cfg.get("use_encoder_mu_head", False)),
+            normalize_latent_slots_before_mu=bool(big_cfg.get("normalize_latent_slots_before_mu", True)),
             latent_prior_kind=str(big_cfg.get("latent_prior_kind", "gaussian")),
             vamp_prior_K=int(big_cfg.get("vamp_prior_K", 64)),
             decoder_query_conditioning_kind=str(big_cfg.get("decoder_query_conditioning_kind", "linear")),
@@ -476,6 +496,7 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         "model.patch_size": int(model_cfg.get("patch_size", 16)),
         "model.big_vae.use_latent_sampling": bool(big_cfg.get("use_latent_sampling", True)),
         "model.big_vae.use_encoder_mu_head": bool(big_cfg.get("use_encoder_mu_head", False)),
+        "model.big_vae.normalize_latent_slots_before_mu": bool(big_cfg.get("normalize_latent_slots_before_mu", True)),
         "model.big_vae.latent_prior_kind": str(big_cfg.get("latent_prior_kind", "gaussian")),
         "model.big_vae.vamp_prior_K": int(big_cfg.get("vamp_prior_K", 64)),
         "model.big_vae.decoder_query_conditioning_kind": str(
@@ -3211,6 +3232,7 @@ def _run_worker(
     master_port: int,
     monitor_queue: Any | None = None,
 ) -> None:
+    print(f"[train_big_vae rank{rank}] worker bootstrapping", flush=True)
     maybe_redirect_stdio(cfg_dict, role="train_worker", section="train", rank=rank)
     cfg = OmegaConf.create(cfg_dict)
     _promote_run_profile_to_root(cfg)
@@ -3398,6 +3420,11 @@ def _run_worker(
                     )
                     if preslicing_enabled:
                         if rank == 0:
+                            logger.info("Ensuring presliced BigVAE dataset before opening training loader")
+                            print(
+                                "[train_big_vae rank0] ensuring presliced BigVAE dataset",
+                                flush=True,
+                            )
                             ensure_presliced_big_vae_dataset(cfg, logger=logger)
                         if is_distributed:
                             dist.barrier()
@@ -5627,6 +5654,7 @@ def _spawn_entry(
 @hydra.main(version_base=None, config_path="../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
     _promote_run_profile_to_root(cfg)
+    print("[train_big_vae] Hydra config composed; entering launcher", flush=True)
     run_artifacts = _configure_run_artifacts(cfg)
     maybe_redirect_stdio(cfg, role="train_launcher", section="train")
     maybe_enable_core_dumps(cfg, section="train", logger=None)
