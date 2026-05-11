@@ -1,658 +1,300 @@
-# BigVAE: A Latent Manifold for Neural Network Weights
+# BigVAE: Fixed-Size Latent Coordinates for Neural Network Weight Manifolds
 
-**A technical preprint for the `diff-meta-opt` repository**
-
-**Status.** Draft report. Heavy experiment figures are expected to be produced on
-the remote training machine and inserted into the marked figure slots.
-
-**Code.** `models/big_weight_vae.py`, `experiments/train_big_vae.py`,
-`post_train_research/`
-
-**Manuscript card.**
-
-| Item | Summary |
-|---|---|
-| Object of study | Linear layers \(W\) from real pretrained models |
-| Conditioning signal | Activation context \(X\) from examples seen by that layer |
-| Learned representation | Fixed-size latent slot set \(z\) |
-| Decoder output | Reconstructed weight slice \(\hat W\) |
-| Primary training signal | Preserve both \(W\) structure and layer behavior \(XW\) |
-| Main hypothesis | BigVAE latents are smoother optimization coordinates than raw weights |
-| Main falsifier | Latent optimization fails or latent landscapes are not smoother than raw landscapes |
+**Status.** Internal preprint-style report draft.  
+**Project.** Activation-conditioned VAE compression of linear-layer weights, followed by latent-space optimization and diffusion-prior initialization.  
+**Main artifact.** `BigWeightVAE` / `WeightQuantileVAE` with held-out latent-geometry and CIFAR-10 latent-optimization experiments.  
+**Current conclusion.** The representation result is positive but specific: held-out latents show clear organization by source model and source dataset. Projections by layer type and layer depth are useful diagnostics, but they are not currently claimed to form clear separated clusters. The optimizer result is not yet positive: direct latent optimization currently converges slower than raw-weight Adam/AdamW on CIFAR-10.
 
 ---
 
 ## Abstract
 
-We study whether neural network weights can be optimized through a learned
-latent manifold rather than directly in raw parameter space. The central object
-is a variational autoencoder, **BigVAE**, trained on real linear layers extracted
-from pretrained vision and multimodal models. Given a weight matrix and a small
-activation context for the corresponding layer, BigVAE encodes the layer into a
-fixed set of latent slots and decodes those slots back into a weight slice. The
-training objective combines functional reconstruction of the layer operator,
-patch-level structural reconstruction of weight direction and scale, and a KL
-regularizer for the latent posterior.
+This project studies whether neural network weights should be optimized directly in raw Euclidean parameter space, or through a learned low-dimensional coordinate system. 
+The core hypothesis is that trained weights lie in a low dimensional manifold of the full parameter space: not every matrix of the right shape is a useful layer, and the functionally relevant degrees of freedom are fewer than the raw number of entries suggests. BigVAE tests this hypothesis by learning a variational autoencoder over real linear layers extracted from pretrained vision and multimodal models.
 
-The intended use is post-training optimization: replace direct optimization of
-weights \(W\) with optimization of latent variables \(z\), where decoded weights
-\(\hat W(z)\) are used by a downstream model. This report documents the model,
-the training procedure, and the evaluation suite used to test the hypothesis
-that BigVAE latents provide a smoother and more semantically organized search
-space than raw weights.
+The central design choice is fixed-size latent compression. A source linear layer may have shape \(64 \times 64\), \(128 \times 128\), or another compatible size, but each processed slice is compressed into the same number of latent slots. This differs from standard tensor autoencoding and many weight-space generative models, where the latent size effectively scales with the tensor size or the architecture is tied to a fixed model family. This design choice is crucial for future project for training latent diffusion model as optimizer in weight latent space: diffusion works badly with non fixed dimensionality of latent space. But in general fixed latent size is not a constraint, because any linear layer can be splitted into several smaller: e. g. \(128 \times 128\) can be splitted into composition of 4 \(64 \times 64\) linear layers, so we can scale model capacity by scaling split resolution of our weights. So fixed latent space is not a constraint.
+
+BigVAE treats a layer as a conditional operator: it receives a weight slice \(W_s\) and an activation context \(X_s\), encodes the slice into a fixed latent set \(z\), and decodes it back into \(\hat W_s\). The activation context (we try to estimate input distribution) matters because reconstructing a linear map is only useful insofar as the map behaves correctly on the input distribution that actually reaches the layer.
+
+The current evidence is asymmetric. Out-of-domain evaluation shows that the learned latents have visible structure by source model and source dataset. This suggests that each model family and each activation distribution induces its own distribution over useful layer weights, and that the VAE has learned part of this structure rather than only memorizing matrix shapes. Downstream optimization is weaker: on CIFAR-10, latent optimization with a diffusion-prior initialization is currently slower than raw-weight Adam/AdamW. The present status is therefore best described as a successful activation-conditioned weight-representation system whose optimizer use case remains unresolved.
 
 ---
 
-## 1. Introduction
+## 1. Research motivation
 
-Modern neural networks are optimized in parameter spaces whose geometry is only
-loosely related to function space. A small Euclidean perturbation of a weight
-matrix can leave the function nearly unchanged, or it can catastrophically
-change the layer output. Conversely, distinct raw parameter vectors can encode
-nearly equivalent computations because of symmetries, rescalings, and redundant
-representations.
+Raw neural weights are a poor coordinate system for optimization. A layer matrix has many degrees of freedom that are not equally meaningful: some perturbations barely change the represented function, some perturbations are functionally equivalent under symmetries. This mismatch is visible in several lines of prior work. Intrinsic-dimension experiments show that many neural objectives can be solved inside much smaller randomly oriented subspaces than the full parameter dimension [1]. Mode-connectivity papers show that independently trained optima can often be connected by low-loss paths [2, 3]. Permutation-aware re-basing work argues that part of the apparent multiplicity of basins disappears after hidden-unit symmetries are aligned [4]. These results do not prove that all useful weights lie on one simple smooth manifold, but they strongly suggest that the raw parameter space contains large irrelevant or redundant regions.
 
-This repository explores a simple but ambitious alternative: learn a generative
-model of neural network layers, then optimize through its latent variables. If a
-latent model captures the structure of real weights, then moving in latent space
-may avoid many destructive raw-weight directions. In downstream optimization,
-the effective parameterization becomes:
+The project turns this geometric observation into a concrete optimizer interface. Instead of updating raw weights \(W\), we learn a decoder
 
 $$
 z \mapsto \hat W_\theta(z, C),
 $$
 
-where \(C\) is a context derived from layer activations and metadata available at
-the layer level. The downstream model still runs with ordinary weights, but
-those weights are produced by a frozen decoder.
+where \(z\) is a fixed-size latent representation and \(C\) is context extracted from the layer input distribution. Downstream optimization can then update \(z\), while the frozen decoder maps latent states back to ordinary linear weights. The decoder becomes a learned chart over a subset of weight space: it restricts search to weights that look like real trained layers and behave plausibly on the relevant activation distribution.
 
-The project is organized around three empirical questions:
-
-1. **Can BigVAE reconstruct held-out layers?**  
-   This is tested with held-out model/dataset pairs and metrics decomposed by
-   source model, dataset, layer type, and layer depth.
-
-2. **Does the latent space organize neural weights meaningfully?**  
-   This is tested by dumping latent vectors and visualizing PCA/t-SNE projections
-   by model, dataset, layer type, and depth.
-
-3. **Does latent optimization change the loss landscape?**  
-   This is tested by comparing raw ViT weight-space landscapes against
-   BigVAE-induced latent landscapes on MNIST, CIFAR-10, and a synthetic
-   stripe-parity benchmark designed to make raw weight space rough.
-
-### Contributions
-
-This repository contributes a complete experimental system rather than a single
-model file:
-
-1. **A conditional VAE for neural layer weights.** BigVAE encodes real source
-   model layers into fixed-size latent slots and decodes them back into
-   shape-variable weight slices.
-2. **A function-aware reconstruction objective.** The model is trained not only
-   to reproduce weights, but also to preserve the layer operator \(XW\) on real
-   activation contexts.
-3. **An AE-to-VAE migration path.** Deterministic autoencoder checkpoints can be
-   resumed as VAEs with gated posterior heads and absolute-step KL schedules.
-4. **A held-out evaluation and geometry pipeline.** Reconstruction and latent
-   organization are evaluated by source dataset, model, layer type, and depth.
-5. **A downstream optimization testbed.** Tiny ViTs can be optimized either in
-   raw weights or through frozen BigVAE latent slots, enabling direct comparison
-   of optimization geometry.
-
-![Evidence matrix](docs/figures/evidence_matrix.svg)
-
-**Figure 1.** The latent-manifold hypothesis is only persuasive if several
-independent diagnostics align. Good reconstruction alone is not enough; the
-latent space must also organize weights, induce smoother landscapes, and support
-downstream optimization.
+The nearest existing areas are hypernetworks, hyper-representations, generative models of checkpoints, and weight-space learning. Hypernetworks generate weights from another network, but they are usually trained end-to-end for a target architecture rather than as a reusable compression map over arbitrary linear-layer slices [5]. Hyper-representations learn embeddings of model zoos and can sample neural weights, but they are often tied to model-zoo structure, layer ordering, or fixed architecture families [6, 7]. Diffusion over neural checkpoints has been used as a learned optimizer/generator, but it operates over checkpoint distributions rather than a reusable activation-conditioned chart for arbitrary linear slices [8]. Weight-space architectures and neural functionals study how to process neural weights while respecting permutation symmetries [9, 10]. BigVAE sits in this broader field, but its practical target is different: we don't want to train VAE for each model family, we try to build foundational model for very broad family of architectures (e. g. VITs for images).
 
 ---
 
-## 2. Problem Setup
+## 2. Problem setup
 
-Consider a source neural network layer represented as a linear map:
-
-$$
-f_W(X) = XW,
-$$
-
-where:
+A linear layer is represented as
 
 $$
-X \in \mathbb{R}^{n \times d_{in}},
-\qquad
-W \in \mathbb{R}^{d_{in} \times d_{out}},
-\qquad
-XW \in \mathbb{R}^{n \times d_{out}}.
+Y = XW,
 $$
 
-Here \(X\) is an activation context collected from examples passing through the
-source model, and \(W\) is a layer weight matrix. BigVAE is trained over records:
+where \(X \in \mathbb{R}^{n \times d_{in}}\) is a batch of layer inputs, \(W \in \mathbb{R}^{d_{in} \times d_{out}}\) is the weight matrix, and \(Y \in \mathbb{R}^{n \times d_{out}}\) is the layer output. Here \(n\) is the number of activation samples, \(d_{in}\) is the input width, and \(d_{out}\) is the output width.
+
+The training record is
 
 $$
-r = (X, W, m, d, \ell),
+r = (W, X, m, d, \ell),
 $$
 
-where \(m\) is the source model identity, \(d\) is the source dataset, and
-\(\ell\) is the layer name. The layer name is later parsed into coarse layer type
-and depth for analysis.
-
-Because source layers have variable shapes, training operates on slices:
+where \(m\) is the source model identity, \(d\) is the source dataset, and \(\ell\) is the layer name. Since source layers have different shapes, the pipeline does not train on full matrices as one fixed tensor. It extracts shape-normalized slices
 
 $$
-S(r) = (X_s, W_s, M_s),
+S(r) = (W_s, X_s, M_s),
 $$
 
-where \(M_s\) denotes masks for valid input rows and output columns. The target
-slice has shape:
-
-$$
-W_s \in \mathbb{R}^{B \times d_{in}^{s} \times d_{out}^{s}},
-\qquad
-X_s \in \mathbb{R}^{B \times n^{s} \times d_{in}^{s}}.
-$$
-
-The BigVAE objective is to learn an encoder-decoder pair:
+where \(M_s\) stores masks for padded or invalid entries. The VAE objective is
 
 $$
 q_\phi(z \mid W_s, X_s),
-\qquad
+$$
+
+$$
 p_\theta(W_s \mid z, X_s),
 $$
 
-such that the decoded matrix \(\hat W_s\) preserves both the raw structure of the
-weight slice and the behavior of the layer on the activation context.
+with \(z \in \mathbb{R}^{K \times d_{lat}}\). The important constraint is that \(K\), the number of latent slots, and \(d_{lat}\), the latent width per slot, are fixed by configuration rather than by the raw layer size. In the current BigVAE stage configuration, \(K=32\) and \(d_{lat}=128\), so each processed slice is represented by 4096 scalar latent coordinates.
+
+The effective compression ratio is
+
+$$
+\rho = \frac{d_{in}^s d_{out}^s}{K d_{lat}},
+$$
+
+where \(d_{in}^s\) and \(d_{out}^s\) are the slice dimensions. The current experimental narrative targets approximately an \(8\times\) compression regime, although the exact ratio depends on the active slicing/tile shape. If a layer is too large for the chosen latent budget, it is decomposed into several slices. This increases the number of local latent blocks while preserving the same interface for each block. Operationally, this is the desired failure mode: a large layer can spend more blocks, but the diffusion/optimizer interface never has to handle arbitrary latent dimensionality inside one local code.
 
 ---
 
 ## 3. Architecture
 
-BigVAE is a conditional VAE over weight matrices. The conditioning signal is not
-a class label or text prompt; it is a distributional summary of the layer input
-activations.
+![BigVAE architecture](bigvae_report_assets/bigvae_architecture.jpg)
 
-![BigVAE architecture](docs/figures/bigvae_architecture.svg)
+**Figure 1.** BigVAE encodes a shape-normalized weight slice and the corresponding activation context into a fixed-size latent representation. The decoder reconstructs weights through direction and scale heads, while the loss checks both matrix structure and layer behavior on \(X_s\).
 
-**Figure 2.** BigVAE receives a weight slice \(W_s\) and activation context
-\(X_s\). The weight slice is patch-tokenized, the context is summarized by a
-distribution encoder, and latent slots are decoded back into a reconstructed
-weight slice \(\hat W_s\). Losses compare both the reconstructed matrix and the
-layer operator on \(X_s\).
+BigVAE is a conditional VAE over linear-layer weight slices. The system has six functional blocks.
 
-### 3.1 Weight Patching
+The **distribution encoder** maps the activation context \(X_s\) into patch-level distribution features. The **patch tokenizer** combines local weight vectors with those distribution features. The **latent encoder** maps the conditioned patch sequence into a fixed-size set of latent slots. The **posterior/prior block** turns encoder states into VAE samples and regularizes them against a VampPrior-style latent prior. The **decoder** maps fixed latent slots and activation-context features back into a weight slice. The **external diffusion prior** is trained after the VAE and samples plausible layer latents for downstream optimization.
 
-Let \(p\) be `patch_size`. The input dimension is padded and partitioned into
-patches:
+This decomposition is important. The model is not just a tensor autoencoder with a bottleneck. It is an operator-conditioned autoencoder: the same matrix error has different importance depending on where the input activation distribution puts mass, and the same latent budget must work across variable source layer shapes.
+
+### 3.1 Weight patching
+
+Let \(p\) be the patch size. The input dimension of \(W_s\) is padded and partitioned into
 
 $$
-T = \left\lceil \frac{d_{in}^{s}}{p} \right\rceil.
+T = \left\lceil \frac{d_{in}^s}{p} \right\rceil
 $$
 
-The padded weight slice is reshaped as:
+patches. The weight slice is reshaped as
 
 $$
-W_s
-\rightarrow
-W_{patch}
-\in
-\mathbb{R}^{B \times d_{out}^{s} \times T \times p}.
+W_s \rightarrow W_{patch} \in \mathbb{R}^{B \times d_{out}^s \times T \times p},
 $$
 
-Thus every output channel owns a sequence of input-patch vectors. This preserves
-the natural row/column structure of a linear layer while allowing the model to
-handle variable \(d_{in}\) and \(d_{out}\).
+where \(B\) is the batch size. Each output column owns a sequence of input-patch vectors. This representation preserves matrix locality while allowing different source dimensions. The current stage config uses `patch_size = 16`, `stage_base_T_patches = 4`, and `stage_base_d_out = 64` in the training schedule.
 
-### 3.2 Distribution Encoder
+### 3.2 Distribution encoder
 
-The activation context \(X_s\) is summarized into per-patch statistics and
-tokens. In the current configuration, these features condition the model through
-two routes:
+The distribution encoder receives activation samples \(X_s\). For each input patch it computes distributional statistics rather than a single pooled vector. The current module uses quantiles over samples, normalized quantile features, mean/log-standard-deviation terms, optional covariance features, a variable-token transformer, and a DCNv2-style cross network to produce patch-level distribution embeddings.
 
-1. **Patch tokenizer conditioning.** The tokenizer receives both the weight patch
-   and activation-distribution features.
-2. **Encoder token adapters.** Each encoder layer can apply a gated residual
-   conditioning adapter to patch tokens.
+This block exists because a layer matrix cannot be judged only as a tensor. Two matrices with similar Euclidean error can have very different functional error on the actual activation support. Conversely, errors in directions never reached by the layer inputs may not matter for the downstream model. Conditioning on \(X_s\) tells the autoencoder where the layer is being used.
 
-This conditioning is important because the same raw matrix perturbation can have
-very different functional impact depending on the input distribution.
+### 3.3 Patch tokenizer and encoder conditioning
 
-### 3.3 Encoder
+The current configuration uses a `conditioned_mlp` patch tokenizer. The tokenizer receives the weight patch and distribution features, then produces patch tokens. Distribution features also enter the encoder through token-adapter conditioning. This creates two conditioning routes: the input distribution affects the local encoding of each patch and also modulates the deeper latent encoder layers.
 
-BigVAE uses a learned latent base:
+The latent encoder constructs output-local sequences of the form
 
 $$
-L_0 \in \mathbb{R}^{K \times d_z},
+[\mathrm{CLS}_o, w_{o,1}, \ldots, w_{o,T}],
 $$
 
-where \(K\) is `big_vae.num_latents` and \(d_z\) is `big_vae.d_lat`.
+where \(o\) indexes an output column and \(t\) indexes an input patch. It then applies local token processing and Perceiver-style resampling into a fixed latent set. In the current stage configuration the encoder has 15 layers, model width 128, latent width 128, 32 latent slots, 8 attention heads, no dropout, full self-attention, and `cross_attend_only_cls = false`.
 
-For each output column, the encoder builds a token sequence:
+### 3.4 VAE posterior and prior
 
-$$
-[\mathrm{CLS}_o,\ w_{o,1}, \ldots,\ w_{o,T}].
-$$
+The system supports deterministic AE operation and VAE operation. The current BigVAE stage uses latent sampling, an encoder mean head, normalized latent slots before posterior heads, and a VampPrior-style learned mixture prior with 64 pseudo-components. The posterior variance is bounded by `latent_sampling_logvar_min = -2`, `latent_sampling_logvar_max = 2`, and `latent_sampling_min_std = 1e-4`.
 
-A stack of latent encoder layers alternates between local token processing and
-latent resampling. The result is a fixed-size latent representation:
-
-$$
-L = E_\phi(W_s, X_s)
-\in
-\mathbb{R}^{B \times K \times d_z}.
-$$
-
-The flattened latent is normalized:
-
-$$
-z_0 = \mathrm{LayerNorm}(\mathrm{vec}(L)).
-$$
-
-### 3.4 Posterior and Sampling Gate
-
-If latent sampling is disabled, BigVAE is a deterministic autoencoder:
-
-$$
-z = z_0,
-\qquad
-\mu = z_0,
-\qquad
-\log \sigma^2 = 0.
-$$
-
-If latent sampling is enabled, the model uses posterior heads:
-
-$$
-\mu =
-(1-g) z_0
-+
-g\,\mu_\phi(z_0),
-$$
-
-$$
-\tilde\sigma =
-\exp\left(\frac{1}{2}\log\sigma^2_\phi(z_0)\right),
-$$
-
-$$
-\sigma =
-\max(\sigma_{\min},\ g\,\tilde\sigma).
-$$
-
-The latent sample during training is:
-
-$$
-z = \mu + \epsilon\sigma,
-\qquad
-\epsilon \sim \mathcal{N}(0,I).
-$$
-
-At evaluation time, the model uses \(z=\mu\).
-
-The gate \(g\) is an absolute-step schedule. It is used to make deterministic
-AE-to-VAE fine-tuning stable: the VAE heads are introduced with nearly zero
-sampling noise, then gradually take over.
+The trainer uses a KL schedule and a latent-sampling gate. KL starts at zero, warms up for 100000 steps, then ramps over 50000 steps toward the target coefficient. The sampling gate starts at \(10^{-4}\) and ramps to 1.0 over the same interval. This is not cosmetic: a hard transition from deterministic reconstruction to stochastic VAE sampling can destroy reconstruction.
 
 ### 3.5 Decoder
 
-The decoder maps latent slots back to a weight slice. It builds query tokens for
-each output-column/input-patch coordinate and cross-attends to latent slots.
-The output head predicts patch direction and scale:
+The decoder maps latent slots back to a weight slice. It builds coordinate queries for each output-column/input-patch location, conditions those queries with distribution embeddings through an MLP, and cross-attends to the latent slots. Its output head predicts direction and scale:
 
 $$
 \hat u_{o,t} = h_{dir}(q_{o,t}),
-\qquad
-\hat s_{o,t} = h_{scale}(q_{o,t}),
 $$
 
-which are combined into reconstructed patch weights:
-
 $$
-\hat w_{o,t} =
-\exp(\hat s_{o,t})
-\frac{\hat u_{o,t}}{\lVert \hat u_{o,t}\rVert_2 + \epsilon}.
+\hat s_{o,t} = h_{scale}(q_{o,t}).
 $$
 
-This parameterization makes direction and magnitude explicit, matching the
-structural loss decomposition.
+The reconstructed patch vector is
 
-### 3.6 Current Model Configuration
+$$
+\hat w_{o,t} = \exp(\hat s_{o,t}) \cdot \frac{\hat u_{o,t}}{\lVert \hat u_{o,t}\rVert_2 + \epsilon}.
+$$
 
-The current stage-1 model configuration is:
+This decomposition is used because raw MSE entangles direction and magnitude. The direction component controls which input subspace contributes to an output channel; the scale component controls the norm of that contribution. The decoder also disables the direct \(z\)-shortcut in the current stage, forcing reconstruction through the intended latent pathway.
 
-| Parameter | Value |
+### 3.6 Active stage configuration
+
+| Parameter | Current value |
 |---|---:|
-| `patch_size` | 64 |
-| `big_vae.d_model` | 512 |
-| `big_vae.d_lat` | 256 |
-| `big_vae.num_latents` | 8 |
+| `patch_size` | 16 |
+| `big_vae.d_model` | 128 |
+| `big_vae.d_lat` | 128 |
+| `big_vae.num_latents` | 32 |
 | `big_vae.num_encoder_layers` | 15 |
 | `big_vae.num_decoder_layers` | 6 |
 | `big_vae.n_heads` | 8 |
 | `big_vae.ffn_mult` | 4.0 |
-| `patch_tokenizer_kind` | `conditioned_mlp` |
-| `distribution_encoder_conditioning_kind` | `token_adapter` |
-| `disable_z_shortcut` | true |
-
-### 3.7 Design Principles
-
-The architecture is built around four design constraints.
-
-| Constraint | Architectural response |
-|---|---|
-| Source layers have different shapes | Slice layers into patch/output-column blocks and use masks |
-| Raw weight MSE is not enough | Add operator reconstruction on \(XW\) |
-| Input distribution matters | Condition encoder and decoder on summaries of \(X\) |
-| Downstream optimization needs stable coordinates | Compress every slice into a fixed number of latent slots |
-
-The most important decision is to treat a layer as a conditional operator, not
-as an isolated tensor. BigVAE is therefore closer to a learned chart over local
-layer functions than to a generic matrix autoencoder.
+| `big_vae.latent_prior_kind` | `vamp` |
+| `big_vae.vamp_prior_K` | 64 |
+| `big_vae.patch_tokenizer_kind` | `conditioned_mlp` |
+| `big_vae.distribution_encoder_conditioning_kind` | `token_adapter` |
+| `big_vae.decoder_query_conditioning_kind` | `mlp` |
+| `big_vae.rope_2d_coord_kind` | `normalized_center` |
+| `big_vae.disable_z_shortcut` | true |
+| `big_vae.disable_distribution_encoder` | false |
 
 ---
 
-## 4. Training Objective
+## 4. Training objective
 
-BigVAE is trained with three families of losses:
-
-$$
-\mathcal{L}
-=
-c_{beh}\mathcal{L}_{beh}
-+
-c_{str}\mathcal{L}_{str}
-+
-\beta(t)\mathcal{L}_{KL}.
-$$
-
-### 4.1 Behavioral Reconstruction
-
-The behavioral objective compares the action of \(W_s\) and \(\hat W_s\) on the
-activation context:
+The training objective combines behavioral reconstruction, structural reconstruction, and KL regularization:
 
 $$
-Y = X_s W_s,
-\qquad
+\mathcal{L}_{total} = c_{beh}\mathcal{L}_{beh} + c_{str}\mathcal{L}_{str} + \beta(t)\mathcal{L}_{KL}.
+$$
+
+In the active stage config, \(c_{beh}=1\), \(c_{str}=1\), and the target KL coefficient is \(0.001\) after warmup.
+
+The behavioral loss is a weighted sum of three terms:
+
+$$
+\mathcal{L}_{beh} = 10\mathcal{L}_{op} + \mathcal{L}^{beh}_{dir} + 10\mathcal{L}^{beh}_{scale}.
+$$
+
+The operator term compares the original and reconstructed layer actions:
+
+$$
+Y = X_s W_s.
+$$
+
+$$
 \hat Y = X_s \hat W_s.
 $$
 
-The main term is an operator reconstruction loss:
-
 $$
-\mathcal{L}_{op}
-=
-\ell(Y,\hat Y).
+\mathcal{L}_{op} = MSE(Y, \hat Y).
 $$
 
-Optional direction and scale terms can also be used in output space:
+The directional behavior term compares normalized output directions, and the scale behavior term compares output magnitudes. The structural loss is
 
 $$
-\mathcal{L}_{beh}
-=
-\lambda_{op}\mathcal{L}_{op}
-+
-\lambda_{dir}^{beh}\mathcal{L}_{dir}^{beh}
-+
-\lambda_{scale}^{beh}\mathcal{L}_{scale}^{beh}.
+\mathcal{L}_{str} = \mathcal{L}_{dir} + 10\mathcal{L}_{scale}.
 $$
 
-The current default emphasizes the operator term.
+Here \(\mathcal{L}_{dir}\) is a cosine-style patch-direction loss, while \(\mathcal{L}_{scale}\) is a Huber penalty on log patch norms. Both behavior and structure losses use a norm-dependent weighting exponent \(\gamma=0.5\), so large-norm patches influence the objective more without completely dominating it. The Huber delta is 0.1.
 
-### 4.2 Structural Reconstruction
-
-For each target patch \(w\) and reconstruction \(\hat w\), the structural loss
-separates direction from magnitude. The full structural objective is:
-
-$$
-\mathcal{L}_{str}
-=
-\lambda_{dir}\mathcal{L}_{dir}
-+
-\lambda_{scale}\mathcal{L}_{scale}
-+
-\lambda_{rec}\mathcal{L}_{rec}
-+
-\lambda_{rel}\mathcal{L}_{rel}.
-$$
-
-The diagnostic invariants are:
-
-$$
-\mathcal{L}_{dir}(w,w) \approx 0,
-$$
-
-$$
-\mathcal{L}_{dir}(w,cw) \approx 0
-\quad
-\text{for } c>0,
-$$
-
-$$
-\mathcal{L}_{dir}(w,-w) \approx 2.
-$$
-
-Local identity diagnostics confirm these values up to numerical precision.
-
-### 4.3 KL Regularization
-
-When `use_latent_sampling=true`, the posterior is regularized against a unit
-Gaussian prior:
-
-$$
-\mathcal{L}_{KL}
-=
-\frac{1}{2}
-\mathbb{E}
-\left[
-\sum_i
-\left(
-\exp(\log\sigma_i^2)
-+ \mu_i^2
-- 1
-- \log\sigma_i^2
-\right)
-\right].
-$$
-
-When `use_latent_sampling=false`, the train loop sets:
-
-$$
-\mathcal{L}_{KL}=0.
-$$
-
-### 4.4 Current Loss Weights
-
-| Parameter | Value |
-|---|---:|
-| `behavioral_coef` | 100.0 |
-| `structural_coef` | 1.0 |
-| target `kl_beta` | 0.1 |
-| `behavioral_loss.lambda_operator` | 1.0 |
-| `behavioral_loss.lambda_dir` | 0.0 |
-| `behavioral_loss.lambda_scale` | 0.0 |
-| `struct_loss.lambda_dir` | 1.0 |
-| `struct_loss.lambda_scale` | 5.0 |
-| `struct_loss.lambda_rec` | 0.0 |
-| `struct_loss.lambda_rel` | 0.0 |
-
-### 4.5 One Training Step
-
-The train loop constructs a mixed batch of compatible slices, runs BigVAE, and
-combines the behavioral, structural, and KL losses.
-
-```text
-Algorithm 1: BigVAE training step
-
-Input:
-  offline dataset iterator over records r = (X, W, metadata)
-  current global step t
-  model parameters theta, phi
-
-1. Select source records with balanced sampling over dataset/model/layer/depth.
-2. Slice each source record into compatible W_s and X_s tensors.
-3. Encode:
-       L = E_phi(W_s, X_s)
-       z0 = LayerNorm(vec(L))
-4. Build posterior:
-       mu(t), sigma(t) using latent sampling gate g(t)
-5. Decode:
-       W_hat = D_theta(z, X_s)
-6. Compute:
-       L_beh = operator reconstruction on X_s W_s
-       L_str = patch direction/scale reconstruction
-       L_KL  = KL(q_phi(z|W_s,X_s) || N(0,I))
-7. Optimize:
-       L = c_beh L_beh + c_str L_str + beta(t) L_KL
-```
+This loss design is central to the project. A pure structural loss can reconstruct entries while failing to preserve the represented function. A pure behavioral loss can preserve behavior on a narrow activation support while leaving the matrix underconstrained elsewhere. The current objective deliberately combines both signals, following the empirical lesson in behavior-aware weight reconstruction: structural and behavioral losses are complementary, and their combination reconstructs useful neural weights better than either signal alone [11].
 
 ---
 
-## 5. Schedules and AE-to-VAE Fine-Tuning
+## 5. Data pipeline
 
-The KL weight and sampling gate use cosine ramps in absolute global step.
+The dataset is built from real pretrained models and real image datasets. Source images are streamed through source models, linear layers are hooked, and each observed layer contributes pairs of weights and activation contexts. The result is an offline dataset of layer slices rather than a dataset of images.
 
-For KL:
+The production path uses raw Hugging Face datasets, model virtualization, `nn.Linear` hooks, shared caching, and a streaming iterable dataset. The stage configuration uses a large offline target size, balanced sampling over dataset/model/layer-type/depth, a maximum activation context of 512 rows, and a slice batch size of 32. This matters because without balancing, the latent space can become dominated by frequent datasets, frequent layer types, or shallow blocks.
 
-$$
-\beta(t)=
-\begin{cases}
-\beta_0, & t \le t_w,\\
-\beta_0 + (\beta_\star-\beta_0)
-\frac{1-\cos(\pi r)}{2}, & t_w < t < t_w+t_r,\\
-\beta_\star, & t \ge t_w+t_r,
-\end{cases}
-$$
+### 5.1 Source datasets
 
-where:
+| Dataset | Enabled | Gated | HF repository | Streaming | Associated source models |
+|---|---:|---:|---|---:|---|
+| `bdd100k` | yes | no | `dgural/bdd100k` | yes | `dinov2_base` |
+| `cc12m` | yes | no | `flax-community/conceptual-captions-12` | yes | `clip_vit_b32` |
+| `coco2017` | yes | no | `phiyodr/coco2017` | yes | `clip_vit_b32`, `siglip_base_p16_384` |
+| `flickr30k` | no | no | `nlphuji/flickr30k` | no | `clip_vit_b32`, `dinov2_base` |
+| `mapillary_vistas_v2` | yes | yes | `candylion/mapillary-vistas-v2` | yes | `swinv2_base` |
+| `relaion400m` | yes | yes | `laion/relaion400m` | yes | `clip_vit_b32` |
+| `scene_parse_150` | yes | no | `zhoubolei/scene_parse_150` | yes | `swinv2_base` |
+| `visual_genome` | yes | no | `ranjaykrishna/visual_genome` | yes | `clip_vit_b32` |
 
-$$
-r = \frac{t-t_w}{t_r}.
-$$
+The default active data profile includes `coco2017`, `cc12m`, `visual_genome`, `scene_parse_150`, `mapillary_vistas_v2`, and `relaion400m`.
 
-For the latent sampling gate:
+### 5.2 Source models
 
-$$
-g(t)=
-g_0 + (g_\star-g_0)
-\frac{1-\cos(\pi r_g)}{2}.
-$$
+| Model id | Runner | Family | Run mode | HF repository |
+|---|---|---|---|---|
+| `beit_base` | `hf_vit_runner` | ViT | encoder-only | `microsoft/beit-base-patch16-224` |
+| `blip_image_captioning_base` | `hf_encdec_runner` | BLIP | vision encoder only | `Salesforce/blip-image-captioning-base` |
+| `clip_vit_b32` | `hf_clip_runner` | CLIP | vision only | `openai/clip-vit-base-patch32` |
+| `deit_base` | `hf_vit_runner` | ViT | encoder-only | `facebook/deit-base-patch16-224` |
+| `dinov2_base` | `hf_vit_runner` | ViT | encoder-only | `facebook/dinov2-base` |
+| `dinov2_vits14` | `hf_vit_runner` | ViT | encoder-only | `facebook/dinov2-small` |
+| `donut_base` | `hf_encdec_runner` | Donut | encoder-only | `naver-clova-ix/donut-base` |
+| `grounding_dino_tiny` | `hf_dense_runner` | Dense detector | vision only | `IDEA-Research/grounding-dino-tiny` |
+| `mask2former_swin_base` | `hf_dense_runner` | Dense segmentation | full | `facebook/mask2former-swin-base-coco-panoptic` |
+| `siglip_base_p16_384` | `hf_siglip_runner` | SigLIP | vision only | `google/siglip-base-patch16-384` |
+| `swinv2_base` | `hf_vit_runner` | SwinV2 | encoder-only | `microsoft/swinv2-base-patch4-window8-256` |
+| `trocr_base_printed` | `hf_encdec_runner` | TrOCR | encoder-only | `microsoft/trocr-base-printed` |
+| `vit_mae_base` | `hf_vit_runner` | ViT-MAE | encoder-only | `facebook/vit-mae-base` |
 
-Current defaults:
-
-| Schedule parameter | Value |
-|---|---:|
-| KL start beta | 0.0 |
-| KL warmup | 100000 steps |
-| KL ramp | 200000 steps |
-| KL target beta | 0.1 |
-| gate start value | `1e-4` |
-| gate end value | 1.0 |
-| gate start step | KL warmup step |
-| gate ramp | KL ramp |
-
-![AE to VAE schedule](docs/figures/ae_to_vae_schedule.svg)
-
-**Figure 3.** The deterministic AE region preserves a pretrained
-reconstruction model. The ramp region gradually introduces posterior variance
-and KL pressure. The VAE region uses the full posterior.
-
-This design supports a two-stage path:
-
-1. Train a deterministic AE.
-2. Resume as a VAE with posterior heads enabled.
-3. Load model weights only.
-4. Ramp KL and sampling gate from the absolute resumed step.
-
-If an AE checkpoint lacks posterior heads, the loader can initialize the missing
-VAE heads. Loading optimizer state in this migration is intentionally rejected,
-because the optimizer has no coherent state for the newly introduced heads.
+The dataset is therefore not a toy collection of synthetic matrices. It mixes source architectures, source tasks, layer positions, and activation distributions.
 
 ---
 
-## 6. Data Pipeline
+## 6. Diffusion prior over layer latents
 
-The dataset is not a conventional image dataset. It is a dataset of source model
-layers and activation contexts.
+The VAE gives a latent code for a layer slice, but this does not by itself give a good initialization distribution for downstream optimization. Sampling \(z\) from a standard Gaussian is too weak: the decoder receives latent points far from the empirical posterior region and often produces weights that are poor starting points. The project therefore trains a layer-latent diffusion prior.
 
-```mermaid
-flowchart LR
-    D[Raw datasets] --> M[Source models]
-    M --> A[Activation contexts X]
-    M --> W[Layer weights W]
-    A --> O[Offline records]
-    W --> O
-    O --> S[Slice sampler]
-    S --> T[BigVAE training batches]
-```
+The diffusion prior operates directly in BigVAE latent space. It conditions on layer metadata and distributional context, uses a transformer/DiT-style denoising network, and supports DDIM sampling. The default prior configuration uses 1000 diffusion training steps, a cosine schedule, 50 sampling steps, DDIM sampling, `prediction_type = v`, and diagonal latent normalization. In the downstream ViT latent-scaling experiments, `init.kind = diffusion_prior` is the default path.
 
-The offline dataset stores:
-
-- source model name;
-- source dataset name;
-- layer name;
-- weight tensor;
-- activation context;
-- metadata used for balanced sampling and analysis.
-
-Training uses balanced offline sampling over:
-
-```text
-dataset, model, layer_type, depth
-```
-
-and can mix several source records per batch. This is important because a single
-large source layer may otherwise dominate a training window.
+The present interpretation is conservative. The diffusion prior is better aligned with the empirical latent distribution than naive Gaussian sampling, but it has not yet made latent optimization competitive with raw-weight Adam/AdamW. This means that the bottleneck may lie in the VAE compression level, the decoder geometry, the fact that the VAE has only seen final trained solutions, the prior, or the interaction between these components.
 
 ---
 
-## 7. Experiments
+## 7. Evaluation protocol and current evidence
 
-The repository contains four complementary evaluation tracks. They are designed
-to measure different aspects of the same claim.
+### 7.1 Out-of-domain latent geometry
 
-The experiments are meant to be read as an evidence stack:
+The main positive result is the held-out latent dump and visualization. The evaluation pipeline builds an offline dataset from model/dataset pairs not used in the training profile, evaluates a BigVAE checkpoint, stores latent vectors, and produces PCA/t-SNE projections colored by source attributes.
 
-| Track | Positive evidence | Negative evidence |
+The current report should insert four PCA panels:
+
+![alt text](bigvae_report_assets/dataset_pca.jpg)
+![alt text](bigvae_report_assets/model_pca.jpg)
+![alt text](bigvae_report_assets/depth_pca.jpg)
+![alt text](bigvae_report_assets/layer_type_pca.jpg)
+
+| Panel | Coloring | Current interpretation |
 |---|---|---|
-| Held-out reconstruction | low macro losses across unseen pairs | good train loss but bad held-out macro loss |
-| Latent geometry | structure by layer type/depth/model with balanced counts | clusters explained by sampling imbalance |
-| Loss landscape | lower \(S_\rho\), lower \(M_\rho\), higher \(A^{frac}\) in latent space | latent slices as sharp or rough as raw slices |
-| ViT latent scaling | competitive val accuracy with fewer optimized variables | latent optimization stalls or needs extreme LR |
+| PCA by model | Source model id | Clear organization by source model. This supports the view that different pretrained models induce different distributions over useful linear-layer weights. |
+| PCA by dataset | Source dataset id | Clear organization by source dataset. This supports the value of activation-conditioned coding: the same kind of layer is not represented independently of its input distribution. |
+| PCA by layer type | Parsed layer type | Diagnostic projection only. It may show some structure, but there is no current claim of clear separation. |
+| PCA by layer number/depth | Parsed depth label | Diagnostic projection only. It may show weak or partial trends, but there is no current claim of clear separation. |
 
-### 7.1 Identity and Structural Sanity Checks
+The qualitative observation is worth reporting, but it must be stated narrowly. The held-out latents show clear structure by source model and source dataset. This suggests that the VAE learns different local distributions of weights for different model families and different activation domains. The layer-type and layer-depth projections are retained as sanity checks, not as headline evidence. The important result is that the latent cloud is not shapeless: model identity and activation domain leave visible signatures in the learned coordinates.
 
-The identity diagnostics validate the structural direction loss and slice
-accounting. Locally available diagnostic summaries show:
+### 7.2 Held-out reconstruction metrics
 
-| Check | Expected | Local diagnostic value |
-|---|---:|---:|
-| identity direction loss | 0 | about `-2.98e-08` |
-| positive scaling direction loss | 0 | `0.0` |
-| negation direction loss | 2 | `2.0` |
-| frozen batch immutability | true | true |
-
-These are not final model results. They are correctness checks for loss
-definitions and target construction.
-
-### 7.2 Held-Out Reconstruction
-
-Held-out evaluation builds an offline dataset from source model/dataset pairs
-excluded from the main training profile. A checkpoint is evaluated on all BigVAE
-loss components.
-
-Held-out pairs:
-
-| Dataset | Source models |
-|---|---|
-| `chexpert` | `vit_large_p16_224`, `clip_vit_l14` |
-| `flickr30k` | `clip_vit_l14`, `vit_base_p16_224` |
-| `food101` | `siglip_so400m_p14_384`, `vit_large_p16_224` |
-| `openimages_v7` | `detr_resnet50`, `clip_vit_l14` |
-| `pascal_voc_2012` | `segformer_b5_cityscapes`, `detr_resnet50` |
-| `rvl_cdip` | `donut_rvlcdip`, `trocr_large_printed` |
-| `sun397` | `vit_large_p16_224`, `clip_vit_l14` |
-
-Expected outputs:
+The held-out evaluation also produces global and grouped metrics:
 
 ```text
 metrics_summary.json
@@ -660,535 +302,91 @@ metrics_global.json
 metrics_macro.json
 metrics_by_model.csv
 metrics_by_dataset.csv
-metrics_by_dataset_model_pair.csv
+metrics_by_pair.csv
 metrics_by_layer.csv
-record_metrics.csv
-```
-
-### 7.3 Latent Geometry
-
-Held-out eval can dump posterior means and plot PCA/t-SNE projections. The
-default dump is balanced over:
-
-```text
-(dataset, model, layer_type, depth_label)
-```
-
-The key parameter:
-
-```text
-EVAL_LATENT_DUMP_MAX_SLICES_PER_SOURCE=1
-```
-
-means that at most one slice-level latent point is taken from a single source
-record. This prevents one large layer from filling the visualization sample.
-
-Generated files:
-
-```text
+record_metrics.jsonl
+coverage.json
 latent_dump.pt
-latent_dump.metadata.csv
-latent_plots/latent_embedding_pca.csv
-latent_plots/latent_embedding_tsne.csv
-latent_plots/latent_counts_by_dataset.csv
-latent_plots/latent_counts_by_model.csv
-latent_plots/latent_counts_by_layer_type.csv
-latent_plots/latent_counts_by_depth_label.csv
-latent_plots/latent_pca_by_dataset.png
-latent_plots/latent_pca_by_model.png
-latent_plots/latent_pca_by_layer_type.png
-latent_plots/latent_pca_by_depth_label.png
-latent_plots/latent_tsne_by_dataset.png
-latent_plots/latent_tsne_by_model.png
-latent_plots/latent_tsne_by_layer_type.png
-latent_plots/latent_tsne_by_depth_label.png
 ```
 
-### 7.4 Loss Landscape Comparison
+The report should include the global reconstruction numbers once the exact run is selected. The most important distinction is between matrix reconstruction and operator reconstruction. A visually organized latent space is not enough unless \(\hat W_s\) also preserves \(X_s W_s\) on held-out activation contexts.
 
-The loss-landscape notebook compares two parameterizations of a tiny ViT:
+**Table slot.** Insert held-out reconstruction metrics here.
 
-1. raw weight perturbations;
-2. BigVAE latent perturbations decoded into weights.
+| Metric group | Metric | Value | Interpretation |
+|---|---|---:|---|
+| Global | operator reconstruction | TBD | Functional fidelity on held-out contexts. |
+| Global | structural direction | TBD | Patch direction fidelity. |
+| Global | structural scale | TBD | Patch norm fidelity. |
+| Macro by model | worst model group | TBD | Detects architecture-specific failure. |
+| Macro by dataset | worst dataset group | TBD | Detects activation-distribution failure. |
 
-The notebook supports MNIST, CIFAR-10, and a synthetic stripe-parity task. The
-stripe-parity task is deliberately nontrivial: 16 image patches each contain a
-local stripe pattern, and the label is the XOR over a fixed subset of 8 patch
-positions. This produces a small benchmark where raw weight space is expected to
-be highly non-convex.
+### 7.3 CIFAR-10 latent optimization
 
-For a 2D slice:
+The operational endpoint is optimization through frozen BigVAE latents. The ViT latent-scaling pipeline trains a small ViT either by direct raw-weight optimization or by optimizing latent parameters that are decoded into weights. The relevant comparison is not whether latent optimization can reduce loss at all; it is whether it can match or beat Adam/AdamW on raw weights under a comparable budget.
 
-$$
-L(\alpha,\beta),
-\qquad
-\Delta L(\alpha,\beta)=L(\alpha,\beta)-L(0,0).
-$$
+The current CIFAR-10 result is negative. Latent optimization converges slower and performs worse than raw-weight Adam/AdamW. This remains true even when using a diffusion-prior initialization rather than naive Gaussian latent sampling. The right interpretation is not that the manifold idea is dead; it is that the current VAE/prior/parameterization stack is not yet a competitive optimizer substrate.
 
-The reported metrics are:
+![alt text](bigvae_report_assets/raw_vs_latent.jpg)
 
-$$
-S_\rho =
-\max_{\alpha^2+\beta^2\le\rho^2}
-\Delta L(\alpha,\beta),
-$$
-
-$$
-M_\rho =
-\frac{1}{|D_\rho|}
-\int_{D_\rho}
-\Delta L(\alpha,\beta)
-d\alpha\,d\beta,
-$$
-
-$$
-A^{frac}_{\tau,\rho} =
-\frac{
-\mathrm{Area}
-\{(\alpha,\beta)\in D_\rho:
-\Delta L(\alpha,\beta)\le\tau\}
-}{
-\mathrm{Area}(D_\rho)
-}.
-$$
-
-Raw directions use filter-wise normalization. Latent directions are sampled in
-BigVAE latent space and decoded before evaluating the task loss.
-
-### 7.5 Downstream ViT Latent Scaling
-
-The scaling experiment compares:
-
-- raw AdamW optimization over ViT parameters;
-- BigVAE latent optimization, initialized from a raw checkpoint and decoded into
-  ViT weights every forward pass.
-
-The latent learning-rate grid is:
-
-```text
-1e-4 1e-3 1e-2 1e-1 1e0
-```
-
-Experiment families:
-
-| Dataset | Model sizes |
-|---|---|
-| MNIST | tiny, small, medium |
-| CIFAR-10 | tiny, small, medium |
-| ImageNet | tiny, small, base |
+There are two main interpretations. The mild interpretation is capacity/compression: an approximately \(8\times\) compression regime may be too aggressive for optimization, even if it is good enough to reveal representation structure. The stronger interpretation is distribution shift: the VAE has mostly seen trained solutions, so early and middle optimization checkpoints are out-of-domain for the decoder. A latent optimizer may therefore leave the learned solution-neighborhood chart and decode into poorly conditioned raw-weight updates.
 
 ---
 
-## 8. Results
+## 8. Interpretation
 
-This section is intentionally structured as a paper results section, but the
-numeric tables and figures are filled after remote runs. The placeholders below
-point to the expected artifact locations.
+The clean positive result is representational. PCA projections of held-out latents show that the learned space has visible structure by source model and source dataset. This means BigVAE is not merely storing local tensor shape. It learns a distribution over weights that depends on the pretrained model and on the activation domain used to condition reconstruction.
 
-The final report should not merely paste figures. For each result, fill in:
+This is already a nontrivial result. Each source model appears to induce its own distribution over linear-layer weights, and each dataset changes the activation contexts under which those weights are reconstructed. The fact that these factors remain visible in held-out latent projections is evidence that fixed-size, activation-conditioned local coding can capture meaningful structure in neural parameters.
 
-- **Observation:** what the plot/table shows.
-- **Interpretation:** what this implies about the latent manifold hypothesis.
-- **Failure mode:** what alternative explanation remains possible.
-- **Next check:** what experiment would disambiguate it.
+The optimizer result is not yet positive. Latent optimization currently performs worse than Adam/AdamW on raw weights. The likely reason is not a single bug-level issue. Raw Adam assumes a Euclidean parameterization of the optimized variables. BigVAE latents are not automatically Euclidean coordinates for the function represented by the decoded weights. The decoder induces its own metric, and a Euclidean step in \(z\)-space may correspond to a highly anisotropic or unstable movement in raw-weight/function space.
 
-### 8.1 Training Dynamics
-
-**Claim to evaluate.** BigVAE should reduce behavioral and structural losses
-while maintaining a controlled KL ramp after VAE sampling is enabled.
-
-**Insert Figure 4 here.**
-
-![Figure 4 placeholder: BigVAE training curves](artifacts/report_placeholders/bigvae_training_curves.png)
-
-Expected source files:
-
-```text
-artifacts/training/checkpoints/weight_quantile_vae/stage_1/wandb/
-artifacts/training/checkpoints/weight_quantile_vae/stage_1/grad_layer_rms.csv
-artifacts/training/checkpoints/weight_quantile_vae/stage_1/grad_layer_rms.png
-artifacts/training/checkpoints/weight_quantile_vae/stage_1/grad_layer_rms_heatmap.png
-```
-
-Suggested caption:
-
-> Training curves for BigVAE. The KL term remains suppressed during warmup and
-> increases with the latent sampling gate, while behavioral and structural
-> reconstruction terms track reconstruction quality.
-
-What would make this figure strong: a smooth transition from AE-like
-reconstruction to VAE training, no sudden explosion when the sampling gate
-opens, and a KL term that becomes active without dominating the operator loss.
-
-NanoBanana prompt:
-
-```text
-Create a publication-quality multi-panel figure for a neural weight VAE training
-run. Four panels: total loss, behavioral operator loss, KL beta and posterior
-sampling gate, gradient RMS heatmap. Clean arXiv style, white background, thin
-axes, blue/orange/green accents, no decorative elements.
-```
-
-### 8.2 Held-Out Reconstruction
-
-**Claim to evaluate.** Reconstruction quality should transfer to source
-model/dataset pairs excluded from the training profile.
-
-Expected source directory:
-
-```text
-post_train_research/big_vae_heldout_eval/artifacts/offline_dataset/eval/<checkpoint>/
-```
-
-Fill after run:
-
-| Metric | Global | Macro by dataset | Macro by model | Macro by pair |
-|---|---:|---:|---:|---:|
-| total loss | TBD | TBD | TBD | TBD |
-| behavioral operator | TBD | TBD | TBD | TBD |
-| structural direction | TBD | TBD | TBD | TBD |
-| structural scale | TBD | TBD | TBD | TBD |
-| KL | TBD | TBD | TBD | TBD |
-
-**Insert Figure 5 here.**
-
-![Figure 5 placeholder: held-out reconstruction by dataset](post_train_research/big_vae_heldout_eval/artifacts/offline_dataset/eval/PUT_CHECKPOINT_HERE/metrics_by_dataset.png)
-
-NanoBanana prompt:
-
-```text
-Create a clean scientific bar-chart dashboard for held-out reconstruction of a
-neural weight VAE. Show grouped bars by dataset and source model for behavioral
-loss and structural loss. Minimal arXiv style, readable labels, no logos.
-```
-
-The key comparison is not the absolute loss of one held-out dataset, but the
-spread. A latent manifold that only works for one source family will show large
-macro gaps by model or by layer type. A useful general manifold should degrade
-gracefully across unseen pairs.
-
-### 8.3 Latent Space Organization
-
-**Claim to evaluate.** If the latent space captures reusable weight structure,
-then points should show organization by layer type, depth, and source model,
-not only random scatter.
-
-Expected source directory:
-
-```text
-post_train_research/big_vae_heldout_eval/artifacts/offline_dataset/eval/<checkpoint>/latent_plots/
-```
-
-**Insert Figure 6 here.**
-
-![Figure 6a placeholder: PCA by dataset](post_train_research/big_vae_heldout_eval/artifacts/offline_dataset/eval/PUT_CHECKPOINT_HERE/latent_plots/latent_pca_by_dataset.png)
-
-![Figure 6b placeholder: PCA by model](post_train_research/big_vae_heldout_eval/artifacts/offline_dataset/eval/PUT_CHECKPOINT_HERE/latent_plots/latent_pca_by_model.png)
-
-![Figure 6c placeholder: t-SNE by layer type](post_train_research/big_vae_heldout_eval/artifacts/offline_dataset/eval/PUT_CHECKPOINT_HERE/latent_plots/latent_tsne_by_layer_type.png)
-
-![Figure 6d placeholder: t-SNE by depth](post_train_research/big_vae_heldout_eval/artifacts/offline_dataset/eval/PUT_CHECKPOINT_HERE/latent_plots/latent_tsne_by_depth_label.png)
-
-Interpretation checklist:
-
-- Are layer types linearly separable in PCA?
-- Does depth form a trajectory or a set of bands?
-- Are dataset clusters weaker than model clusters?
-- Do count CSVs confirm balanced sampling?
-
-NanoBanana prompt:
-
-```text
-Create a 2x2 scientific figure of latent-space embeddings for neural network
-layers. Each panel is a scatter plot with the same point cloud colored by:
-dataset, source model, layer type, and depth. White background, transparent
-points, colorblind-safe palette, thin axes, arXiv preprint style.
-```
-
-The strongest geometry result would be layered structure: model family and
-layer type should explain large-scale clusters, while depth should vary more
-smoothly inside those clusters. If dataset color dominates everything, the
-latent model may be overfitting context distribution rather than reusable weight
-structure.
-
-### 8.4 Loss Landscape Smoothing
-
-**Claim to evaluate.** BigVAE latent-induced slices should have lower sharpness,
-lower mean loss increase, or larger good-area fractions than raw weight slices.
-
-Expected source directory:
-
-```text
-post_train_research/loss_landscape_analysis/artifacts/loss_landscape_stripe_parity_vit/
-```
-
-**Insert Figure 7 here.**
-
-![Figure 7a placeholder: raw 2D landscape](post_train_research/loss_landscape_analysis/artifacts/loss_landscape_stripe_parity_vit/raw_fn_direction_0_2d.png)
-
-![Figure 7b placeholder: latent 2D landscape](post_train_research/loss_landscape_analysis/artifacts/loss_landscape_stripe_parity_vit/latent_direction_0_2d.png)
-
-![Figure 7c placeholder: sharpness summary](post_train_research/loss_landscape_analysis/artifacts/loss_landscape_stripe_parity_vit/metric_S_rho_boxplot.png)
-
-![Figure 7d placeholder: mean increase summary](post_train_research/loss_landscape_analysis/artifacts/loss_landscape_stripe_parity_vit/metric_M_rho_boxplot.png)
-
-Fill after run:
-
-| Parameterization | \(S_\rho\) | \(M_\rho\) | \(A^{frac}_{\tau,\rho}\) | Notes |
-|---|---:|---:|---:|---|
-| raw weights | TBD | TBD | TBD | |
-| BigVAE latents | TBD | TBD | TBD | |
-
-NanoBanana prompt:
-
-```text
-Create a paper-quality side-by-side comparison of neural network loss
-landscapes. Left: raw weight space with jagged peaks, narrow basin, irregular
-contours. Right: BigVAE latent space with smoother basin and gentler contours.
-Use the same axes and color scale, perceptually uniform colormap, white
-background, no unnecessary labels.
-```
-
-The landscape result is the core scientific test. The desired pattern is not
-only a visually smoother surface; it should also appear in the scalar metrics:
-smaller \(S_\rho\), smaller \(M_\rho\), and larger \(A^{frac}_{\tau,\rho}\)
-across multiple random directions and tasks.
-
-### 8.5 Downstream Optimization Through Latents
-
-**Claim to evaluate.** Optimizing BigVAE latent slots should produce competitive
-task performance while using fewer trainable degrees of freedom than raw
-weights.
-
-Expected source directory:
-
-```text
-post_train_research/vit_latent_scaling/artifacts/<dataset>/<size>/
-```
-
-**Insert Figure 8 here.**
-
-![Figure 8 placeholder: raw vs latent optimization](post_train_research/vit_latent_scaling/artifacts/PUT_DATASET_HERE/PUT_SIZE_HERE/comparison.png)
-
-Fill after run:
-
-| Dataset | Size | Setup | LR | Train acc | Val acc | Optimized params | Decoded params |
-|---|---|---|---:|---:|---:|---:|---:|
-| TBD | TBD | raw | TBD | TBD | TBD | TBD | TBD |
-| TBD | TBD | latent | TBD | TBD | TBD | TBD | TBD |
-
-This experiment is the practical endpoint. If latent optimization only looks
-nice in 2D but cannot train a small ViT, the manifold is descriptive rather than
-useful. If it reaches competitive validation accuracy while optimizing far
-fewer variables, the latent decoder is doing real work as an optimization prior.
+This makes the next research question precise. The project has evidence for learned structure in weight latents. It does not yet have evidence that these coordinates are smooth enough, complete enough, or metric-compatible enough for first-order optimization. The path forward is to make the decoder chart less curved and less out-of-domain for optimization trajectories.
 
 ---
 
-## 9. Discussion
+## 9. Future work
 
-The project should not be read as merely a compression model for weights. The
-more important question is whether learned weight manifolds can become practical
-optimization coordinates.
+The first likely bottleneck is compression. The current experiments target approximately \(8\times\) compression. This may be too aggressive for optimization even if it is sufficient for reconstruction and clustering. The direct test is to reduce compression by increasing \(K\), increasing \(d_{lat}\), changing tile size, or weakening the KL pressure, then rerun the same CIFAR-10 latent-optimization protocol. If convergence improves sharply when compression is relaxed, the present failure is primarily capacity-limited.
 
-The architecture makes three deliberate choices:
+The second bottleneck is decoder geometry. Adam, AdamW, and similar first-order methods are tuned for Euclidean coordinates. A learned decoder defines a pullback metric
 
-1. It conditions on activation distributions because functionally important
-   directions depend on the data seen by the layer.
-2. It reconstructs both operator behavior and weight structure because either
-   target alone is insufficient: pure weight MSE ignores function, while pure
-   operator loss may underconstrain unused directions.
-3. It uses fixed latent slots because downstream optimization needs a stable
-   parameter count independent of the source layer shape.
+$$
+G(z) = J_D(z)^\top J_D(z),
+$$
 
-The strongest evidence would be a consistent pattern across held-out eval,
-latent geometry, and downstream optimization: good held-out reconstruction,
-organized latent embeddings, smoother latent landscapes, and competitive latent
-optimization.
+where \(D(z)=\hat W_\theta(z,C)\) is the decoder and \(J_D(z)\) is its Jacobian with respect to \(z\). If \(G(z)\) is highly anisotropic or changes rapidly, Euclidean latent updates are not well matched to functional movement of the decoded layer. A natural next direction is Riemannian smoothing: penalize local metric roughness, curvature proxies, or trace/Hutchinson estimates of decoder Jacobian/Hessian variation. The practical target is local Euclideanity: nearby latent points should decode into controlled nearby operators on \(X_s\), so that ordinary optimizers have a useful inductive bias in latent space [12, 13, 14].
 
-### What Would Count as a Convincing Story?
-
-The repository is aiming for a specific chain of evidence:
-
-1. BigVAE reconstructs held-out layer operators, so the decoder has learned more
-   than a memorized training-set prior.
-2. Latent embeddings separate by layer type and depth, so the encoder is not
-   collapsing unrelated layers into an unstructured cloud.
-3. Latent-induced loss landscapes are smoother on hard ViT tasks, so the decoder
-   removes destructive raw perturbation directions.
-4. Latent-only downstream optimization reaches useful accuracy, so the smoother
-   geometry is not merely a visualization artifact.
-
-If all four hold, the interpretation is strong: BigVAE has learned a reusable
-coordinate system for neural weights. If only the first two hold, the model is a
-good representation learner but not yet an optimizer. If only the landscape
-plots look better, the result is visually suggestive but not operationally
-useful.
-
-### Failure Taxonomy
-
-| Symptom | Likely interpretation | Next diagnostic |
-|---|---|---|
-| Low structural loss but high operator loss | Reconstructed weights look similar but act differently on data | Increase behavioral weight or inspect activation-conditioned decoder paths |
-| Low operator loss but bad direction loss | Function preserved only on observed context, unconstrained elsewhere | Evaluate with fresh activation contexts |
-| Latent PCA clusters only by dataset | Encoder may overuse input distribution instead of weight structure | Compare plots with distribution encoder disabled |
-| t-SNE clusters vanish in PCA | Nonlinear visualization may be exaggerating weak structure | Report PCA explained variance and count CSVs |
-| Latent landscapes smooth but accuracy poor | Decoder manifold may be too restrictive | Compare decoded parameter count and reconstruction residuals |
-| KL explodes after resume | Posterior variance introduced too quickly | Lower gate start value or extend ramp |
+The third bottleneck is training-domain mismatch. The VAE has primarily learned to encode/decode trained or near-trained weights. But optimization begins from random or prior-sampled weights and spends many steps in early and middle trajectory regions. Formally, these regions are out-of-domain for a VAE trained only on final solutions. If curvature smoothing and lower compression are insufficient, the likely fix is to train the VAE not only on final trained weights but also on intermediate checkpoints along optimization trajectories. This would teach the chart to cover the states through which latent optimization must actually pass, not only the final solution neighborhood.
 
 ---
 
-## 10. Limitations
+## 10. References
 
-The current pipeline has several limitations.
+[1] Chunyuan Li, Heerad Farkhoor, Rosanne Liu, Jason Yosinski. **Measuring the Intrinsic Dimension of Objective Landscapes.** ICLR 2018 / arXiv:1804.08838. https://arxiv.org/abs/1804.08838
 
-First, PCA and t-SNE can reveal structure but cannot prove that the latent space
-is useful for optimization. The count CSVs must be checked to ensure that
-apparent clusters are not sampling artifacts.
+[2] Timur Garipov, Pavel Izmailov, Dmitrii Podoprikhin, Dmitry Vetrov, Andrew Gordon Wilson. **Loss Surfaces, Mode Connectivity, and Fast Ensembling of DNNs.** NeurIPS 2018 / arXiv:1802.10026. https://arxiv.org/abs/1802.10026
 
-Second, 2D loss landscapes are diagnostic slices through a high-dimensional
-space. They can show roughness and local basin geometry, but they are not full
-global characterizations.
+[3] Felix Draxler, Kambis Veschgini, Manfred Salmhofer, Fred A. Hamprecht. **Essentially No Barriers in Neural Network Energy Landscape.** ICML 2018 / arXiv:1803.00885. https://arxiv.org/abs/1803.00885
 
-Third, held-out reconstruction measures the quality of reconstructed source
-layers. It does not directly prove downstream task performance.
+[4] Samuel K. Ainsworth, Jonathan Hayase, Siddhartha Srinivasa. **Git Re-Basin: Merging Models modulo Permutation Symmetries.** ICLR 2023 / arXiv:2209.04836. https://arxiv.org/abs/2209.04836
 
-Fourth, the VAE path depends on careful schedules. If KL or posterior noise is
-introduced too aggressively after deterministic AE training, reconstruction can
-collapse.
+[5] David Ha, Andrew Dai, Quoc V. Le. **HyperNetworks.** ICLR 2017 / arXiv:1609.09106. https://arxiv.org/abs/1609.09106
 
----
+[6] Konstantin Schürholt, Boris Knyazev, Xavier Giró-i-Nieto, Damian Borth. **Hyper-Representations as Generative Models: Sampling Unseen Neural Network Weights.** NeurIPS 2022 / arXiv:2209.14733. https://arxiv.org/abs/2209.14733
 
-## 11. Reproducibility
+[7] Konstantin Schürholt, Diyar Taskiran, Boris Knyazev, Xavier Giró-i-Nieto, Damian Borth. **Model Zoos: A Dataset of Diverse Populations of Neural Network Models.** NeurIPS 2022 Datasets and Benchmarks / arXiv:2209.14717. https://arxiv.org/abs/2209.14717
 
-Build the BigVAE offline dataset:
+[8] William Peebles, Ilija Radosavovic, Tim Brooks, Alexei A. Efros, Jitendra Malik. **Learning to Learn with Generative Models of Neural Network Checkpoints.** arXiv:2209.12892, 2022. https://arxiv.org/abs/2209.12892
 
-```bash
-./run_big_vae_offline_dataset_build.sh \
-  train.offline_dataset.root_dir=./artifacts/training/checkpoints/weight_quantile_vae/stage_1/offline_dataset \
-  train.offline_dataset.builder.target_size_gb=300 \
-  train.offline_dataset.builder.overwrite_existing=true
-```
+[9] Aviv Navon, Aviv Shamsian, Idan Achituve, Ethan Fetaya, Gal Chechik, Haggai Maron. **Equivariant Architectures for Learning in Deep Weight Spaces.** ICML 2023 / arXiv:2301.12780. https://arxiv.org/abs/2301.12780
 
-Train BigVAE:
+[10] Allan Zhou, Kaien Yang, Kaylee Burns, Adriano Cardace, Yiding Jiang, Samuel Sokota, J. Zico Kolter, Chelsea Finn. **Permutation Equivariant Neural Functionals.** NeurIPS 2023 / arXiv:2302.14040. https://arxiv.org/abs/2302.14040
 
-```bash
-./run_big_vae_train.sh
-```
+[11] Léo Meynent, Ivan Melev, Konstantin Schürholt, Göran Kauermann, Damian Borth. **Structure Is Not Enough: Leveraging Behavior for Neural Network Weight Reconstruction.** ICLR Workshop on Neural Network Weights as a New Data Modality 2025 / arXiv:2503.17138. https://arxiv.org/abs/2503.17138
 
-Build held-out dataset:
+[12] Clément Chadebec, Stéphanie Allassonnière. **A Geometric Perspective on Variational Autoencoders.** NeurIPS 2022 / arXiv:2209.07370. https://arxiv.org/abs/2209.07370
 
-```bash
-HELDOUT_ROOT=post_train_research/big_vae_heldout_eval/artifacts/offline_dataset \
-HELDOUT_RECORDS_PER_PAIR=1024 \
-HELDOUT_TARGET_SIZE_GB=20 \
-HELDOUT_OVERWRITE=true \
-post_train_research/big_vae_heldout_eval/run_build_heldout_offline_dataset.sh
-```
+[13] Yonghyeon Lee, Frank Chongwoo Park. **On Explicit Curvature Regularization in Deep Generative Models.** TAG-ML 2023 / arXiv:2309.10237. https://arxiv.org/abs/2309.10237
 
-Evaluate checkpoint:
-
-```bash
-BIG_VAE_CHECKPOINT=artifacts/training/checkpoints/weight_quantile_vae/stage_1/latest.pt \
-HELDOUT_ROOT=post_train_research/big_vae_heldout_eval/artifacts/offline_dataset \
-post_train_research/big_vae_heldout_eval/run_evaluate_big_vae_heldout.sh
-```
-
-Rebuild latent plots:
-
-```bash
-python post_train_research/big_vae_heldout_eval/plot_latent_dump.py \
-  "$HELDOUT_ROOT/eval/<checkpoint_dir>_<checkpoint_name>/latent_dump.pt"
-```
-
-Run ViT latent scaling:
-
-```bash
-BIG_VAE_CHECKPOINT=artifacts/training/checkpoints/weight_quantile_vae/stage_1/latest.pt \
-post_train_research/vit_latent_scaling/run_vit_latent_scaling.sh cifar10_small
-```
-
----
-
-## Appendix A. Artifact Checklist
-
-Before filling the results section, collect:
-
-```text
-metrics_summary.json
-metrics_global.json
-metrics_macro.json
-metrics_by_model.csv
-metrics_by_dataset.csv
-metrics_by_layer.csv
-latent_counts_by_dataset.csv
-latent_counts_by_model.csv
-latent_counts_by_layer_type.csv
-latent_counts_by_depth_label.csv
-landscape_metrics.csv
-latent_transfer_projection_points.csv
-vit_latent_scaling/*/summary.json
-vit_latent_scaling/*/metrics.csv
-```
-
-Recommended figure names for a polished final report:
-
-```text
-figures/fig1_training_dynamics.png
-figures/fig2_heldout_reconstruction.png
-figures/fig3_latent_geometry.png
-figures/fig4_loss_landscapes.png
-figures/fig5_vit_latent_scaling.png
-```
-
----
-
-## Appendix B. Code Reading Guide
-
-The report maps to the code as follows.
-
-| Concept | Primary code |
-|---|---|
-| BigVAE config dataclasses | `models/big_weight_vae.py` |
-| Patch tokenizer choice | `BigWeightVAE.__init__` |
-| Encoder latent slots | `BigWeightVAE._encode_latent_slots` |
-| Posterior heads and sampling gate | `BigWeightVAE._sample_latent_posterior` |
-| Decoder from latent slots | `BigWeightVAE._decode_from_latent_slots` |
-| KL loss | `WeightQuantileVAE.kl_loss` |
-| Structural loss | `WeightQuantileVAE.patch_structure_loss` |
-| KL schedule | `experiments/train_big_vae.py::_compute_kl_beta_for_step` |
-| Latent sampling gate schedule | `experiments/train_big_vae.py::_compute_latent_sampling_gate_for_step` |
-| AE-to-VAE checkpoint migration | `experiments/train_big_vae.py::_load_training_state_from_checkpoint` |
-| Offline held-out eval | `post_train_research/big_vae_heldout_eval/evaluate_big_vae_heldout.py` |
-| Latent PCA/t-SNE replot | `post_train_research/big_vae_heldout_eval/plot_latent_dump.py` |
-| Loss landscape notebook | `post_train_research/loss_landscape_analysis/mnist_one_layer_vit_loss_landscape_latent_vs_raw.ipynb` |
-| ViT latent scaling | `post_train_research/vit_latent_scaling/run_vit_latent_scaling.py` |
-
-The fastest way to understand the system is to read in this order:
-
-1. `models/big_weight_vae.py`: follow `forward`, `_encode_latent_slots`,
-   `_sample_latent_posterior`, `_decode_from_latent_slots`.
-2. `experiments/train_big_vae.py`: inspect schedule computation and the loss
-   block around behavioral, structural, and KL terms.
-3. `post_train_research/big_vae_heldout_eval/evaluate_big_vae_heldout.py`:
-   inspect how held-out metrics and latent dumps are produced.
-4. `post_train_research/loss_landscape_analysis/loss_landscape_metrics.md`:
-   inspect the scalar landscape metrics used in the notebook.
-
----
-
-## Appendix C. Glossary
-
-| Symbol or term | Meaning |
-|---|---|
-| \(W\) | Source model linear-layer weight matrix |
-| \(X\) | Activation context entering the layer |
-| \(\hat W\) | BigVAE reconstruction |
-| \(z_0\) | Deterministic encoded latent before posterior heads |
-| \(\mu\) | Posterior mean |
-| \(\sigma\) | Posterior standard deviation |
-| \(g\) | Latent sampling gate |
-| `latent slot` | One vector in the fixed-size latent set |
-| `behavioral loss` | Reconstruction loss on \(XW\) versus \(X\hat W\) |
-| `structural loss` | Patch-level direction/scale reconstruction loss |
-| `held-out eval` | Evaluation on model/dataset pairs excluded from training |
-| `latent landscape` | Task loss slice induced by perturbing BigVAE latent slots |
+[14] Dionysios Kalatzis, David Eklund, Georgios Arvanitidis, Søren Hauberg. **Variational Autoencoders with Riemannian Brownian Motion Priors.** ICML 2020 / arXiv:2002.05227. https://arxiv.org/abs/2002.05227
