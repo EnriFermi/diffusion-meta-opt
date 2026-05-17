@@ -21,7 +21,7 @@ predownload_models: true
 
 warmup_steps: 0
 min_lr_ratio: 0.1
-kl_beta: 0.001
+kl_beta: 0.01
 kl_schedule:
   enabled: true
   start_beta: 0.0
@@ -30,7 +30,7 @@ kl_schedule:
 latent_sampling_gate:
   # Absolute global-step schedule. For AE -> VAE fine-tune, set start_step
   # to the resumed checkpoint step if the gate should start small after resume.
-  enabled: true
+  enabled: false
   start_step: ${train.kl_schedule.warmup_steps}
   ramp_steps: ${train.kl_schedule.ramp_steps}
   start_value: 1e-4
@@ -72,9 +72,9 @@ resume_state:
   save_every: ${train.checkpoint_every}
   dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/resume_state
   load_model_state: true
-  load_optimizer_state: false
-  load_scheduler_state: false
-  load_scaler_state: false
+  load_optimizer_state: true
+  load_scheduler_state: true
+  load_scaler_state: true
   load_step: true
 
 stage: 1
@@ -133,7 +133,7 @@ offline_dataset:
   runtime_enforce_stage_compatibility: true
   # Optional DataLoader worker pool for the offline IterableDataset. 0 keeps the
   # legacy single-process iterator path. Positive values enable multi-process IO.
-  loader_workers: 20
+  loader_workers: 4
   loader_prefetch_factor: 8
   # Optional IPC batching between offline DataLoader workers and the main process.
   # 1 keeps one SharedSample per queue transfer; larger values amortize worker IPC.
@@ -178,7 +178,7 @@ offline_batch_prefetch:
   queue_size: 24
   pin_memory: true
   # 0 -> auto min(16, available_cpu_cores) for CPU-side data assembly ops.
-  cpu_threads: 10
+  cpu_threads: 4
   # 0 -> auto min(16, requested_source_samples_per_refresh) candidates per refill.
   refill_fetch_batch_size: 8
 # Optional stage-specific cache of already sliced/padded BigVAE training items.
@@ -198,14 +198,14 @@ preslicing:
   target_x_rows: 0
   target_d_in: 0
   target_d_out: 0
-  chunk_size_slices: 1024
+  chunk_size_slices: 128
   log_every_slices: 10000
   seed: ${data.seed}
   shuffle_chunks: true
   shuffle_slices_within_chunk: true
   repeat: true
   shard_by_rank: true
-  chunk_cache_size: 4
+  chunk_cache_size: 32
   loader_workers: 8
   loader_batch_size: 16
   loader_prefetch_factor: 8

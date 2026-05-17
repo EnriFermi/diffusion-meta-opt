@@ -5,7 +5,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 cd "$PROJECT_ROOT"
 
-CONDA_ENV_NAME="onerec"
+CONDA_ENV_NAME="diff-meta-opt312"
 
 RUN_LABEL="cifar10_50k_latent_prior"
 PROFILE="cifar10_50k"
@@ -22,14 +22,15 @@ SOURCE_RUN_DIR=""                   # path to old run dir or run_id under artifa
 SOURCE_CHECKPOINT="best"            # best | latest | final | step_000250 | /abs/path/to.ckpt.pt
 SOURCE_PREFER_DIRECT_LATENT="true"  # exact latent restore when compatible
 
-BIG_VAE_CHECKPOINT=""
+
+BIG_VAE_CHECKPOINT="./artifacts/training/checkpoints/weight_quantile_vae_gpu0_square_VAE/stage_1/latest.pt"
 BIG_VAE_DECODE="weights"            # weights | all
 BIG_VAE_TILE_T_PATCHES="4"
 BIG_VAE_TILE_D_OUT="64"
-BIG_VAE_LATENT_PARAMETERIZATION="sphere"
+BIG_VAE_LATENT_PARAMETERIZATION="euclidean"
 BIG_VAE_LATENT_NOISE_STD="0.0"
 
-DIFFUSION_PRIOR_CHECKPOINT=""
+DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/runs/train_big_vae_latent_diffusion_prior_20260427_032313_pid2515158_cdb92e/checkpoints/big_vae_latent_diffusion_prior/stage_1/latest.pt"
 DIFFUSION_PRIOR_STEPS="50"
 DIFFUSION_PRIOR_SAMPLER="ddim"
 DIFFUSION_PRIOR_ETA="0.0"
@@ -48,12 +49,12 @@ DOWNLOAD="true"
 DEVICE="${DEVICE:-auto}"
 SEED="42"
 EPOCHS="1000"
-MAX_STEPS="3000"
-OPTIMIZER_NAME="AdamW"
-LR="1e-3"
+MAX_STEPS="20000"
+OPTIMIZER_NAME="Adam"
+LR="8e-3"
 WEIGHT_DECAY="0.0"
 ADAM_BETA1="0.9"
-ADAM_BETA2="0.95"
+ADAM_BETA2="0.999"
 ADAM_EPS="1e-9"
 GRAD_CLIP_NORM="0.0"
 LABEL_SMOOTHING="0.0"

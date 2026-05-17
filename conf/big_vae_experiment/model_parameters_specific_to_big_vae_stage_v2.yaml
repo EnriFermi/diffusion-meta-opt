@@ -10,7 +10,7 @@ big_vae:
   # When true, keep a deterministic encoder mu-head active even if use_latent_sampling=false.
   use_encoder_mu_head: true
   # When false, feed raw encoder latent slots into to_mu/to_logvar instead of LayerNorm-normalized slots.
-  normalize_latent_slots_before_mu: true
+  normalize_latent_slots_before_mu: false
   # gaussian -> standard Normal prior
   # vamp -> VampPrior-style learned mixture prior in latent space
   latent_prior_kind: vamp
