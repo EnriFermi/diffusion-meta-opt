@@ -19,10 +19,10 @@ Streaming modes:
 
 Подробности и тюнинг streaming вынесены в:
 - `docs/data_pipeline_README.md` (разделы 8-15)
-- `tutorials/00_how_to_choose_data_mode.md` (выбор режима)
-- `tutorials/10_data_mode_none_in_memory.ipynb`
-- `tutorials/11_data_mode_local_disk_gpu_parallel.ipynb`
-- `tutorials/12_data_mode_s3_bridge.ipynb`
+- `legacy/tutorials/00_how_to_choose_data_mode.md` (выбор режима)
+- `legacy/tutorials/10_data_mode_none_in_memory.ipynb`
+- `legacy/tutorials/11_data_mode_local_disk_gpu_parallel.ipynb`
+- `legacy/tutorials/12_data_mode_s3_bridge.ipynb`
 
 ## Быстрые команды
 

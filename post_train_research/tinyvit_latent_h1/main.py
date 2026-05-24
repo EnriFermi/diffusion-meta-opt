@@ -13,6 +13,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from post_train_research.tinyvit_latent_h1.config import build_run_config
 from post_train_research.tinyvit_latent_h1.experiment import prepare_config_from_source_checkpoint, run_experiment
 from post_train_research.tinyvit_latent_h1.runtime import CometTracker, configure_logger, prepare_run_paths, write_config_snapshots
+from training.runtime import patch_argparse_lazy_help_for_hydra_py314
+
+
+patch_argparse_lazy_help_for_hydra_py314()
 
 
 @hydra.main(version_base=None, config_path="../../conf/tinyvit_latent_h1", config_name="config")

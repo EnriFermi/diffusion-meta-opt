@@ -13,6 +13,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from post_train_research.big_vae_latent_flattening.config import build_run_config
 from post_train_research.big_vae_latent_flattening.runtime import configure_logger, prepare_run_paths, write_config_snapshots
 from post_train_research.big_vae_latent_flattening.train import run_training
+from training.runtime import patch_argparse_lazy_help_for_hydra_py314
+
+
+patch_argparse_lazy_help_for_hydra_py314()
 
 
 @hydra.main(version_base=None, config_path="../../conf/big_vae_latent_flattening", config_name="config")
@@ -28,4 +32,3 @@ def main(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     main()
-

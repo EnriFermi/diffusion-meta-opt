@@ -1,0 +1,23 @@
+# @package _global_
+hf:
+  token: ${oc.env:HF_TOKEN,""}
+  hf_home: ${oc.select:data.path,./data}/hf_home
+  datasets_cache: ${oc.select:data.path,./data}/hf_datasets_cache
+  hub_cache: ${oc.select:data.path,./data}/hf_hub_cache
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+logging:
+  project_name: diffusion_meta_opt
+  dir: ${oc.select:training_artifacts.logs_dir,logs}
+  file_name: ${logging.project_name}_${hydra:job.name}_${now:%Y-%m-%d_%H-%M-%S}.log
+  file_path: ${logging.dir}/${logging.file_name}
+  format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+models:
+  enabled: []
+  model_config_dirs:
+    - conf/data/models

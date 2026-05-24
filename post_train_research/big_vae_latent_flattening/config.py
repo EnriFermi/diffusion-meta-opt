@@ -135,7 +135,7 @@ def build_run_config(cfg: DictConfig) -> tuple[RunConfig, dict[str, Any]]:
             tags=_tags(experiment.get("tags", [])),
         ),
         storage=StorageConfig(
-            root_dir=str(storage.get("root_dir", "./post_train_research/big_vae_latent_flattening/artifacts")),
+            root_dir=str(storage.get("root_dir", "./artifacts/big_vae/eval/latent_flattening")),
             checkpoint_every_steps=int(storage.get("checkpoint_every_steps", 250)),
             save_latest=bool(storage.get("save_latest", True)),
             save_final=bool(storage.get("save_final", True)),
@@ -205,4 +205,3 @@ def build_run_config(cfg: DictConfig) -> tuple[RunConfig, dict[str, Any]]:
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
-

@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - /run_profiles@_global_: train_big_vae_v2
+  - _self_
+
+run_config:
+  family: big_vae
+  name: v2
+  legacy_entrypoint: config_big_vae_v2

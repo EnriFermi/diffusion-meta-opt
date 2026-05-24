@@ -77,10 +77,16 @@ def _tensor_dict_metadata(mapping: dict[str, Any]) -> dict[str, Any]:
 
 def _checkpoint_payload_json_view(payload: dict[str, Any]) -> dict[str, Any]:
     view = {key: value for key, value in payload.items() if key not in {"named_tensors", "latent_slots", "tile_cond_patch"}}
+    count_aliases = {
+        "named_tensors": "named_tensor_count",
+        "latent_slots": "latent_slot_count",
+        "tile_cond_patch": "tile_cond_patch_count",
+    }
     for key in ("named_tensors", "latent_slots", "tile_cond_patch"):
         value = payload.get(key)
         if isinstance(value, dict):
             view[f"{key}_count"] = len(value)
+            view[count_aliases[key]] = len(value)
             view[key] = _tensor_dict_metadata(value)
     return view
 

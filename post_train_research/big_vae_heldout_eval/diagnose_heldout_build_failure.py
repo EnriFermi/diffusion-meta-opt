@@ -14,6 +14,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from common import default_heldout_eval_dir, default_heldout_root
+
 PROGRESS_RE = re.compile(
     r"Held-out build progress: seen_total=(?P<seen>\d+) accepted=(?P<accepted>\d+) "
     r"size_gb=(?P<size>[0-9.]+) pair_min=(?P<pair_min>\d+) pair_max=(?P<pair_max>\d+)"
@@ -684,14 +686,14 @@ def main() -> None:
 
     heldout_root = _env_path(
         "HELDOUT_ROOT",
-        args.heldout_root or "post_train_research/big_vae_heldout_eval/artifacts/offline_dataset",
+        args.heldout_root or default_heldout_root(),
     )
+    heldout_eval_dir = default_heldout_eval_dir()
     log_dirs = _dedupe_paths(
         [
-            _resolve_path(args.log_dir) if args.log_dir else _env_path("HELDOUT_LOG_DIR", heldout_root.parent / "logs"),
+            _resolve_path(args.log_dir) if args.log_dir else _env_path("HELDOUT_LOG_DIR", heldout_eval_dir / "logs"),
+            heldout_eval_dir / "logs",
             heldout_root.parent / "logs",
-            PROJECT_ROOT / "artifacts/training/logs",
-            PROJECT_ROOT / "post_train_research/big_vae_heldout_eval/artifacts/logs",
             PROJECT_ROOT / "logs",
         ]
     )
@@ -699,18 +701,20 @@ def main() -> None:
 
     reports_dirs = _dedupe_paths(
         [
-            _resolve_path(args.reports_dir) if args.reports_dir else PROJECT_ROOT / "artifacts/training/reports",
-            PROJECT_ROOT / "artifacts/training/reports",
+            _resolve_path(args.reports_dir)
+            if args.reports_dir
+            else _env_path("HELDOUT_REPORTS_DIR", heldout_eval_dir / "reports"),
+            heldout_eval_dir / "reports",
             heldout_root.parent / "reports",
-            PROJECT_ROOT / "post_train_research/big_vae_heldout_eval/artifacts/reports",
         ]
     )
     crashes_dirs = _dedupe_paths(
         [
-            _resolve_path(args.crashes_dir) if args.crashes_dir else PROJECT_ROOT / "artifacts/training/crashes",
-            PROJECT_ROOT / "artifacts/training/crashes",
+            _resolve_path(args.crashes_dir)
+            if args.crashes_dir
+            else _env_path("HELDOUT_CRASHES_DIR", heldout_eval_dir / "crashes"),
+            heldout_eval_dir / "crashes",
             heldout_root.parent / "crashes",
-            PROJECT_ROOT / "post_train_research/big_vae_heldout_eval/artifacts/crashes",
         ]
     )
 
@@ -718,14 +722,14 @@ def main() -> None:
         _resolve_path(args.crash_report)
         if args.crash_report
         else _first_existing([path / "collector_crash_report.json" for path in crashes_dirs])
-        or PROJECT_ROOT / "artifacts/training/crashes/collector_crash_report.json"
+        or heldout_eval_dir / "crashes" / "collector_crash_report.json"
     )
 
     worker_status_dir = (
         _resolve_path(args.worker_status_dir)
         if args.worker_status_dir
         else _first_existing([path / "dataset_workers" for path in reports_dirs])
-        or PROJECT_ROOT / "artifacts/training/reports/dataset_workers"
+        or heldout_eval_dir / "reports" / "dataset_workers"
     )
 
     report: dict[str, Any] = {

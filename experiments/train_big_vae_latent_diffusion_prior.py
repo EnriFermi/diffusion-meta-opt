@@ -45,12 +45,14 @@ from training.runtime import (
     configure_per_run_artifacts,
     create_grad_scaler,
     maybe_compile_model,
+    patch_argparse_lazy_help_for_hydra_py314,
     resolve_amp,
     set_speed_optimizations,
 )
 
 
 LOGGER = logging.getLogger("train_big_vae_latent_diffusion_prior")
+patch_argparse_lazy_help_for_hydra_py314()
 
 
 @dataclass(slots=True)
@@ -311,7 +313,9 @@ def _concat_optional_condition_vectors(
 def _resolve_checkpoint_layout(cfg: DictConfig) -> int:
     train_cfg = cfg.train
     stage = max(1, int(train_cfg.get("stage", 1)))
-    checkpoint_dir = Path(str(train_cfg.get("checkpoint_dir", "./artifacts/training/checkpoints/big_vae_latent_diffusion_prior")))
+    checkpoint_dir = Path(
+        str(train_cfg.get("checkpoint_dir", "./artifacts/big_vae/checkpoints/latent_diffusion_prior"))
+    )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     return stage
 

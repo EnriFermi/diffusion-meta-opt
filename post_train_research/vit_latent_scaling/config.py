@@ -274,7 +274,7 @@ def build_run_config(cfg: DictConfig) -> tuple[RunConfig, dict[str, Any]]:
     profile = PROFILE_PRESETS[profile_name]
 
     storage = StorageConfig(
-        root_dir=str(storage_raw.get("root_dir", "./post_train_research/vit_latent_scaling/artifacts")).strip(),
+        root_dir=str(storage_raw.get("root_dir", "./artifacts/big_vae/eval/vit_latent_scaling")).strip(),
         shared_checkpoint_root_dir=str(storage_raw.get("shared_checkpoint_root_dir", "")).strip(),
         shared_checkpoint_label=str(storage_raw.get("shared_checkpoint_label", "")).strip(),
         run_label=str(experiment.get("run_label", "")).strip(),

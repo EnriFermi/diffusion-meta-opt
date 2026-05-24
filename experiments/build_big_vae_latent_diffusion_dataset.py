@@ -10,9 +10,11 @@ from dataset.big_vae_offline import OfflineBigVAEDataset
 from dataset.big_vae_latent_diffusion_offline import build_big_vae_latent_diffusion_offline_dataset
 from dataset.logging_utils import configure_process_logging
 from training.big_vae_latent_diffusion import load_frozen_big_vae_from_checkpoint
+from training.runtime import patch_argparse_lazy_help_for_hydra_py314
 
 
 LOGGER = logging.getLogger("build_big_vae_latent_diffusion_dataset")
+patch_argparse_lazy_help_for_hydra_py314()
 
 
 def _promote_run_profile_to_root(cfg: DictConfig) -> None:

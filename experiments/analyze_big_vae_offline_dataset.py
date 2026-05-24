@@ -12,6 +12,10 @@ import hydra
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from dataset.logging_utils import configure_process_logging
+from training.runtime import patch_argparse_lazy_help_for_hydra_py314
+
+
+patch_argparse_lazy_help_for_hydra_py314()
 
 
 LOGGER = logging.getLogger("analyze_big_vae_offline_dataset")

@@ -4,8 +4,8 @@
 
 - один Hydra-конфиг: [conf/vit_latent_scaling/config.yaml](/Users/enrifermi/Projects/diff-meta-opt/conf/vit_latent_scaling/config.yaml)
 - один launcher: [run_vit_latent_scaling.sh](/Users/enrifermi/Projects/diff-meta-opt/post_train_research/vit_latent_scaling/run_vit_latent_scaling.sh)
-- единое хранилище запусков: `post_train_research/vit_latent_scaling/artifacts/runs/<run_label>/<run_id>/`
-- shared checkpoint store: `post_train_research/vit_latent_scaling/artifacts/checkpoints/<shared_checkpoint_label>/`
+- единое хранилище запусков: `artifacts/big_vae/eval/vit_latent_scaling/runs/<run_label>/<run_id>/`
+- shared checkpoint store: `artifacts/big_vae/eval/vit_latent_scaling/checkpoints/<shared_checkpoint_label>/`
 
 ## Что умеет
 
@@ -69,7 +69,7 @@ SHARED_CHECKPOINT_ROOT=""
 Если `SHARED_CHECKPOINT_ROOT=""`, то используется дефолт:
 
 ```text
-post_train_research/vit_latent_scaling/artifacts/checkpoints/<shared_checkpoint_label>/
+artifacts/big_vae/eval/vit_latent_scaling/checkpoints/<shared_checkpoint_label>/
 ```
 
 И потом:

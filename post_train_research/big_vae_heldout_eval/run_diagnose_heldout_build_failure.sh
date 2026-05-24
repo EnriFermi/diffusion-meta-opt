@@ -11,12 +11,17 @@ if [ -f "$PROJECT_ROOT/mom.env" ]; then
   set +a
 fi
 
-export HELDOUT_ROOT="${HELDOUT_ROOT:-$PROJECT_ROOT/post_train_research/big_vae_heldout_eval/artifacts/offline_dataset}"
-export HELDOUT_LOG_DIR="${HELDOUT_LOG_DIR:-$PROJECT_ROOT/post_train_research/big_vae_heldout_eval/artifacts/logs}"
-export HELDOUT_DIAG_JSON_OUT="${HELDOUT_DIAG_JSON_OUT:-$PROJECT_ROOT/post_train_research/big_vae_heldout_eval/artifacts/heldout_diag.json}"
+ARTIFACT_ROOT="${BIG_VAE_ARTIFACT_ROOT:-$PROJECT_ROOT/artifacts/big_vae}"
+export HELDOUT_ROOT="${HELDOUT_ROOT:-$ARTIFACT_ROOT/datasets/heldout/big_vae/offline_dataset}"
+export HELDOUT_LOG_DIR="${HELDOUT_LOG_DIR:-$ARTIFACT_ROOT/eval/heldout/logs}"
+export HELDOUT_REPORTS_DIR="${HELDOUT_REPORTS_DIR:-$ARTIFACT_ROOT/eval/heldout/reports}"
+export HELDOUT_CRASHES_DIR="${HELDOUT_CRASHES_DIR:-$ARTIFACT_ROOT/eval/heldout/crashes}"
+export HELDOUT_DIAG_JSON_OUT="${HELDOUT_DIAG_JSON_OUT:-$ARTIFACT_ROOT/eval/heldout/heldout_diag.json}"
 
 exec python "$SCRIPT_DIR/diagnose_heldout_build_failure.py" \
   --heldout-root "$HELDOUT_ROOT" \
   --log-dir "$HELDOUT_LOG_DIR" \
+  --reports-dir "$HELDOUT_REPORTS_DIR" \
+  --crashes-dir "$HELDOUT_CRASHES_DIR" \
   --json-out "$HELDOUT_DIAG_JSON_OUT" \
   "$@"

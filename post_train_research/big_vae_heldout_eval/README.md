@@ -20,8 +20,7 @@ sun397: vit_large_p16_224, clip_vit_l14
 Build once:
 
 ```bash
-HELDOUT_ROOT=post_train_research/big_vae_heldout_eval/artifacts/offline_dataset \
-HELDOUT_LOG_DIR=post_train_research/big_vae_heldout_eval/artifacts/logs \
+BIG_VAE_ARTIFACT_ROOT=artifacts/big_vae \
 HELDOUT_RECORDS_PER_PAIR=1024 \
 HELDOUT_TARGET_SIZE_GB=20 \
 HELDOUT_OVERWRITE=true \
@@ -32,17 +31,15 @@ post_train_research/big_vae_heldout_eval/run_build_heldout_offline_dataset.sh
 Evaluate any checkpoint:
 
 ```bash
-BIG_VAE_CHECKPOINT=artifacts/training/checkpoints/weight_quantile_vae/stage_1/latest.pt \
-HELDOUT_ROOT=post_train_research/big_vae_heldout_eval/artifacts/offline_dataset \
-HELDOUT_LOG_DIR=post_train_research/big_vae_heldout_eval/artifacts/logs \
+BIG_VAE_CHECKPOINT=artifacts/big_vae/checkpoints/train/default/stage_1/latest.pt \
 post_train_research/big_vae_heldout_eval/run_evaluate_big_vae_heldout.sh
 ```
 
 Run logs are written to `HELDOUT_LOG_DIR` by default:
 
 ```text
-post_train_research/big_vae_heldout_eval/artifacts/logs/build_big_vae_heldout_offline_dataset_rank0.log
-post_train_research/big_vae_heldout_eval/artifacts/logs/evaluate_big_vae_heldout_rank0.log
+artifacts/big_vae/eval/heldout/logs/build_big_vae_heldout_offline_dataset_rank0.log
+artifacts/big_vae/eval/heldout/logs/evaluate_big_vae_heldout_rank0.log
 ```
 
 During dataset build, waiting for a new collector sample is logged every
@@ -149,6 +146,6 @@ post_train_research/big_vae_heldout_eval/run_diagnose_heldout_build_failure.sh
 
 This reads the latest heldout build log, collector crash report, dataset worker
 status files, and recent fatal reports. It also writes a JSON copy to
-`post_train_research/big_vae_heldout_eval/artifacts/heldout_diag.json` by
+`artifacts/big_vae/eval/heldout/heldout_diag.json` by
 default. Override that path with `HELDOUT_DIAG_JSON_OUT=/tmp/heldout_diag.json`
 if needed.

@@ -20,6 +20,8 @@ from common import (
     GroupedMetrics,
     apply_heldout_log_dir,
     coverage_report,
+    default_heldout_eval_dir,
+    default_heldout_root,
     env_bool,
     env_int,
     env_path,
@@ -1022,13 +1024,13 @@ def main() -> None:
 
     offline_root = env_path(
         "HELDOUT_ROOT",
-        "post_train_research/big_vae_heldout_eval/artifacts/offline_dataset",
+        default_heldout_root(),
     )
     log_dir = apply_heldout_log_dir(cfg, root_dir=offline_root)
     if not (offline_root / "manifest.json").exists():
         raise FileNotFoundError(f"Held-out offline dataset manifest not found: {offline_root / 'manifest.json'}")
 
-    default_output = offline_root / "eval" / f"{checkpoint_path.parent.name}_{checkpoint_path.stem}"
+    default_output = default_heldout_eval_dir() / "runs" / f"{checkpoint_path.parent.name}_{checkpoint_path.stem}"
     output_dir = env_path("EVAL_OUTPUT_DIR", default_output)
     output_dir.mkdir(parents=True, exist_ok=True)
 

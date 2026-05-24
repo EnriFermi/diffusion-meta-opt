@@ -5,15 +5,16 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 cd "$PROJECT_ROOT"
 
-CONDA_ENV_NAME="diff-meta-opt312"
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-diff-meta-opt312}"
+ARTIFACT_ROOT="${BIG_VAE_ARTIFACT_ROOT:-./artifacts/big_vae}"
 
-RUN_LABEL="cifar10_50k_latent_prior"
-PROFILE="cifar10_50k"
-NOTES=""
+RUN_LABEL="${RUN_LABEL:-cifar10_50k_latent_prior}"
+PROFILE="${PROFILE:-cifar10_50k}"
+NOTES="${NOTES:-}"
 
-STORAGE_ROOT="./post_train_research/vit_latent_scaling/artifacts"
-SHARED_CHECKPOINT_ROOT=""
-SHARED_CHECKPOINT_LABEL=""
+STORAGE_ROOT="${STORAGE_ROOT:-$ARTIFACT_ROOT/eval/vit_latent_scaling}"
+SHARED_CHECKPOINT_ROOT="${SHARED_CHECKPOINT_ROOT:-}"
+SHARED_CHECKPOINT_LABEL="${SHARED_CHECKPOINT_LABEL:-}"
 
 SETUP_KIND="latent"                 # raw | latent
 INIT_KIND="diffusion_prior"         # fresh | source | diffusion_prior
@@ -23,14 +24,14 @@ SOURCE_CHECKPOINT="best"            # best | latest | final | step_000250 | /abs
 SOURCE_PREFER_DIRECT_LATENT="true"  # exact latent restore when compatible
 
 
-BIG_VAE_CHECKPOINT="./artifacts/training/checkpoints/weight_quantile_vae_gpu0_square_VAE/stage_1/latest.pt"
+BIG_VAE_CHECKPOINT="${BIG_VAE_CHECKPOINT:-$ARTIFACT_ROOT/checkpoints/train/default/stage_1/latest.pt}"
 BIG_VAE_DECODE="weights"            # weights | all
 BIG_VAE_TILE_T_PATCHES="4"
 BIG_VAE_TILE_D_OUT="64"
 BIG_VAE_LATENT_PARAMETERIZATION="euclidean"
 BIG_VAE_LATENT_NOISE_STD="0.0"
 
-DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/runs/train_big_vae_latent_diffusion_prior_20260427_032313_pid2515158_cdb92e/checkpoints/big_vae_latent_diffusion_prior/stage_1/latest.pt"
+DIFFUSION_PRIOR_CHECKPOINT="${DIFFUSION_PRIOR_CHECKPOINT:-$ARTIFACT_ROOT/checkpoints/latent_diffusion_prior/stage_1/latest.pt}"
 DIFFUSION_PRIOR_STEPS="50"
 DIFFUSION_PRIOR_SAMPLER="ddim"
 DIFFUSION_PRIOR_ETA="0.0"

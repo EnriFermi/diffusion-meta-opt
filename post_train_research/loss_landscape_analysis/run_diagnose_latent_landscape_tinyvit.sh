@@ -5,9 +5,10 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 cd "$PROJECT_ROOT"
 
-CONDA_ENV_NAME="diff-meta-opt312"
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-diff-meta-opt312}"
+ARTIFACT_ROOT="${BIG_VAE_ARTIFACT_ROOT:-./artifacts/big_vae}"
 DATA_DIR="./data/cifar10"
-OUTPUT_DIR="./post_train_research/loss_landscape_analysis/artifacts/latent_landscape_tinyvit"
+OUTPUT_DIR="${OUTPUT_DIR:-$ARTIFACT_ROOT/eval/loss_landscape/latent_landscape_tinyvit}"
 DEVICE="auto"
 
 SEEDS="0"
@@ -28,10 +29,10 @@ LOG_EVERY="25"
 EVAL_EVERY="100"
 CHECKPOINT_STEPS="1 50 100 200 500 1000 2000"
 
-BIG_VAE_CHECKPOINT="./artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt"
-BIG_VAE_LATENT_INIT="mean"
+BIG_VAE_CHECKPOINT="${BIG_VAE_CHECKPOINT:-$ARTIFACT_ROOT/checkpoints/train/default/stage_1/latest.pt}"
+BIG_VAE_LATENT_INIT="diffusion_prior"
 BIG_VAE_LATENT_PARAMETERIZATION="euclidean"
-BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/checkpoints/big_vae_latent_diffusion_prior_AE/stage_1/latest.pt"
+BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT="${BIG_VAE_DIFFUSION_PRIOR_CHECKPOINT:-$ARTIFACT_ROOT/checkpoints/latent_diffusion_prior/stage_1/latest.pt}"
 BIG_VAE_DIFFUSION_PRIOR_STEPS="50"
 BIG_VAE_DIFFUSION_PRIOR_SAMPLER="ddim"
 BIG_VAE_DIFFUSION_PRIOR_ETA="0.0"
@@ -76,7 +77,8 @@ if [ "$BIG_VAE_LATENT_INIT" = "diffusion_prior" ]; then
 fi
 
 run_python() {
-  if [ -n "${CONDA_PREFIX:-}" ]; then
+  CURRENT_CONDA_ENV="${CONDA_DEFAULT_ENV:-}"
+  if [ -n "${CONDA_PREFIX:-}" ] && [ -n "$CURRENT_CONDA_ENV" ] && [ "$CURRENT_CONDA_ENV" = "$CONDA_ENV_NAME" ]; then
     export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     python "$@"
     return

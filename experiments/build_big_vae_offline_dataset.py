@@ -13,6 +13,10 @@ from dataset.big_vae_offline import (
     resolve_offline_target_size_bytes,
 )
 from dataset.logging_utils import configure_process_logging
+from training.runtime import patch_argparse_lazy_help_for_hydra_py314
+
+
+patch_argparse_lazy_help_for_hydra_py314()
 
 
 def _promote_run_profile_to_root(cfg: DictConfig) -> None:

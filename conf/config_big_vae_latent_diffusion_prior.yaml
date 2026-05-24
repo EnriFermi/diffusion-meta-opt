@@ -1,5 +1,5 @@
 defaults:
-  - /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
+  - /shared_runtime_environment: big_vae_artifacts
   - _self_
 
 hydra:
@@ -7,10 +7,10 @@ hydra:
     name: train_big_vae_latent_diffusion_prior
 
 latent_diffusion_prior:
-  big_vae_checkpoint: /home/coder/project/artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt
+  big_vae_checkpoint: ${oc.env:BIG_VAE_CHECKPOINT,${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/latest.pt}
 
 latent_diffusion_dataset:
-  root_dir: ${oc.env:BIG_VAE_LATENT_DIFFUSION_DATASET_DIR,${training_artifacts.base_root_dir}/datasets/big_vae_latent_diffusion_AE/stage_${train.stage}}
+  root_dir: ${oc.env:BIG_VAE_LATENT_DIFFUSION_DATASET_DIR,${training_artifacts.latent_diffusion_dataset_dir}/stage_${train.stage}}
 
 train:
   stage: 1
@@ -38,7 +38,7 @@ train:
   grad_clip_norm: 1.0
   checkpoint_every: 5000
   log_every: 100
-  checkpoint_dir: /home/coder/project/artifacts/training/checkpoints/big_vae_latent_diffusion_prior_AE
+  checkpoint_dir: ${training_artifacts.latent_diffusion_prior_checkpoint_dir}
   distribution_encoder_finetune:
     enabled: true
     lr: ${train.lr}

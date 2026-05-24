@@ -7,14 +7,15 @@
 - `models/mini_patch_vae.py`
 - `models/patch_tokenizers.py`
 - `models/big_weight_vae.py`
+- `models/big_weight_vae_parts/`
 - `models/vae_shared.py`
-- `pretrain_mini_patch_vae.py`
-- `conf/model/weight_quantile_vae.yaml`
-- `conf/mini_model/mini_patch_vae.yaml`
-- `conf/mini_train/default.yaml`
+- `legacy/mini_vae/pretrain_mini_patch_vae.py`
+- `conf/big_vae/train/`
 
 Основная реализация больше не лежит в одном файле: `models/weight_quantile_vae.py`
 сохранен для обратной совместимости и просто реэкспортирует публичные классы.
+MiniVAE training is legacy; new training runs should use `conf/big_vae/train/`
+and `scripts/launchers/big_vae/`.
 
 ## Modules
 
@@ -138,7 +139,7 @@
 
 `ResamplerConfig.n_layers` оставлен как backward-compat placeholder и не используется в текущей реализации `BigWeightVAE`.
 
-## Synthetic pretrain config (pretrain_mini_patch_vae.py)
+## Legacy Synthetic Pretrain Config
 
 Все параметры synthetic pretrain вынесены в `PretrainConfig`.
 
@@ -262,11 +263,9 @@
 
 `conf/model/weight_quantile_vae.yaml` соответствует `ModelConfig` и его вложенным dataclass.
 
-### Mini pipeline configs
+### Legacy Mini pipeline configs
 
-- `conf/mini_model/mini_patch_vae.yaml`: архитектурные параметры mini/distribution.
-- `conf/mini_train/default.yaml`: параметры оптимизации и runtime (`ddp`, `amp`, `compile`, logging, checkpoints).
-- `conf/mini_vae_train.yaml`: корневой entrypoint-конфиг mini pipeline.
+MiniVAE training configs were moved under `legacy/mini_vae/conf/`.
 
 ## Quick run
 
@@ -279,11 +278,11 @@ python models/weight_quantile_vae.py
 ### Synthetic mini pretrain
 
 ```bash
-python pretrain_mini_patch_vae.py
+python -m legacy.mini_vae.pretrain_mini_patch_vae
 ```
 
 ### Real mini pipeline (dataset/collector based)
 
 ```bash
-./train_mini_vae.sh
+legacy/mini_vae/scripts/train_mini_vae.sh
 ```

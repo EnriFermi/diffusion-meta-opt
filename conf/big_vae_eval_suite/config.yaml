@@ -1,0 +1,175 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    name: big_vae_eval_suite
+
+suite:
+  root_dir: ${oc.env:BIG_VAE_EVAL_SUITE_ROOT,./artifacts/big_vae/eval/suite}
+  run_label: ""
+  fail_fast: true
+  dry_run: false
+  python: ""
+  conda_env: ""
+  conda_executable: conda
+
+checkpoint:
+  big_vae: ""
+  latent_diffusion_prior: ""
+  label: ""
+
+stages:
+  heldout_eval:
+    enabled: true
+    python: ""
+    conda_env: ""
+    heldout_root: ${oc.env:BIG_VAE_HELDOUT_ROOT,./artifacts/big_vae/datasets/heldout/big_vae/offline_dataset}
+    device: auto
+    batch_size: 256
+    max_records: 0
+    max_slices_per_source: 0
+    save_record_metrics: true
+    log_every_records: 100
+    require_full_coverage: true
+    latent_dump_enabled: true
+    latent_dump_max_entries: 256
+    latent_dump_max_slices_per_source: 1
+    latent_dump_balance_enabled: true
+    latent_dump_balance_keys: dataset,model,layer_type,depth_label
+    latent_dump_max_per_group: 1
+    latent_plot_enabled: true
+    latent_plot_tsne: true
+
+  scaling_check:
+    enabled: true
+    python: ""
+    conda_env: ""
+    run_latent: true
+    run_raw_baseline: true
+    common:
+      notes: "BigVAE checkpoint eval-suite scaling check"
+      checkpoint_every_steps: 250
+      setup:
+        big_vae_decode: weights
+        big_vae_tile_T_patches: 4
+        big_vae_tile_d_out: 64
+        big_vae_latent_parameterization: euclidean
+        big_vae_latent_noise_std: 0.0
+      init:
+        kind: diffusion_prior
+        fresh_latent_mode: random
+        random_init_std: 0.02
+        source_run_dir: ""
+        source_checkpoint: best
+        source_prefer_direct_latent: true
+        diffusion_prior_checkpoint: ""
+        diffusion_prior_steps: 50
+        diffusion_prior_sampler: ddim
+        diffusion_prior_eta: 0.0
+        calibration_batches: 1
+      data:
+        data_dir: ""
+        train_subset: 0
+        test_subset: 0
+        batch_size: 0
+        eval_batch_size: 0
+        num_workers: 4
+        download: true
+      train:
+        device: auto
+        seed: 42
+        epochs: 1000
+        max_steps: 3000
+        optimizer_name: Adam
+        lr: 8e-3
+        weight_decay: 0.0
+        adam_beta1: 0.9
+        adam_beta2: 0.999
+        adam_eps: 1e-9
+        grad_clip_norm: 0.0
+        label_smoothing: 0.0
+        amp: true
+        tf32: true
+        compile: false
+        latent_lr_scheduler: constant
+        latent_lr_floor_ratio: 0.1
+        latent_lr_decay_steps: 0
+      logging:
+        log_every_steps: 50
+        eval_every_steps: 150
+        latent_debug_metrics: true
+        latent_jacobian_eps: 1e-3
+        latent_jacobian_probes: 16
+    jobs:
+      - label: cifar10_50k_h64_d1
+        profile: cifar10_50k
+        max_steps: 3000
+      - label: cifar_mili_h128_d3
+        profile: cifar_mili
+        max_steps: 3000
+      - label: cifar10_tiny_h192_d6
+        profile: cifar10_tiny
+        max_steps: 3000
+
+  landscape_ablation:
+    enabled: true
+    python: ""
+    conda_env: ""
+    data_dir: ./data/cifar10
+    device: auto
+    download: true
+    seeds: [0]
+    train_subset: 30000
+    test_subset: 2000
+    batch_size: 128
+    eval_batch_size: 256
+    num_workers: 4
+    diag_batch_size: 1024
+    diagnostic_split: train
+    steps: 5000
+    epochs: 1000
+    lr: 1e-2
+    weight_decay: 0.0
+    grad_clip_norm: 0.0
+    log_every: 25
+    eval_every: 100
+    checkpoint_steps: [1, 50, 100, 200, 500, 1000, 2000]
+    latent_init: diffusion_prior
+    latent_parameterization: euclidean
+    diffusion_prior_checkpoint: ""
+    diffusion_prior_steps: 50
+    diffusion_prior_sampler: ddim
+    diffusion_prior_eta: 0.0
+    big_vae_decode: weights
+    big_vae_tile_T_patches: 4
+    big_vae_tile_d_out: 64
+    big_vae_encoder_context_rows: 64
+    big_vae_encoder_context_std: 1.0
+    big_vae_encoder_batch_size: 16
+    calibration_batches: 4
+    model:
+      image_size: 32
+      patch_size: 8
+      in_channels: 3
+      num_classes: 10
+      hidden_dim: 64
+      depth: 1
+      num_heads: 4
+      mlp_ratio: 2.0
+      dropout: 0.0
+      attention_dropout: 0.0
+    search:
+      radial_scales: [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0]
+      theta_grid: [-1.5707963267948966, -1.0471975511965976, -0.5235987755982988, -0.2617993877991494, 0.0, 0.2617993877991494, 0.5235987755982988, 1.0471975511965976, 1.5707963267948966]
+      angular_random_dirs: 4
+      jacobian_eps_rel: 1e-3
+      jacobian_tangent_dirs: 8
+      compute_accessibility: true
+      compute_hessian: true
+      hessian_subspace_dim: 128
+      hessian_topk: 5
+      hessian_trace_probes: 16
+      compute_2d_slices: true
+      slice_grid_size: 31
+      slice_scale: 1.0

@@ -6,12 +6,13 @@ PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 cd "$PROJECT_ROOT"
 
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-onerec}"
+ARTIFACT_ROOT="${BIG_VAE_ARTIFACT_ROOT:-./artifacts/big_vae}"
 
 RUN_LABEL="${RUN_LABEL:-big_vae_latent_flattening}"
-STORAGE_ROOT="${STORAGE_ROOT:-./post_train_research/big_vae_latent_flattening/artifacts}"
+STORAGE_ROOT="${STORAGE_ROOT:-$ARTIFACT_ROOT/eval/latent_flattening}"
 
-BIG_VAE_CHECKPOINT="${BIG_VAE_CHECKPOINT:-}"
-OFFLINE_ROOT="${OFFLINE_ROOT:-}"
+BIG_VAE_CHECKPOINT="${BIG_VAE_CHECKPOINT:-$ARTIFACT_ROOT/checkpoints/train/default/stage_1/latest.pt}"
+OFFLINE_ROOT="${OFFLINE_ROOT:-$ARTIFACT_ROOT/datasets/offline/big_vae/stage_1/offline_dataset}"
 
 DEVICE="${DEVICE:-auto}"
 SEED="${SEED:-42}"
@@ -92,4 +93,3 @@ run_python \
   "train.z_norm_coef=$Z_NORM_COEF" \
   "train.log_every_steps=$LOG_EVERY_STEPS" \
   "train.amp_encode=$AMP_ENCODE"
-

@@ -23,6 +23,7 @@ from common import (
     apply_heldout_data_profile,
     apply_offline_dataset_defaults,
     counter_to_rows,
+    default_heldout_root,
     env_bool,
     env_float,
     env_int,
@@ -384,7 +385,7 @@ def main() -> None:
     sanitize_programmatic_hydra_logging(cfg, role="build_big_vae_heldout_offline_dataset")
     root_dir = env_path(
         "HELDOUT_ROOT",
-        "post_train_research/big_vae_heldout_eval/artifacts/offline_dataset",
+        default_heldout_root(),
     )
     log_dir = apply_heldout_log_dir(cfg, root_dir=root_dir)
     apply_heldout_data_profile(cfg)
