@@ -71,13 +71,14 @@ checkpoints/
 logs/
 runs/
 outputs/
-experiments/
 results/
 wandb/
 mlruns/
 mlartifacts/
 tensorboard/
 lightning_logs/
+artifacts/
+test_*
 
 # Data (large datasets, usually downloaded separately - root level only)
 /data/
