@@ -13,8 +13,8 @@ if [ -n "${CONDA_PREFIX:-}" ]; then
 fi
 
 if [ -n "${PIPENV_ACTIVE:-}" ]; then
-  exec python -m experiments.train_big_vae "$@"
-fi
+  exec python -m experimen s.train_big_vae "$@"
+fi 
 
 if [ -n "${CONDA_PREFIX:-}" ]; then
   exec python -m experiments.train_big_vae "$@"

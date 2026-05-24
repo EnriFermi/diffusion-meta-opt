@@ -13,6 +13,13 @@ defaults:
 
   - _self_
 
+training_artifacts:
+  # Parallel BigVAE copy: keep checkpoints/resume state separate from the
+  # default train_big_vae run, while reusing the default prebuilt offline dataset.
+  big_vae_checkpoint_dir: ${training_artifacts.base_root_dir}/checkpoints/weight_quantile_vae_non_compressed
+  big_vae_offline_dataset_base_dir: ${training_artifacts.base_root_dir}/checkpoints/weight_quantile_vae
+
+
 # BigVAE speed tuning for explicit model-diverse batches:
 # keep bursts short enough for diversity, but long enough to amortize model loads.
 collector:

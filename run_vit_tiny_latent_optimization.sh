@@ -9,4 +9,8 @@ exec conda run --no-capture-output -n "$CONDA_ENV_NAME" python -m experiments.co
   --big-vae-checkpoint artifacts/training/checkpoints/weight_quantile_vae_gpu0/stage_1/latest.pt \
   --epochs 20 \
   --batch-size 128 \
-  --device cuda:0
+  --device cuda:0 \
+  --latent-lr 1e-1 \
+  --big-vae-latent-noise-std 0.02 \
+  --big-vae-tile-t-patches 4 \
+  --big-vae-tile-d-out 64 

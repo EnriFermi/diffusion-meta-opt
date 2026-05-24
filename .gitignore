@@ -25,6 +25,10 @@ env/
 ENV/
 .env/
 .env.local
+artifacts/
+checkpoints/
+data_tutorials/
+
 
 # -----------------------------------------------------------------------------
 # macOS
