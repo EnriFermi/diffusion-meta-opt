@@ -6,7 +6,7 @@ from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
-from experiments.compare_vit_tiny_latent_optimization import ViTTinyConfig
+from big_vae.eval.vit_tiny_latent_optimization import ViTTinyConfig
 
 
 @dataclass(frozen=True, slots=True)

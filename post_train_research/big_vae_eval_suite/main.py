@@ -17,6 +17,8 @@ from typing import Any, Mapping, Sequence
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
+from big_vae.runtime.artifacts import write_artifact_layout, write_json_file
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -222,27 +224,40 @@ class EvalSuite:
         return [self.python]
 
     def write_snapshots(self) -> None:
-        (self.run_dir / "config_resolved.json").write_text(
-            json.dumps(self.cfg, indent=2, sort_keys=True),
-            encoding="utf-8",
+        config_path = self.run_dir / "config_resolved.json"
+        context_path = self.run_dir / "suite_context.json"
+        write_json_file(config_path, self.cfg)
+        write_json_file(
+            context_path,
+            {
+                "run_id": self.run_id,
+                "run_dir": str(self.run_dir),
+                "checkpoint": str(self.checkpoint_path),
+                "checkpoint_label": self.label,
+                "latent_diffusion_prior": self.prior_checkpoint,
+                "python": self.python,
+                "conda_env": self.conda_env,
+                "conda_executable": self.conda_executable,
+                "dry_run": self.dry_run,
+            },
         )
-        (self.run_dir / "suite_context.json").write_text(
-            json.dumps(
-                {
-                    "run_id": self.run_id,
-                    "run_dir": str(self.run_dir),
-                    "checkpoint": str(self.checkpoint_path),
-                    "checkpoint_label": self.label,
-                    "latent_diffusion_prior": self.prior_checkpoint,
-                    "python": self.python,
-                    "conda_env": self.conda_env,
-                    "conda_executable": self.conda_executable,
-                    "dry_run": self.dry_run,
-                },
-                indent=2,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
+        write_artifact_layout(
+            self.run_dir,
+            kind="post_train.big_vae_eval_suite",
+            run_id=self.run_id,
+            files={
+                "config_json": config_path,
+                "context": context_path,
+                "summary": self.summary_path,
+                "log": self.run_dir / "suite.log",
+            },
+            dirs={
+                "logs": self.logs_dir,
+                "heldout_eval": self.run_dir / "heldout_eval",
+                "scaling_check": self.run_dir / "scaling_check",
+                "landscape_ablation": self.run_dir / "landscape_ablation",
+            },
+            metadata={"checkpoint": self.checkpoint_path, "checkpoint_label": self.label},
         )
 
     def update_summary(self) -> None:
@@ -255,7 +270,7 @@ class EvalSuite:
             "ok": all(result.ok for result in self.results if result.enabled),
             "stages": [result.to_dict() for result in self.results],
         }
-        self.summary_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        write_json_file(self.summary_path, payload)
 
     def run_command(
         self,
@@ -356,7 +371,8 @@ class EvalSuite:
             name="heldout_eval",
             command=[
                 *self.python_command(heldout),
-                "post_train_research/big_vae_heldout_eval/evaluate_big_vae_heldout.py",
+                "-m",
+                "post_train_research.big_vae_heldout_eval.evaluate_parts.runner",
             ],
             output_dir=output_dir,
             env=env,

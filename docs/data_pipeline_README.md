@@ -18,7 +18,7 @@
 
 Точка входа:
 
-- `conf/config.yaml` -> `defaults: - data: test_dataset`
+- `conf/big_vae/train/default.yaml` -> `defaults: - data: test_dataset`
 - `conf/data/test_dataset.yaml`:
   - `dataset_config_dirs`: где искать yaml-файлы датасетов,
   - `enabled_datasets`: какие имена датасетов включены в ран,
@@ -68,7 +68,7 @@
 - `enabled: bool`
   - локальный флаг включения.
 - `gated: bool`
-  - если `true`, обязателен `hf.token` в `conf/config.yaml`.
+  - если `true`, обязателен `hf.token` в `conf/big_vae/train/default.yaml`.
 - `sampling_weight: float`
   - вес датасета в mixed batching.
 - `models: list[str]`
@@ -242,7 +242,7 @@ ${data.path}/${name}/
    - `gated`, `licensing_note`.
 3. Если датасет gated:
    - `gated: true`,
-   - убедиться, что `hf.token` задан в `conf/config.yaml`,
+   - убедиться, что `hf.token` задан в `conf/big_vae/train/default.yaml`,
    - лицензия принята на HF странице датасета.
 
 ### Шаг 2. Добавить adapter-модуль
@@ -337,7 +337,7 @@ python -m dataset.data_raw.tools.inspect_dataset <dataset_name> --n 8 --output-f
 
 Исправление:
 
-1. заполнить `hf.token` в `conf/config.yaml`,
+1. заполнить `hf.token` в `conf/big_vae/train/default.yaml`,
 2. принять лицензию на HF dataset page,
 3. убедиться, что токен имеет доступ.
 

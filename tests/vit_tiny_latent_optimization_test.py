@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from experiments.compare_vit_tiny_latent_optimization import (
+from big_vae.eval.vit_tiny_latent_optimization import (
     ExperimentConfig,
     FunctionalViTTiny,
     ViTTinyConfig,
@@ -11,8 +11,8 @@ from experiments.compare_vit_tiny_latent_optimization import (
     count_trainable_parameters,
     make_initial_tensors,
 )
-from models.layer_latent_diffusion_prior import LayerLatentDiffusionPrior, LayerLatentDiffusionPriorConfig
-from models.weight_quantile_vae import BigVAEConfig, BigWeightVAE, DistributionConfig, EncoderConfig, MiniVAEConfig, ModelConfig
+from big_vae.models.layer_latent_diffusion_prior import LayerLatentDiffusionPrior, LayerLatentDiffusionPriorConfig
+from big_vae.models import BigVAEConfig, BigWeightVAE, DistributionConfig, EncoderConfig, MiniVAEConfig, ModelConfig
 from training.big_vae_latent_diffusion import latent_diffusion_layer_metadata_cond_dim
 
 

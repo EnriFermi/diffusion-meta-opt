@@ -19,7 +19,7 @@ if [ -z "$DATASET_ROOT" ]; then
 fi
 
 exec "$SCRIPT_DIR/../_run_python_module.sh" \
-  experiments.repair_big_vae_latent_diffusion_dataset \
+  big_vae.entrypoints.latent_diffusion_dataset_repair \
   "$DATASET_ROOT" \
   --output-dir "$OUTPUT_DIR" \
   --prefix-fractions "$PREFIX_FRACTIONS" \

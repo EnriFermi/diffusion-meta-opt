@@ -27,6 +27,3 @@ training_artifacts:
   latent_diffusion_dataset_dir: ${training_artifacts.datasets_dir}/latent_diffusion
   heldout_dataset_dir: ${training_artifacts.datasets_dir}/heldout/big_vae
   eval_suite_dir: ${training_artifacts.eval_dir}/suite
-
-  mini_vae_checkpoint_dir: ${training_artifacts.checkpoints_dir}/legacy_mini_patch_vae
-  mini_encoder_latest_checkpoint: ${training_artifacts.mini_vae_checkpoint_dir}/mini_encoder_latest.pt

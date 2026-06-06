@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from experiments.compare_vit_tiny_latent_optimization import (
+from big_vae.eval.vit_tiny_latent_optimization import (
     BigVAELatentTensorStore,
     FunctionalViTTiny,
     load_frozen_big_vae_decoder,

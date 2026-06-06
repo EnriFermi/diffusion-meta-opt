@@ -6,7 +6,7 @@ ARTIFACT_ROOT="${BIG_VAE_ARTIFACT_ROOT:-./artifacts/big_vae}"
 BIG_VAE_CHECKPOINT="${BIG_VAE_CHECKPOINT:-$ARTIFACT_ROOT/checkpoints/train/default/stage_1/latest.pt}"
 
 exec "$SCRIPT_DIR/../_run_python_module.sh" \
-  experiments.compare_vit_tiny_latent_optimization \
+  big_vae.entrypoints.vit_tiny_latent_optimization \
   "$@" \
   --setup bigvae_latent \
   --big-vae-checkpoint "$BIG_VAE_CHECKPOINT" \

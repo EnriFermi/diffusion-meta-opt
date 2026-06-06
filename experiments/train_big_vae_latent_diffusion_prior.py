@@ -13,19 +13,19 @@ import torch.nn as nn
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 
 from dataset.logging_utils import configure_process_logging
-from dataset.big_vae_latent_diffusion_offline import (
+from big_vae.datasets.latent_diffusion import (
     collate_big_vae_latent_diffusion_batch,
     offline_big_vae_latent_diffusion_data_pipeline,
 )
-from experiments.train_big_vae import (
+from training.big_vae.checkpointing import (
     _find_latest_resume_state_checkpoint,
     _normalize_model_state_dict_keys,
     _resume_state_load_policy,
     _save_checkpoint_payload,
     _unwrap_model_for_state_io,
-    compute_grad_stats,
 )
-from models.layer_latent_diffusion_prior import (
+from training.big_vae.grad_stats import compute_grad_stats
+from big_vae.models.layer_latent_diffusion_prior import (
     LayerLatentDiffusionPrior,
     build_layer_latent_diffusion_prior_config,
     compute_layer_latent_diffusion_loss,
@@ -603,7 +603,7 @@ def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[s
     return moved
 
 
-@hydra.main(version_base=None, config_path="../conf", config_name="config_big_vae_latent_diffusion_prior")
+@hydra.main(version_base=None, config_path="../conf", config_name="big_vae/latent_diffusion/prior")
 def main(cfg: DictConfig) -> None:
     _promote_run_profile_to_root(cfg)
     artifacts = configure_per_run_artifacts(cfg, run_label="train_big_vae_latent_diffusion_prior")

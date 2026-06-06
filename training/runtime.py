@@ -327,7 +327,6 @@ def configure_per_run_artifacts(
         datasets_dir = path_cfg("datasets_dir", base_root / "datasets")
         eval_dir = path_cfg("eval_dir", base_root / "eval")
         tmp_dir = path_cfg("tmp_dir", base_root / "tmp")
-        default_mini_ckpt_dir = checkpoints_dir / "legacy_mini_patch_vae"
         default_big_ckpt_dir = checkpoints_dir / "train" / "default"
         default_big_offline_base_dir = datasets_dir / "offline" / "big_vae"
         default_big_presliced_base_dir = datasets_dir / "presliced" / "big_vae" / "default"
@@ -336,7 +335,6 @@ def configure_per_run_artifacts(
         default_heldout_dataset_dir = datasets_dir / "heldout" / "big_vae"
         default_eval_suite_dir = eval_dir / "suite"
 
-        mini_ckpt_dir = path_cfg("mini_vae_checkpoint_dir", default_mini_ckpt_dir)
         big_ckpt_dir = path_cfg("big_vae_checkpoint_dir", default_big_ckpt_dir)
         big_offline_base_dir = path_cfg("big_vae_offline_dataset_base_dir", default_big_offline_base_dir)
         big_presliced_base_dir = path_cfg("big_vae_presliced_dataset_base_dir", default_big_presliced_base_dir)
@@ -362,7 +360,6 @@ def configure_per_run_artifacts(
         ta["logs_dir"] = str(logs_dir)
         ta["reports_dir"] = str(reports_dir)
         ta["crashes_dir"] = str(crashes_dir)
-        ta["mini_vae_checkpoint_dir"] = str(mini_ckpt_dir)
         ta["big_vae_checkpoint_dir"] = str(big_ckpt_dir)
         ta["big_vae_offline_dataset_base_dir"] = str(big_offline_base_dir)
         ta["big_vae_presliced_dataset_base_dir"] = str(big_presliced_base_dir)
@@ -370,8 +367,6 @@ def configure_per_run_artifacts(
         ta["latent_diffusion_dataset_dir"] = str(latent_dataset_dir)
         ta["heldout_dataset_dir"] = str(heldout_dataset_dir)
         ta["eval_suite_dir"] = str(eval_suite_dir)
-        ta["mini_encoder_latest_checkpoint"] = str(mini_ckpt_dir / "mini_encoder_latest.pt")
-
         if isinstance(cfg.get("logging"), (dict, DictConfig)):
             cfg["logging"]["dir"] = str(logs_dir)
 
@@ -385,7 +380,6 @@ def configure_per_run_artifacts(
         datasets_dir,
         eval_dir,
         tmp_dir,
-        mini_ckpt_dir,
         big_ckpt_dir,
         big_offline_base_dir,
         big_presliced_base_dir,
@@ -408,7 +402,6 @@ def configure_per_run_artifacts(
         "logs_dir": str(logs_dir),
         "reports_dir": str(reports_dir),
         "crashes_dir": str(crashes_dir),
-        "mini_vae_checkpoint_dir": str(mini_ckpt_dir),
         "big_vae_checkpoint_dir": str(big_ckpt_dir),
         "big_vae_offline_dataset_base_dir": str(big_offline_base_dir),
         "big_vae_presliced_dataset_base_dir": str(big_presliced_base_dir),

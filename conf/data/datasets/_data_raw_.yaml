@@ -22,7 +22,7 @@ enabled: true
 
 # true, если датасет gated на Hugging Face.
 # ВАЖНО:
-# 1) обязательно задайте cfg.hf.token в conf/config.yaml;
+# 1) обязательно задайте cfg.hf.token в conf/big_vae/train/default.yaml;
 # 2) примите лицензию/условия на странице датасета в HF.
 gated: false
 

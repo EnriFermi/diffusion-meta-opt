@@ -71,7 +71,7 @@ class HFBaseRunner(BaseVirtualModel):
         token = get_hf_token(self.global_cfg_dict)
         if self.gated and not token:
             raise ValueError(
-                f"{HF_TOKEN_MISSING_ERROR}. Set hf.token in conf/config.yaml. "
+                f"{HF_TOKEN_MISSING_ERROR}. Set hf.token in conf/big_vae/train/default.yaml. "
                 f"Accept the dataset license on Hugging Face dataset page. "
                 f"Ensure token has access. Affected model: {self.name}"
             )

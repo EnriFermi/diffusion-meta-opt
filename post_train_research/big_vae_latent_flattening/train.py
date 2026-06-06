@@ -11,19 +11,18 @@ import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
 
-from dataset.big_vae_offline import OfflineBigVAEDataset
-from experiments.train_big_vae import (
-    SourceSampleRecord,
-    _build_model_cfg,
-    _build_training_batch_from_source_states,
-    _make_source_slice_state,
-    _normalize_model_state_dict_keys,
-)
-from models.weight_quantile_vae import build_weight_quantile_vae
+from big_vae.runtime.artifacts import write_json_file
+from big_vae.datasets.offline import OfflineBigVAEDataset
+from big_vae.models import build_weight_quantile_vae
 from post_train_research.big_vae_latent_flattening.config import RunConfig
 from post_train_research.big_vae_latent_flattening.flow import RealNVPConfig, RealNVPFlow
 from post_train_research.big_vae_latent_flattening.geometry import relaxed_distortion_measure
 from post_train_research.big_vae_latent_flattening.runtime import RunPaths, append_metrics_row, resolve_path, save_checkpoint
+from training.big_vae.checkpointing import _normalize_model_state_dict_keys
+from training.big_vae.data_types import SourceSampleRecord
+from training.big_vae.runtime import _build_model_cfg
+from training.big_vae.source_batching import _build_training_batch_from_source_states
+from training.big_vae.source_pool import _make_source_slice_state
 
 
 @dataclass(slots=True)
@@ -446,8 +445,10 @@ def run_training(cfg: RunConfig, paths: RunPaths, logger: logging.Logger) -> dic
     finally:
         dataset.close()
 
-    return {
+    summary = {
         "run_dir": str(paths.run_dir),
         "checkpoint": str(paths.checkpoints_dir / "final.pt"),
         "last_metrics": last_metrics,
     }
+    write_json_file(paths.summary_json, summary)
+    return summary

@@ -8,14 +8,14 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from experiments.compare_vit_tiny_latent_optimization import (
+from big_vae.eval.vit_tiny_latent_optimization import (
     BigVAELatentTensorStore,
     FunctionalViTTiny,
     ViTTinyConfig,
     load_frozen_big_vae_decoder,
     make_initial_tensors,
 )
-from models.weight_quantile_vae import BigWeightVAE
+from big_vae.models import BigWeightVAE
 from post_train_research.vit_latent_scaling.config import RunConfig
 from training.big_vae_latent_diffusion import (
     load_distribution_encoder_state_from_latent_diffusion_prior_checkpoint,

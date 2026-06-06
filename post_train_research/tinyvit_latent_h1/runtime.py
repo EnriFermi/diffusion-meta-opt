@@ -11,6 +11,8 @@ from typing import Any
 
 from omegaconf import OmegaConf
 
+from big_vae.runtime.artifacts import append_csv_row as append_standard_csv_row
+from big_vae.runtime.artifacts import write_artifact_layout, write_json_file, write_yaml_file
 from post_train_research.tinyvit_latent_h1.config import CometConfig, RunConfig
 
 
@@ -112,22 +114,36 @@ def configure_logger(paths: RunPaths) -> logging.Logger:
 
 def write_config_snapshots(paths: RunPaths, cfg: RunConfig, raw_cfg: dict[str, Any]) -> None:
     payload = {"resolved": cfg.to_dict(), "raw": raw_cfg}
-    paths.config_json.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    paths.config_yaml.write_text(OmegaConf.to_yaml(payload, resolve=True), encoding="utf-8")
+    write_json_file(paths.config_json, payload)
+    write_yaml_file(paths.config_yaml, payload)
+    write_artifact_layout(
+        paths.run_dir,
+        kind="post_train.tinyvit_latent_h1",
+        run_id=paths.run_id,
+        files={
+            "config_yaml": paths.config_yaml,
+            "config_json": paths.config_json,
+            "log": paths.log_file,
+            "summary": paths.summary_file,
+            "paired_results": paths.paired_results_file,
+            "aggregate_summary": paths.aggregate_summary_file,
+            "starts": paths.starts_file,
+        },
+        dirs={
+            "starts": paths.starts_dir,
+            "plots": paths.plots_dir,
+            "anchor": paths.anchor_dir,
+        },
+        metadata={"run_label": cfg.run_label, "source_run_dir": cfg.source.run_dir},
+    )
 
 
 def append_csv_row(path: Path, row: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists()
-    with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    append_standard_csv_row(path, row)
 
 
 def write_summary(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_json_file(path, payload)
 
 
 def update_run_index(paths: RunPaths, cfg: RunConfig, summary: dict[str, Any]) -> None:

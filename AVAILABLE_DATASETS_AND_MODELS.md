@@ -46,10 +46,9 @@ Runtime-регистрация адаптеров (`register_dataset`) сейч�
 
 ## 3) Модель обучения в `train.py`
 
-`train.py` обучает `WeightQuantileVAE` из `models/weight_quantile_vae.py` с гиперпараметрами из `conf/model/weight_quantile_vae.yaml`.
+BigVAE training uses `big_vae.models` with configs from `conf/big_vae/train/`.
 
 ## 4) Что активно по умолчанию в текущем профиле данных
 
 В `conf/data/test_dataset.yaml` в `enabled_datasets` включены:
 `coco2017`, `cc12m`, `visual_genome`, `scene_parse_150`, `mapillary_vistas_v2`, `relaion400m`.
-

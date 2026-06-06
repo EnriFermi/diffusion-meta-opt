@@ -29,6 +29,16 @@ ${BIG_VAE_ARTIFACT_ROOT:-./artifacts/big_vae}/
   tmp/
 ```
 
+Every run-like directory should contain the same minimum contract:
+
+```text
+config_resolved.yaml or config_resolved.json
+artifact_layout.json
+run.log or suite.log
+metrics.csv when the job emits step metrics
+summary.json or a documented summary file
+```
+
 `BIG_VAE_ARTIFACT_ROOT` is the only root-level override. Use narrower env vars
 only when a specific tool must read or write somewhere else:
 

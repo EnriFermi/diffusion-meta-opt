@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 import torch
 
+from big_vae.runtime.artifacts import append_csv_row, write_artifact_layout, write_json_file, write_yaml_file
 from post_train_research.big_vae_latent_flattening.config import RunConfig, project_root
 
 
@@ -19,9 +20,10 @@ class RunPaths:
     run_dir: Path
     checkpoints_dir: Path
     metrics_csv: Path
+    config_yaml: Path
     config_json: Path
-    raw_config_json: Path
     log_path: Path
+    summary_json: Path
 
 
 def resolve_path(path: str | Path) -> Path:
@@ -42,9 +44,10 @@ def prepare_run_paths(cfg: RunConfig) -> RunPaths:
         run_dir=run_dir,
         checkpoints_dir=checkpoints_dir,
         metrics_csv=run_dir / "metrics.csv",
-        config_json=run_dir / "config.json",
-        raw_config_json=run_dir / "raw_config.json",
+        config_yaml=run_dir / "config_resolved.yaml",
+        config_json=run_dir / "config_resolved.json",
         log_path=run_dir / "run.log",
+        summary_json=run_dir / "summary.json",
     )
 
 
@@ -64,19 +67,27 @@ def configure_logger(paths: RunPaths) -> logging.Logger:
 
 
 def write_config_snapshots(paths: RunPaths, cfg: RunConfig, raw_cfg: Mapping[str, Any]) -> None:
-    paths.config_json.write_text(json.dumps(cfg.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
-    paths.raw_config_json.write_text(json.dumps(dict(raw_cfg), indent=2, sort_keys=True), encoding="utf-8")
+    payload = {"resolved": cfg.to_dict(), "raw": dict(raw_cfg)}
+    write_json_file(paths.config_json, payload)
+    write_yaml_file(paths.config_yaml, payload)
+    write_artifact_layout(
+        paths.run_dir,
+        kind="post_train.big_vae_latent_flattening",
+        run_id=paths.run_id,
+        files={
+            "config_yaml": paths.config_yaml,
+            "config_json": paths.config_json,
+            "log": paths.log_path,
+            "metrics": paths.metrics_csv,
+            "summary": paths.summary_json,
+        },
+        dirs={"checkpoints": paths.checkpoints_dir},
+        metadata={"run_label": cfg.run_label, "big_vae_checkpoint": cfg.big_vae.checkpoint},
+    )
 
 
 def append_metrics_row(path: Path, row: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    fieldnames = list(row.keys())
-    with path.open("a", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        if not exists:
-            writer.writeheader()
-        writer.writerow(dict(row))
+    append_csv_row(path, row)
 
 
 def save_checkpoint(
@@ -101,4 +112,3 @@ def save_checkpoint(
         },
         path,
     )
-

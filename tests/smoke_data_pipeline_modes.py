@@ -174,7 +174,7 @@ def _project_root() -> Path:
 def _load_cfg(overrides: list[str]) -> DictConfig:
     config_dir = _project_root() / "conf"
     with initialize_config_dir(version_base=None, config_dir=str(config_dir.resolve())):
-        cfg = compose(config_name="config", overrides=overrides)
+        cfg = compose(config_name="big_vae/train/default", overrides=overrides)
 
     # This script composes config outside @hydra.main.
     # Replace hydra-dependent log interpolations with concrete values.

@@ -16,6 +16,8 @@ torchvision = "*"
 transformers = "*"
 boto3 = "*"
 comet-ml = "*"
+wandb = "*"
+rpds-py = "*"
 
 [dev-packages]
 pytest = "*"

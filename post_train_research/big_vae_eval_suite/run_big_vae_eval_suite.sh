@@ -39,7 +39,7 @@ if [ -z "$BIG_VAE_CHECKPOINT" ]; then
 fi
 
 run_python \
-  "$SCRIPT_DIR/main.py" \
+  -m big_vae.entrypoints.post_train_eval_suite \
   "checkpoint.big_vae=$BIG_VAE_CHECKPOINT" \
   "checkpoint.latent_diffusion_prior=$LATENT_DIFFUSION_PRIOR_CHECKPOINT" \
   "checkpoint.label=$CHECKPOINT_LABEL" \

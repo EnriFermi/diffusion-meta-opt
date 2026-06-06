@@ -1,7 +1,6 @@
 # BigVAE Training Package
 
-`experiments/train_big_vae.py` is now a compatibility entrypoint. The actual
-implementation is split here by responsibility:
+The active training implementation is split here by responsibility:
 
 - `launcher.py`: Hydra entrypoint, artifact setup, distributed process launch.
 - `worker.py`: the stateful training worker loop.
@@ -13,8 +12,5 @@ implementation is split here by responsibility:
   batch shaping and offline/presliced dataset helpers.
 - `checkpointing.py`: checkpoint and resume-state helpers.
 - `tracking.py`: logging, telemetry, and scalar helpers.
-- `grad_monitoring.py`: compatibility re-export for gradient monitoring,
-  backed by `grad_stats.py`, `grad_plots.py`, and `collector_monitoring.py`.
-
-Keep old imports through `experiments.train_big_vae` working unless all callers
-are migrated.
+- `grad_stats.py`, `grad_plots.py`, and `collector_monitoring.py`: gradient
+  telemetry helpers.

@@ -36,11 +36,9 @@ from experiments.diagnose_big_vae_identity import (
     _write_json,
     _sample_synthetic_deterministic,
 )
-from experiments.train_big_vae import (
-    _build_optimizer as _train_build_optimizer,
-    _build_scheduler as _train_build_scheduler,
-    _slice_sample as _train_slice_sample,
-)
+from training.big_vae.batch_padding import _slice_sample as _train_slice_sample
+from training.big_vae.runtime import _build_optimizer as _train_build_optimizer
+from training.big_vae.runtime import _build_scheduler as _train_build_scheduler
 
 
 @dataclass(frozen=True, slots=True)

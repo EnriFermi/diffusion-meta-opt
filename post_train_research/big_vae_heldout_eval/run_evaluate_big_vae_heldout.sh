@@ -35,16 +35,16 @@ export EVAL_LATENT_PLOT_TSNE="${EVAL_LATENT_PLOT_TSNE:-true}"
 
 if [ -n "${CONDA_PREFIX:-}" ]; then
   export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  exec python "$SCRIPT_DIR/evaluate_big_vae_heldout.py" "$@"
+  exec python -m post_train_research.big_vae_heldout_eval.evaluate_parts.runner "$@"
 fi
 
 if command -v conda >/dev/null 2>&1; then
   CONDA_ENV_NAME="${CONDA_ENV_NAME:-onerec}"
-  exec conda run -n "$CONDA_ENV_NAME" python "$SCRIPT_DIR/evaluate_big_vae_heldout.py" "$@"
+  exec conda run -n "$CONDA_ENV_NAME" python -m post_train_research.big_vae_heldout_eval.evaluate_parts.runner "$@"
 fi
 
 if command -v pipenv >/dev/null 2>&1; then
-  exec pipenv run python "$SCRIPT_DIR/evaluate_big_vae_heldout.py" "$@"
+  exec pipenv run python -m post_train_research.big_vae_heldout_eval.evaluate_parts.runner "$@"
 fi
 
-exec python "$SCRIPT_DIR/evaluate_big_vae_heldout.py" "$@"
+exec python -m post_train_research.big_vae_heldout_eval.evaluate_parts.runner "$@"

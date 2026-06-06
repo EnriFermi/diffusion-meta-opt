@@ -1516,7 +1516,7 @@ def _format_dataset_load_error(dataset_cfg: dict[str, Any], exc: Exception) -> s
         return str(exc)
 
     base = (
-        f"{exc}. Set hf.token in conf/config.yaml. "
+        f"{exc}. Set hf.token in conf/big_vae/train/default.yaml. "
         "Accept the dataset license on Hugging Face dataset page. "
         "Ensure token has access (for fine-grained tokens enable access to public gated repositories)."
     )

@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 
 from dataset import data_pipeline, setup_logging
-from models.weight_quantile_vae import (
+from big_vae.models import (
     BigVAEConfig,
     BigWeightVAE,
     DistributionConfig,

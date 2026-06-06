@@ -25,14 +25,14 @@ except Exception:  # pragma: no cover - compatibility for older PyTorch
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dataset import data_pipeline, setup_logging
-from dataset.big_vae_offline import (
+from big_vae.datasets.offline import (
     ensure_presliced_big_vae_dataset,
     offline_big_vae_data_pipeline,
     presliced_big_vae_data_pipeline,
 )
 from dataset.logging_utils import LOG_PATH_ENV, configure_process_logging, resolve_process_log_path
 from experiments.background_prefetch import BackgroundPrefetcher
-from models.weight_quantile_vae import (
+from big_vae.models import (
     BigVAEConfig,
     DistributionConfig,
     EncoderConfig,

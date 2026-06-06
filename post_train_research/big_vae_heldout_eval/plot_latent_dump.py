@@ -4,7 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
-from evaluate_big_vae_heldout import plot_latent_dump
+from post_train_research.big_vae_heldout_eval.evaluate_parts.latent_dump import plot_latent_dump
 
 
 def main() -> None:

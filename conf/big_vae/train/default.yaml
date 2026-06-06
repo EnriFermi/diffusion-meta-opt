@@ -6,4 +6,3 @@ defaults:
 run_config:
   family: big_vae
   name: default
-  legacy_entrypoint: config

@@ -56,7 +56,3 @@ train:
 hydra:
   job:
     name: train_big_vae_v2
-
-model:
-  # full | simple_direct
-  variant: full

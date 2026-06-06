@@ -403,7 +403,7 @@ def _summary_lines(report: dict[str, Any]) -> list[str]:
     return lines
 
 
-@hydra.main(version_base=None, config_path="../conf", config_name="config")
+@hydra.main(version_base=None, config_path="../conf", config_name="big_vae/train/default")
 def main(cfg: DictConfig) -> None:
     _promote_run_profile_to_root(cfg)
     log_path = configure_process_logging(cfg=cfg, role="analyze_big_vae_offline_dataset", rank=0, force=True)

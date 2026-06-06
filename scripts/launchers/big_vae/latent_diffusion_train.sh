@@ -2,9 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-CONFIG_NAME="${BIG_VAE_LATENT_DIFFUSION_CONFIG:-config_big_vae_latent_diffusion_prior}"
+CONFIG_NAME="${BIG_VAE_LATENT_DIFFUSION_CONFIG:-big_vae/latent_diffusion/prior}"
 
 exec "$SCRIPT_DIR/../_run_python_module.sh" \
-  experiments.train_big_vae_latent_diffusion_prior \
+  big_vae.entrypoints.latent_diffusion_train \
   --config-name "$CONFIG_NAME" \
   "$@"

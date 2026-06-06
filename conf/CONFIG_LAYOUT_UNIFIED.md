@@ -3,8 +3,8 @@
 ## Entry points
 - `conf/big_vae/train/default.yaml` -> `run_profiles/train_big_vae`
 - `conf/big_vae/train/v2.yaml` -> `run_profiles/train_big_vae_v2`
-- `conf/config.yaml` -> compatibility wrapper for `big_vae/train/default`
-- `conf/config_big_vae_v2.yaml` -> compatibility wrapper for `big_vae/train/v2`
+- `conf/big_vae/latent_diffusion/dataset_build.yaml`
+- `conf/big_vae/latent_diffusion/prior.yaml`
 
 ## Main groups
 - `shared_runtime_environment/`
@@ -28,11 +28,14 @@
   - one-file BigVAE train entrypoints; add a new run here instead of touching
     several root configs
 
+- `big_vae/latent_diffusion/`
+  - BigVAE latent diffusion dataset-build and prior-train configs
+
 - `run_profiles/`
   - final composition per BigVAE run
 
 ## Notes
-- MiniVAE train configs and launchers live under `legacy/mini_vae/`.
+- MiniVAE training code was removed; active training is BigVAE-only.
 - New active BigVAE runs write under `BIG_VAE_ARTIFACT_ROOT` when set, otherwise
   `./artifacts/big_vae`.
 - Use direct key overrides (e.g. `train.max_steps=...`).

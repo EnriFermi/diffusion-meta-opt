@@ -25,14 +25,14 @@ except Exception:  # pragma: no cover - compatibility for older PyTorch
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dataset import data_pipeline, setup_logging
-from dataset.big_vae_offline import (
+from big_vae.datasets.offline import (
     ensure_presliced_big_vae_dataset,
     offline_big_vae_data_pipeline,
     presliced_big_vae_data_pipeline,
 )
 from dataset.logging_utils import LOG_PATH_ENV, configure_process_logging, resolve_process_log_path
 from experiments.background_prefetch import BackgroundPrefetcher
-from models.weight_quantile_vae import (
+from big_vae.models import (
     BigVAEConfig,
     DistributionConfig,
     EncoderConfig,
@@ -65,6 +65,7 @@ from training.runtime import (
     seed_everything as runtime_seed_everything,
     set_speed_optimizations as runtime_set_speed_optimizations,
 )
+from big_vae.runtime.artifacts import write_artifact_layout, write_json_file, write_yaml_file
 
 import hydra
 
@@ -113,13 +114,26 @@ def _write_run_artifact_metadata(cfg: DictConfig, run_artifacts: dict[str, str])
     run_root_dir.mkdir(parents=True, exist_ok=True)
     config_payload = OmegaConf.to_container(cfg, resolve=True)
     redacted_payload = _redact_config_secrets(config_payload)
-    (run_root_dir / "config_resolved.yaml").write_text(
-        OmegaConf.to_yaml(OmegaConf.create(redacted_payload), resolve=False),
-        encoding="utf-8",
-    )
-    (run_root_dir / "artifact_layout.json").write_text(
-        json.dumps(run_artifacts, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    write_yaml_file(run_root_dir / "config_resolved.yaml", redacted_payload)
+    write_json_file(run_root_dir / "config_resolved.json", redacted_payload)
+    write_artifact_layout(
+        run_root_dir,
+        kind="train.big_vae",
+        run_id=str(run_artifacts["run_id"]),
+        files={
+            "config_yaml": run_root_dir / "config_resolved.yaml",
+            "config_json": run_root_dir / "config_resolved.json",
+            "log": run_artifacts["logs_dir"],
+        },
+        dirs={
+            "logs": run_artifacts["logs_dir"],
+            "reports": run_artifacts["reports_dir"],
+            "crashes": run_artifacts["crashes_dir"],
+            "checkpoints": run_artifacts["big_vae_checkpoint_dir"],
+            "offline_dataset": run_artifacts["big_vae_offline_dataset_base_dir"],
+            "presliced_dataset": run_artifacts["big_vae_presliced_dataset_base_dir"],
+        },
+        metadata=run_artifacts,
     )
 
 
@@ -142,7 +156,7 @@ def _spawn_entry(
     )
 
 
-@hydra.main(version_base=None, config_path=_HYDRA_CONFIG_PATH, config_name="config")
+@hydra.main(version_base=None, config_path=_HYDRA_CONFIG_PATH, config_name="big_vae/train/default")
 def main(cfg: DictConfig) -> None:
     _promote_run_profile_to_root(cfg)
     print("[train_big_vae] Hydra config composed; entering launcher", flush=True)

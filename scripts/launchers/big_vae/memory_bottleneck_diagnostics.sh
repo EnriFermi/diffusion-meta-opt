@@ -5,5 +5,5 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export CONDA_ENV_NAME="${DIAGNOSTICS_CONDA_ENV:-${CONDA_ENV_NAME:-onerec}}"
 
 exec "$SCRIPT_DIR/../_run_python_module.sh" \
-  experiments.diagnose_big_vae_memory_bottleneck \
+  big_vae.entrypoints.memory_bottleneck_diagnostics \
   "$@"

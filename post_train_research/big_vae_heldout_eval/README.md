@@ -3,7 +3,7 @@
 This directory contains a two-stage post-train pipeline:
 
 1. `build_heldout_offline_dataset.py` collects a reusable offline dataset from dataset/model pairs that were not in the BigVAE train profile.
-2. `evaluate_big_vae_heldout.py` loads a trained BigVAE checkpoint and evaluates all BigVAE loss components on the prebuilt dataset.
+2. `run_evaluate_big_vae_heldout.sh` loads a trained BigVAE checkpoint and evaluates all BigVAE loss components on the prebuilt dataset.
 
 Held-out pairs:
 
