@@ -15,7 +15,7 @@ big_vae:
   # vamp -> VampPrior-style learned mixture prior in latent space
   latent_prior_kind: vamp
   # Number of pseudo-components for latent_prior_kind=vamp.
-  vamp_prior_K: 64
+  vamp_prior_K: 8
   # linear -> current single linear projection for decoder query conditioning
   # mlp -> decoder-only MLP over [positional_query_base, dist_patch_by_patch]
   decoder_query_conditioning_kind: mlp
@@ -27,8 +27,8 @@ big_vae:
   latent_sampling_min_std: 1e-4
   latent_sampling_logvar_min: -2
   latent_sampling_logvar_max: 2
-  num_encoder_layers: 6
-  num_decoder_layers: 6
+  num_encoder_layers: 3
+  num_decoder_layers: 3
   n_heads: 1
   ffn_mult: 4.0
   dropout: 0.0
