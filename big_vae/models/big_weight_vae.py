@@ -45,6 +45,7 @@ __all__ = [
     "MiniVAEConfig",
     "MixerPatchTokenizer",
     "ModelConfig",
+    "PatchTokenizerConfig",
     "PatchConditionedMLPTokenizer",
     "ResidualPatchTokenizer",
     "ResamplerConfig",

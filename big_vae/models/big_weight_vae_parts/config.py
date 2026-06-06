@@ -43,6 +43,19 @@ class TTMMemoryConfig:
 
 
 @dataclass(slots=True)
+class PatchTokenizerConfig:
+    kind: str = ""
+    d_patch: int = 0
+    hidden_dim: int | None = None
+    cond_proj_dim: int | None = None
+    num_blocks: int = 2
+    dropout: float | None = None
+    residual_hidden_dim: int = 256
+    residual_num_layers: int = 3
+    residual_dropout: float = 0.0
+
+
+@dataclass(slots=True)
 class BigVAEConfig:
     d_model: int = 256
     d_lat: int = 256
@@ -69,6 +82,7 @@ class BigVAEConfig:
     patch_tokenizer_kind: str = "residual"
     distribution_encoder_conditioning_kind: str = "legacy"
     latent_bottleneck_kind: str = "perceiver_resampler"
+    patch_tokenizer: PatchTokenizerConfig = field(default_factory=PatchTokenizerConfig)
     ttm: TTMMemoryConfig = field(default_factory=TTMMemoryConfig)
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
 
@@ -114,6 +128,7 @@ def _make_rope_axis_positions(length: int, *, device: torch.device, coord_kind: 
 __all__ = [
     'EncoderConfig',
     'TTMMemoryConfig',
+    'PatchTokenizerConfig',
     'BigVAEConfig',
     'ResamplerConfig',
     'ModelConfig',

@@ -8,7 +8,6 @@ defaults:
   - /shared_training_parameters@train: trainer_execution_common
   - /big_vae_experiment@train: trainer_parameters_specific_to_big_vae_stage_v2
 
-  - /shared_training_parameters@model: model_backbone_distribution_and_mini_vae_v2
   - /big_vae_experiment@model: model_parameters_specific_to_big_vae_stage_v2
 
   - _self_

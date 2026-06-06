@@ -72,6 +72,11 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
     train_cfg = cfg.get("train", {})
     model_cfg = cfg.get("model", {})
     big_cfg = model_cfg.get("big_vae", {})
+    patch_tokenizer_cfg = big_cfg.get("patch_tokenizer", {}) if isinstance(big_cfg, (dict, DictConfig)) else {}
+    if patch_tokenizer_cfg is None:
+        patch_tokenizer_cfg = {}
+    if not isinstance(patch_tokenizer_cfg, (dict, DictConfig)):
+        patch_tokenizer_cfg = {}
     streaming_cfg = cfg.get("streaming", {})
     collector_cfg = cfg.get("collector", {})
     batch_source_mixing_cfg = train_cfg.get("batch_source_mixing", {})
@@ -177,7 +182,11 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
         "model.big_vae.latent_sampling_logvar_min": float(big_cfg.get("latent_sampling_logvar_min", -20.0)),
         "model.big_vae.latent_sampling_logvar_max": float(big_cfg.get("latent_sampling_logvar_max", 10.0)),
         "model.big_vae.disable_distribution_encoder": bool(big_cfg.get("disable_distribution_encoder", False)),
-        "model.big_vae.patch_tokenizer_kind": str(big_cfg.get("patch_tokenizer_kind", "residual")),
+        "model.big_vae.patch_tokenizer.kind": str(
+            patch_tokenizer_cfg.get("kind", big_cfg.get("patch_tokenizer_kind", "residual"))
+        ),
+        "model.big_vae.patch_tokenizer.d_patch": int(patch_tokenizer_cfg.get("d_patch", 0)),
+        "model.big_vae.patch_tokenizer.num_blocks": int(patch_tokenizer_cfg.get("num_blocks", 2)),
         "model.big_vae.distribution_encoder_conditioning_kind": str(
             big_cfg.get("distribution_encoder_conditioning_kind", "legacy")
         ),

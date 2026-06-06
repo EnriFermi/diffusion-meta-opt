@@ -53,7 +53,9 @@ class BigWeightVAE(
         dropout = cfg.big_vae.dropout
 
         self.use_distribution_encoder = not bool(cfg.big_vae.disable_distribution_encoder)
-        self.patch_tokenizer_kind = self._normalize_patch_tokenizer_kind(cfg.big_vae.patch_tokenizer_kind)
+        patch_tokenizer_cfg = cfg.big_vae.patch_tokenizer
+        patch_tokenizer_kind_raw = str(patch_tokenizer_cfg.kind or cfg.big_vae.patch_tokenizer_kind)
+        self.patch_tokenizer_kind = self._normalize_patch_tokenizer_kind(patch_tokenizer_kind_raw)
         self.distribution_encoder_conditioning_kind = self._normalize_distribution_encoder_conditioning_kind(
             cfg.big_vae.distribution_encoder_conditioning_kind
         )
@@ -73,7 +75,11 @@ class BigWeightVAE(
             self.distribution_encoder = None
             patch_tokenizer_d_dist = 0
             query_in_dim = d_model
-        d_patch = cfg.mini_vae.d_patch
+        d_patch = int(patch_tokenizer_cfg.d_patch) if int(patch_tokenizer_cfg.d_patch) > 0 else int(cfg.mini_vae.d_patch)
+        self.patch_token_d_patch = d_patch
+        tokenizer_dropout = (
+            float(dropout) if patch_tokenizer_cfg.dropout is None else float(patch_tokenizer_cfg.dropout)
+        )
         if self.patch_tokenizer_kind == "conditioned_mlp":
             if not self.use_distribution_encoder:
                 raise ValueError(
@@ -83,7 +89,10 @@ class BigWeightVAE(
                 p=p,
                 d_var=d_var,
                 d_patch=d_patch,
-                dropout=dropout,
+                hidden_dim=patch_tokenizer_cfg.hidden_dim,
+                cond_proj_dim=patch_tokenizer_cfg.cond_proj_dim,
+                num_blocks=int(patch_tokenizer_cfg.num_blocks),
+                dropout=tokenizer_dropout,
             )
         else:
             # self.patch_tokenizer = MixerPatchTokenizer(
@@ -99,9 +108,9 @@ class BigWeightVAE(
                 p=p,
                 d_dist=patch_tokenizer_d_dist,
                 d_patch=d_patch,
-                hidden_dim=256,
-                num_layers=3,
-                dropout=0.0,
+                hidden_dim=int(patch_tokenizer_cfg.residual_hidden_dim),
+                num_layers=int(patch_tokenizer_cfg.residual_num_layers),
+                dropout=float(patch_tokenizer_cfg.residual_dropout),
             )
 
         if d_model % n_heads != 0:
