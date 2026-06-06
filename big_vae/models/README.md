@@ -99,6 +99,24 @@ New training runs should use `conf/big_vae/train/` and `scripts/launchers/big_va
 | `d_patch` | `int` | Размер patch token после `encode_patch` (проекция из `mu`). |
 | `dropout` | `float` | Dropout mini encoder/decoder. |
 
+Active BigVAE train configs no longer set `mini_vae.d_patch` directly. The
+current config path is `model.big_vae.patch_tokenizer.d_patch`; the parser still
+maps old checkpoint/config payloads with `mini_vae.d_patch` for compatibility.
+
+### PatchTokenizerConfig
+
+| Param | Type | Meaning |
+|---|---|---|
+| `kind` | `str` | `"residual"` or `"conditioned_mlp"`. |
+| `d_patch` | `int` | Patch-token width before `patch_token_proj`. |
+| `hidden_dim` | `int | null` | Hidden width for `conditioned_mlp`; `null` means `4 * d_patch`. |
+| `cond_proj_dim` | `int | null` | X-conditioning projection width; `null` means `min(64, max(16, d_patch // 2))`. |
+| `num_blocks` | `int` | Number of aligned conditioned residual MLP blocks. |
+| `dropout` | `float | null` | Tokenizer dropout; `null` inherits `big_vae.dropout`. |
+| `residual_hidden_dim` | `int` | Hidden width for legacy/residual tokenizer. |
+| `residual_num_layers` | `int` | Number of residual tokenizer MLP layers. |
+| `residual_dropout` | `float` | Dropout for legacy/residual tokenizer. |
+
 ### EncoderConfig
 
 | Param | Type | Meaning |
@@ -126,8 +144,8 @@ New training runs should use `conf/big_vae/train/` and `scripts/launchers/big_va
 | Param | Type | Meaning |
 |---|---|---|
 | `patch_size` | `int` | Размер patch по оси `d_in`. |
-| `distribution` | `DistributionConfig` | Конфиг distribution encoder. |
-| `mini_vae` | `MiniVAEConfig` | Конфиг mini patch VAE encoder/decoder. |
+| `distribution` | `DistributionConfig` | Конфиг distribution encoder. В активных YAML задаётся как `big_vae.distribution_encoder`. |
+| `mini_vae` | `MiniVAEConfig` | Backward-compatible holder; active BigVAE tokenizer params live under `big_vae.patch_tokenizer`. |
 | `big_vae` | `BigVAEConfig` | Конфиг full matrix VAE. |
 | `beta` | `float` | KL коэффициент (используется в training scripts). |
 | `mini_encoder_ckpt_path` | `str` | Путь к pretrained mini encoder checkpoint для загрузки в `BigWeightVAE`. |
@@ -258,7 +276,7 @@ New training runs should use `conf/big_vae/train/` and `scripts/launchers/big_va
 
 ### Full model config
 
-`conf/shared_training_parameters/model_backbone_distribution_and_mini_vae*.yaml`
+`conf/big_vae_experiment/model_parameters_specific_to_big_vae_stage*.yaml`
 correspond to `ModelConfig` and nested dataclasses.
 
 ## Quick run

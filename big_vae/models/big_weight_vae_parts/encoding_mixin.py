@@ -203,7 +203,7 @@ class BigWeightVAEEncodingMixin:
             dist_var_for_inject = None
             dist_var_global = None
 
-        d_patch = self.cfg.mini_vae.d_patch
+        d_patch = int(getattr(self, "patch_token_d_patch", self.cfg.mini_vae.d_patch))
         patch_token_raw_flat = self.patch_tokenizer(
             w_patch=w_flat,
             dist_var_tokens=dist_var_flat_expanded,

@@ -161,8 +161,14 @@ def _enforce_diagnostic_constraints(cfg: DictConfig) -> None:
         cfg.train.struct_loss.lambda_scale = 0.0
         cfg.train.struct_loss.lambda_rec = 0.0
         cfg.train.struct_loss.lambda_rel = 0.0
-        cfg.model.distribution.dropout = 0.0
-        cfg.model.mini_vae.dropout = 0.0
+        if "distribution" in cfg.model:
+            cfg.model.distribution.dropout = 0.0
+        if "distribution_encoder" in cfg.model.big_vae:
+            cfg.model.big_vae.distribution_encoder.dropout = 0.0
+        if "mini_vae" in cfg.model:
+            cfg.model.mini_vae.dropout = 0.0
+        if "patch_tokenizer" in cfg.model.big_vae:
+            cfg.model.big_vae.patch_tokenizer.dropout = 0.0
         cfg.model.big_vae.dropout = 0.0
         cfg.model.big_vae.use_latent_sampling = False
 

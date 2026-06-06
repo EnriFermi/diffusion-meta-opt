@@ -1,4 +1,4 @@
-# Unified Config Layout (No Backward Compatibility)
+# Unified Config Layout
 
 ## Entry points
 - `conf/big_vae/train/default.yaml` -> `run_profiles/train_big_vae`
@@ -18,11 +18,13 @@
 
 - `shared_training_parameters/`
   - trainer execution common params shared by both stages
-  - model backbone shared by both stages (`distribution` + `mini_vae`)
+  - old model-backbone files kept for compatibility, not used by active
+    BigVAE train entrypoints
 
 - `big_vae_experiment/`
   - big-specific trainer params
-  - big-specific model params
+  - complete active BigVAE model params, including distribution encoder and
+    patch tokenizer
 
 - `big_vae/train/`
   - one-file BigVAE train entrypoints; add a new run here instead of touching
