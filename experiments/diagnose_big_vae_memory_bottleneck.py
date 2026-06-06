@@ -36,11 +36,9 @@ from experiments.diagnose_big_vae_identity import (
     _write_json,
     _sample_synthetic_deterministic,
 )
-from experiments.train_big_vae import (
-    _build_optimizer as _train_build_optimizer,
-    _build_scheduler as _train_build_scheduler,
-    _slice_sample as _train_slice_sample,
-)
+from training.big_vae.batch_padding import _slice_sample as _train_slice_sample
+from training.big_vae.runtime import _build_optimizer as _train_build_optimizer
+from training.big_vae.runtime import _build_scheduler as _train_build_scheduler
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +97,7 @@ def _compose_default_cfg() -> DictConfig:
     conf_root = _repo_root() / "conf"
     root_cfg = OmegaConf.merge(
         _load_yaml_without_defaults(conf_root / "shared_runtime_environment" / "global_app_hydra_logging_and_model_registry.yaml"),
-        _load_yaml_without_defaults(conf_root / "shared_runtime_environment" / "checkpoint_and_artifact_paths_for_mini_then_big.yaml"),
+        _load_yaml_without_defaults(conf_root / "shared_runtime_environment" / "big_vae_artifacts.yaml"),
     )
     data_cfg = OmegaConf.merge(
         _load_yaml_without_defaults(conf_root / "data_collection_runtime" / "data_profiles" / "data_profile_common_settings.yaml"),

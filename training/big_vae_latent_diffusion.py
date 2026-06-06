@@ -8,13 +8,13 @@ import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 
-from dataset.big_vae_offline import infer_layer_depth, infer_layer_type
-from models.layer_latent_diffusion_prior import (
+from big_vae.datasets.offline import infer_layer_depth, infer_layer_type
+from big_vae.models.layer_latent_diffusion_prior import (
     LayerLatentDiffusionPrior,
     build_layer_latent_diffusion_prior_config,
 )
-from models.vae_shared import sinusoidal_embedding
-from models.weight_quantile_vae import (
+from big_vae.models.vae_shared import sinusoidal_embedding
+from big_vae.models import (
     BigVAEConfig,
     BigWeightVAE,
     DistributionConfig,
@@ -281,7 +281,6 @@ def build_big_vae_model_cfg(raw_cfg: Mapping[str, Any]) -> ModelConfig:
     return ModelConfig(
         patch_size=int(model_cfg.get("patch_size", 16)),
         beta=float(model_cfg.get("beta", 1e-3)),
-        variant=str(model_cfg.get("variant", "full")),
         distribution=DistributionConfig(
             k_s=int(dist_cfg.get("k_s", 16)),
             Kq=int(dist_cfg.get("Kq", 32)),

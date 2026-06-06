@@ -188,9 +188,7 @@ offline_batch_prefetch:
 # records directly.
 preslicing:
   enabled: false
-  # Keep this under checkpoint_dir so parallel BigVAE configs do not overwrite
-  # each other's presliced caches while sharing the same master offline dataset.
-  root_dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/presliced_offline_dataset
+  root_dir: ${training_artifacts.big_vae_presliced_dataset_base_dir}/stage_${train.stage}/presliced_offline_dataset
   # Required when enabled. This is the effective training-set size in slices.
   num_slices: 0
   # 0 -> use train.max_x_rows. target_d_in/target_d_out default to the active

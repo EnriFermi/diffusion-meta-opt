@@ -256,7 +256,7 @@ def resolve_artifact_paths(cfg: Any) -> dict[str, Path]:
     cfg_dict = _to_plain_dict(cfg)
     artifacts = cfg_dict.get("training_artifacts") if isinstance(cfg_dict.get("training_artifacts"), dict) else {}
 
-    root_dir = Path(str(artifacts.get("root_dir", "./artifacts/training")))
+    root_dir = Path(str(artifacts.get("root_dir", "./artifacts/big_vae")))
     logs_dir = Path(str(artifacts.get("logs_dir", root_dir / "logs")))
     reports_dir = Path(str(artifacts.get("reports_dir", root_dir / "reports")))
     crashes_dir = Path(str(artifacts.get("crashes_dir", root_dir / "crashes")))

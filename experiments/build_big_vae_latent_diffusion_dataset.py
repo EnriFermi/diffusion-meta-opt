@@ -6,13 +6,15 @@ import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 
-from dataset.big_vae_offline import OfflineBigVAEDataset
-from dataset.big_vae_latent_diffusion_offline import build_big_vae_latent_diffusion_offline_dataset
+from big_vae.datasets.offline import OfflineBigVAEDataset
+from big_vae.datasets.latent_diffusion import build_big_vae_latent_diffusion_offline_dataset
 from dataset.logging_utils import configure_process_logging
 from training.big_vae_latent_diffusion import load_frozen_big_vae_from_checkpoint
+from training.runtime import patch_argparse_lazy_help_for_hydra_py314
 
 
 LOGGER = logging.getLogger("build_big_vae_latent_diffusion_dataset")
+patch_argparse_lazy_help_for_hydra_py314()
 
 
 def _promote_run_profile_to_root(cfg: DictConfig) -> None:
@@ -26,7 +28,7 @@ def _promote_run_profile_to_root(cfg: DictConfig) -> None:
                 cfg[section] = run_profiles_cfg[section]
 
 
-@hydra.main(version_base=None, config_path="../conf", config_name="config_big_vae_latent_diffusion_dataset_build")
+@hydra.main(version_base=None, config_path="../conf", config_name="big_vae/latent_diffusion/dataset_build")
 def main(cfg: DictConfig) -> None:
     _promote_run_profile_to_root(cfg)
     log_path = configure_process_logging(cfg=cfg, role="build_big_vae_latent_diffusion_dataset", rank=0, force=True)

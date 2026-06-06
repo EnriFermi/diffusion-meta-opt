@@ -11,10 +11,10 @@ experiment:
   tags: []
 
 storage:
-  root_dir: ./post_train_research/tinyvit_latent_h1/artifacts
+  root_dir: ${oc.env:BIG_VAE_TINYVIT_H1_ROOT,${oc.env:BIG_VAE_ARTIFACT_ROOT,./artifacts/big_vae}/eval/tinyvit_latent_h1}
 
 source:
-  vit_scaling_artifacts_root: ./post_train_research/vit_latent_scaling/artifacts
+  vit_scaling_artifacts_root: ${oc.env:BIG_VAE_VIT_SCALING_ROOT,${oc.env:BIG_VAE_ARTIFACT_ROOT,./artifacts/big_vae}/eval/vit_latent_scaling}
   run_dir: ""
   checkpoint_name: best
   use_checkpoint_vit_config: true

@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from experiments.compare_vit_tiny_latent_optimization import (
+from big_vae.eval.vit_tiny_latent_optimization import (
     BigVAELatentTensorStore,
     FunctionalViTTiny,
     ViTTinyConfig,

@@ -28,5 +28,4 @@ OFFLINE_ROOT=/path/to/offline_big_vae_dataset \
 post_train_research/big_vae_latent_flattening/run_big_vae_latent_flattening.sh
 ```
 
-Outputs are written under `post_train_research/big_vae_latent_flattening/artifacts/runs/*`.
-
+Outputs are written under `artifacts/big_vae/eval/latent_flattening/runs/*` by default.

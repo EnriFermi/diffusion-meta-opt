@@ -12,9 +12,12 @@ if [ -f "$PROJECT_ROOT/mom.env" ]; then
 fi
 
 
-export BIG_VAE_CHECKPOINT="${BIG_VAE_CHECKPOINT:-/home/coder/project/artifacts/training/checkpoints/weight_quantile_vae_gpu0_square/stage_1/latest.pt}"
-export HELDOUT_ROOT="${HELDOUT_ROOT:-$PROJECT_ROOT/post_train_research/big_vae_heldout_eval/artifacts/offline_dataset}"
-export HELDOUT_LOG_DIR="${HELDOUT_LOG_DIR:-$PROJECT_ROOT/post_train_research/big_vae_heldout_eval/artifacts/logs}"
+ARTIFACT_ROOT="${BIG_VAE_ARTIFACT_ROOT:-$PROJECT_ROOT/artifacts/big_vae}"
+export BIG_VAE_CHECKPOINT="${BIG_VAE_CHECKPOINT:-$ARTIFACT_ROOT/checkpoints/train/default/stage_1/latest.pt}"
+export HELDOUT_ROOT="${HELDOUT_ROOT:-$ARTIFACT_ROOT/datasets/heldout/big_vae/offline_dataset}"
+export HELDOUT_LOG_DIR="${HELDOUT_LOG_DIR:-$ARTIFACT_ROOT/eval/heldout/logs}"
+export HELDOUT_REPORTS_DIR="${HELDOUT_REPORTS_DIR:-$ARTIFACT_ROOT/eval/heldout/reports}"
+export HELDOUT_CRASHES_DIR="${HELDOUT_CRASHES_DIR:-$ARTIFACT_ROOT/eval/heldout/crashes}"
 export EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-256}"
 export EVAL_MAX_RECORDS="${EVAL_MAX_RECORDS:-0}"
 export EVAL_MAX_SLICES_PER_SOURCE="${EVAL_MAX_SLICES_PER_SOURCE:-0}"
@@ -32,16 +35,16 @@ export EVAL_LATENT_PLOT_TSNE="${EVAL_LATENT_PLOT_TSNE:-true}"
 
 if [ -n "${CONDA_PREFIX:-}" ]; then
   export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  exec python "$SCRIPT_DIR/evaluate_big_vae_heldout.py" "$@"
+  exec python -m post_train_research.big_vae_heldout_eval.evaluate_parts.runner "$@"
 fi
 
 if command -v conda >/dev/null 2>&1; then
   CONDA_ENV_NAME="${CONDA_ENV_NAME:-onerec}"
-  exec conda run -n "$CONDA_ENV_NAME" python "$SCRIPT_DIR/evaluate_big_vae_heldout.py" "$@"
+  exec conda run -n "$CONDA_ENV_NAME" python -m post_train_research.big_vae_heldout_eval.evaluate_parts.runner "$@"
 fi
 
 if command -v pipenv >/dev/null 2>&1; then
-  exec pipenv run python "$SCRIPT_DIR/evaluate_big_vae_heldout.py" "$@"
+  exec pipenv run python -m post_train_research.big_vae_heldout_eval.evaluate_parts.runner "$@"
 fi
 
-exec python "$SCRIPT_DIR/evaluate_big_vae_heldout.py" "$@"
+exec python -m post_train_research.big_vae_heldout_eval.evaluate_parts.runner "$@"

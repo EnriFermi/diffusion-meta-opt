@@ -7,7 +7,7 @@ experiment:
     - latent_flattening
 
 storage:
-  root_dir: ./post_train_research/big_vae_latent_flattening/artifacts
+  root_dir: ${oc.env:BIG_VAE_LATENT_FLATTENING_ROOT,${oc.env:BIG_VAE_ARTIFACT_ROOT,./artifacts/big_vae}/eval/latent_flattening}
   checkpoint_every_steps: 250
   save_latest: true
   save_final: true
@@ -64,4 +64,3 @@ train:
   log_every_steps: 10
   amp_encode: true
   tf32: true
-

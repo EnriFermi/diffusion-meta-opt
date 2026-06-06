@@ -1,0 +1,29 @@
+# @package _global_
+defaults:
+  - global_app_hydra_logging_and_model_registry
+  - _self_
+
+training_artifacts:
+  layout_version: big_vae_v1
+  base_root_dir: ${oc.env:BIG_VAE_ARTIFACT_ROOT,./artifacts/big_vae}
+  separate_run_dirs: true
+  runs_dir: ${training_artifacts.base_root_dir}/runs
+  run_id: ""
+  root_dir: ${training_artifacts.base_root_dir}
+
+  checkpoints_dir: ${training_artifacts.base_root_dir}/checkpoints
+  datasets_dir: ${training_artifacts.base_root_dir}/datasets
+  eval_dir: ${training_artifacts.base_root_dir}/eval
+  tmp_dir: ${training_artifacts.base_root_dir}/tmp
+
+  logs_dir: ${training_artifacts.base_root_dir}/logs
+  reports_dir: ${training_artifacts.base_root_dir}/reports
+  crashes_dir: ${training_artifacts.base_root_dir}/crashes
+
+  big_vae_checkpoint_dir: ${training_artifacts.checkpoints_dir}/train/default
+  big_vae_offline_dataset_base_dir: ${training_artifacts.datasets_dir}/offline/big_vae
+  big_vae_presliced_dataset_base_dir: ${training_artifacts.datasets_dir}/presliced/big_vae/default
+  latent_diffusion_prior_checkpoint_dir: ${training_artifacts.checkpoints_dir}/latent_diffusion_prior
+  latent_diffusion_dataset_dir: ${training_artifacts.datasets_dir}/latent_diffusion
+  heldout_dataset_dir: ${training_artifacts.datasets_dir}/heldout/big_vae
+  eval_suite_dir: ${training_artifacts.eval_dir}/suite

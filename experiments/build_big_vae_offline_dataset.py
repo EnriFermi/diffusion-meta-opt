@@ -7,12 +7,16 @@ import hydra
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from dataset import data_pipeline
-from dataset.big_vae_offline import (
+from big_vae.datasets.offline import (
     build_big_vae_offline_dataset,
     resolve_big_vae_curriculum_targets,
     resolve_offline_target_size_bytes,
 )
 from dataset.logging_utils import configure_process_logging
+from training.runtime import patch_argparse_lazy_help_for_hydra_py314
+
+
+patch_argparse_lazy_help_for_hydra_py314()
 
 
 def _promote_run_profile_to_root(cfg: DictConfig) -> None:
@@ -49,7 +53,7 @@ def _dataset_iterator_with_collection(dataset: Any, collector: Any) -> Iterator[
         seen += 1
 
 
-@hydra.main(version_base=None, config_path="../conf", config_name="config")
+@hydra.main(version_base=None, config_path="../conf", config_name="big_vae/train/default")
 def main(cfg: DictConfig) -> None:
     _promote_run_profile_to_root(cfg)
     log_path = configure_process_logging(cfg=cfg, role="build_big_vae_offline_dataset", rank=0, force=True)

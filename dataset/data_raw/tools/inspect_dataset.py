@@ -35,7 +35,7 @@ def main() -> None:
 
     conf_dir = Path(__file__).resolve().parents[3] / "conf"
     with initialize_config_dir(version_base=None, config_dir=str(conf_dir)):
-        cfg = compose(config_name="config")
+        cfg = compose(config_name="big_vae/train/default")
 
     with open_dict(cfg):
         cfg.data.enabled_datasets = [args.dataset_name]
@@ -48,7 +48,7 @@ def main() -> None:
             "cache": {"chunk_size_images": max(8, min(args.n * 2, 32))},
             "worker": {"startup_get_timeout_s": 60.0},
         }
-        # `config.yaml` uses `${hydra:job.name}` in logging.file_name, but this script
+        # `big_vae/train/default.yaml` uses `${hydra:job.name}` in logging.file_name, but this script
         # composes config outside `@hydra.main`. Replace with concrete values.
         if "logging" in cfg:
             cfg.logging.file_name = f"inspect_dataset_{args.dataset_name}.log"

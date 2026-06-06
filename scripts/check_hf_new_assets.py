@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
 def _compose_base_cfg() -> DictConfig:
     conf_dir = Path(__file__).resolve().parents[1] / "conf"
     with initialize_config_dir(version_base=None, config_dir=str(conf_dir)):
-        cfg = compose(config_name="config")
+        cfg = compose(config_name="big_vae/train/default")
 
     with open_dict(cfg):
         if "logging" in cfg:

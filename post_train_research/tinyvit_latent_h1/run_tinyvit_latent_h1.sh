@@ -5,12 +5,13 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 cd "$PROJECT_ROOT"
 
-CONDA_ENV_NAME="diff-meta-opt312"
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-diff-meta-opt312}"
+ARTIFACT_ROOT="${BIG_VAE_ARTIFACT_ROOT:-./artifacts/big_vae}"
 
-RUN_LABEL="tinyvit_h1"
-OUTPUT_ROOT="./post_train_research/tinyvit_latent_h1/artifacts"
+RUN_LABEL="${RUN_LABEL:-tinyvit_h1}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$ARTIFACT_ROOT/eval/tinyvit_latent_h1}"
 
-SOURCE_VIT_SCALING_ROOT="./post_train_research/vit_latent_scaling/artifacts"
+SOURCE_VIT_SCALING_ROOT="${SOURCE_VIT_SCALING_ROOT:-$ARTIFACT_ROOT/eval/vit_latent_scaling}"
 SOURCE_RUN_DIR=""
 SOURCE_CHECKPOINT="best"
 USE_CHECKPOINT_VIT_CONFIG="false"
@@ -44,13 +45,13 @@ MLP_RATIO="2.0"
 DROPOUT="0.0"
 ATTENTION_DROPOUT="0.0"
 
-BIG_VAE_CHECKPOINT="./artifacts/training/checkpoints/weight_quantile_vae_gpu0_square_VAE/stage_1/latest.pt"
+BIG_VAE_CHECKPOINT="${BIG_VAE_CHECKPOINT:-$ARTIFACT_ROOT/checkpoints/train/default/stage_1/latest.pt}"
 BIG_VAE_DECODE="weights"
 BIG_VAE_TILE_T_PATCHES="4"
 BIG_VAE_TILE_D_OUT="64"
 BIG_VAE_LATENT_PARAMETERIZATION="euclidean"
 
-DIFFUSION_PRIOR_CHECKPOINT="./artifacts/training/runs/train_big_vae_latent_diffusion_prior_20260427_032313_pid2515158_cdb92e/checkpoints/big_vae_latent_diffusion_prior/stage_1/latest.pt"
+DIFFUSION_PRIOR_CHECKPOINT="${DIFFUSION_PRIOR_CHECKPOINT:-$ARTIFACT_ROOT/checkpoints/latent_diffusion_prior/stage_1/latest.pt}"
 DIFFUSION_PRIOR_STEPS="50"
 DIFFUSION_PRIOR_SAMPLER="ddim"
 DIFFUSION_PRIOR_ETA="0.0"

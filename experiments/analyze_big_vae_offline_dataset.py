@@ -12,6 +12,10 @@ import hydra
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from dataset.logging_utils import configure_process_logging
+from training.runtime import patch_argparse_lazy_help_for_hydra_py314
+
+
+patch_argparse_lazy_help_for_hydra_py314()
 
 
 LOGGER = logging.getLogger("analyze_big_vae_offline_dataset")
@@ -399,7 +403,7 @@ def _summary_lines(report: dict[str, Any]) -> list[str]:
     return lines
 
 
-@hydra.main(version_base=None, config_path="../conf", config_name="config")
+@hydra.main(version_base=None, config_path="../conf", config_name="big_vae/train/default")
 def main(cfg: DictConfig) -> None:
     _promote_run_profile_to_root(cfg)
     log_path = configure_process_logging(cfg=cfg, role="analyze_big_vae_offline_dataset", rank=0, force=True)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import datetime as dt
 import inspect
@@ -13,6 +14,23 @@ from typing import Any
 
 import torch
 from omegaconf import DictConfig, open_dict
+
+
+def patch_argparse_lazy_help_for_hydra_py314() -> None:
+    """Hydra 1.3 passes lazy help objects; Python 3.14 validates help as a string."""
+    if getattr(argparse.ArgumentParser, "_hydra_lazy_help_py314_patch", False):
+        return
+    original_check_help = getattr(argparse.ArgumentParser, "_check_help", None)
+    if original_check_help is None:
+        return
+
+    def patched_check_help(self: argparse.ArgumentParser, action: argparse.Action) -> None:
+        if action.help is not None and not isinstance(action.help, str):
+            action.help = str(action.help)
+        original_check_help(self, action)
+
+    argparse.ArgumentParser._check_help = patched_check_help  # type: ignore[method-assign]
+    argparse.ArgumentParser._hydra_lazy_help_py314_patch = True  # type: ignore[attr-defined]
 
 
 def get_rank_logger(name: str, rank: int) -> logging.Logger:
@@ -269,12 +287,12 @@ def configure_per_run_artifacts(
     run_label: str,
 ) -> dict[str, str]:
     """
-    Configure per-run artifact directories under training_artifacts.
+    Configure BigVAE artifact directories under training_artifacts.
 
-    By default this keeps shared artifacts under:
-      <base_root_dir>/{checkpoints,reports,crashes}
-    and uses per-run directories only for logs:
-      <base_root_dir>/runs/<run_id>/logs
+    Shared payloads live under:
+      <base_root_dir>/{checkpoints,datasets,eval,tmp}
+    and run-local logs/diagnostics live under:
+      <base_root_dir>/runs/<run_id>/{logs,reports,crashes}
     """
 
     with open_dict(cfg):
@@ -282,9 +300,10 @@ def configure_per_run_artifacts(
             cfg["training_artifacts"] = {}
         ta = cfg["training_artifacts"]
 
-        base_root = Path(str(ta.get("base_root_dir", ta.get("root_dir", "./artifacts/training"))))
+        default_base_root = os.environ.get("BIG_VAE_ARTIFACT_ROOT", "./artifacts/big_vae")
+        base_root = Path(str(ta.get("base_root_dir", ta.get("root_dir", default_base_root)))).expanduser()
         separate_run_dirs = bool(ta.get("separate_run_dirs", True))
-        runs_dir = Path(str(ta.get("runs_dir", base_root / "runs")))
+        runs_dir = Path(str(ta.get("runs_dir", base_root / "runs"))).expanduser()
 
         run_id = str(ta.get("run_id", "")).strip()
         if not run_id:
@@ -296,26 +315,58 @@ def configure_per_run_artifacts(
         run_root_dir = (runs_dir / run_id) if separate_run_dirs else base_root
         root_dir = base_root
         logs_dir = run_root_dir / "logs"
-        reports_dir = base_root / "reports"
-        crashes_dir = base_root / "crashes"
-        default_mini_ckpt_dir = base_root / "checkpoints" / "mini_patch_vae"
-        default_big_ckpt_dir = base_root / "checkpoints" / "weight_quantile_vae"
-        mini_ckpt_dir = Path(str(ta.get("mini_vae_checkpoint_dir", default_mini_ckpt_dir)))
-        big_ckpt_dir = Path(str(ta.get("big_vae_checkpoint_dir", default_big_ckpt_dir)))
+        reports_dir = run_root_dir / "reports"
+        crashes_dir = run_root_dir / "crashes"
 
+        def path_cfg(key: str, default: Path) -> Path:
+            raw = ta.get(key, str(default))
+            text = str(raw).strip()
+            return Path(text if text else str(default)).expanduser()
+
+        checkpoints_dir = path_cfg("checkpoints_dir", base_root / "checkpoints")
+        datasets_dir = path_cfg("datasets_dir", base_root / "datasets")
+        eval_dir = path_cfg("eval_dir", base_root / "eval")
+        tmp_dir = path_cfg("tmp_dir", base_root / "tmp")
+        default_big_ckpt_dir = checkpoints_dir / "train" / "default"
+        default_big_offline_base_dir = datasets_dir / "offline" / "big_vae"
+        default_big_presliced_base_dir = datasets_dir / "presliced" / "big_vae" / "default"
+        default_latent_prior_ckpt_dir = checkpoints_dir / "latent_diffusion_prior"
+        default_latent_dataset_dir = datasets_dir / "latent_diffusion"
+        default_heldout_dataset_dir = datasets_dir / "heldout" / "big_vae"
+        default_eval_suite_dir = eval_dir / "suite"
+
+        big_ckpt_dir = path_cfg("big_vae_checkpoint_dir", default_big_ckpt_dir)
+        big_offline_base_dir = path_cfg("big_vae_offline_dataset_base_dir", default_big_offline_base_dir)
+        big_presliced_base_dir = path_cfg("big_vae_presliced_dataset_base_dir", default_big_presliced_base_dir)
+        latent_prior_ckpt_dir = path_cfg(
+            "latent_diffusion_prior_checkpoint_dir",
+            default_latent_prior_ckpt_dir,
+        )
+        latent_dataset_dir = path_cfg("latent_diffusion_dataset_dir", default_latent_dataset_dir)
+        heldout_dataset_dir = path_cfg("heldout_dataset_dir", default_heldout_dataset_dir)
+        eval_suite_dir = path_cfg("eval_suite_dir", default_eval_suite_dir)
+
+        ta["layout_version"] = str(ta.get("layout_version", "big_vae_v1"))
         ta["base_root_dir"] = str(base_root)
         ta["separate_run_dirs"] = bool(separate_run_dirs)
         ta["runs_dir"] = str(runs_dir)
         ta["run_id"] = run_id
         ta["root_dir"] = str(root_dir)
         ta["run_root_dir"] = str(run_root_dir)
+        ta["checkpoints_dir"] = str(checkpoints_dir)
+        ta["datasets_dir"] = str(datasets_dir)
+        ta["eval_dir"] = str(eval_dir)
+        ta["tmp_dir"] = str(tmp_dir)
         ta["logs_dir"] = str(logs_dir)
         ta["reports_dir"] = str(reports_dir)
         ta["crashes_dir"] = str(crashes_dir)
-        ta["mini_vae_checkpoint_dir"] = str(mini_ckpt_dir)
         ta["big_vae_checkpoint_dir"] = str(big_ckpt_dir)
-        ta["mini_encoder_latest_checkpoint"] = str(mini_ckpt_dir / "mini_encoder_latest.pt")
-
+        ta["big_vae_offline_dataset_base_dir"] = str(big_offline_base_dir)
+        ta["big_vae_presliced_dataset_base_dir"] = str(big_presliced_base_dir)
+        ta["latent_diffusion_prior_checkpoint_dir"] = str(latent_prior_ckpt_dir)
+        ta["latent_diffusion_dataset_dir"] = str(latent_dataset_dir)
+        ta["heldout_dataset_dir"] = str(heldout_dataset_dir)
+        ta["eval_suite_dir"] = str(eval_suite_dir)
         if isinstance(cfg.get("logging"), (dict, DictConfig)):
             cfg["logging"]["dir"] = str(logs_dir)
 
@@ -325,18 +376,37 @@ def configure_per_run_artifacts(
         logs_dir,
         reports_dir,
         crashes_dir,
-        mini_ckpt_dir,
+        checkpoints_dir,
+        datasets_dir,
+        eval_dir,
+        tmp_dir,
         big_ckpt_dir,
+        big_offline_base_dir,
+        big_presliced_base_dir,
+        latent_prior_ckpt_dir,
+        latent_dataset_dir,
+        heldout_dataset_dir,
+        eval_suite_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)
 
     return {
         "run_id": run_id,
+        "layout_version": str(cfg.training_artifacts.get("layout_version", "big_vae_v1")),
         "root_dir": str(root_dir),
         "run_root_dir": str(run_root_dir),
+        "checkpoints_dir": str(checkpoints_dir),
+        "datasets_dir": str(datasets_dir),
+        "eval_dir": str(eval_dir),
+        "tmp_dir": str(tmp_dir),
         "logs_dir": str(logs_dir),
         "reports_dir": str(reports_dir),
         "crashes_dir": str(crashes_dir),
-        "mini_vae_checkpoint_dir": str(mini_ckpt_dir),
         "big_vae_checkpoint_dir": str(big_ckpt_dir),
+        "big_vae_offline_dataset_base_dir": str(big_offline_base_dir),
+        "big_vae_presliced_dataset_base_dir": str(big_presliced_base_dir),
+        "latent_diffusion_prior_checkpoint_dir": str(latent_prior_ckpt_dir),
+        "latent_diffusion_dataset_dir": str(latent_dataset_dir),
+        "heldout_dataset_dir": str(heldout_dataset_dir),
+        "eval_suite_dir": str(eval_suite_dir),
     }

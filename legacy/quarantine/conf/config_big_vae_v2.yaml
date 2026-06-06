@@ -1,0 +1,3 @@
+defaults:
+  - /big_vae/train: v2
+  - _self_

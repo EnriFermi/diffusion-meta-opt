@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from experiments.compare_vit_tiny_latent_optimization import (
+from big_vae.eval.vit_tiny_latent_optimization import (
     BigVAELatentTensorStore,
     EvalMetrics,
     autocast_context,

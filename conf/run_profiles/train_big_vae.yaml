@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - /shared_runtime_environment: checkpoint_and_artifact_paths_for_mini_then_big
+  - /shared_runtime_environment: big_vae_artifacts
   - /data_collection_runtime/data_profiles@data: data_profile_for_big_vae_training
   - /data_collection_runtime/collector_profiles@collector: collector_profile_async_gpu1
   - /data_collection_runtime/streaming_profiles@streaming: streaming_profile_none
@@ -14,10 +14,9 @@ defaults:
   - _self_
 
 training_artifacts:
-  # Parallel BigVAE copy: keep checkpoints/resume state separate from the
-  # default train_big_vae run, while reusing the default prebuilt offline dataset.
-  big_vae_checkpoint_dir: ${training_artifacts.base_root_dir}/checkpoints/weight_quantile_vae_non_compressed
-  big_vae_offline_dataset_base_dir: ${training_artifacts.base_root_dir}/checkpoints/weight_quantile_vae
+  big_vae_checkpoint_dir: ${training_artifacts.checkpoints_dir}/train/default
+  big_vae_offline_dataset_base_dir: ${training_artifacts.datasets_dir}/offline/big_vae
+  big_vae_presliced_dataset_base_dir: ${training_artifacts.datasets_dir}/presliced/big_vae/default
 
 
 # BigVAE speed tuning for explicit model-diverse batches:
@@ -58,7 +57,3 @@ train:
 hydra:
   job:
     name: train_big_vae
-
-model:
-  # full | simple_direct
-  variant: full

@@ -12,7 +12,7 @@ experiment:
   tags: []
 
 storage:
-  root_dir: ./post_train_research/vit_latent_scaling/artifacts
+  root_dir: ${oc.env:BIG_VAE_VIT_SCALING_ROOT,${oc.env:BIG_VAE_ARTIFACT_ROOT,./artifacts/big_vae}/eval/vit_latent_scaling}
   shared_checkpoint_root_dir: ""
   shared_checkpoint_label: ""
   checkpoint_every_steps: 250

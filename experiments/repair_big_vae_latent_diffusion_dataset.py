@@ -11,12 +11,12 @@ from typing import Any, Iterable, Sequence
 
 import torch
 
-from dataset.big_vae_latent_diffusion_offline import (
+from big_vae.datasets.latent_diffusion import (
     OFFLINE_BIG_VAE_LATENT_DIFFUSION_FORMAT_VERSION,
     _directory_size_bytes,
     _prepare_cpu_tensor,
 )
-from dataset.big_vae_offline import infer_layer_depth, infer_layer_type
+from big_vae.datasets.offline import infer_layer_depth, infer_layer_type
 
 
 LOGGER = logging.getLogger("repair_big_vae_latent_diffusion_dataset")

@@ -1,0 +1,1 @@
+"""Legacy MiniVAE training helpers."""

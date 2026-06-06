@@ -5,7 +5,7 @@ from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
-from experiments.compare_vit_tiny_latent_optimization import ViTTinyConfig
+from big_vae.eval.vit_tiny_latent_optimization import ViTTinyConfig
 
 
 @dataclass(slots=True)
@@ -203,11 +203,11 @@ def build_run_config(cfg: DictConfig) -> tuple[RunConfig, dict[str, Any]]:
             tags=_as_tags(experiment_raw.get("tags", [])),
         ),
         storage=StorageConfig(
-            root_dir=str(storage_raw.get("root_dir", "./post_train_research/tinyvit_latent_h1/artifacts")).strip(),
+            root_dir=str(storage_raw.get("root_dir", "./artifacts/big_vae/eval/tinyvit_latent_h1")).strip(),
         ),
         source=SourceConfig(
             vit_scaling_artifacts_root=str(
-                source_raw.get("vit_scaling_artifacts_root", "./post_train_research/vit_latent_scaling/artifacts")
+                source_raw.get("vit_scaling_artifacts_root", "./artifacts/big_vae/eval/vit_latent_scaling")
             ).strip(),
             run_dir=str(source_raw.get("run_dir", "")).strip(),
             checkpoint_name=str(source_raw.get("checkpoint_name", "best")).strip() or "best",

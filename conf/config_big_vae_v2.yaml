@@ -1,3 +1,0 @@
-defaults:
-  - /run_profiles@_global_: train_big_vae_v2
-  - _self_

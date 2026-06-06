@@ -13,7 +13,7 @@ from dataset import data_pipeline, setup_logging
 DEMO_STEPS = 120
 
 
-@hydra.main(version_base=None, config_path="../../conf", config_name="config")
+@hydra.main(version_base=None, config_path="../../conf", config_name="big_vae/train/default")
 def main(cfg: DictConfig) -> None:
     setup_logging(cfg)
     logger = logging.getLogger("dataset.shared.demo_interleaved")

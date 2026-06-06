@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
-from experiments.compare_vit_tiny_latent_optimization import (
+from big_vae.eval.vit_tiny_latent_optimization import (
     BigVAELatentTensorStore,
     EvalMetrics,
     FunctionalViTTiny,

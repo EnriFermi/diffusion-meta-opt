@@ -74,6 +74,18 @@ def env_path(name: str, default: str | Path) -> Path:
     return path
 
 
+def big_vae_artifact_root() -> Path:
+    return env_path("BIG_VAE_ARTIFACT_ROOT", "artifacts/big_vae")
+
+
+def default_heldout_root() -> Path:
+    return big_vae_artifact_root() / "datasets" / "heldout" / "big_vae" / "offline_dataset"
+
+
+def default_heldout_eval_dir() -> Path:
+    return big_vae_artifact_root() / "eval" / "heldout"
+
+
 def promote_run_profile_to_root(cfg: DictConfig) -> None:
     run_profiles_cfg = cfg.get("run_profiles")
     if not isinstance(run_profiles_cfg, (dict, DictConfig)):
@@ -112,14 +124,23 @@ def sanitize_programmatic_hydra_logging(cfg: DictConfig, *, role: str) -> None:
 
 
 def apply_heldout_log_dir(cfg: DictConfig, *, root_dir: str | Path) -> Path:
-    default_log_dir = Path(root_dir).expanduser().parent / "logs"
+    default_eval_dir = default_heldout_eval_dir()
+    default_log_dir = (
+        Path(root_dir).expanduser().parent / "logs"
+        if os.environ.get("HELDOUT_ROOT")
+        else default_eval_dir / "logs"
+    )
     log_dir = env_path("HELDOUT_LOG_DIR", default_log_dir)
+    reports_dir = env_path("HELDOUT_REPORTS_DIR", default_eval_dir / "reports")
+    crashes_dir = env_path("HELDOUT_CRASHES_DIR", default_eval_dir / "crashes")
     with open_dict(cfg):
         if "training_artifacts" not in cfg or cfg.training_artifacts is None:
             cfg.training_artifacts = {}
         if "logging" not in cfg or cfg.logging is None:
             cfg.logging = {}
         cfg.training_artifacts.logs_dir = str(log_dir)
+        cfg.training_artifacts.reports_dir = str(reports_dir)
+        cfg.training_artifacts.crashes_dir = str(crashes_dir)
         cfg.logging.dir = str(log_dir)
     return log_dir
 

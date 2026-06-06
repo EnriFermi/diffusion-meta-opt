@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from experiments.compare_vit_tiny_latent_optimization import BigVAELatentTensorStore, autocast_context
+from big_vae.eval.vit_tiny_latent_optimization import BigVAELatentTensorStore, autocast_context
 from post_train_research.tinyvit_latent_h1.config import RunConfig
 from post_train_research.tinyvit_latent_h1.runtime import CometTracker, RunPaths, append_csv_row
 from post_train_research.tinyvit_latent_h1.source import (

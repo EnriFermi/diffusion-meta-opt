@@ -10,6 +10,8 @@ from typing import Any
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
+from big_vae.runtime.artifacts import write_artifact_layout
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -23,6 +25,7 @@ from common import (
     apply_heldout_data_profile,
     apply_offline_dataset_defaults,
     counter_to_rows,
+    default_heldout_root,
     env_bool,
     env_float,
     env_int,
@@ -38,7 +41,7 @@ from common import (
     write_json,
 )
 from dataset import data_pipeline
-from dataset.big_vae_offline import (
+from big_vae.datasets.offline import (
     BigVAEOfflineDatasetWriter,
     resolve_big_vae_curriculum_targets,
     resolve_offline_target_size_bytes,
@@ -375,7 +378,7 @@ def _build_balanced_heldout_dataset(
 
 def _load_base_config() -> DictConfig:
     with initialize_config_dir(version_base=None, config_dir=str(PROJECT_ROOT / "conf")):
-        return compose(config_name="config")
+        return compose(config_name="big_vae/train/default")
 
 
 def main() -> None:
@@ -384,9 +387,17 @@ def main() -> None:
     sanitize_programmatic_hydra_logging(cfg, role="build_big_vae_heldout_offline_dataset")
     root_dir = env_path(
         "HELDOUT_ROOT",
-        "post_train_research/big_vae_heldout_eval/artifacts/offline_dataset",
+        default_heldout_root(),
     )
     log_dir = apply_heldout_log_dir(cfg, root_dir=root_dir)
+    write_artifact_layout(
+        root_dir.parent,
+        kind="post_train.heldout_dataset_build",
+        run_id=root_dir.name,
+        files={"manifest": root_dir / "manifest.json", "summary": root_dir / "heldout_build_analysis" / "summary.json"},
+        dirs={"dataset": root_dir, "logs": log_dir, "analysis": root_dir / "heldout_build_analysis"},
+        metadata={"heldout_root": root_dir},
+    )
     apply_heldout_data_profile(cfg)
     apply_heldout_collector_defaults_from_env(cfg)
     apply_offline_dataset_defaults(cfg, root_dir=root_dir)

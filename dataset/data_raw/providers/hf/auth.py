@@ -59,7 +59,7 @@ def validate_gated_datasets_token(cfg: Any, active_dataset_cfgs: dict[str, Any])
     if missing_for:
         names = ", ".join(sorted(missing_for))
         raise ValueError(
-            f"{HF_TOKEN_MISSING_ERROR}. Set hf.token in conf/config.yaml. "
+            f"{HF_TOKEN_MISSING_ERROR}. Set hf.token in conf/big_vae/train/default.yaml. "
             f"Accept the dataset license on Hugging Face dataset page. "
             f"Ensure token has access. Affected datasets: {names}"
         )
@@ -74,7 +74,7 @@ def init_hf_auth(cfg: Any, allow_missing_token: bool = False) -> str | None:
     token = get_hf_token(plain)
     if not token and not allow_missing_token:
         raise ValueError(
-            f"{HF_TOKEN_MISSING_ERROR}. Set hf.token in conf/config.yaml."
+            f"{HF_TOKEN_MISSING_ERROR}. Set hf.token in conf/big_vae/train/default.yaml."
         )
 
     hf_home = str(hf_cfg.get("hf_home", "./data/hf_home"))

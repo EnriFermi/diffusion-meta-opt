@@ -11,8 +11,11 @@ if [ -f "$PROJECT_ROOT/mom.env" ]; then
   set +a
 fi
 
-export HELDOUT_ROOT="${HELDOUT_ROOT:-$PROJECT_ROOT/post_train_research/big_vae_heldout_eval/artifacts/offline_dataset}"
-export HELDOUT_LOG_DIR="${HELDOUT_LOG_DIR:-$PROJECT_ROOT/post_train_research/big_vae_heldout_eval/artifacts/logs}"
+ARTIFACT_ROOT="${BIG_VAE_ARTIFACT_ROOT:-$PROJECT_ROOT/artifacts/big_vae}"
+export HELDOUT_ROOT="${HELDOUT_ROOT:-$ARTIFACT_ROOT/datasets/heldout/big_vae/offline_dataset}"
+export HELDOUT_LOG_DIR="${HELDOUT_LOG_DIR:-$ARTIFACT_ROOT/eval/heldout/logs}"
+export HELDOUT_REPORTS_DIR="${HELDOUT_REPORTS_DIR:-$ARTIFACT_ROOT/eval/heldout/reports}"
+export HELDOUT_CRASHES_DIR="${HELDOUT_CRASHES_DIR:-$ARTIFACT_ROOT/eval/heldout/crashes}"
 export HELDOUT_RECORDS_PER_PAIR="${HELDOUT_RECORDS_PER_PAIR:-1024}"
 export HELDOUT_TARGET_SIZE_GB="${HELDOUT_TARGET_SIZE_GB:-20}"
 export HELDOUT_OVERWRITE="${HELDOUT_OVERWRITE:-false}"

@@ -11,6 +11,7 @@ from typing import Any
 
 from omegaconf import OmegaConf
 
+from big_vae.runtime.artifacts import append_csv_row, write_artifact_layout, write_json_file, write_yaml_file
 from post_train_research.vit_latent_scaling.config import CometConfig, RunConfig
 
 
@@ -111,35 +112,34 @@ def configure_logger(paths: RunPaths) -> logging.Logger:
 
 
 def write_config_snapshots(paths: RunPaths, cfg: RunConfig, raw_cfg: dict[str, Any]) -> None:
-    paths.config_json.write_text(
-        json.dumps(
-            {
-                "resolved": cfg.to_dict(),
-                "raw": raw_cfg,
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    paths.config_yaml.write_text(
-        OmegaConf.to_yaml({"resolved": cfg.to_dict(), "raw": raw_cfg}, resolve=True),
-        encoding="utf-8",
+    payload = {"resolved": cfg.to_dict(), "raw": raw_cfg}
+    write_json_file(paths.config_json, payload)
+    write_yaml_file(paths.config_yaml, payload)
+    write_artifact_layout(
+        paths.run_dir,
+        kind="post_train.vit_latent_scaling",
+        run_id=paths.run_id,
+        files={
+            "config_yaml": paths.config_yaml,
+            "config_json": paths.config_json,
+            "log": paths.log_file,
+            "metrics": paths.metrics_file,
+            "summary": paths.summary_file,
+        },
+        dirs={
+            "checkpoints": paths.checkpoints_dir,
+            "shared_checkpoints": paths.shared_checkpoints_dir,
+        },
+        metadata={"run_label": cfg.run_label, "profile": cfg.profile.name, "setup": cfg.setup.kind},
     )
 
 
 def append_metrics_row(path: Path, row: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists()
-    with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    append_csv_row(path, row)
 
 
 def write_summary(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    write_json_file(path, payload)
 
 
 def update_run_index(paths: RunPaths, cfg: RunConfig, summary: dict[str, Any]) -> None:
