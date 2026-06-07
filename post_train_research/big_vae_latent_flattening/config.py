@@ -78,6 +78,9 @@ class TrainConfig:
     amp_encode: bool
     tf32: bool
     force_math_attention: bool
+    skip_nonfinite_updates: bool
+    max_consecutive_nonfinite_steps: int
+    nonfinite_debug_topk: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +193,9 @@ def build_run_config(cfg: DictConfig) -> tuple[RunConfig, dict[str, Any]]:
             amp_encode=bool(train.get("amp_encode", True)),
             tf32=bool(train.get("tf32", True)),
             force_math_attention=bool(train.get("force_math_attention", True)),
+            skip_nonfinite_updates=bool(train.get("skip_nonfinite_updates", True)),
+            max_consecutive_nonfinite_steps=int(train.get("max_consecutive_nonfinite_steps", 20)),
+            nonfinite_debug_topk=int(train.get("nonfinite_debug_topk", 8)),
         ),
     )
 

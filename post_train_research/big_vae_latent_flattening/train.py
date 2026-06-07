@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ from big_vae.runtime.artifacts import write_json_file
 from big_vae.datasets.offline import OfflineBigVAEDataset
 from big_vae.models import build_weight_quantile_vae
 from post_train_research.big_vae_latent_flattening.config import RunConfig
+from post_train_research.big_vae_latent_flattening.debug import log_nonfinite_debug, should_emit_nonfinite_debug
 from post_train_research.big_vae_latent_flattening.flow import RealNVPConfig, RealNVPFlow
 from post_train_research.big_vae_latent_flattening.geometry import relaxed_distortion_measure
 from post_train_research.big_vae_latent_flattening.runtime import RunPaths, append_metrics_row, resolve_path, save_checkpoint
@@ -313,6 +315,17 @@ def build_optimizer(flow: nn.Module, cfg: RunConfig) -> torch.optim.Optimizer:
     )
 
 
+def _tensor_is_finite(tensor: torch.Tensor) -> bool:
+    return bool(torch.isfinite(tensor.detach()).all().item())
+
+
+def _module_gradients_are_finite(module: nn.Module) -> bool:
+    for param in module.parameters():
+        if param.grad is not None and not torch.isfinite(param.grad.detach()).all().item():
+            return False
+    return True
+
+
 def run_training(cfg: RunConfig, paths: RunPaths, logger: logging.Logger) -> dict[str, Any]:
     seed_everything(int(cfg.train.seed))
     device = resolve_device(cfg.train.device)
@@ -345,6 +358,7 @@ def run_training(cfg: RunConfig, paths: RunPaths, logger: logging.Logger) -> dic
     dataset = build_offline_dataset(cfg, patch_size=patch_size)
     dataset_iter = iter(dataset)
     last_metrics: dict[str, Any] = {}
+    consecutive_nonfinite_steps = 0
     try:
         for step in range(1, int(cfg.train.max_steps) + 1):
             flow.train()
@@ -376,15 +390,6 @@ def run_training(cfg: RunConfig, paths: RunPaths, logger: logging.Logger) -> dic
                 z_roundtrip, _roundtrip_log_det = flow.inverse(z_prime.detach())
                 flow_cycle_mse = (z_roundtrip - state.z).pow(2).mean()
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            grad_norm = 0.0
-            if float(cfg.train.grad_clip_norm) > 0.0:
-                grad_norm = float(
-                    torch.nn.utils.clip_grad_norm_(flow.parameters(), max_norm=float(cfg.train.grad_clip_norm)).item()
-                )
-            optimizer.step()
-
             last_metrics = {
                 "step": int(step),
                 "loss": float(loss.detach().cpu().item()),
@@ -396,13 +401,129 @@ def run_training(cfg: RunConfig, paths: RunPaths, logger: logging.Logger) -> dic
                 "z_norm_loss": float(z_norm_loss.detach().cpu().item()),
                 "flow_cycle_mse": float(flow_cycle_mse.cpu().item()),
                 "flow_logdet_mean": float(forward_log_det.detach().mean().cpu().item()),
-                "grad_norm": float(grad_norm),
+                "grad_norm": 0.0,
+                "skipped_update": 0,
+                "nonfinite_reason": "",
                 "batch_size": int(state.z.shape[0]),
                 "latent_dim": int(state.z.shape[1]),
                 "d_in": int(state.d_in),
                 "d_out": int(state.d_out),
                 "T": int(state.T),
             }
+
+            if not _tensor_is_finite(loss):
+                consecutive_nonfinite_steps += 1
+                last_metrics["skipped_update"] = 1
+                last_metrics["nonfinite_reason"] = "nonfinite_loss"
+                append_metrics_row(paths.metrics_csv, last_metrics)
+                logger.warning(
+                    "Skipping non-finite latent flattening update: step=%s reason=%s "
+                    "consecutive=%s/%s loss=%s iso=%s z_norm=%s shape=(B%s,%s,%s)",
+                    step,
+                    last_metrics["nonfinite_reason"],
+                    consecutive_nonfinite_steps,
+                    int(cfg.train.max_consecutive_nonfinite_steps),
+                    last_metrics["loss"],
+                    last_metrics["iso_loss"],
+                    last_metrics["z_norm_loss"],
+                    last_metrics["batch_size"],
+                    last_metrics["d_in"],
+                    last_metrics["d_out"],
+                )
+                if should_emit_nonfinite_debug(consecutive_nonfinite_steps):
+                    log_nonfinite_debug(
+                        logger=logger,
+                        step=step,
+                        reason=str(last_metrics["nonfinite_reason"]),
+                        consecutive_nonfinite_steps=consecutive_nonfinite_steps,
+                        cfg=cfg,
+                        flow=flow,
+                        batch=batch,
+                        state=state,
+                        z_prime=z_prime,
+                        forward_log_det=forward_log_det,
+                        distortion=distortion,
+                        z_norm_loss=z_norm_loss,
+                        flow_cycle_mse=flow_cycle_mse,
+                        loss=loss,
+                        include_grads=False,
+                    )
+                if not bool(cfg.train.skip_nonfinite_updates) or consecutive_nonfinite_steps > int(
+                    cfg.train.max_consecutive_nonfinite_steps
+                ):
+                    raise RuntimeError(
+                        "Latent flattening produced non-finite loss "
+                        f"at step={step}: metrics={last_metrics}"
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            grad_norm = 0.0
+            raw_grads_finite = _module_gradients_are_finite(flow)
+            if float(cfg.train.grad_clip_norm) > 0.0:
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(flow.parameters(), max_norm=float(cfg.train.grad_clip_norm)).item()
+                )
+            post_clip_grads_finite = _module_gradients_are_finite(flow)
+            last_metrics["grad_norm"] = float(grad_norm)
+            if not raw_grads_finite or not post_clip_grads_finite or not math.isfinite(float(grad_norm)):
+                consecutive_nonfinite_steps += 1
+                if not raw_grads_finite:
+                    nonfinite_reason = "nonfinite_raw_grad"
+                elif not post_clip_grads_finite:
+                    nonfinite_reason = "nonfinite_clipped_grad"
+                else:
+                    nonfinite_reason = "nonfinite_grad_norm"
+                last_metrics["skipped_update"] = 1
+                last_metrics["nonfinite_reason"] = nonfinite_reason
+                append_metrics_row(paths.metrics_csv, last_metrics)
+                logger.warning(
+                    "Skipping non-finite latent flattening update: step=%s reason=%s "
+                    "consecutive=%s/%s loss=%s iso=%s z_norm=%s grad=%s shape=(B%s,%s,%s)",
+                    step,
+                    nonfinite_reason,
+                    consecutive_nonfinite_steps,
+                    int(cfg.train.max_consecutive_nonfinite_steps),
+                    last_metrics["loss"],
+                    last_metrics["iso_loss"],
+                    last_metrics["z_norm_loss"],
+                    last_metrics["grad_norm"],
+                    last_metrics["batch_size"],
+                    last_metrics["d_in"],
+                    last_metrics["d_out"],
+                )
+                if should_emit_nonfinite_debug(consecutive_nonfinite_steps):
+                    log_nonfinite_debug(
+                        logger=logger,
+                        step=step,
+                        reason=nonfinite_reason,
+                        consecutive_nonfinite_steps=consecutive_nonfinite_steps,
+                        cfg=cfg,
+                        flow=flow,
+                        batch=batch,
+                        state=state,
+                        z_prime=z_prime,
+                        forward_log_det=forward_log_det,
+                        distortion=distortion,
+                        z_norm_loss=z_norm_loss,
+                        flow_cycle_mse=flow_cycle_mse,
+                        loss=loss,
+                        include_grads=True,
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                if not bool(cfg.train.skip_nonfinite_updates) or consecutive_nonfinite_steps > int(
+                    cfg.train.max_consecutive_nonfinite_steps
+                ):
+                    raise RuntimeError(
+                        "Latent flattening produced non-finite gradients "
+                        f"at step={step}: metrics={last_metrics}"
+                    )
+                continue
+
+            optimizer.step()
+            consecutive_nonfinite_steps = 0
             append_metrics_row(paths.metrics_csv, last_metrics)
 
             if step % max(1, int(cfg.train.log_every_steps)) == 0 or step == 1:
