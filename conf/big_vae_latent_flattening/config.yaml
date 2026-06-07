@@ -64,3 +64,6 @@ train:
   log_every_steps: 10
   amp_encode: true
   tf32: true
+  # Higher-order JVPs through the BigVAE decoder are not implemented for CUDA
+  # flash/mem-efficient SDPA kernels in current PyTorch builds.
+  force_math_attention: true
