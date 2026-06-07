@@ -62,10 +62,29 @@ def resolve_device(raw: str) -> torch.device:
     return torch.device(value)
 
 
-def configure_torch_runtime(cfg: RunConfig, device: torch.device) -> None:
-    if device.type == "cuda" and bool(cfg.train.tf32):
+def configure_torch_runtime(
+    cfg: RunConfig,
+    device: torch.device,
+    *,
+    logger: logging.Logger | None = None,
+) -> None:
+    if device.type != "cuda":
+        return
+    if bool(cfg.train.tf32):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+    if bool(cfg.train.force_math_attention):
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(True)
+        if logger is not None:
+            logger.info(
+                "CUDA SDPA forced to math kernels for higher-order decoder derivatives "
+                "(flash=False mem_efficient=False math=True)"
+            )
 
 
 @contextlib.contextmanager
@@ -297,7 +316,7 @@ def build_optimizer(flow: nn.Module, cfg: RunConfig) -> torch.optim.Optimizer:
 def run_training(cfg: RunConfig, paths: RunPaths, logger: logging.Logger) -> dict[str, Any]:
     seed_everything(int(cfg.train.seed))
     device = resolve_device(cfg.train.device)
-    configure_torch_runtime(cfg, device)
+    configure_torch_runtime(cfg, device, logger=logger)
     logger.info("Loading frozen BigVAE checkpoint: %s", cfg.big_vae.checkpoint)
     big_vae = load_frozen_big_vae(cfg.big_vae.checkpoint, device=device)
     latent_dim = int(getattr(big_vae, "flat_lat_dim"))

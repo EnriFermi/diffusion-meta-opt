@@ -36,15 +36,18 @@ fi
 
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-onerec}"
 
-if [ -n "${CONDA_PREFIX:-}" ]; then
+if [ -n "${CONDA_PREFIX:-}" ] && [ "${CONDA_DEFAULT_ENV:-}" = "$CONDA_ENV_NAME" ]; then
   export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  if [ "${CONDA_DEFAULT_ENV:-}" = "$CONDA_ENV_NAME" ]; then
-    exec python -m "$MODULE_NAME" "$@"
-  fi
+  exec python -m "$MODULE_NAME" "$@"
 fi
 
 if command -v conda >/dev/null 2>&1; then
-  exec conda run --no-capture-output -n "$CONDA_ENV_NAME" python -m "$MODULE_NAME" "$@"
+  exec conda run --no-capture-output -n "$CONDA_ENV_NAME" bash -c '
+    export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    module_name="$1"
+    shift
+    exec python -m "$module_name" "$@"
+  ' _ "$MODULE_NAME" "$@"
 fi
 
 if command -v pipenv >/dev/null 2>&1; then

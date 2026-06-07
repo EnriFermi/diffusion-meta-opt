@@ -77,6 +77,7 @@ class TrainConfig:
     log_every_steps: int
     amp_encode: bool
     tf32: bool
+    force_math_attention: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +189,7 @@ def build_run_config(cfg: DictConfig) -> tuple[RunConfig, dict[str, Any]]:
             log_every_steps=int(train.get("log_every_steps", 10)),
             amp_encode=bool(train.get("amp_encode", True)),
             tf32=bool(train.get("tf32", True)),
+            force_math_attention=bool(train.get("force_math_attention", True)),
         ),
     )
 

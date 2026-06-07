@@ -40,15 +40,19 @@ Z_NORM_COEF="${Z_NORM_COEF:-1e-6}"
 LOG_EVERY_STEPS="${LOG_EVERY_STEPS:-10}"
 CHECKPOINT_EVERY_STEPS="${CHECKPOINT_EVERY_STEPS:-250}"
 AMP_ENCODE="${AMP_ENCODE:-true}"
+FORCE_MATH_ATTENTION="${FORCE_MATH_ATTENTION:-true}"
 
 run_python() {
-  if [ -n "${CONDA_PREFIX:-}" ]; then
+  if [ -n "${CONDA_PREFIX:-}" ] && [ "${CONDA_DEFAULT_ENV:-}" = "$CONDA_ENV_NAME" ]; then
     export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     python "$@"
     return
   fi
   if command -v conda >/dev/null 2>&1; then
-    conda run --no-capture-output -n "$CONDA_ENV_NAME" python "$@"
+    conda run --no-capture-output -n "$CONDA_ENV_NAME" sh -c '
+      export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      exec python "$@"
+    ' _ "$@"
     return
   fi
   python "$@"
@@ -92,4 +96,5 @@ run_python \
   "train.iso_coef=$ISO_COEF" \
   "train.z_norm_coef=$Z_NORM_COEF" \
   "train.log_every_steps=$LOG_EVERY_STEPS" \
-  "train.amp_encode=$AMP_ENCODE"
+  "train.amp_encode=$AMP_ENCODE" \
+  "train.force_math_attention=$FORCE_MATH_ATTENTION"
