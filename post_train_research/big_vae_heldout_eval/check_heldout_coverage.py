@@ -16,7 +16,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from common import (  # noqa: E402
+from post_train_research.big_vae_heldout_eval.common import (  # noqa: E402
     allowed_pairs,
     coverage_report,
     expected_datasets,

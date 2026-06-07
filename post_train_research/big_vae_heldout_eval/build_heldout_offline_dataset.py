@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from common import (
+from post_train_research.big_vae_heldout_eval.common import (
     HELDOUT_DATASET_MODELS,
     apply_heldout_collector_defaults_from_env,
     apply_heldout_log_dir,

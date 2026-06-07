@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover - compatibility for older PyTorch
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dataset import data_pipeline, setup_logging
+from dataset.big_vae_offline_parts.metadata import _prepare_cpu_sample_tensor
 from big_vae.datasets.offline import (
     ensure_presliced_big_vae_dataset,
     offline_big_vae_data_pipeline,
@@ -138,7 +139,7 @@ def _next_valid_presliced_slice(
                 model_name=str(getattr(sample, "model_name", "")).strip(),
                 layer_name=str(getattr(sample, "layer_name", "")).strip(),
             )
-        except Exception as exc:
+        except (TypeError, ValueError) as exc:
             attempts += 1
             if attempts % 100 == 0:
                 logger.warning("Skipping invalid presliced samples repeatedly; attempts=%s error=%s", attempts, exc)
