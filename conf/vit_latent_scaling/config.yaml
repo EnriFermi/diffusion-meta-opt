@@ -50,6 +50,9 @@ setup:
   big_vae_tile_d_out: 64
   big_vae_latent_parameterization: sphere
   big_vae_latent_noise_std: 0.0
+  big_vae_decoder_adapter: ${oc.env:EVAL_DECODER_ADAPTER,identity}
+  big_vae_decoder_adapter_checkpoint: ${oc.env:EVAL_DECODER_ADAPTER_CHECKPOINT,""}
+  big_vae_decoder_adapter_require_checkpoint_match: false
 
 init:
   kind: diffusion_prior

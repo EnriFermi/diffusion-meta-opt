@@ -286,8 +286,15 @@ def run_training(
     seed_everything(int(cfg.train.seed))
     train_loader, test_loader = build_loaders(cfg.data, cfg.model, device, seed=cfg.train.seed)
     initial_tensors, source_payload = prepare_initial_tensors(cfg, storage_root=paths.root_dir, logger=logger)
-    big_vae, prior = load_big_vae_components(cfg, device=device, logger=logger)
-    model = build_model(cfg, cfg.vit_cfg, initial_tensors, big_vae=big_vae, prior=prior).to(device)
+    big_vae, prior, big_vae_decoder_flow = load_big_vae_components(cfg, device=device, logger=logger)
+    model = build_model(
+        cfg,
+        cfg.vit_cfg,
+        initial_tensors,
+        big_vae=big_vae,
+        prior=prior,
+        big_vae_decoder_flow=big_vae_decoder_flow,
+    ).to(device)
 
     if cfg.init.kind == "source":
         maybe_restore_direct_latent_state(

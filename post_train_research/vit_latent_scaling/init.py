@@ -16,6 +16,11 @@ from big_vae.eval.vit_tiny_latent_optimization import (
     make_initial_tensors,
 )
 from big_vae.models import BigWeightVAE
+from post_train_research.big_vae_heldout_eval.evaluate_parts.decoder_adapter import (
+    latent_flattening_payload_big_vae_checkpoint,
+    load_latent_flattening_flow_from_checkpoint,
+    paths_match,
+)
 from post_train_research.vit_latent_scaling.config import RunConfig
 from training.big_vae_latent_diffusion import (
     load_distribution_encoder_state_from_latent_diffusion_prior_checkpoint,
@@ -46,11 +51,44 @@ def load_big_vae_components(
     *,
     device: torch.device,
     logger: logging.Logger,
-) -> tuple[BigWeightVAE | None, Any | None]:
+) -> tuple[BigWeightVAE | None, Any | None, torch.nn.Module | None]:
     if cfg.setup.kind != "latent":
-        return None, None
+        return None, None, None
     logger.info("Loading frozen BigVAE decoder: %s", cfg.setup.big_vae_checkpoint)
     big_vae = load_frozen_big_vae_decoder(cfg.setup.big_vae_checkpoint, device=device)
+    decoder_flow = None
+    adapter_kind = str(cfg.setup.big_vae_decoder_adapter).strip().lower()
+    if adapter_kind not in {"", "identity", "none", "off", "false"}:
+        if adapter_kind not in {"latent_flattening_flow", "flow", "ir_smoothing", "latent_smoothing"}:
+            raise ValueError(f"Unsupported BigVAE decoder adapter: {cfg.setup.big_vae_decoder_adapter!r}")
+        logger.info("Loading BigVAE decoder adapter flow: %s", cfg.setup.big_vae_decoder_adapter_checkpoint)
+        decoder_flow, flow_cfg, payload = load_latent_flattening_flow_from_checkpoint(
+            checkpoint_path=cfg.setup.big_vae_decoder_adapter_checkpoint,
+            model=big_vae,
+            device=device,
+        )
+        adapter_big_vae_checkpoint = latent_flattening_payload_big_vae_checkpoint(payload)
+        checkpoint_matches = bool(adapter_big_vae_checkpoint) and paths_match(
+            adapter_big_vae_checkpoint,
+            cfg.setup.big_vae_checkpoint,
+        )
+        if adapter_big_vae_checkpoint and not checkpoint_matches:
+            message = (
+                "BigVAE decoder adapter was trained for a different checkpoint: "
+                f"adapter_big_vae_checkpoint={adapter_big_vae_checkpoint} "
+                f"scaling_big_vae_checkpoint={cfg.setup.big_vae_checkpoint}"
+            )
+            if bool(cfg.setup.big_vae_decoder_adapter_require_checkpoint_match):
+                raise ValueError(message)
+            logger.warning(message)
+        logger.info(
+            "BigVAE decoder adapter ready: kind=%s flow_layers=%s hidden=%s depth=%s checkpoint_matches=%s",
+            adapter_kind,
+            int(flow_cfg.num_layers),
+            int(flow_cfg.hidden_dim),
+            int(flow_cfg.network_depth),
+            bool(checkpoint_matches),
+        )
     prior = None
     if cfg.init.kind == "diffusion_prior":
         logger.info("Loading frozen latent diffusion prior: %s", cfg.init.diffusion_prior_checkpoint)
@@ -61,7 +99,7 @@ def load_big_vae_components(
         )
         if loaded:
             logger.info("Loaded finetuned distribution encoder state from diffusion prior checkpoint")
-    return big_vae, prior
+    return big_vae, prior, decoder_flow
 
 
 def collect_calibration_images(train_loader: DataLoader, *, num_batches: int) -> torch.Tensor | None:
@@ -84,6 +122,7 @@ def build_model(
     *,
     big_vae: BigWeightVAE | None,
     prior: Any | None,
+    big_vae_decoder_flow: torch.nn.Module | None = None,
 ) -> torch.nn.Module:
     if cfg.setup.kind == "raw":
         return FunctionalViTTiny(vit_cfg, initial_tensors, parameter_mode="direct")
@@ -97,6 +136,7 @@ def build_model(
         initial_tensors,
         parameter_mode="bigvae_latent",
         big_vae=big_vae,
+        big_vae_decoder_flow=big_vae_decoder_flow,
         big_vae_latent_init=latent_init,
         big_vae_diffusion_prior=prior,
         big_vae_diffusion_prior_steps=int(cfg.init.diffusion_prior_steps),

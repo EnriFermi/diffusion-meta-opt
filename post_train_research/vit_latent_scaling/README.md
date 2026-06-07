@@ -78,6 +78,21 @@ artifacts/big_vae/eval/vit_latent_scaling/checkpoints/<shared_checkpoint_label>/
 ./post_train_research/vit_latent_scaling/run_vit_latent_scaling.sh
 ```
 
+## Decoder Adapter
+
+Latent setup can decode through a post-train BigVAE decoder adapter:
+
+```bash
+EVAL_DECODER_ADAPTER=latent_flattening_flow \
+EVAL_DECODER_ADAPTER_CHECKPOINT=/path/to/latent_flattening/checkpoints/latest.pt \
+./post_train_research/vit_latent_scaling/run_vit_latent_scaling.sh
+```
+
+For latent flattening this means trainable latents are interpreted as
+`z_prime`, and weights are decoded as `decoder(flow.inverse(z_prime))`. This is
+available for `init.kind=diffusion_prior`, where latent slots live in
+`decoder_z` space.
+
 ## Source init
 
 Чтобы дообучить новый запуск из старого:

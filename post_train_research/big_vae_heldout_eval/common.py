@@ -37,6 +37,13 @@ METRIC_NAMES: tuple[str, ...] = (
     "struct_rec",
     "struct_rel",
     "kl_loss",
+    "decoder_adapter_base_recon_mse",
+    "decoder_adapter_recon_mse",
+    "decoder_adapter_decode_delta_mse",
+    "decoder_adapter_latent_delta_mse",
+    "decoder_adapter_cycle_mse",
+    "decoder_adapter_forward_logdet_mean",
+    "decoder_adapter_inverse_logdet_mean",
 )
 
 

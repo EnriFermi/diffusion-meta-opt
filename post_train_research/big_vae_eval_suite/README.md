@@ -43,6 +43,22 @@ post_train_research/big_vae_eval_suite/run_big_vae_eval_suite.sh \
   stages.landscape_ablation.enabled=false
 ```
 
+BigVAE decoder stages can run with a post-train decoder adapter:
+
+```sh
+BIG_VAE_CHECKPOINT=/path/to/big_vae/latest.pt \
+EVAL_DECODER_ADAPTER=latent_flattening_flow \
+EVAL_DECODER_ADAPTER_CHECKPOINT=/path/to/latent_flattening/checkpoints/latest.pt \
+post_train_research/big_vae_eval_suite/run_big_vae_eval_suite.sh
+```
+
+Those env vars are picked up by heldout eval, latent scaling, and landscape
+ablation. Heldout adapter metadata is written into `metrics_summary.json`;
+per-record adapter metrics are written into `record_metrics.csv`. For scaling
+and landscape, the adapter is applied to `decoder_z` latents as
+`decoder(flow.inverse(z_prime))`, so it currently requires diffusion-prior
+initialization.
+
 Scaling profiles are configured under `stages.scaling_check.jobs`. Each job can
 override `profile`, `max_steps`, `lr`, `batch_size`, `eval_batch_size`,
 `train_subset`, `test_subset`, and whether to run latent/raw variants.

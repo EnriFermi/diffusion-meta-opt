@@ -7,7 +7,7 @@ from typing import Any
 
 from hydra import compose, initialize_config_dir
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 from big_vae.runtime.artifacts import write_artifact_layout
 from ..common import (
@@ -39,6 +39,7 @@ from .core import (
     _resolve_eval_device,
     _source_record_from_sample,
 )
+from .decoder_adapter import IdentityDecoderAdapter, build_decoder_adapter_from_env
 from .latent_dump import (
     _extract_latents_for_batch,
     _latent_dump_metadata_row,
@@ -58,6 +59,7 @@ def _evaluate_dataset(
     dataset: OfflineBigVAEDataset,
     device: torch.device,
     output_dir: Path,
+    decoder_adapter: IdentityDecoderAdapter,
 ) -> dict[str, Any]:
     eval_batch_size = max(1, env_int("EVAL_BATCH_SIZE", int(ckpt_cfg.train.get("slice_batch_size", 1))))
     max_records = max(0, env_int("EVAL_MAX_RECORDS", 0))
@@ -171,6 +173,7 @@ def _evaluate_dataset(
                     d_out_mask_s=d_out_mask_batch,
                     amp_enabled=amp_enabled,
                     amp_dtype=amp_dtype,
+                    decoder_adapter=decoder_adapter,
                 )
                 source_dump_remaining = latent_dump_max_slices_per_source - dumped_for_source
                 if latent_dump_enabled and latent_dump_max_entries > 0 and source_dump_remaining > 0:
@@ -283,6 +286,7 @@ def _evaluate_dataset(
         "amp_enabled": bool(amp_enabled),
         "amp_dtype": str(amp_dtype),
         "device": str(device),
+        "decoder_adapter": decoder_adapter.metadata(),
     }
     candidate_entries = sum(len(bucket) for bucket in latent_dump_buckets.values())
     latent_dump_config["candidate_groups"] = int(len(latent_dump_buckets))
@@ -358,6 +362,12 @@ def main() -> None:
     LOGGER.info("Loading BigVAE checkpoint: %s", checkpoint_path)
     device = _resolve_eval_device(cfg)
     model, ckpt_cfg, ckpt_payload = _load_checkpoint_model(checkpoint_path, device)
+    decoder_adapter = build_decoder_adapter_from_env(
+        model=model,
+        big_vae_checkpoint_path=checkpoint_path,
+        device=device,
+        logger=LOGGER,
+    )
 
     dataset = OfflineBigVAEDataset(
         root_dir=offline_root,
@@ -380,7 +390,9 @@ def main() -> None:
         dataset=dataset,
         device=device,
         output_dir=output_dir,
+        decoder_adapter=decoder_adapter,
     )
+    payload["decoder_adapter"] = decoder_adapter.metadata()
     payload["checkpoint"] = {
         "path": str(checkpoint_path),
         "step": int(ckpt_payload.get("step", 0) or 0),

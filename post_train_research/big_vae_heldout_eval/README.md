@@ -35,6 +35,24 @@ BIG_VAE_CHECKPOINT=artifacts/big_vae/checkpoints/train/default/stage_1/latest.pt
 post_train_research/big_vae_heldout_eval/run_evaluate_big_vae_heldout.sh
 ```
 
+Evaluate through a post-train decoder adapter, for example a latent-flattening
+flow checkpoint:
+
+```bash
+BIG_VAE_CHECKPOINT=artifacts/big_vae/checkpoints/train/default/stage_1/latest.pt \
+EVAL_DECODER_ADAPTER=latent_flattening_flow \
+EVAL_DECODER_ADAPTER_CHECKPOINT=artifacts/big_vae/eval/latent_flattening/<run>/checkpoints/latest.pt \
+post_train_research/big_vae_heldout_eval/run_evaluate_big_vae_heldout.sh
+```
+
+For latent flattening, held-out eval uses the lossless post-hoc
+reparameterization: encoder latent `z` is mapped to adapter coordinates
+`z_prime = flow(z)`, then the adapted decoder evaluates
+`decoder(flow.inverse(z_prime))`. `record_metrics.csv` and
+`metrics_summary.json` include `decoder_adapter_*` columns. The main quality
+guard is `decoder_adapter_decode_delta_mse`: it should stay near zero if the
+adapter preserves the original decoder on encoded held-out points.
+
 Run logs are written to `HELDOUT_LOG_DIR` by default:
 
 ```text

@@ -344,6 +344,10 @@ class EvalSuite:
             raise FileNotFoundError(
                 f"stages.heldout_eval.heldout_root manifest not found: {heldout_root / 'manifest.json'}"
             )
+        decoder_adapter = _mapping(
+            heldout.get("decoder_adapter", {}),
+            "stages.heldout_eval.decoder_adapter",
+        )
         env = {
             "BIG_VAE_CHECKPOINT": str(self.checkpoint_path),
             "HELDOUT_ROOT": str(heldout_root),
@@ -367,6 +371,15 @@ class EvalSuite:
             "EVAL_LATENT_PLOT_ENABLED": bool_str(heldout.get("latent_plot_enabled", True)),
             "EVAL_LATENT_PLOT_TSNE": bool_str(heldout.get("latent_plot_tsne", True)),
         }
+        adapter_kind = str(decoder_adapter.get("kind", "identity")).strip()
+        adapter_checkpoint = str(decoder_adapter.get("checkpoint", "") or "").strip()
+        if adapter_kind:
+            env["EVAL_DECODER_ADAPTER"] = adapter_kind
+        if adapter_checkpoint:
+            env["EVAL_DECODER_ADAPTER_CHECKPOINT"] = str(resolve_path(adapter_checkpoint))
+        env["EVAL_DECODER_ADAPTER_REQUIRE_CHECKPOINT_MATCH"] = bool_str(
+            decoder_adapter.get("require_checkpoint_match", False)
+        )
         self.run_command(
             name="heldout_eval",
             command=[
@@ -435,6 +448,10 @@ class EvalSuite:
             f"setup.big_vae_tile_d_out={int(setup_common.get('big_vae_tile_d_out', 64))}",
             f"setup.big_vae_latent_parameterization={str(setup_common.get('big_vae_latent_parameterization', 'euclidean'))}",
             f"setup.big_vae_latent_noise_std={float(setup_common.get('big_vae_latent_noise_std', 0.0))}",
+            f"setup.big_vae_decoder_adapter={str(setup_common.get('big_vae_decoder_adapter', 'identity'))}",
+            f"setup.big_vae_decoder_adapter_checkpoint={str(setup_common.get('big_vae_decoder_adapter_checkpoint', ''))}",
+            "setup.big_vae_decoder_adapter_require_checkpoint_match="
+            f"{bool_str(setup_common.get('big_vae_decoder_adapter_require_checkpoint_match', False))}",
             f"init.kind={init_kind}",
             f"init.fresh_latent_mode={str(init_common.get('fresh_latent_mode', 'random'))}",
             f"init.random_init_std={float(init_common.get('random_init_std', 0.02))}",
@@ -614,6 +631,10 @@ class EvalSuite:
             str(ablation.get("big_vae_tile_T_patches", 4)),
             "--big_vae_tile_d_out",
             str(ablation.get("big_vae_tile_d_out", 64)),
+            "--big_vae_decoder_adapter",
+            str(ablation.get("big_vae_decoder_adapter", "identity")),
+            "--big_vae_decoder_adapter_checkpoint",
+            str(ablation.get("big_vae_decoder_adapter_checkpoint", "")),
             "--big_vae_encoder_context_rows",
             str(ablation.get("big_vae_encoder_context_rows", 64)),
             "--big_vae_encoder_context_std",
@@ -669,6 +690,8 @@ class EvalSuite:
             command.append("--compute_hessian")
         if bool(search.get("compute_2d_slices", True)):
             command.append("--compute_2d_slices")
+        if bool(ablation.get("big_vae_decoder_adapter_require_checkpoint_match", False)):
+            command.append("--big_vae_decoder_adapter_require_checkpoint_match")
         if not bool(ablation.get("download", True)):
             command.append("--no-download")
         self.run_command(name="landscape_ablation", command=command, output_dir=output_dir)
