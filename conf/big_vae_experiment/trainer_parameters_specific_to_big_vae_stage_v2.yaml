@@ -126,7 +126,7 @@ offline_dataset:
   # Full dataset root may also be overridden with BIG_VAE_OFFLINE_DATASET_DIR.
   # Keep this separate from checkpoint_dir when running multiple trainings on
   # the same prebuilt offline dataset.
-  root_dir: ${oc.env:BIG_VAE_OFFLINE_DATASET_DIR,${training_artifacts.big_vae_offline_dataset_base_dir}/stage_${train.stage}/offline_dataset}
+  root_dir: /home/coder/project/artifacts/training/checkpoints/weight_quantile_vae/stage_1/offline_dataset
   # Optional runtime filter on the reader side. Unlike builder.enforce_stage_compatibility,
   # this does not require rebuilding the offline dataset; it drops shape-incompatible
   # record refs up front using chunk-index metadata before loading x/weight tensors.
@@ -187,10 +187,10 @@ offline_batch_prefetch:
 # regular offline_dataset, then training reads these lightweight fixed-shape
 # records directly.
 preslicing:
-  enabled: false
+  enabled: true
   root_dir: ${training_artifacts.big_vae_presliced_dataset_base_dir}/stage_${train.stage}/presliced_offline_dataset
   # Required when enabled. This is the effective training-set size in slices.
-  num_slices: 0
+  num_slices: 200000
   # 0 -> use train.max_x_rows. target_d_in/target_d_out default to the active
   # curriculum shape: model.patch_size * max_T_patches and max_d_out.
   target_x_rows: 0
