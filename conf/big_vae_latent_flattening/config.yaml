@@ -67,3 +67,6 @@ train:
   # Higher-order JVPs through the BigVAE decoder are not implemented for CUDA
   # flash/mem-efficient SDPA kernels in current PyTorch builds.
   force_math_attention: true
+  skip_nonfinite_updates: true
+  max_consecutive_nonfinite_steps: 20
+  nonfinite_debug_topk: 8

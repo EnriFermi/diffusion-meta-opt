@@ -41,6 +41,9 @@ LOG_EVERY_STEPS="${LOG_EVERY_STEPS:-10}"
 CHECKPOINT_EVERY_STEPS="${CHECKPOINT_EVERY_STEPS:-250}"
 AMP_ENCODE="${AMP_ENCODE:-true}"
 FORCE_MATH_ATTENTION="${FORCE_MATH_ATTENTION:-true}"
+SKIP_NONFINITE_UPDATES="${SKIP_NONFINITE_UPDATES:-true}"
+MAX_CONSECUTIVE_NONFINITE_STEPS="${MAX_CONSECUTIVE_NONFINITE_STEPS:-20}"
+NONFINITE_DEBUG_TOPK="${NONFINITE_DEBUG_TOPK:-8}"
 
 run_python() {
   if [ -n "${CONDA_PREFIX:-}" ] && [ "${CONDA_DEFAULT_ENV:-}" = "$CONDA_ENV_NAME" ]; then
@@ -97,4 +100,7 @@ run_python \
   "train.z_norm_coef=$Z_NORM_COEF" \
   "train.log_every_steps=$LOG_EVERY_STEPS" \
   "train.amp_encode=$AMP_ENCODE" \
-  "train.force_math_attention=$FORCE_MATH_ATTENTION"
+  "train.force_math_attention=$FORCE_MATH_ATTENTION" \
+  "train.skip_nonfinite_updates=$SKIP_NONFINITE_UPDATES" \
+  "train.max_consecutive_nonfinite_steps=$MAX_CONSECUTIVE_NONFINITE_STEPS" \
+  "train.nonfinite_debug_topk=$NONFINITE_DEBUG_TOPK"
