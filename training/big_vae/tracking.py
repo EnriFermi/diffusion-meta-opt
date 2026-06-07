@@ -116,6 +116,10 @@ def _build_external_tracking_params(cfg: DictConfig) -> dict[str, Any]:
     tracking_params: dict[str, Any] = {
         "train.max_steps": int(train_cfg.get("max_steps", 0)),
         "train.lr": float(train_cfg.get("lr", 0.0)),
+        "train.patch_tokenizer_alpha_lr": float(train_cfg.get("patch_tokenizer_alpha_lr", 0.0) or 0.0),
+        "train.patch_tokenizer_alpha_weight_decay": float(
+            train_cfg.get("patch_tokenizer_alpha_weight_decay", 0.0) or 0.0
+        ),
         "train.grad_accum_steps": int(train_cfg.get("grad_accum_steps", 1)),
         "train.kl_beta": float(train_cfg.get("kl_beta", 0.0)),
         "train.kl_schedule.enabled": bool(train_cfg.get("kl_schedule", {}).get("enabled", False)),
