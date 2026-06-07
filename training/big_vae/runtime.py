@@ -223,9 +223,17 @@ def _compute_latent_sampling_gate_for_step(
     return max(0.0, min(1.0, value))
 
 
+def _unwrap_model_for_runtime_state(model: torch.nn.Module) -> torch.nn.Module:
+    target = model.module if isinstance(model, DDP) else model
+    compiled_target = getattr(target, "_orig_mod", None)
+    if isinstance(compiled_target, torch.nn.Module):
+        target = compiled_target
+    return target
+
+
 
 def _set_model_latent_sampling_gate(model: torch.nn.Module, gate: float) -> None:
-    target = _unwrap_model_for_state_io(model)
+    target = _unwrap_model_for_runtime_state(model)
     setter = getattr(target, "set_latent_sampling_gate", None)
     if callable(setter):
         setter(float(gate))
@@ -233,7 +241,7 @@ def _set_model_latent_sampling_gate(model: torch.nn.Module, gate: float) -> None
 
 
 def _compute_model_latent_kl(model: torch.nn.Module, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    target = _unwrap_model_for_state_io(model)
+    target = _unwrap_model_for_runtime_state(model)
     latent_kl = getattr(target, "latent_kl_loss", None)
     if callable(latent_kl):
         return latent_kl(mu, logvar)
@@ -269,6 +277,7 @@ __all__ = [
     '_build_scheduler',
     '_compute_kl_beta_for_step',
     '_compute_latent_sampling_gate_for_step',
+    '_unwrap_model_for_runtime_state',
     '_set_model_latent_sampling_gate',
     '_compute_model_latent_kl',
     '_resolve_amp',
