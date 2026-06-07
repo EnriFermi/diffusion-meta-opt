@@ -392,6 +392,18 @@ def _run_worker(
                     )
 
             optimizer = _build_optimizer(model=model, cfg=cfg, device=device)
+            if rank == 0:
+                group_summaries = []
+                for group_idx, param_group in enumerate(optimizer.param_groups):
+                    group_name = (
+                        str(param_group.get("group_name", f"group_{group_idx}")).strip() or f"group_{group_idx}"
+                    )
+                    group_param_count = sum(int(param.numel()) for param in param_group.get("params", []))
+                    group_summaries.append(
+                        f"{group_name}:params={group_param_count:,},lr={float(param_group['lr']):.6e},"
+                        f"wd={float(param_group.get('weight_decay', 0.0)):.6e}"
+                    )
+                logger.info("Optimizer param groups: %s", "; ".join(group_summaries))
             scheduler = _build_scheduler(optimizer=optimizer, cfg=cfg)
             comet_tracker = CometTracker(cfg=cfg, logger=logger, rank=rank)
             wandb_tracker = WandbTracker(cfg=cfg, logger=logger, rank=rank)
@@ -2020,6 +2032,14 @@ def _run_worker(
                     avg_struct_rec = struct_rec_window / max(1, window_steps)
                     avg_struct_rel = struct_rel_window / max(1, window_steps)
                     lr = float(optimizer.param_groups[0]["lr"])
+                    lr_by_group: dict[str, float] = {}
+                    for group_idx, param_group in enumerate(optimizer.param_groups):
+                        if len(optimizer.param_groups) <= 1 and "group_name" not in param_group:
+                            continue
+                        group_name = str(param_group.get("group_name", f"group_{group_idx}")).strip()
+                        if not group_name:
+                            group_name = f"group_{group_idx}"
+                        lr_by_group[group_name] = float(param_group["lr"])
                     speed = window_steps / dt
                     window_micro_steps = max(1, window_steps * grad_accum_steps)
                     avg_data_build_ms = 1000.0 * data_build_window_s / float(window_micro_steps)
@@ -2195,6 +2215,8 @@ def _run_worker(
                             "param/rms": float(grad_stats.get("param/rms", 0.0)),
                             "grad_to_param_rms_ratio": float(grad_stats.get("grad_to_param_rms_ratio", 0.0)),
                         }
+                        for group_name, group_lr in lr_by_group.items():
+                            comet_metrics[f"train/lr/{group_name}"] = float(group_lr)
                         if encoder_alpha_values:
                             comet_metrics["encoder_conditioning/alpha_mean"] = float(
                                 sum(encoder_alpha_values) / max(1, len(encoder_alpha_values))

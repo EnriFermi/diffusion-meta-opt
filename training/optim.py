@@ -8,6 +8,74 @@ import torch
 from omegaconf import DictConfig
 
 
+_WRAPPER_PARAM_NAME_PREFIXES = ("module.", "_orig_mod.")
+_PATCH_TOKENIZER_ALPHA_GROUP = "patch_tokenizer_alpha"
+
+
+def _strip_optimizer_wrapper_prefixes(name: str) -> str:
+    normalized = str(name)
+    while True:
+        for prefix in _WRAPPER_PARAM_NAME_PREFIXES:
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):]
+                break
+        else:
+            return normalized
+
+
+def _is_patch_tokenizer_alpha_parameter(name: str) -> bool:
+    parts = _strip_optimizer_wrapper_prefixes(name).split(".")
+    return (
+        len(parts) == 4
+        and parts[0] == "patch_tokenizer"
+        and parts[1] == "blocks"
+        and parts[3] == "alpha"
+    )
+
+
+def _build_patch_tokenizer_alpha_param_groups(
+    model: torch.nn.Module,
+    *,
+    lr: float,
+    weight_decay: float,
+    alpha_lr: float,
+    alpha_weight_decay: float,
+) -> list[dict[str, Any]] | None:
+    if alpha_lr <= 0.0:
+        return None
+
+    main_params: list[torch.nn.Parameter] = []
+    alpha_params: list[torch.nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if _is_patch_tokenizer_alpha_parameter(name):
+            alpha_params.append(param)
+        else:
+            main_params.append(param)
+
+    if not alpha_params:
+        return None
+
+    param_groups: list[dict[str, Any]] = []
+    if main_params:
+        param_groups.append(
+            {
+                "params": main_params,
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "group_name": "main",
+            }
+        )
+    param_groups.append(
+        {
+            "params": alpha_params,
+            "lr": alpha_lr,
+            "weight_decay": alpha_weight_decay,
+            "group_name": _PATCH_TOKENIZER_ALPHA_GROUP,
+        }
+    )
+    return param_groups
+
+
 def build_adamw_optimizer(
     model: torch.nn.Module,
     cfg: DictConfig,
@@ -25,6 +93,10 @@ def build_adamw_optimizer(
     optimizer_name = str(train_cfg.get("optimizer_name", "adamw")).strip().lower()
     lr = float(train_cfg.get(lr_key, default_lr))
     weight_decay = float(train_cfg.get(weight_decay_key, default_weight_decay))
+    patch_tokenizer_alpha_lr = float(train_cfg.get("patch_tokenizer_alpha_lr", 0.0) or 0.0)
+    patch_tokenizer_alpha_weight_decay = float(
+        train_cfg.get("patch_tokenizer_alpha_weight_decay", 0.0) or 0.0
+    )
 
     betas_cfg = train_cfg.get(betas_key, [0.9, 0.95])
     beta1 = float(betas_cfg[0])
@@ -56,7 +128,16 @@ def build_adamw_optimizer(
     if "foreach" in params:
         kwargs["foreach"] = use_foreach
 
-    return optimizer_cls(model.parameters(), **kwargs)
+    optimizer_params = _build_patch_tokenizer_alpha_param_groups(
+        model,
+        lr=lr,
+        weight_decay=weight_decay,
+        alpha_lr=patch_tokenizer_alpha_lr,
+        alpha_weight_decay=patch_tokenizer_alpha_weight_decay,
+    )
+    if optimizer_params is None:
+        return optimizer_cls(model.parameters(), **kwargs)
+    return optimizer_cls(optimizer_params, **kwargs)
 
 
 def build_cosine_scheduler(

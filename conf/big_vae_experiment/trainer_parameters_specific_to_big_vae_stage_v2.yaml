@@ -37,6 +37,10 @@ latent_sampling_gate:
   end_value: 1.0
 weight_decay: 0.01
 lr: 3e-5
+# Optional separate optimizer group for patch_tokenizer.blocks.*.alpha.
+# 0 disables the split and keeps the legacy single-lr optimizer.
+patch_tokenizer_alpha_lr: 0.0
+patch_tokenizer_alpha_weight_decay: 0.0
 
 behavioral_coef: 1.0
 structural_coef: 1.0
