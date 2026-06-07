@@ -32,6 +32,10 @@ stages:
     save_record_metrics: true
     log_every_records: 100
     require_full_coverage: true
+    decoder_adapter:
+      kind: ${oc.env:EVAL_DECODER_ADAPTER,identity}
+      checkpoint: ${oc.env:EVAL_DECODER_ADAPTER_CHECKPOINT,""}
+      require_checkpoint_match: false
     latent_dump_enabled: true
     latent_dump_max_entries: 256
     latent_dump_max_slices_per_source: 1
@@ -56,6 +60,9 @@ stages:
         big_vae_tile_d_out: 64
         big_vae_latent_parameterization: euclidean
         big_vae_latent_noise_std: 0.0
+        big_vae_decoder_adapter: ${oc.env:EVAL_DECODER_ADAPTER,identity}
+        big_vae_decoder_adapter_checkpoint: ${oc.env:EVAL_DECODER_ADAPTER_CHECKPOINT,""}
+        big_vae_decoder_adapter_require_checkpoint_match: false
       init:
         kind: diffusion_prior
         fresh_latent_mode: random
@@ -144,6 +151,9 @@ stages:
     big_vae_decode: weights
     big_vae_tile_T_patches: 4
     big_vae_tile_d_out: 64
+    big_vae_decoder_adapter: ${oc.env:EVAL_DECODER_ADAPTER,identity}
+    big_vae_decoder_adapter_checkpoint: ${oc.env:EVAL_DECODER_ADAPTER_CHECKPOINT,""}
+    big_vae_decoder_adapter_require_checkpoint_match: false
     big_vae_encoder_context_rows: 64
     big_vae_encoder_context_std: 1.0
     big_vae_encoder_batch_size: 16

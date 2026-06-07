@@ -32,6 +32,11 @@ from big_vae.eval.vit_tiny_latent_optimization import (
     resolve_device,
     seed_everything,
 )
+from post_train_research.big_vae_heldout_eval.evaluate_parts.decoder_adapter import (
+    latent_flattening_payload_big_vae_checkpoint,
+    load_latent_flattening_flow_from_checkpoint,
+    paths_match,
+)
 from training.big_vae_latent_diffusion import (
     load_distribution_encoder_state_from_latent_diffusion_prior_checkpoint,
     load_frozen_layer_latent_diffusion_prior,
@@ -136,6 +141,9 @@ class LandscapeConfig:
     big_vae_decode: str
     big_vae_tile_T_patches: int
     big_vae_tile_d_out: int
+    big_vae_decoder_adapter: str
+    big_vae_decoder_adapter_checkpoint: str
+    big_vae_decoder_adapter_require_checkpoint_match: bool
     big_vae_encoder_context_rows: int
     big_vae_encoder_context_std: float
     big_vae_encoder_batch_size: int
@@ -788,6 +796,37 @@ def build_latent_model(
     vit_cfg = make_vit_cfg(cfg)
     initial_tensors = make_initial_tensors(vit_cfg, seed=int(seed))
     big_vae = load_frozen_big_vae_decoder(cfg.big_vae_checkpoint, device=device)
+    decoder_flow = None
+    adapter_kind = str(cfg.big_vae_decoder_adapter).strip().lower()
+    if adapter_kind not in {"", "identity", "none", "off", "false"}:
+        if adapter_kind not in {"latent_flattening_flow", "flow", "ir_smoothing", "latent_smoothing"}:
+            raise ValueError(f"unsupported --big_vae_decoder_adapter={cfg.big_vae_decoder_adapter!r}")
+        decoder_flow, flow_cfg, payload = load_latent_flattening_flow_from_checkpoint(
+            checkpoint_path=cfg.big_vae_decoder_adapter_checkpoint,
+            model=big_vae,
+            device=device,
+        )
+        adapter_big_vae_checkpoint = latent_flattening_payload_big_vae_checkpoint(payload)
+        checkpoint_matches = bool(adapter_big_vae_checkpoint) and paths_match(
+            adapter_big_vae_checkpoint,
+            cfg.big_vae_checkpoint,
+        )
+        if adapter_big_vae_checkpoint and not checkpoint_matches:
+            message = (
+                "BigVAE decoder adapter was trained for a different checkpoint: "
+                f"adapter_big_vae_checkpoint={adapter_big_vae_checkpoint} "
+                f"landscape_big_vae_checkpoint={cfg.big_vae_checkpoint}"
+            )
+            if bool(cfg.big_vae_decoder_adapter_require_checkpoint_match):
+                raise ValueError(message)
+            print(f"[latent_landscape] WARNING: {message}", flush=True)
+        print(
+            "[latent_landscape] BigVAE decoder adapter ready: "
+            f"kind={adapter_kind} flow_layers={int(flow_cfg.num_layers)} "
+            f"hidden={int(flow_cfg.hidden_dim)} depth={int(flow_cfg.network_depth)} "
+            f"checkpoint_matches={bool(checkpoint_matches)}",
+            flush=True,
+        )
     prior = None
     if str(cfg.big_vae_latent_init).strip().lower() == "diffusion_prior":
         if not str(cfg.big_vae_diffusion_prior_checkpoint).strip():
@@ -814,6 +853,7 @@ def build_latent_model(
         big_vae_latent_init=str(cfg.big_vae_latent_init),
         big_vae_latent_parameterization=str(cfg.big_vae_latent_parameterization),
         big_vae_diffusion_prior=prior,
+        big_vae_decoder_flow=decoder_flow,
         big_vae_diffusion_prior_steps=int(cfg.big_vae_diffusion_prior_steps),
         big_vae_diffusion_prior_sampler=str(cfg.big_vae_diffusion_prior_sampler),
         big_vae_diffusion_prior_eta=float(cfg.big_vae_diffusion_prior_eta),
@@ -1824,6 +1864,9 @@ def parse_args() -> LandscapeConfig:
     parser.add_argument("--big_vae_decode", choices=("weights", "all"), default="weights")
     parser.add_argument("--big_vae_tile_T_patches", type=int, default=4)
     parser.add_argument("--big_vae_tile_d_out", type=int, default=64)
+    parser.add_argument("--big_vae_decoder_adapter", default="identity")
+    parser.add_argument("--big_vae_decoder_adapter_checkpoint", default="")
+    parser.add_argument("--big_vae_decoder_adapter_require_checkpoint_match", action="store_true")
     parser.add_argument("--big_vae_encoder_context_rows", type=int, default=64)
     parser.add_argument("--big_vae_encoder_context_std", type=float, default=1.0)
     parser.add_argument("--big_vae_encoder_batch_size", type=int, default=16)
@@ -1861,6 +1904,15 @@ def parse_args() -> LandscapeConfig:
         raise ValueError(
             "--big_vae_diffusion_prior_checkpoint/--prior_ckpt is required when --big_vae_latent_init=diffusion_prior"
         )
+    decoder_adapter = str(args.big_vae_decoder_adapter).strip().lower()
+    decoder_adapter_checkpoint = str(args.big_vae_decoder_adapter_checkpoint or "").strip()
+    if decoder_adapter_checkpoint and decoder_adapter in {"", "identity", "none", "off", "false"}:
+        decoder_adapter = "latent_flattening_flow"
+    if decoder_adapter not in {"", "identity", "none", "off", "false"}:
+        if not decoder_adapter_checkpoint:
+            raise ValueError("--big_vae_decoder_adapter_checkpoint is required when decoder adapter is enabled")
+        if str(args.big_vae_latent_init).strip().lower() != "diffusion_prior":
+            raise ValueError("--big_vae_decoder_adapter currently requires --big_vae_latent_init=diffusion_prior")
 
     return LandscapeConfig(
         data_dir=str(args.data_dir),
@@ -1893,6 +1945,9 @@ def parse_args() -> LandscapeConfig:
         big_vae_decode=str(args.big_vae_decode),
         big_vae_tile_T_patches=int(args.big_vae_tile_T_patches),
         big_vae_tile_d_out=int(args.big_vae_tile_d_out),
+        big_vae_decoder_adapter=decoder_adapter,
+        big_vae_decoder_adapter_checkpoint=decoder_adapter_checkpoint,
+        big_vae_decoder_adapter_require_checkpoint_match=bool(args.big_vae_decoder_adapter_require_checkpoint_match),
         big_vae_encoder_context_rows=int(args.big_vae_encoder_context_rows),
         big_vae_encoder_context_std=float(args.big_vae_encoder_context_std),
         big_vae_encoder_batch_size=int(args.big_vae_encoder_batch_size),

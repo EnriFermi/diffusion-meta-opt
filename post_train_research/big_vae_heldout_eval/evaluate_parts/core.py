@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from ..common import env_bool, tensor_to_float
+from ..common import METRIC_NAMES, env_bool, tensor_to_float
 from big_vae.datasets.offline import infer_layer_depth, infer_layer_type
 from big_vae.models import WeightQuantileVAE, build_weight_quantile_vae
 from training.big_vae.checkpointing import _normalize_model_state_dict_keys
@@ -17,6 +17,8 @@ from training.big_vae.runtime import _autocast_context, _build_model_cfg, _resol
 from training.big_vae.source_batching import _build_training_batch_from_source_states
 from training.big_vae.source_pool import _make_source_slice_state
 from training.runtime import resolve_device as runtime_resolve_device
+from .decoder_adapter import IdentityDecoderAdapter
+
 
 def _compute_model_latent_kl(model: torch.nn.Module, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     latent_kl = getattr(model, "latent_kl_loss", None)
@@ -115,19 +117,26 @@ def _compute_loss_metrics(
     d_out_mask_s: torch.Tensor,
     amp_enabled: bool,
     amp_dtype: torch.dtype | None,
+    decoder_adapter: IdentityDecoderAdapter | None = None,
 ) -> dict[str, float]:
     coeffs = _loss_coefficients(cfg)
     patch_size = int(cfg.model.get("patch_size", 16))
     use_latent_sampling = bool(getattr(model.cfg.big_vae, "use_latent_sampling", False))
+    adapter = decoder_adapter or IdentityDecoderAdapter()
 
     with _autocast_context(enabled=amp_enabled, dtype=amp_dtype):
-        W_hat, mu, logvar, pred_dirs = model(
-            W_s,
-            x_s,
+        decoded = adapter.decode(
+            model=model,
+            W_s=W_s,
+            x_s=x_s,
             x_mask=x_mask_s,
             d_in_mask=d_in_mask_s,
             d_out_mask=d_out_mask_s,
         )
+        W_hat = decoded.W_hat
+        mu = decoded.mu
+        logvar = decoded.logvar
+        pred_dirs = decoded.pred_dirs
         behavioral_operator = WeightQuantileVAE.operator_recon_loss(
             x_s,
             W_s,
@@ -193,6 +202,7 @@ def _compute_loss_metrics(
         "struct_rec": tensor_to_float(struct_rec),
         "struct_rel": tensor_to_float(struct_rel),
         "kl_loss": tensor_to_float(kl_loss),
+        **{key: float(value) for key, value in decoded.metrics.items()},
     }
 
 
@@ -212,17 +222,7 @@ def _record_metrics_writer(path: Path) -> tuple[csv.DictWriter, Any] | tuple[Non
         "source_slices_total",
         "source_batch_index",
         "finite",
-        "total_loss",
-        "behavioral_loss",
-        "behavioral_operator",
-        "behavioral_dir",
-        "behavioral_scale",
-        "structural_loss",
-        "struct_dir",
-        "struct_scale",
-        "struct_rec",
-        "struct_rel",
-        "kl_loss",
+        *METRIC_NAMES,
     ]
     writer = csv.DictWriter(fh, fieldnames=fieldnames)
     writer.writeheader()

@@ -30,6 +30,9 @@ BIG_VAE_TILE_T_PATCHES="4"
 BIG_VAE_TILE_D_OUT="64"
 BIG_VAE_LATENT_PARAMETERIZATION="euclidean"
 BIG_VAE_LATENT_NOISE_STD="0.0"
+BIG_VAE_DECODER_ADAPTER="${BIG_VAE_DECODER_ADAPTER:-${EVAL_DECODER_ADAPTER:-identity}}"
+BIG_VAE_DECODER_ADAPTER_CHECKPOINT="${BIG_VAE_DECODER_ADAPTER_CHECKPOINT:-${EVAL_DECODER_ADAPTER_CHECKPOINT:-}}"
+BIG_VAE_DECODER_ADAPTER_REQUIRE_CHECKPOINT_MATCH="${BIG_VAE_DECODER_ADAPTER_REQUIRE_CHECKPOINT_MATCH:-false}"
 
 DIFFUSION_PRIOR_CHECKPOINT="${DIFFUSION_PRIOR_CHECKPOINT:-$ARTIFACT_ROOT/checkpoints/latent_diffusion_prior/stage_1/latest.pt}"
 DIFFUSION_PRIOR_STEPS="50"
@@ -124,6 +127,9 @@ run_python \
   "setup.big_vae_tile_d_out=$BIG_VAE_TILE_D_OUT" \
   "setup.big_vae_latent_parameterization=$BIG_VAE_LATENT_PARAMETERIZATION" \
   "setup.big_vae_latent_noise_std=$BIG_VAE_LATENT_NOISE_STD" \
+  "setup.big_vae_decoder_adapter=$BIG_VAE_DECODER_ADAPTER" \
+  "setup.big_vae_decoder_adapter_checkpoint=$BIG_VAE_DECODER_ADAPTER_CHECKPOINT" \
+  "setup.big_vae_decoder_adapter_require_checkpoint_match=$BIG_VAE_DECODER_ADAPTER_REQUIRE_CHECKPOINT_MATCH" \
   "init.kind=$INIT_KIND" \
   "init.fresh_latent_mode=$FRESH_LATENT_MODE" \
   "init.random_init_std=$RANDOM_INIT_STD" \

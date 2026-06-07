@@ -20,6 +20,7 @@ class BigVAELatentTensorStore(nn.Module):
         latent_diffusion_prior_steps: int = 50,
         latent_diffusion_prior_sampler: str = "ddim",
         latent_diffusion_prior_eta: float = 0.0,
+        big_vae_decoder_flow: nn.Module | None = None,
         encoder_context_rows: int = 64,
         encoder_context_std: float = 1.0,
         encoder_batch_size: int = 16,
@@ -88,6 +89,14 @@ class BigVAELatentTensorStore(nn.Module):
         self.latent_diffusion_prior_steps = max(1, int(latent_diffusion_prior_steps))
         self.latent_diffusion_prior_sampler = str(latent_diffusion_prior_sampler).strip().lower()
         self.latent_diffusion_prior_eta = float(latent_diffusion_prior_eta)
+        self.big_vae_decoder_flow = big_vae_decoder_flow
+        if self.big_vae_decoder_flow is not None:
+            if self.latent_space != "decoder_z":
+                raise ValueError("big_vae_decoder_flow requires latent_space='decoder_z'")
+            self.big_vae_decoder_flow.to(device=self.big_vae.latent_base.device)
+            self.big_vae_decoder_flow.eval()
+            for param in self.big_vae_decoder_flow.parameters():
+                param.requires_grad_(False)
         if self.latent_diffusion_prior is not None:
             self.latent_diffusion_prior.to(device=self.big_vae.latent_base.device)
             self.latent_diffusion_prior.eval()
@@ -152,7 +161,12 @@ class BigVAELatentTensorStore(nn.Module):
                 self.latent_radii[tile_key] = FrozenBufferTensor(
                     torch.zeros((), device=latent.device, dtype=latent.dtype)
                 )
-                self._load_materialized_latent_slot_(tile_key, latent, update_radius=True)
+                self._load_materialized_latent_slot_(
+                    tile_key,
+                    latent,
+                    update_radius=True,
+                    value_is_decoder_latent=True,
+                )
                 pending_segments = []
 
             current_tile_rows = 0
@@ -219,6 +233,15 @@ class BigVAELatentTensorStore(nn.Module):
         radius = self.latent_radii[key]().to(device=latent.device, dtype=latent.dtype)
         return latent * (radius / self._stable_norm(latent))
 
+    def _to_decoder_adapter_latent(self, value: torch.Tensor) -> torch.Tensor:
+        if self.big_vae_decoder_flow is None:
+            return value
+        if self.latent_space != "decoder_z":
+            raise ValueError("big_vae_decoder_flow requires latent_space='decoder_z'")
+        flat_value = value.reshape(1, -1).to(dtype=torch.float32)
+        adapter_flat = self.big_vae_decoder_flow(flat_value)[0]
+        return adapter_flat.to(device=value.device, dtype=value.dtype).reshape_as(value)
+
     @torch.no_grad()
     def materialized_latent_slots_state_dict(self) -> dict[str, torch.Tensor]:
         return {
@@ -233,9 +256,12 @@ class BigVAELatentTensorStore(nn.Module):
         value: torch.Tensor,
         *,
         update_radius: bool,
+        value_is_decoder_latent: bool = False,
     ) -> None:
         target = self.latent_slots[key]
         value = value.detach().to(device=target.device, dtype=target.dtype).contiguous()
+        if value_is_decoder_latent:
+            value = self._to_decoder_adapter_latent(value)
         target.copy_(value)
         if self.latent_parameterization == "sphere" and update_radius:
             radius = value.reshape(-1).norm()
@@ -561,7 +587,12 @@ class BigVAELatentTensorStore(nn.Module):
                             self._tile_cond_patch[key] = cond_patch
                         if self.latent_noise_std > 0.0:
                             encoded = encoded + torch.randn_like(encoded) * self.latent_noise_std
-                        self._load_materialized_latent_slot_(key, encoded, update_radius=True)
+                        self._load_materialized_latent_slot_(
+                            key,
+                            encoded,
+                            update_radius=True,
+                            value_is_decoder_latent=self.latent_space == "decoder_z",
+                        )
 
     def _initialize_latents_from_diffusion_prior(self, initial_tensors: dict[str, torch.Tensor]) -> None:
         if not self.latent_slots:
@@ -671,7 +702,12 @@ class BigVAELatentTensorStore(nn.Module):
                         self._tile_cond_patch[key] = cond_patch
                         if self.latent_noise_std > 0.0:
                             sampled_item = sampled_item + torch.randn_like(sampled_item) * self.latent_noise_std
-                        self._load_materialized_latent_slot_(key, sampled_item, update_radius=True)
+                        self._load_materialized_latent_slot_(
+                            key,
+                            sampled_item,
+                            update_radius=True,
+                            value_is_decoder_latent=True,
+                        )
 
     def decoded_matrix(self, name: str) -> torch.Tensor:
         return self.decode_all_matrices()[name]
@@ -717,8 +753,14 @@ class BigVAELatentTensorStore(nn.Module):
                 else:
                     dist_patch = torch.zeros(batch, int(T), self.d_dist, device=device, dtype=latents.dtype)
             if self.latent_space == "decoder_z":
+                decoder_latents = latents
+                if self.big_vae_decoder_flow is not None:
+                    decoder_latents_flat = self.big_vae_decoder_flow.inverse(
+                        latents.reshape(batch, -1).to(dtype=torch.float32)
+                    )[0]
+                    decoder_latents = decoder_latents_flat.to(device=latents.device, dtype=latents.dtype).reshape_as(latents)
                 decoded = self.big_vae._decode_from_decoder_latent(
-                    latents,
+                    decoder_latents,
                     dist_patch_by_patch=dist_patch,
                     patch_mask=patch_mask,
                     d_in_mask=d_in_mask,

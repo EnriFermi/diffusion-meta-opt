@@ -17,6 +17,7 @@ class FunctionalViTTiny(nn.Module):
         big_vae_latent_init: str = "random",
         big_vae_latent_space: str | None = None,
         big_vae_diffusion_prior: Any | None = None,
+        big_vae_decoder_flow: nn.Module | None = None,
         big_vae_diffusion_prior_steps: int = 50,
         big_vae_diffusion_prior_sampler: str = "ddim",
         big_vae_diffusion_prior_eta: float = 0.0,
@@ -47,6 +48,7 @@ class FunctionalViTTiny(nn.Module):
                 tile_T_patches=int(big_vae_tile_T_patches),
                 tile_d_out=int(big_vae_tile_d_out),
                 latent_diffusion_prior=big_vae_diffusion_prior,
+                big_vae_decoder_flow=big_vae_decoder_flow,
                 latent_diffusion_prior_steps=int(big_vae_diffusion_prior_steps),
                 latent_diffusion_prior_sampler=str(big_vae_diffusion_prior_sampler),
                 latent_diffusion_prior_eta=float(big_vae_diffusion_prior_eta),
@@ -291,5 +293,4 @@ class FunctionalViTTiny(nn.Module):
                 self.train(True)
 
         raise KeyError(f"Unsupported tensor name for activation-conditioned diffusion prior init: {tensor_name}")
-
 

@@ -95,6 +95,9 @@ class SetupConfig:
     big_vae_tile_d_out: int
     big_vae_latent_parameterization: str
     big_vae_latent_noise_std: float
+    big_vae_decoder_adapter: str
+    big_vae_decoder_adapter_checkpoint: str
+    big_vae_decoder_adapter_require_checkpoint_match: bool
 
 
 @dataclass(slots=True)
@@ -310,6 +313,10 @@ def build_run_config(cfg: DictConfig) -> tuple[RunConfig, dict[str, Any]]:
         attention_dropout=float(model_raw.get("attention_dropout", 0.0) or 0.0),
     )
 
+    decoder_adapter = str(setup_raw.get("big_vae_decoder_adapter", "identity")).strip().lower()
+    decoder_adapter_checkpoint = str(setup_raw.get("big_vae_decoder_adapter_checkpoint", "") or "").strip()
+    if decoder_adapter_checkpoint and decoder_adapter in {"", "identity", "none", "off", "false"}:
+        decoder_adapter = "latent_flattening_flow"
     setup = SetupConfig(
         kind=str(setup_raw.get("kind", "latent")).strip().lower(),
         big_vae_checkpoint=str(setup_raw.get("big_vae_checkpoint", "")).strip(),
@@ -320,6 +327,11 @@ def build_run_config(cfg: DictConfig) -> tuple[RunConfig, dict[str, Any]]:
             setup_raw.get("big_vae_latent_parameterization", "euclidean")
         ).strip().lower(),
         big_vae_latent_noise_std=max(0.0, float(setup_raw.get("big_vae_latent_noise_std", 0.0))),
+        big_vae_decoder_adapter=decoder_adapter,
+        big_vae_decoder_adapter_checkpoint=decoder_adapter_checkpoint,
+        big_vae_decoder_adapter_require_checkpoint_match=bool(
+            setup_raw.get("big_vae_decoder_adapter_require_checkpoint_match", False)
+        ),
     )
 
     init = InitConfig(
@@ -408,6 +420,20 @@ def validate_run_config(cfg: RunConfig) -> None:
         raise ValueError("setup.big_vae_decode must be 'weights' or 'all'")
     if cfg.setup.big_vae_latent_parameterization not in {"euclidean", "sphere"}:
         raise ValueError("setup.big_vae_latent_parameterization must be 'euclidean' or 'sphere'")
+    if cfg.setup.big_vae_decoder_adapter not in {"", "identity", "none", "off", "false", "latent_flattening_flow", "flow", "ir_smoothing", "latent_smoothing"}:
+        raise ValueError("setup.big_vae_decoder_adapter must be identity or latent_flattening_flow")
+    if (
+        cfg.setup.kind == "latent"
+        and cfg.setup.big_vae_decoder_adapter not in {"", "identity", "none", "off", "false"}
+        and not cfg.setup.big_vae_decoder_adapter_checkpoint
+    ):
+        raise ValueError("setup.big_vae_decoder_adapter_checkpoint is required when decoder adapter is enabled")
+    if (
+        cfg.setup.kind == "latent"
+        and cfg.setup.big_vae_decoder_adapter not in {"", "identity", "none", "off", "false"}
+        and cfg.init.kind != "diffusion_prior"
+    ):
+        raise ValueError("setup.big_vae_decoder_adapter currently requires init.kind='diffusion_prior'")
     if cfg.init.kind not in {"fresh", "source", "diffusion_prior"}:
         raise ValueError("init.kind must be one of {'fresh','source','diffusion_prior'}")
     if cfg.init.fresh_latent_mode not in {"base", "random"}:

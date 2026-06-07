@@ -13,6 +13,7 @@ from big_vae.eval.vit_tiny_latent_optimization import (
 )
 from big_vae.models.layer_latent_diffusion_prior import LayerLatentDiffusionPrior, LayerLatentDiffusionPriorConfig
 from big_vae.models import BigVAEConfig, BigWeightVAE, DistributionConfig, EncoderConfig, MiniVAEConfig, ModelConfig
+from post_train_research.big_vae_latent_flattening.flow import RealNVPConfig, RealNVPFlow
 from training.big_vae_latent_diffusion import latent_diffusion_layer_metadata_cond_dim
 
 
@@ -151,6 +152,65 @@ def test_bigvae_latent_default_keeps_non_weight_tensors_direct() -> None:
     diversity = model.store.latent_init_diversity()
     assert diversity["across_layer_std_mean"] > 0.0
     assert diversity["max_pair_delta"] > 0.0
+
+
+def test_bigvae_latent_decoder_flow_decodes_flow_space_latents() -> None:
+    cfg = _small_vit_cfg()
+    initial = make_initial_tensors(cfg, seed=151)
+    big_vae = BigWeightVAE(
+        ModelConfig(
+            patch_size=8,
+            distribution=DistributionConfig(k_s=4, Kq=4, d_var=16, d_dist=16, use_covariance=False),
+            mini_vae=MiniVAEConfig(z_dim=8, d_e=16, num_attn_layers_encoder=1, num_layers_decoder=1, n_heads=2, d_patch=8),
+            big_vae=BigVAEConfig(
+                d_model=24,
+                d_lat=12,
+                num_latents=2,
+                num_encoder_layers=1,
+                num_decoder_layers=1,
+                n_heads=3,
+                ffn_mult=2.0,
+                pos_fourier_dim=12,
+                use_latent_sampling=False,
+                disable_distribution_encoder=True,
+                disable_z_shortcut=True,
+                encoder=EncoderConfig(self_attn_mode="cls_only", cross_attend_only_cls=True),
+            ),
+        )
+    )
+    flow = RealNVPFlow(
+        RealNVPConfig(dim=int(big_vae.flat_lat_dim), num_layers=1, hidden_dim=16, network_depth=1, log_scale_clamp=1.0)
+    )
+    with torch.no_grad():
+        flow.layers[0].net[-1].bias[1] = 1.25
+
+    base_model = FunctionalViTTiny(
+        cfg,
+        initial,
+        parameter_mode="bigvae_latent",
+        big_vae=big_vae,
+        big_vae_latent_init="base",
+        big_vae_latent_space="decoder_z",
+    )
+    flow_model = FunctionalViTTiny(
+        cfg,
+        initial,
+        parameter_mode="bigvae_latent",
+        big_vae=big_vae,
+        big_vae_latent_init="base",
+        big_vae_latent_space="decoder_z",
+        big_vae_decoder_flow=flow,
+    )
+
+    key = "blocks.0.attn.qkv.weight"
+    base_decoded = base_model.store.decode_all_tensors()[key]
+    flow_decoded = flow_model.store.decode_all_tensors()[key]
+
+    assert torch.allclose(flow_decoded, base_decoded, atol=1e-5, rtol=1e-5)
+    latent_flat = next(iter(flow_model.store.latent_slots.values())).detach().reshape(-1)
+    base_flat = big_vae.latent_base.detach().reshape(-1)
+    latent_delta = latent_flat[1].sub(base_flat[1]).abs()
+    assert float(latent_delta.item()) > 0.1
 
 
 def test_bigvae_latent_encoded_init_can_optimize_only_latent_slots() -> None:
