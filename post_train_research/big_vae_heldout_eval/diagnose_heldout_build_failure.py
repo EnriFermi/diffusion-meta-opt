@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from common import default_heldout_eval_dir, default_heldout_root
+from post_train_research.big_vae_heldout_eval.common import default_heldout_eval_dir, default_heldout_root
 
 PROGRESS_RE = re.compile(
     r"Held-out build progress: seen_total=(?P<seen>\d+) accepted=(?P<accepted>\d+) "
