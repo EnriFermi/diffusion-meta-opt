@@ -98,6 +98,9 @@ class ExperimentConfig:
     aulc_eps: float = 1e-12
     bootstrap_samples: int = 2000
     bootstrap_seed: int = 12345
+    downstream_tuning_batch_size: int = 0
+    downstream_eval_batch_size: int = 0
+    parallel_contexts: int = 1
 
     write_csv: bool = True
     write_parquet: bool = True

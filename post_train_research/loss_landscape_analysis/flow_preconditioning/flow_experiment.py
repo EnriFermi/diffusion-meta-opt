@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 
@@ -13,6 +14,7 @@ from .probe_geometry import TensorFn, isometry_objective_from_jacobians, probe_j
 
 
 LOGGER = logging.getLogger("flow_preconditioning")
+_FLOW_INIT_LOCK = threading.Lock()
 
 
 def make_flow(dim: int, cfg: ExperimentConfig) -> RealNVPFlow:
@@ -78,8 +80,9 @@ def train_flow(
     dim = int(theta_samples.shape[1])
     device = theta_samples.device
     dtype = theta_samples.dtype
-    torch.manual_seed(int(seed))
-    flow = make_flow(dim, cfg).to(device=device, dtype=dtype)
+    with _FLOW_INIT_LOCK:
+        torch.manual_seed(int(seed))
+        flow = make_flow(dim, cfg).to(device=device, dtype=dtype)
     optimizer = torch.optim.Adam(flow.parameters(), lr=float(cfg.flow_lr))
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed) + 17)

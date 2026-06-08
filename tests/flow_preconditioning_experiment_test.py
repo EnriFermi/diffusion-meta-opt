@@ -6,7 +6,16 @@ import torch
 
 from post_train_research.loss_landscape_analysis.flow_preconditioning import ExperimentConfig, run_or_load
 from post_train_research.loss_landscape_analysis.flow_preconditioning.config import torch_dtype
-from post_train_research.loss_landscape_analysis.flow_preconditioning.optimization import Curve, aulc, curve_metrics
+from post_train_research.loss_landscape_analysis.flow_preconditioning.flow_experiment import make_flow
+from post_train_research.loss_landscape_analysis.flow_preconditioning.optimization import (
+    Curve,
+    aulc,
+    curve_metrics,
+    run_direct_curve,
+    run_direct_curves_batched,
+    run_flow_curve,
+    run_flow_curves_batched,
+)
 from post_train_research.loss_landscape_analysis.flow_preconditioning.probe_geometry import (
     ResidualOnlyProbe,
     ResidualThetaProbe,
@@ -190,8 +199,77 @@ def test_aulc_and_curve_metrics() -> None:
     assert metrics["success"] == 1.0
 
 
+def test_batched_downstream_curves_match_single_curve_runners() -> None:
+    cfg = _small_cfg()
+    starts = torch.tensor([[1.0, 2.0], [-1.5, 0.25], [0.1, -0.3]], dtype=torch.float32)
+    lrs = torch.tensor([1e-2, 3e-3, 1e-3], dtype=torch.float32)
+    target = torch.tensor([0.5, -1.0], dtype=torch.float32)
+
+    def loss_fn(theta: torch.Tensor) -> torch.Tensor:
+        return 0.5 * (theta - target).square().sum()
+
+    flow = make_flow(2, cfg).to(dtype=torch.float32)
+
+    for optimizer_name in ("sgd", "adam"):
+        direct_single = [
+            run_direct_curve(
+                train_loss_fn=loss_fn,
+                test_loss_fn=loss_fn,
+                theta0=start,
+                optimizer_name=optimizer_name,
+                lr=float(lr),
+                steps=4,
+            )
+            for start, lr in zip(starts, lrs, strict=True)
+        ]
+        direct_batched = run_direct_curves_batched(
+            train_loss_fn=loss_fn,
+            test_loss_fn=loss_fn,
+            theta0_batch=starts,
+            optimizer_name=optimizer_name,
+            lrs=lrs,
+            steps=4,
+        )
+        flow_single = [
+            run_flow_curve(
+                train_loss_fn=loss_fn,
+                test_loss_fn=loss_fn,
+                flow=flow,
+                theta0=start,
+                optimizer_name=optimizer_name,
+                lr=float(lr),
+                steps=4,
+            )
+            for start, lr in zip(starts, lrs, strict=True)
+        ]
+        flow_batched = run_flow_curves_batched(
+            train_loss_fn=loss_fn,
+            test_loss_fn=loss_fn,
+            flow=flow,
+            theta0_batch=starts,
+            optimizer_name=optimizer_name,
+            lrs=lrs,
+            steps=4,
+        )
+
+        for single, batched in zip(direct_single, direct_batched, strict=True):
+            assert np.allclose(single.train_loss, batched.train_loss)
+            assert np.allclose(single.test_loss, batched.test_loss)
+            assert np.allclose(single.final_theta, batched.final_theta)
+        for single, batched in zip(flow_single, flow_batched, strict=True):
+            assert np.allclose(single.train_loss, batched.train_loss)
+            assert np.allclose(single.test_loss, batched.test_loss)
+            assert np.allclose(single.final_theta, batched.final_theta)
+
+
 def test_flow_preconditioning_smoke_writes_outputs(tmp_path) -> None:
-    cfg = _small_cfg(run_label="smoke", artifact_root=str(tmp_path))
+    cfg = _small_cfg(
+        run_label="smoke",
+        artifact_root=str(tmp_path),
+        downstream_tuning_batch_size=4,
+        downstream_eval_batch_size=2,
+        parallel_contexts=2,
+    )
 
     tables = run_or_load(cfg)
 

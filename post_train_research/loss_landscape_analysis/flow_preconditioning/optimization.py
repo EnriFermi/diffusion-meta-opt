@@ -19,13 +19,45 @@ class Curve:
     path: np.ndarray | None = None
 
 
-def _make_optimizer(name: str, params: list[torch.nn.Parameter], lr: float) -> torch.optim.Optimizer:
+def _vmap_scalar_loss(loss_fn: LossFn, values: torch.Tensor) -> torch.Tensor:
+    try:
+        from torch.func import vmap
+
+        return vmap(loss_fn)(values)
+    except Exception:
+        return torch.stack([loss_fn(value) for value in values], dim=0)
+
+
+def _optimizer_name(name: str) -> str:
     value = str(name).strip().lower()
-    if value == "sgd":
-        return torch.optim.SGD(params, lr=float(lr))
-    if value == "adam":
-        return torch.optim.Adam(params, lr=float(lr))
-    raise ValueError(f"optimizer must be one of {{'sgd', 'adam'}}, got {name!r}")
+    if value not in {"sgd", "adam"}:
+        raise ValueError(f"optimizer must be one of {{'sgd', 'adam'}}, got {name!r}")
+    return value
+
+
+def _manual_optimizer_step(
+    value: torch.Tensor,
+    grad: torch.Tensor,
+    *,
+    optimizer_name: str,
+    lr: float,
+    step: int,
+    state: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    if optimizer_name == "sgd":
+        return value - float(lr) * grad
+    if optimizer_name == "adam":
+        beta1, beta2 = 0.9, 0.999
+        eps = 1e-8
+        if "m" not in state:
+            state["m"] = torch.zeros_like(value)
+            state["v"] = torch.zeros_like(value)
+        state["m"] = beta1 * state["m"] + (1.0 - beta1) * grad
+        state["v"] = beta2 * state["v"] + (1.0 - beta2) * grad.square()
+        m_hat = state["m"] / (1.0 - beta1 ** int(step))
+        v_hat = state["v"] / (1.0 - beta2 ** int(step))
+        return value - float(lr) * m_hat / (v_hat.sqrt() + eps)
+    raise ValueError(f"unknown optimizer {optimizer_name!r}")
 
 
 def run_direct_curve(
@@ -38,23 +70,32 @@ def run_direct_curve(
     steps: int,
     store_path: bool = False,
 ) -> Curve:
-    theta = torch.nn.Parameter(theta0.detach().clone())
-    optimizer = _make_optimizer(optimizer_name, [theta], float(lr))
-    train_losses = np.empty(int(steps) + 1, dtype=np.float64)
-    test_losses = np.empty(int(steps) + 1, dtype=np.float64)
+    optimizer_value = _optimizer_name(optimizer_name)
+    theta = theta0.detach().clone().requires_grad_(True)
+    train_losses_device = torch.empty(int(steps) + 1, device=theta.device, dtype=torch.float64)
+    test_losses_device = torch.empty(int(steps) + 1, device=theta.device, dtype=torch.float64)
     path = np.empty((int(steps) + 1, int(theta0.numel())), dtype=np.float64) if store_path else None
+    opt_state: dict[str, torch.Tensor] = {}
     for step in range(0, int(steps) + 1):
+        loss = train_loss_fn(theta)
+        train_losses_device[step] = loss.detach().to(dtype=torch.float64)
         with torch.no_grad():
-            train_losses[step] = float(train_loss_fn(theta).detach().cpu().item())
-            test_losses[step] = float(test_loss_fn(theta).detach().cpu().item())
+            test_losses_device[step] = test_loss_fn(theta).detach().to(dtype=torch.float64)
             if path is not None:
                 path[step] = theta.detach().cpu().numpy().astype(np.float64)
         if step == int(steps):
             break
-        optimizer.zero_grad(set_to_none=True)
-        loss = train_loss_fn(theta)
-        loss.backward()
-        optimizer.step()
+        grad = torch.autograd.grad(loss, theta)[0]
+        theta = _manual_optimizer_step(
+            theta,
+            grad,
+            optimizer_name=optimizer_value,
+            lr=float(lr),
+            step=step + 1,
+            state=opt_state,
+        ).detach().requires_grad_(True)
+    train_losses = train_losses_device.detach().cpu().numpy()
+    test_losses = test_losses_device.detach().cpu().numpy()
     return Curve(
         train_loss=train_losses,
         test_loss=test_losses,
@@ -74,37 +115,154 @@ def run_flow_curve(
     steps: int,
     store_path: bool = False,
 ) -> Curve:
+    optimizer_value = _optimizer_name(optimizer_name)
     flow.eval()
     for param in flow.parameters():
         param.requires_grad_(False)
     with torch.no_grad():
         u0 = flow(theta0.detach().reshape(1, -1))[0].reshape(-1)
-    u = torch.nn.Parameter(u0.detach().clone())
-    optimizer = _make_optimizer(optimizer_name, [u], float(lr))
-    train_losses = np.empty(int(steps) + 1, dtype=np.float64)
-    test_losses = np.empty(int(steps) + 1, dtype=np.float64)
+    u = u0.detach().clone().requires_grad_(True)
+    train_losses_device = torch.empty(int(steps) + 1, device=u.device, dtype=torch.float64)
+    test_losses_device = torch.empty(int(steps) + 1, device=u.device, dtype=torch.float64)
     path = np.empty((int(steps) + 1, int(theta0.numel())), dtype=np.float64) if store_path else None
+    opt_state: dict[str, torch.Tensor] = {}
 
     def theta_from_u() -> torch.Tensor:
         return flow.inverse(u.reshape(1, -1))[0].reshape(-1)
 
     for step in range(0, int(steps) + 1):
-        with torch.no_grad():
-            theta_eval = theta_from_u()
-            train_losses[step] = float(train_loss_fn(theta_eval).detach().cpu().item())
-            test_losses[step] = float(test_loss_fn(theta_eval).detach().cpu().item())
-            if path is not None:
-                path[step] = theta_eval.detach().cpu().numpy().astype(np.float64)
-        if step == int(steps):
-            break
-        optimizer.zero_grad(set_to_none=True)
         theta = theta_from_u()
         loss = train_loss_fn(theta)
-        loss.backward()
-        optimizer.step()
+        train_losses_device[step] = loss.detach().to(dtype=torch.float64)
+        with torch.no_grad():
+            test_losses_device[step] = test_loss_fn(theta).detach().to(dtype=torch.float64)
+            if path is not None:
+                path[step] = theta.detach().cpu().numpy().astype(np.float64)
+        if step == int(steps):
+            break
+        grad = torch.autograd.grad(loss, u)[0]
+        u = _manual_optimizer_step(
+            u,
+            grad,
+            optimizer_name=optimizer_value,
+            lr=float(lr),
+            step=step + 1,
+            state=opt_state,
+        ).detach().requires_grad_(True)
     with torch.no_grad():
         final_theta = theta_from_u().detach().cpu().numpy().astype(np.float64)
+    train_losses = train_losses_device.detach().cpu().numpy()
+    test_losses = test_losses_device.detach().cpu().numpy()
     return Curve(train_loss=train_losses, test_loss=test_losses, final_theta=final_theta, path=path)
+
+
+def run_direct_curves_batched(
+    *,
+    train_loss_fn: LossFn,
+    test_loss_fn: LossFn,
+    theta0_batch: torch.Tensor,
+    optimizer_name: str,
+    lrs: torch.Tensor,
+    steps: int,
+) -> list[Curve]:
+    optimizer_value = _optimizer_name(optimizer_name)
+    theta = theta0_batch.detach().clone().requires_grad_(True)
+    lr_values = lrs.detach().to(device=theta.device, dtype=theta.dtype).reshape(-1, 1)
+    batch = int(theta.shape[0])
+    train_losses_device = torch.empty(int(steps) + 1, batch, device=theta.device, dtype=torch.float64)
+    test_losses_device = torch.empty(int(steps) + 1, batch, device=theta.device, dtype=torch.float64)
+    opt_state: dict[str, torch.Tensor] = {}
+    for step in range(0, int(steps) + 1):
+        losses = _vmap_scalar_loss(train_loss_fn, theta)
+        train_losses_device[step] = losses.detach().to(dtype=torch.float64)
+        with torch.no_grad():
+            test_losses_device[step] = _vmap_scalar_loss(test_loss_fn, theta).detach().to(dtype=torch.float64)
+        if step == int(steps):
+            break
+        grad = torch.autograd.grad(losses.sum(), theta)[0]
+        theta = _manual_optimizer_step(
+            theta,
+            grad,
+            optimizer_name=optimizer_value,
+            lr=1.0,
+            step=step + 1,
+            state=opt_state,
+        )
+        if optimizer_value == "sgd":
+            # _manual_optimizer_step with lr=1 applies a unit update; scale SGD explicitly per row.
+            theta = (theta + grad - lr_values * grad).detach().requires_grad_(True)
+        else:
+            # Recompute Adam update with row-wise lr because lr is scalar in the generic helper.
+            beta1, beta2 = 0.9, 0.999
+            eps = 1e-8
+            m_hat = opt_state["m"] / (1.0 - beta1 ** int(step + 1))
+            v_hat = opt_state["v"] / (1.0 - beta2 ** int(step + 1))
+            theta = (theta + m_hat / (v_hat.sqrt() + eps) - lr_values * m_hat / (v_hat.sqrt() + eps)).detach().requires_grad_(True)
+    train_losses = train_losses_device.detach().cpu().numpy()
+    test_losses = test_losses_device.detach().cpu().numpy()
+    final_theta = theta.detach().cpu().numpy().astype(np.float64)
+    return [
+        Curve(train_loss=train_losses[:, idx], test_loss=test_losses[:, idx], final_theta=final_theta[idx])
+        for idx in range(batch)
+    ]
+
+
+def run_flow_curves_batched(
+    *,
+    train_loss_fn: LossFn,
+    test_loss_fn: LossFn,
+    flow: torch.nn.Module,
+    theta0_batch: torch.Tensor,
+    optimizer_name: str,
+    lrs: torch.Tensor,
+    steps: int,
+) -> list[Curve]:
+    optimizer_value = _optimizer_name(optimizer_name)
+    flow.eval()
+    for param in flow.parameters():
+        param.requires_grad_(False)
+    with torch.no_grad():
+        u = flow(theta0_batch.detach())[0]
+    u = u.detach().clone().requires_grad_(True)
+    lr_values = lrs.detach().to(device=u.device, dtype=u.dtype).reshape(-1, 1)
+    batch = int(u.shape[0])
+    train_losses_device = torch.empty(int(steps) + 1, batch, device=u.device, dtype=torch.float64)
+    test_losses_device = torch.empty(int(steps) + 1, batch, device=u.device, dtype=torch.float64)
+    opt_state: dict[str, torch.Tensor] = {}
+    for step in range(0, int(steps) + 1):
+        theta = flow.inverse(u)[0]
+        losses = _vmap_scalar_loss(train_loss_fn, theta)
+        train_losses_device[step] = losses.detach().to(dtype=torch.float64)
+        with torch.no_grad():
+            test_losses_device[step] = _vmap_scalar_loss(test_loss_fn, theta).detach().to(dtype=torch.float64)
+        if step == int(steps):
+            break
+        grad = torch.autograd.grad(losses.sum(), u)[0]
+        u = _manual_optimizer_step(
+            u,
+            grad,
+            optimizer_name=optimizer_value,
+            lr=1.0,
+            step=step + 1,
+            state=opt_state,
+        )
+        if optimizer_value == "sgd":
+            u = (u + grad - lr_values * grad).detach().requires_grad_(True)
+        else:
+            beta1, beta2 = 0.9, 0.999
+            eps = 1e-8
+            m_hat = opt_state["m"] / (1.0 - beta1 ** int(step + 1))
+            v_hat = opt_state["v"] / (1.0 - beta2 ** int(step + 1))
+            update = m_hat / (v_hat.sqrt() + eps)
+            u = (u + update - lr_values * update).detach().requires_grad_(True)
+    with torch.no_grad():
+        final_theta = flow.inverse(u)[0].detach().cpu().numpy().astype(np.float64)
+    train_losses = train_losses_device.detach().cpu().numpy()
+    test_losses = test_losses_device.detach().cpu().numpy()
+    return [
+        Curve(train_loss=train_losses[:, idx], test_loss=test_losses[:, idx], final_theta=final_theta[idx])
+        for idx in range(batch)
+    ]
 
 
 def aulc(train_losses: np.ndarray, *, budget: int, l_ref: float, eps: float) -> float:
