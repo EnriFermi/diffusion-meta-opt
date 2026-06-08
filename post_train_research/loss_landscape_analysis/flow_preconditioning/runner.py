@@ -4,9 +4,10 @@ import hashlib
 import json
 import logging
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +24,10 @@ from .optimization import (
     curve_rows,
     run_direct_curve,
     run_direct_curves_batched,
+    run_direct_curves_batched_loss,
     run_flow_curve,
     run_flow_curves_batched,
+    run_flow_curves_batched_loss,
 )
 from .probe_geometry import (
     flow_coordinate_diagnostic_rows,
@@ -56,6 +59,13 @@ class ExperimentTables:
     figure_paths: dict[str, str]
     interpretation_markdown: str
 
+
+@dataclass(slots=True)
+class BaselineRecordCache:
+    records: dict[tuple[object, ...], list[dict[str, Any]]] = field(default_factory=dict)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
 def _method_name(family: str, optimizer: str) -> str:
     return f"{family}_{optimizer}"
 
@@ -70,6 +80,73 @@ def _lr_grid(cfg: ExperimentConfig, optimizer: str) -> tuple[float, ...]:
 
 def _curve_id(*parts: object) -> str:
     return "__".join(str(part).replace(".", "p") for part in parts)
+
+
+def _baseline_cache_key(ctx: ConditionContext, cfg: ExperimentConfig, *, split: str, family: str) -> tuple[object, ...] | None:
+    if ctx.experiment not in {"E2", "E4"}:
+        return None
+    if family == "direct":
+        pass
+    elif family == "random_flow" and float(cfg.random_flow_near_identity_noise_std) <= 0.0:
+        pass
+    else:
+        return None
+    return (
+        str(split),
+        str(family),
+        str(ctx.experiment),
+        str(ctx.task),
+        int(ctx.seed),
+    )
+
+
+def _clone_records_for_context(records: list[dict[str, Any]], ctx: ConditionContext) -> list[dict[str, Any]]:
+    cloned: list[dict[str, Any]] = []
+    for record in records:
+        row = dict(record)
+        curve_budget = int(row.get("curve_budget", row["budget"]))
+        row["condition_name"] = ctx.condition_name
+        row["condition_value"] = str(ctx.condition_value)
+        row["numeric_condition"] = ctx.numeric_condition
+        row["seed"] = int(ctx.seed)
+        row["curve_id"] = _curve_id(
+            ctx.experiment,
+            ctx.task,
+            row["split"],
+            ctx.seed,
+            ctx.condition_value,
+            curve_budget,
+            row["method"],
+            row["lr"],
+            row["start_index"],
+        )
+        cloned.append(row)
+    return cloned
+
+
+def _cache_get(
+    cache: BaselineRecordCache | None,
+    key: tuple[object, ...] | None,
+    ctx: ConditionContext,
+) -> list[dict[str, Any]] | None:
+    if cache is None or key is None:
+        return None
+    with cache.lock:
+        records = cache.records.get(key)
+    if records is None:
+        return None
+    return _clone_records_for_context(records, ctx)
+
+
+def _cache_put(
+    cache: BaselineRecordCache | None,
+    key: tuple[object, ...] | None,
+    records: list[dict[str, Any]],
+) -> None:
+    if cache is None or key is None or not records:
+        return
+    with cache.lock:
+        cache.records.setdefault(key, records)
 
 
 def _stable_int(*parts: object, modulo: int = 20_000) -> int:
@@ -110,8 +187,20 @@ def _context_label(ctx: ConditionContext) -> str:
     )
 
 
-def _is_batchable_context(ctx: ConditionContext) -> bool:
+def _is_shared_loss_batchable_context(ctx: ConditionContext) -> bool:
     return all(item.target is None for item in ctx.tune_items + ctx.eval_items)
+
+
+def _is_target_loss_batchable_context(ctx: ConditionContext) -> bool:
+    return (
+        ctx.train_batch_loss_factory is not None
+        and ctx.test_batch_loss_factory is not None
+        and all(item.target is not None for item in ctx.tune_items + ctx.eval_items)
+    )
+
+
+def _is_batchable_context(ctx: ConditionContext) -> bool:
+    return _is_shared_loss_batchable_context(ctx) or _is_target_loss_batchable_context(ctx)
 
 
 def _batch_slices(total: int, batch_size: int) -> list[slice]:
@@ -483,6 +572,7 @@ def _make_tuning_records(
     trained_flow: torch.nn.Module,
     random_flow: torch.nn.Module,
     cfg: ExperimentConfig,
+    baseline_cache: BaselineRecordCache | None = None,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     label = _context_label(ctx)
@@ -497,12 +587,19 @@ def _make_tuning_records(
     )
     run_budget = int(max(cfg.budgets))
     metric_budgets = tuple(sorted({int(v) for v in cfg.budgets}))
-    if _is_batchable_context(ctx):
+    if _is_shared_loss_batchable_context(ctx):
         started = time.time()
         train_loss = ctx.train_loss_factory(ctx.tune_items[0])
         test_loss = ctx.test_loss_factory(ctx.tune_items[0])
         starts = torch.stack([item.start for item in ctx.tune_items], dim=0)
         for family in FAMILIES:
+            cache_key = _baseline_cache_key(ctx, cfg, split="tune", family=family)
+            cached = _cache_get(baseline_cache, cache_key, ctx)
+            if cached is not None:
+                LOGGER.info("%s tuning baseline-cache hit family=%s records=%d", label, family, len(cached))
+                records.extend(cached)
+                continue
+            family_records: list[dict[str, Any]] = []
             for optimizer in OPTIMIZERS:
                 lr_grid = tuple(float(v) for v in _lr_grid(cfg, optimizer))
                 theta_batch = torch.cat([starts for _ in lr_grid], dim=0)
@@ -550,7 +647,7 @@ def _make_tuning_records(
                 for lr_index, lr in enumerate(lr_grid):
                     for start_index in range(len(ctx.tune_items)):
                         curve = curves[lr_index * len(ctx.tune_items) + start_index]
-                        records.append(
+                        family_records.append(
                             {
                                 "curve_id": _curve_id(ctx.experiment, ctx.task, "tune", ctx.seed, ctx.condition_value, run_budget, method, lr, start_index),
                                 "curve": curve,
@@ -572,8 +669,109 @@ def _make_tuning_records(
                                 "start_index": int(start_index),
                             }
                         )
+            _cache_put(baseline_cache, cache_key, family_records)
+            if cache_key is not None:
+                LOGGER.info("%s tuning baseline-cache store family=%s records=%d", label, family, len(family_records))
+            records.extend(family_records)
         LOGGER.info(
             "%s tuning batched done curves=%d metric_rows=%d elapsed_s=%.1f",
+            label,
+            len(records),
+            len(records) * len(metric_budgets),
+            time.time() - started,
+        )
+        return records
+    if _is_target_loss_batchable_context(ctx):
+        started = time.time()
+        for family in FAMILIES:
+            cache_key = _baseline_cache_key(ctx, cfg, split="tune", family=family)
+            cached = _cache_get(baseline_cache, cache_key, ctx)
+            if cached is not None:
+                LOGGER.info("%s tuning baseline-cache hit family=%s records=%d", label, family, len(cached))
+                records.extend(cached)
+                continue
+            family_records: list[dict[str, Any]] = []
+            for optimizer in OPTIMIZERS:
+                lr_grid = tuple(float(v) for v in _lr_grid(cfg, optimizer))
+                repeated_items = [item for _lr in lr_grid for item in ctx.tune_items]
+                theta_batch = torch.stack([item.start for item in repeated_items], dim=0)
+                lr_batch = torch.tensor(
+                    [lr for lr in lr_grid for _ in range(len(ctx.tune_items))],
+                    device=theta_batch.device,
+                    dtype=theta_batch.dtype,
+                )
+                LOGGER.info(
+                    "%s tuning target-batched family=%s optimizer=%s batch=%d chunk_size=%d run_budget=%d",
+                    label,
+                    family,
+                    optimizer,
+                    int(theta_batch.shape[0]),
+                    int(cfg.downstream_tuning_batch_size),
+                    run_budget,
+                )
+                curves: list[Curve] = []
+                for chunk in _batch_slices(int(theta_batch.shape[0]), int(cfg.downstream_tuning_batch_size)):
+                    chunk_items = repeated_items[chunk]
+                    if ctx.train_batch_loss_factory is None or ctx.test_batch_loss_factory is None:
+                        raise RuntimeError("target-batched context missing batch loss factories")
+                    train_batch_loss = ctx.train_batch_loss_factory(chunk_items)
+                    test_batch_loss = ctx.test_batch_loss_factory(chunk_items)
+                    if family == "direct":
+                        curves.extend(
+                            run_direct_curves_batched_loss(
+                                train_loss_batch_fn=train_batch_loss,
+                                test_loss_batch_fn=test_batch_loss,
+                                theta0_batch=theta_batch[chunk],
+                                optimizer_name=optimizer,
+                                lrs=lr_batch[chunk],
+                                steps=run_budget,
+                            )
+                        )
+                    else:
+                        flow = trained_flow if family == "trained_flow" else random_flow
+                        curves.extend(
+                            run_flow_curves_batched_loss(
+                                train_loss_batch_fn=train_batch_loss,
+                                test_loss_batch_fn=test_batch_loss,
+                                flow=flow,
+                                theta0_batch=theta_batch[chunk],
+                                optimizer_name=optimizer,
+                                lrs=lr_batch[chunk],
+                                steps=run_budget,
+                            )
+                        )
+                method = _method_name(family, optimizer)
+                for lr_index, lr in enumerate(lr_grid):
+                    for start_index in range(len(ctx.tune_items)):
+                        curve = curves[lr_index * len(ctx.tune_items) + start_index]
+                        family_records.append(
+                            {
+                                "curve_id": _curve_id(ctx.experiment, ctx.task, "tune", ctx.seed, ctx.condition_value, run_budget, method, lr, start_index),
+                                "curve": curve,
+                                "experiment": ctx.experiment,
+                                "task": ctx.task,
+                                "condition_name": ctx.condition_name,
+                                "condition_value": str(ctx.condition_value),
+                                "numeric_condition": ctx.numeric_condition,
+                                "split": "tune",
+                                "candidate": True,
+                                "seed": int(ctx.seed),
+                                "budget": run_budget,
+                                "curve_budget": run_budget,
+                                "metric_budgets": metric_budgets,
+                                "family": family,
+                                "method": method,
+                                "optimizer": optimizer,
+                                "lr": float(lr),
+                                "start_index": int(start_index),
+                            }
+                        )
+            _cache_put(baseline_cache, cache_key, family_records)
+            if cache_key is not None:
+                LOGGER.info("%s tuning baseline-cache store family=%s records=%d", label, family, len(family_records))
+            records.extend(family_records)
+        LOGGER.info(
+            "%s tuning target-batched done curves=%d metric_rows=%d elapsed_s=%.1f",
             label,
             len(records),
             len(records) * len(metric_budgets),
@@ -645,6 +843,7 @@ def _make_eval_records(
     random_flow: torch.nn.Module,
     selected_lrs: pd.DataFrame,
     cfg: ExperimentConfig,
+    baseline_cache: BaselineRecordCache | None = None,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     label = _context_label(ctx)
@@ -656,13 +855,21 @@ def _make_eval_records(
         & (selected_lrs["seed"] == int(ctx.seed))
     ]
     LOGGER.info("%s eval start selected_lr_rows=%d eval_starts=%d", label, len(selected), len(ctx.eval_items))
-    if _is_batchable_context(ctx):
+    if _is_shared_loss_batchable_context(ctx):
         train_loss = ctx.train_loss_factory(ctx.eval_items[0])
         test_loss = ctx.test_loss_factory(ctx.eval_items[0])
         starts = torch.stack([item.start for item in ctx.eval_items], dim=0)
         group_cols = ["family", "method", "optimizer", "selected_lr"]
         for group_key, selected_group in selected.groupby(group_cols, dropna=False):
             family, method, optimizer, selected_lr = group_key
+            cache_key = _baseline_cache_key(ctx, cfg, split="eval", family=str(family))
+            if cache_key is not None:
+                cache_key = (*cache_key, str(method), str(optimizer), float(selected_lr))
+            cached = _cache_get(baseline_cache, cache_key, ctx)
+            if cached is not None:
+                LOGGER.info("%s eval baseline-cache hit family=%s records=%d", label, family, len(cached))
+                records.extend(cached)
+                continue
             metric_budgets = tuple(sorted({int(v) for v in selected_group["budget"].tolist()}))
             run_budget = int(max(metric_budgets))
             started = time.time()
@@ -703,8 +910,9 @@ def _make_eval_records(
                             steps=run_budget,
                         )
                     )
+            family_records: list[dict[str, Any]] = []
             for start_index, curve in enumerate(curves):
-                records.append(
+                family_records.append(
                     {
                         "curve_id": _curve_id(ctx.experiment, ctx.task, "eval", ctx.seed, ctx.condition_value, run_budget, method, selected_lr, start_index),
                         "curve": curve,
@@ -726,6 +934,10 @@ def _make_eval_records(
                         "start_index": int(start_index),
                     }
                 )
+            _cache_put(baseline_cache, cache_key, family_records)
+            if cache_key is not None:
+                LOGGER.info("%s eval baseline-cache store family=%s records=%d", label, family, len(family_records))
+            records.extend(family_records)
             LOGGER.info(
                 "%s eval batched method=%s run_budget=%d done elapsed_s=%.1f",
                 label,
@@ -734,6 +946,101 @@ def _make_eval_records(
                 time.time() - started,
             )
         LOGGER.info("%s eval batched done curves=%d", label, len(records))
+        return records
+    if _is_target_loss_batchable_context(ctx):
+        starts = torch.stack([item.start for item in ctx.eval_items], dim=0)
+        group_cols = ["family", "method", "optimizer", "selected_lr"]
+        for group_key, selected_group in selected.groupby(group_cols, dropna=False):
+            family, method, optimizer, selected_lr = group_key
+            cache_key = _baseline_cache_key(ctx, cfg, split="eval", family=str(family))
+            if cache_key is not None:
+                cache_key = (*cache_key, str(method), str(optimizer), float(selected_lr))
+            cached = _cache_get(baseline_cache, cache_key, ctx)
+            if cached is not None:
+                LOGGER.info("%s eval baseline-cache hit family=%s records=%d", label, family, len(cached))
+                records.extend(cached)
+                continue
+            metric_budgets = tuple(sorted({int(v) for v in selected_group["budget"].tolist()}))
+            run_budget = int(max(metric_budgets))
+            started = time.time()
+            lr_batch = torch.full((len(ctx.eval_items),), float(selected_lr), device=starts.device, dtype=starts.dtype)
+            LOGGER.info(
+                "%s eval target-batched method=%s run_budget=%d metric_budgets=%s batch=%d chunk_size=%d lr=%g",
+                label,
+                method,
+                run_budget,
+                metric_budgets,
+                int(starts.shape[0]),
+                int(cfg.downstream_eval_batch_size),
+                float(selected_lr),
+            )
+            curves: list[Curve] = []
+            for chunk in _batch_slices(int(starts.shape[0]), int(cfg.downstream_eval_batch_size)):
+                chunk_items = ctx.eval_items[chunk]
+                if ctx.train_batch_loss_factory is None or ctx.test_batch_loss_factory is None:
+                    raise RuntimeError("target-batched context missing batch loss factories")
+                train_batch_loss = ctx.train_batch_loss_factory(chunk_items)
+                test_batch_loss = ctx.test_batch_loss_factory(chunk_items)
+                if family == "direct":
+                    curves.extend(
+                        run_direct_curves_batched_loss(
+                            train_loss_batch_fn=train_batch_loss,
+                            test_loss_batch_fn=test_batch_loss,
+                            theta0_batch=starts[chunk],
+                            optimizer_name=str(optimizer),
+                            lrs=lr_batch[chunk],
+                            steps=run_budget,
+                        )
+                    )
+                else:
+                    flow = trained_flow if family == "trained_flow" else random_flow
+                    curves.extend(
+                        run_flow_curves_batched_loss(
+                            train_loss_batch_fn=train_batch_loss,
+                            test_loss_batch_fn=test_batch_loss,
+                            flow=flow,
+                            theta0_batch=starts[chunk],
+                            optimizer_name=str(optimizer),
+                            lrs=lr_batch[chunk],
+                            steps=run_budget,
+                        )
+                    )
+            family_records: list[dict[str, Any]] = []
+            for start_index, curve in enumerate(curves):
+                family_records.append(
+                    {
+                        "curve_id": _curve_id(ctx.experiment, ctx.task, "eval", ctx.seed, ctx.condition_value, run_budget, method, selected_lr, start_index),
+                        "curve": curve,
+                        "experiment": ctx.experiment,
+                        "task": ctx.task,
+                        "condition_name": ctx.condition_name,
+                        "condition_value": str(ctx.condition_value),
+                        "numeric_condition": ctx.numeric_condition,
+                        "split": "eval",
+                        "candidate": False,
+                        "seed": int(ctx.seed),
+                        "budget": run_budget,
+                        "curve_budget": run_budget,
+                        "metric_budgets": metric_budgets,
+                        "family": str(family),
+                        "method": str(method),
+                        "optimizer": str(optimizer),
+                        "lr": float(selected_lr),
+                        "start_index": int(start_index),
+                    }
+                )
+            _cache_put(baseline_cache, cache_key, family_records)
+            if cache_key is not None:
+                LOGGER.info("%s eval baseline-cache store family=%s records=%d", label, family, len(family_records))
+            records.extend(family_records)
+            LOGGER.info(
+                "%s eval target-batched method=%s run_budget=%d done elapsed_s=%.1f",
+                label,
+                method,
+                run_budget,
+                time.time() - started,
+            )
+        LOGGER.info("%s eval target-batched done curves=%d", label, len(records))
         return records
     group_cols = ["family", "method", "optimizer", "selected_lr"]
     for group_key, selected_group in selected.groupby(group_cols, dropna=False):
@@ -808,7 +1115,11 @@ def _make_eval_records(
     return records
 
 
-def _run_context(ctx: ConditionContext, cfg: ExperimentConfig) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _run_context(
+    ctx: ConditionContext,
+    cfg: ExperimentConfig,
+    baseline_cache: BaselineRecordCache | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     label = _context_label(ctx)
     started = time.time()
     LOGGER.info(
@@ -824,14 +1135,21 @@ def _run_context(ctx: ConditionContext, cfg: ExperimentConfig) -> tuple[pd.DataF
     grid_rows = warped_grid_rows(ctx, trained_flow, random_flow, cfg)
     if grid_rows:
         LOGGER.info("%s warped_grid rows=%d", label, len(grid_rows))
-    tuning_records = _make_tuning_records(ctx, trained_flow=trained_flow, random_flow=random_flow, cfg=cfg)
+    tuning_records = _make_tuning_records(ctx, trained_flow=trained_flow, random_flow=random_flow, cfg=cfg, baseline_cache=baseline_cache)
     tuning_results, tuning_curves, _ = _raw_records_to_tables(tuning_records, cfg=cfg, success_threshold_by_key=None)
     tuning_df = pd.DataFrame(tuning_results)
     selected_lrs = _select_lrs(tuning_df)
     LOGGER.info("%s selected_lrs rows=%d", label, len(selected_lrs))
     thresholds = _success_thresholds(tuning_df, selected_lrs)
     LOGGER.info("%s success_thresholds rows=%d", label, len(thresholds))
-    eval_records = _make_eval_records(ctx, trained_flow=trained_flow, random_flow=random_flow, selected_lrs=selected_lrs, cfg=cfg)
+    eval_records = _make_eval_records(
+        ctx,
+        trained_flow=trained_flow,
+        random_flow=random_flow,
+        selected_lrs=selected_lrs,
+        cfg=cfg,
+        baseline_cache=baseline_cache,
+    )
     eval_results, eval_curves, trajectories = _raw_records_to_tables(eval_records, cfg=cfg, success_threshold_by_key=thresholds)
     LOGGER.info(
         "%s context done result_rows=%d curve_rows=%d geometry_rows=%d elapsed_s=%.1f",
@@ -918,14 +1236,17 @@ def run_all_experiments(cfg: ExperimentConfig) -> ExperimentTables:
         for seed in cfg.seeds
         for ctx in build_contexts_for_seed(cfg, seed=int(seed), device=device, dtype=dtype)
     ])
+    if not contexts:
+        raise ValueError(f"no experiment contexts were built; cfg.experiments={cfg.experiments!r}")
     workers = min(max(1, int(cfg.parallel_contexts)), max(1, len(contexts)))
     LOGGER.info("planned contexts=%d parallel_contexts=%d", len(contexts), workers)
+    baseline_cache = BaselineRecordCache()
     parts: list[tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]] = []
     if workers == 1:
         for context_index, ctx in enumerate(contexts, start=1):
             context_started = time.time()
             LOGGER.info("context %d/%d begin %s", context_index, len(contexts), _context_label(ctx))
-            parts.append(_run_context(ctx, cfg))
+            parts.append(_run_context(ctx, cfg, baseline_cache))
             elapsed = time.time() - run_started
             per_context = elapsed / float(context_index)
             remaining = max(0, len(contexts) - context_index) * per_context
@@ -946,7 +1267,7 @@ def run_all_experiments(cfg: ExperimentConfig) -> ExperimentTables:
             futures = {}
             for context_index, ctx in enumerate(contexts, start=1):
                 LOGGER.info("context %d/%d queued %s", context_index, len(contexts), _context_label(ctx))
-                futures[executor.submit(_run_context, ctx, cfg)] = (context_index, ctx, time.time())
+                futures[executor.submit(_run_context, ctx, cfg, baseline_cache)] = (context_index, ctx, time.time())
             completed = 0
             for future in as_completed(futures):
                 context_index, ctx, submitted_at = futures[future]

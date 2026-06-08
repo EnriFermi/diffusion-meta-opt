@@ -13,8 +13,10 @@ from post_train_research.loss_landscape_analysis.flow_preconditioning.optimizati
     curve_metrics,
     run_direct_curve,
     run_direct_curves_batched,
+    run_direct_curves_batched_loss,
     run_flow_curve,
     run_flow_curves_batched,
+    run_flow_curves_batched_loss,
 )
 from post_train_research.loss_landscape_analysis.flow_preconditioning.probe_geometry import (
     ResidualOnlyProbe,
@@ -22,6 +24,13 @@ from post_train_research.loss_landscape_analysis.flow_preconditioning.probe_geom
     fit_probe_scales,
     metric_tensors_from_jacobians,
     probe_jacobians_for_theta,
+)
+from post_train_research.loss_landscape_analysis.flow_preconditioning.problems import Decoder2DProblem
+from post_train_research.loss_landscape_analysis.flow_preconditioning.contexts import build_contexts_for_seed
+from post_train_research.loss_landscape_analysis.flow_preconditioning.e4_debug import (
+    E4DebugConfig,
+    build_e4_debug_state,
+    train_e4_debug_flow,
 )
 from post_train_research.loss_landscape_analysis.flow_preconditioning.runner import _select_lrs
 from post_train_research.loss_landscape_analysis.flow_preconditioning.toy_mlp import (
@@ -177,6 +186,7 @@ def test_lr_selection_uses_tuning_rows_only() -> None:
 def test_default_config_contains_required_e0_e4_sweeps() -> None:
     cfg = ExperimentConfig()
 
+    assert tuple(cfg.experiments) == ("E0", "E1", "E2", "E3", "E4")
     assert set(cfg.e2_dims) >= {2, 4}
     assert {"rastrigin_abs", "rosenbrock_abs"}.issubset(set(cfg.e2_objectives))
     assert tuple(cfg.e2_gamma_values) == (0.3, 1.0, 3.0)
@@ -197,6 +207,15 @@ def test_aulc_and_curve_metrics() -> None:
     assert metrics["final_train_loss"] == 1.0
     assert metrics["best_train_loss"] == 1.0
     assert metrics["success"] == 1.0
+
+
+def test_e4_only_context_filter_and_flow_steps() -> None:
+    cfg = _small_cfg(experiments=("E4",), e4_flow_steps=7)
+    contexts = build_contexts_for_seed(cfg, seed=0, device=torch.device("cpu"), dtype=torch.float32)
+
+    assert len(contexts) == len(cfg.e4_rho_values)
+    assert {ctx.experiment for ctx in contexts} == {"E4"}
+    assert {ctx.flow_steps for ctx in contexts} == {7}
 
 
 def test_batched_downstream_curves_match_single_curve_runners() -> None:
@@ -262,6 +281,70 @@ def test_batched_downstream_curves_match_single_curve_runners() -> None:
             assert np.allclose(single.final_theta, batched.final_theta)
 
 
+def test_target_batched_downstream_curves_match_single_curve_runners() -> None:
+    cfg = _small_cfg()
+    problem = Decoder2DProblem(cfg, seed=0, device=torch.device("cpu"), dtype=torch.float32)
+    pairs = problem.sample_pairs(3, seed=123)
+    starts = torch.stack([item.start for item in pairs], dim=0)
+    targets = torch.stack([item.target for item in pairs], dim=0)
+    lrs = torch.tensor([1e-2, 3e-3, 1e-3], dtype=torch.float32)
+    flow = make_flow(2, cfg).to(dtype=torch.float32)
+
+    def batch_loss(theta_batch: torch.Tensor) -> torch.Tensor:
+        return problem.loss_for_targets(theta_batch, targets)
+
+    for optimizer_name in ("sgd", "adam"):
+        direct_single = [
+            run_direct_curve(
+                train_loss_fn=lambda theta, target=item.target: problem.loss_for_target(theta, target),
+                test_loss_fn=lambda theta, target=item.target: problem.loss_for_target(theta, target),
+                theta0=item.start,
+                optimizer_name=optimizer_name,
+                lr=float(lr),
+                steps=4,
+            )
+            for item, lr in zip(pairs, lrs, strict=True)
+        ]
+        direct_batched = run_direct_curves_batched_loss(
+            train_loss_batch_fn=batch_loss,
+            test_loss_batch_fn=batch_loss,
+            theta0_batch=starts,
+            optimizer_name=optimizer_name,
+            lrs=lrs,
+            steps=4,
+        )
+        flow_single = [
+            run_flow_curve(
+                train_loss_fn=lambda theta, target=item.target: problem.loss_for_target(theta, target),
+                test_loss_fn=lambda theta, target=item.target: problem.loss_for_target(theta, target),
+                flow=flow,
+                theta0=item.start,
+                optimizer_name=optimizer_name,
+                lr=float(lr),
+                steps=4,
+            )
+            for item, lr in zip(pairs, lrs, strict=True)
+        ]
+        flow_batched = run_flow_curves_batched_loss(
+            train_loss_batch_fn=batch_loss,
+            test_loss_batch_fn=batch_loss,
+            flow=flow,
+            theta0_batch=starts,
+            optimizer_name=optimizer_name,
+            lrs=lrs,
+            steps=4,
+        )
+
+        for single, batched in zip(direct_single, direct_batched, strict=True):
+            assert np.allclose(single.train_loss, batched.train_loss)
+            assert np.allclose(single.test_loss, batched.test_loss)
+            assert np.allclose(single.final_theta, batched.final_theta)
+        for single, batched in zip(flow_single, flow_batched, strict=True):
+            assert np.allclose(single.train_loss, batched.train_loss)
+            assert np.allclose(single.test_loss, batched.test_loss)
+            assert np.allclose(single.final_theta, batched.final_theta)
+
+
 def test_flow_preconditioning_smoke_writes_outputs(tmp_path) -> None:
     cfg = _small_cfg(
         run_label="smoke",
@@ -285,3 +368,38 @@ def test_flow_preconditioning_smoke_writes_outputs(tmp_path) -> None:
     assert (tables.output_dir / "geometry.parquet").is_file()
     assert (tables.output_dir / "selected_lrs.csv").is_file()
     assert (tables.output_dir / "config.json").is_file()
+
+
+def test_e4_geometry_debug_smoke_writes_outputs(tmp_path) -> None:
+    debug_cfg = E4DebugConfig(
+        run_label="e4_debug_smoke",
+        artifact_root=str(tmp_path),
+        device="cpu",
+        seed=0,
+        rho=1e-2,
+        flow_steps=1,
+        eval_every=1,
+        flow_batch_size=1,
+        flow_num_layers=2,
+        flow_hidden_dim=8,
+        flow_network_depth=1,
+        flow_random_samples=2,
+        flow_trajectory_count=1,
+        flow_trajectory_steps=1,
+        heldout_geometry_samples=2,
+        train_eval_samples=1,
+        heldout_eval_samples=1,
+        train_points=8,
+        probe_points=8,
+        test_points=16,
+    )
+
+    state = build_e4_debug_state(debug_cfg)
+    result = train_e4_debug_flow(state)
+
+    assert list(result.history["step"]) == [0, 1]
+    assert set(result.final_geometry["split"]) == {"train_eval", "heldout_eval"}
+    assert set(result.final_geometry["coordinate"]) == {"original", "flow"}
+    assert (result.output_dir / "history.csv").is_file()
+    assert (result.output_dir / "final_geometry.csv").is_file()
+    assert (result.output_dir / "flow_state.pt").is_file()
