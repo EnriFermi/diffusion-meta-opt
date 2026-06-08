@@ -32,8 +32,12 @@ def _small_cfg(**overrides) -> ExperimentConfig:
         "k_tune": 1,
         "k_eval": 1,
         "budgets": (1,),
-        "rho_values": (1e-2,),
-        "main_rho": 1e-2,
+        "e2_gamma_values": (1.0,),
+        "e2_dims": (2,),
+        "e2_objectives": ("rastrigin_abs",),
+        "e3_condition_numbers": (1.0,),
+        "e4_rho_values": (1e-2,),
+        "e4_main_rho": 1e-2,
         "flow_steps": 1,
         "sanity_flow_steps": 1,
         "flow_batch_size": 2,
@@ -46,6 +50,18 @@ def _small_cfg(**overrides) -> ExperimentConfig:
         "sanity_trajectory_steps": 1,
         "heldout_geometry_samples": 2,
         "sanity_heldout_geometry_samples": 2,
+        "e1_random_samples": 4,
+        "e1_trajectory_count": 1,
+        "e1_trajectory_steps": 1,
+        "e1_heldout_geometry_samples": 2,
+        "e2_random_samples": 4,
+        "e2_trajectory_count": 1,
+        "e2_trajectory_steps": 1,
+        "e2_heldout_geometry_samples": 2,
+        "e3_random_samples": 4,
+        "e3_trajectory_count": 1,
+        "e3_trajectory_steps": 1,
+        "e3_heldout_geometry_samples": 2,
         "sgd_lrs": (1e-3,),
         "adam_lrs": (1e-3,),
         "bootstrap_samples": 10,
@@ -117,8 +133,10 @@ def test_lr_selection_uses_tuning_rows_only() -> None:
         [
             {
                 "experiment": "mlp",
+                "task": "task",
+                "condition_name": "rho",
+                "condition_value": "0.01",
                 "seed": 0,
-                "rho": 1e-2,
                 "budget": 10,
                 "family": "direct",
                 "method": "direct_sgd",
@@ -128,8 +146,10 @@ def test_lr_selection_uses_tuning_rows_only() -> None:
             },
             {
                 "experiment": "mlp",
+                "task": "task",
+                "condition_name": "rho",
+                "condition_value": "0.01",
                 "seed": 0,
-                "rho": 1e-2,
                 "budget": 10,
                 "family": "direct",
                 "method": "direct_sgd",
@@ -143,6 +163,16 @@ def test_lr_selection_uses_tuning_rows_only() -> None:
     selected = _select_lrs(tuning)
 
     assert float(selected.iloc[0]["selected_lr"]) == 1e-2
+
+
+def test_default_config_contains_required_e0_e4_sweeps() -> None:
+    cfg = ExperimentConfig()
+
+    assert set(cfg.e2_dims) >= {2, 4}
+    assert {"rastrigin_abs", "rosenbrock_abs"}.issubset(set(cfg.e2_objectives))
+    assert tuple(cfg.e2_gamma_values) == (0.3, 1.0, 3.0)
+    assert tuple(cfg.e3_condition_numbers) == (1.0, 100.0, 10000.0)
+    assert tuple(cfg.e4_rho_values) == (0.0, 1e-3, 1e-2, 5e-2)
 
 
 def test_aulc_and_curve_metrics() -> None:
@@ -169,6 +199,8 @@ def test_flow_preconditioning_smoke_writes_outputs(tmp_path) -> None:
     assert not tables.curves.empty
     assert not tables.geometry.empty
     assert not tables.selected_lrs.empty
+    assert set(tables.results["experiment"].unique()) == {"E0", "E1", "E2", "E3", "E4"}
+    assert "coordinate_map" in set(tables.geometry["diagnostic"].unique())
     assert (tables.output_dir / "results.parquet").is_file()
     assert (tables.output_dir / "results.csv").is_file()
     assert (tables.output_dir / "curves.parquet").is_file()
