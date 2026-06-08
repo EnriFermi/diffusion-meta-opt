@@ -15,7 +15,7 @@ def _default_device() -> str:
 
 @dataclass(frozen=True, slots=True)
 class ExperimentConfig:
-    run_label: str = "paperish"
+    run_label: str = "e0_e4_paperish"
     artifact_root: str = "artifacts/loss_landscape_analysis/flow_preconditioning"
     cache_first: bool = True
     force_rerun: bool = False
@@ -26,10 +26,17 @@ class ExperimentConfig:
     k_tune: int = 8
     k_eval: int = 32
     budgets: tuple[int, ...] = (300, 1000)
-    rho_values: tuple[float, ...] = (0.0, 1e-3, 1e-2, 5e-2)
-    main_rho: float = 1e-2
+    e2_gamma_values: tuple[float, ...] = (0.3, 1.0, 3.0)
+    e2_dims: tuple[int, ...] = (2, 4)
+    e2_objectives: tuple[str, ...] = ("rastrigin_abs", "rosenbrock_abs")
+    e3_condition_numbers: tuple[float, ...] = (1.0, 1e2, 1e4)
+    e4_rho_values: tuple[float, ...] = (0.0, 1e-3, 1e-2, 5e-2)
+    e4_main_rho: float = 1e-2
 
     init_std: float = 0.5
+    e2_init_std: float = 2.0
+    e1_domain_z1: tuple[float, float] = (-2.0, 2.0)
+    e1_domain_z2: tuple[float, float] = (-4.0, 4.0)
     train_points: int = 128
     probe_points: int = 64
     test_points: int = 512
@@ -57,6 +64,7 @@ class ExperimentConfig:
     flow_log_scale_clamp: float = 1.5
     flow_dropout: float = 0.0
     random_flow_std: float = 1e-3
+    random_flow_near_identity_noise_std: float = 0.0
 
     sanity_dim: int = 16
     sanity_condition_number: float = 1e3
@@ -64,6 +72,26 @@ class ExperimentConfig:
     sanity_trajectory_count: int = 16
     sanity_trajectory_steps: int = 25
     sanity_heldout_geometry_samples: int = 128
+    e1_dim: int = 2
+    e1_random_samples: int = 1024
+    e1_trajectory_count: int = 32
+    e1_trajectory_steps: int = 25
+    e1_heldout_geometry_samples: int = 256
+    e2_random_samples: int = 1024
+    e2_trajectory_count: int = 32
+    e2_trajectory_steps: int = 25
+    e2_heldout_geometry_samples: int = 256
+    e3_dim: int = 16
+    e3_output_dim: int = 64
+    e3_hidden_dim: int = 128
+    e3_skip: float = 0.05
+    e3_random_samples: int = 1024
+    e3_trajectory_count: int = 32
+    e3_trajectory_steps: int = 25
+    e3_heldout_geometry_samples: int = 256
+
+    low_dim_grid_points: int = 80
+    low_dim_trajectory_budget: int = 300
 
     sgd_lrs: tuple[float, ...] = (1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1)
     adam_lrs: tuple[float, ...] = (1e-4, 3e-4, 1e-3, 3e-3, 1e-2)

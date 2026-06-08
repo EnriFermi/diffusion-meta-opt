@@ -26,6 +26,9 @@ def make_flow(dim: int, cfg: ExperimentConfig) -> RealNVPFlow:
 
 def make_random_flow(dim: int, cfg: ExperimentConfig, *, device: torch.device, dtype: torch.dtype, seed: int) -> RealNVPFlow:
     flow = make_flow(int(dim), cfg).to(device=device, dtype=dtype)
+    std = float(cfg.random_flow_near_identity_noise_std)
+    if std <= 0.0:
+        return flow
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
     with torch.no_grad():
@@ -36,8 +39,8 @@ def make_random_flow(dim: int, cfg: ExperimentConfig, *, device: torch.device, d
                     final_linear = module
             if final_linear is None:
                 continue
-            weight = torch.randn(final_linear.weight.shape, generator=generator, dtype=dtype) * float(cfg.random_flow_std)
-            bias = torch.randn(final_linear.bias.shape, generator=generator, dtype=dtype) * float(cfg.random_flow_std)
+            weight = torch.randn(final_linear.weight.shape, generator=generator, dtype=dtype) * std
+            bias = torch.randn(final_linear.bias.shape, generator=generator, dtype=dtype) * std
             final_linear.weight.copy_(weight.to(device=device))
             final_linear.bias.copy_(bias.to(device=device))
     return flow

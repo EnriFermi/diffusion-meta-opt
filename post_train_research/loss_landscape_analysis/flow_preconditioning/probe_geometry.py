@@ -110,6 +110,9 @@ def geometry_rows_from_jacobians(
     coordinate: str,
     seed: int,
     rho: float,
+    task: str = "",
+    condition_name: str = "",
+    condition_value: float | str = "",
     eps: float = 1e-12,
 ) -> list[dict[str, object]]:
     metric, trace_g, trace_g2 = metric_tensors_from_jacobians(jacobians.detach())
@@ -130,6 +133,10 @@ def geometry_rows_from_jacobians(
         rows.append(
             {
                 "experiment": experiment,
+                "task": task,
+                "condition_name": condition_name,
+                "condition_value": condition_value,
+                "diagnostic": "pullback_metric",
                 "coordinate": coordinate,
                 "seed": int(seed),
                 "rho": float(rho),
@@ -142,6 +149,9 @@ def geometry_rows_from_jacobians(
                 "eig_min": float(eig_min),
                 "eig_max": float(eig_max),
                 "eigenvalues_json": json.dumps([float(v) for v in eig.tolist()]),
+                "flow_log_abs_det_jacobian": float("nan"),
+                "flow_condition_number": float("nan"),
+                "flow_displacement_norm": float("nan"),
             }
         )
     return rows
@@ -152,3 +162,57 @@ def trace_cv(trace_values: torch.Tensor, *, eps: float = 1e-12) -> float:
     if int(values.numel()) <= 1:
         return 0.0
     return float((values.std(unbiased=False) / values.mean().abs().clamp_min(float(eps))).cpu().item())
+
+
+def flow_coordinate_diagnostic_rows(
+    flow: torch.nn.Module,
+    samples: torch.Tensor,
+    *,
+    experiment: str,
+    coordinate: str,
+    seed: int,
+    rho: float,
+    task: str = "",
+    condition_name: str = "",
+    condition_value: float | str = "",
+    eps: float = 1e-12,
+) -> list[dict[str, object]]:
+    flow.eval()
+
+    def flow_forward(z: torch.Tensor) -> torch.Tensor:
+        return flow(z.unsqueeze(0))[0].squeeze(0)
+
+    jacobians = exact_jacobians(flow_forward, samples, create_graph=False).detach()
+    mapped, log_det = flow(samples)
+    singular_values = torch.linalg.svdvals(jacobians.float()).detach().cpu()
+    rows: list[dict[str, object]] = []
+    for idx in range(int(samples.shape[0])):
+        svals = singular_values[idx]
+        smin = float(svals.min().item())
+        smax = float(svals.max().item())
+        cond = float("inf") if smin <= float(eps) else float(smax / smin)
+        rows.append(
+            {
+                "experiment": experiment,
+                "task": task,
+                "condition_name": condition_name,
+                "condition_value": condition_value,
+                "diagnostic": "coordinate_map",
+                "coordinate": coordinate,
+                "seed": int(seed),
+                "rho": float(rho),
+                "sample_index": int(idx),
+                "isometry_objective": float("nan"),
+                "trace_g": float("nan"),
+                "trace_g2": float("nan"),
+                "condition_number": float("nan"),
+                "log_condition_number": float("nan"),
+                "eig_min": float("nan"),
+                "eig_max": float("nan"),
+                "eigenvalues_json": "[]",
+                "flow_log_abs_det_jacobian": float(log_det[idx].detach().cpu().item()),
+                "flow_condition_number": cond,
+                "flow_displacement_norm": float((mapped[idx] - samples[idx]).detach().float().norm().cpu().item()),
+            }
+        )
+    return rows

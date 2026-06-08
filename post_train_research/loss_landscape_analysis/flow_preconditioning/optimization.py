@@ -16,6 +16,7 @@ class Curve:
     train_loss: np.ndarray
     test_loss: np.ndarray
     final_theta: np.ndarray | None = None
+    path: np.ndarray | None = None
 
 
 def _make_optimizer(name: str, params: list[torch.nn.Parameter], lr: float) -> torch.optim.Optimizer:
@@ -35,15 +36,19 @@ def run_direct_curve(
     optimizer_name: str,
     lr: float,
     steps: int,
+    store_path: bool = False,
 ) -> Curve:
     theta = torch.nn.Parameter(theta0.detach().clone())
     optimizer = _make_optimizer(optimizer_name, [theta], float(lr))
     train_losses = np.empty(int(steps) + 1, dtype=np.float64)
     test_losses = np.empty(int(steps) + 1, dtype=np.float64)
+    path = np.empty((int(steps) + 1, int(theta0.numel())), dtype=np.float64) if store_path else None
     for step in range(0, int(steps) + 1):
         with torch.no_grad():
             train_losses[step] = float(train_loss_fn(theta).detach().cpu().item())
             test_losses[step] = float(test_loss_fn(theta).detach().cpu().item())
+            if path is not None:
+                path[step] = theta.detach().cpu().numpy().astype(np.float64)
         if step == int(steps):
             break
         optimizer.zero_grad(set_to_none=True)
@@ -54,6 +59,7 @@ def run_direct_curve(
         train_loss=train_losses,
         test_loss=test_losses,
         final_theta=theta.detach().cpu().numpy().astype(np.float64),
+        path=path,
     )
 
 
@@ -66,6 +72,7 @@ def run_flow_curve(
     optimizer_name: str,
     lr: float,
     steps: int,
+    store_path: bool = False,
 ) -> Curve:
     flow.eval()
     for param in flow.parameters():
@@ -76,6 +83,7 @@ def run_flow_curve(
     optimizer = _make_optimizer(optimizer_name, [u], float(lr))
     train_losses = np.empty(int(steps) + 1, dtype=np.float64)
     test_losses = np.empty(int(steps) + 1, dtype=np.float64)
+    path = np.empty((int(steps) + 1, int(theta0.numel())), dtype=np.float64) if store_path else None
 
     def theta_from_u() -> torch.Tensor:
         return flow.inverse(u.reshape(1, -1))[0].reshape(-1)
@@ -85,6 +93,8 @@ def run_flow_curve(
             theta_eval = theta_from_u()
             train_losses[step] = float(train_loss_fn(theta_eval).detach().cpu().item())
             test_losses[step] = float(test_loss_fn(theta_eval).detach().cpu().item())
+            if path is not None:
+                path[step] = theta_eval.detach().cpu().numpy().astype(np.float64)
         if step == int(steps):
             break
         optimizer.zero_grad(set_to_none=True)
@@ -94,7 +104,7 @@ def run_flow_curve(
         optimizer.step()
     with torch.no_grad():
         final_theta = theta_from_u().detach().cpu().numpy().astype(np.float64)
-    return Curve(train_loss=train_losses, test_loss=test_losses, final_theta=final_theta)
+    return Curve(train_loss=train_losses, test_loss=test_losses, final_theta=final_theta, path=path)
 
 
 def aulc(train_losses: np.ndarray, *, budget: int, l_ref: float, eps: float) -> float:
