@@ -358,3 +358,96 @@ def run_probe_metric_curves(
         )
         for idx in range(int(theta0_batch.shape[0]))
     ]
+
+
+def _safe_cosine(lhs: torch.Tensor, rhs: torch.Tensor, *, eps: float = 1e-12) -> float:
+    lhs_flat = lhs.detach().reshape(-1).float()
+    rhs_flat = rhs.detach().reshape(-1).float()
+    denom = lhs_flat.norm() * rhs_flat.norm()
+    if float(denom.cpu().item()) <= float(eps):
+        return float("nan")
+    return float((lhs_flat @ rhs_flat / denom.clamp_min(float(eps))).cpu().item())
+
+
+def preconditioner_alignment_row(
+    *,
+    train_loss_fn: LossFn,
+    probe: TensorFn,
+    flow: torch.nn.Module,
+    theta: torch.Tensor,
+    damping: float,
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    theta_value = theta.detach().reshape(-1)
+    dim = int(theta_value.numel())
+    theta_req = theta_value.clone().requires_grad_(True)
+    loss = train_loss_fn(theta_req)
+    grad = torch.autograd.grad(loss, theta_req)[0].detach()
+
+    probe_jacobian = probe_jacobians_for_theta(probe, theta_value.reshape(1, -1), create_graph=False).squeeze(0)
+    probe_metric = probe_jacobian.transpose(0, 1) @ probe_jacobian
+    eye = torch.eye(dim, device=theta_value.device, dtype=theta_value.dtype)
+    p_metric = torch.linalg.solve(probe_metric + float(damping) * eye, grad.reshape(-1, 1)).reshape(-1)
+
+    flow_was_training = flow.training
+    flow.eval()
+    try:
+        with torch.no_grad():
+            u_value = flow(theta_value.reshape(1, -1))[0].reshape(-1).detach()
+
+        def inverse_at_u(u: torch.Tensor) -> torch.Tensor:
+            return flow.inverse(u.unsqueeze(0))[0].squeeze(0)
+
+        inverse_jacobian = exact_jacobians(inverse_at_u, u_value.reshape(1, -1), create_graph=False).squeeze(0)
+        p_nf = inverse_jacobian @ (inverse_jacobian.transpose(0, 1) @ grad)
+    finally:
+        flow.train(flow_was_training)
+
+    grad_norm = grad.float().norm()
+    metric_norm = p_metric.float().norm()
+    nf_norm = p_nf.float().norm()
+    return {
+        "loss": float(loss.detach().cpu().item()),
+        "grad_norm": float(grad_norm.cpu().item()),
+        "p_metric_norm": float(metric_norm.cpu().item()),
+        "p_nf_norm": float(nf_norm.cpu().item()),
+        "norm_ratio_metric_to_nf": float((metric_norm / nf_norm.clamp_min(float(eps))).cpu().item()),
+        "cos_p_nf_p_metric": _safe_cosine(p_nf, p_metric, eps=eps),
+        "cos_g_p_metric": _safe_cosine(grad, p_metric, eps=eps),
+        "cos_g_p_nf": _safe_cosine(grad, p_nf, eps=eps),
+    }
+
+
+def preconditioner_alignment_rows(
+    *,
+    train_loss_fn: LossFn,
+    probe: TensorFn,
+    flow: torch.nn.Module,
+    theta_points: torch.Tensor,
+    damping: float,
+    source: str,
+    start_index: int,
+    steps: list[int] | tuple[int, ...],
+) -> list[dict[str, float | int | str]]:
+    rows: list[dict[str, float | int | str]] = []
+    if theta_points.ndim != 2:
+        raise ValueError(f"theta_points must be [N,D], got {tuple(theta_points.shape)}")
+    if len(steps) != int(theta_points.shape[0]):
+        raise ValueError(f"steps length must match theta_points rows: {len(steps)} vs {int(theta_points.shape[0])}")
+    for row_idx in range(int(theta_points.shape[0])):
+        row = preconditioner_alignment_row(
+            train_loss_fn=train_loss_fn,
+            probe=probe,
+            flow=flow,
+            theta=theta_points[row_idx],
+            damping=float(damping),
+        )
+        rows.append(
+            {
+                "source": str(source),
+                "start_index": int(start_index),
+                "step": int(steps[row_idx]),
+                **row,
+            }
+        )
+    return rows

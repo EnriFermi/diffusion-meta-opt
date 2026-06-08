@@ -30,6 +30,7 @@ from post_train_research.loss_landscape_analysis.flow_preconditioning.contexts i
 from post_train_research.loss_landscape_analysis.flow_preconditioning.e4_debug import (
     E4DebugConfig,
     build_e4_debug_state,
+    preconditioner_alignment_rows,
     run_probe_metric_curves,
     train_e4_debug_flow,
 )
@@ -442,3 +443,51 @@ def test_probe_metric_curves_smoke(tmp_path) -> None:
         assert curve.final_theta is not None
         assert curve.final_theta.shape == (25,)
         assert np.isfinite(curve.train_loss).all()
+
+
+def test_preconditioner_alignment_rows_smoke(tmp_path) -> None:
+    debug_cfg = E4DebugConfig(
+        run_label="preconditioner_alignment_smoke",
+        artifact_root=str(tmp_path),
+        device="cpu",
+        seed=0,
+        flow_steps=1,
+        eval_every=1,
+        flow_batch_size=1,
+        flow_num_layers=2,
+        flow_hidden_dim=8,
+        flow_network_depth=1,
+        flow_random_samples=2,
+        flow_trajectory_count=1,
+        flow_trajectory_steps=1,
+        heldout_geometry_samples=2,
+        train_eval_samples=1,
+        heldout_eval_samples=1,
+        train_points=8,
+        probe_points=8,
+        test_points=16,
+    )
+    state = build_e4_debug_state(debug_cfg)
+    result = train_e4_debug_flow(state)
+    theta_points = state.problem.sample_starts(2, seed=654)
+
+    rows = preconditioner_alignment_rows(
+        train_loss_fn=state.problem.train_loss,
+        probe=state.probe,
+        flow=result.flow,
+        theta_points=theta_points,
+        damping=1e-3,
+        source="test_path",
+        start_index=0,
+        steps=[0, 1],
+    )
+
+    assert len(rows) == 2
+    for row in rows:
+        assert row["source"] == "test_path"
+        assert np.isfinite(float(row["p_metric_norm"]))
+        assert np.isfinite(float(row["p_nf_norm"]))
+        assert np.isfinite(float(row["norm_ratio_metric_to_nf"]))
+        assert -1.0001 <= float(row["cos_p_nf_p_metric"]) <= 1.0001
+        assert -1.0001 <= float(row["cos_g_p_metric"]) <= 1.0001
+        assert -1.0001 <= float(row["cos_g_p_nf"]) <= 1.0001
