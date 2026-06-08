@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,15 @@ import torch
 from .config import ExperimentConfig, config_hash, read_config, run_dir, torch_dtype, write_config
 from .contexts import ConditionContext, LossFn, StartItem, build_contexts_for_seed, warped_grid_rows
 from .flow_experiment import freeze_flow, make_random_flow, train_flow
-from .optimization import Curve, curve_metrics, curve_rows, run_direct_curve, run_flow_curve
+from .optimization import (
+    Curve,
+    curve_metrics,
+    curve_rows,
+    run_direct_curve,
+    run_direct_curves_batched,
+    run_flow_curve,
+    run_flow_curves_batched,
+)
 from .probe_geometry import (
     flow_coordinate_diagnostic_rows,
     geometry_rows_from_jacobians,
@@ -99,6 +108,37 @@ def _context_label(ctx: ConditionContext) -> str:
         f"[{ctx.experiment} task={ctx.task} {ctx.condition_name}={ctx.condition_value} "
         f"seed={ctx.seed}]"
     )
+
+
+def _is_batchable_context(ctx: ConditionContext) -> bool:
+    return all(item.target is None for item in ctx.tune_items + ctx.eval_items)
+
+
+def _batch_slices(total: int, batch_size: int) -> list[slice]:
+    total = int(total)
+    batch_size = int(batch_size)
+    if total <= 0:
+        return []
+    if batch_size <= 0 or batch_size >= total:
+        return [slice(0, total)]
+    return [slice(start, min(total, start + batch_size)) for start in range(0, total, batch_size)]
+
+
+def _interleave_contexts_by_experiment(contexts: list[ConditionContext]) -> list[ConditionContext]:
+    buckets: dict[str, list[ConditionContext]] = {}
+    order: list[str] = []
+    for ctx in contexts:
+        if ctx.experiment not in buckets:
+            buckets[ctx.experiment] = []
+            order.append(ctx.experiment)
+        buckets[ctx.experiment].append(ctx)
+
+    interleaved: list[ConditionContext] = []
+    while any(buckets[experiment] for experiment in order):
+        for experiment in order:
+            if buckets[experiment]:
+                interleaved.append(buckets[experiment].pop(0))
+    return interleaved
 
 
 def _run_method_curve(
@@ -261,36 +301,36 @@ def _raw_records_to_tables(
     trajectory_rows: list[dict[str, object]] = []
     ref: dict[tuple[str, str, str, str, str, int, int, int], float] = {}
     for record in records:
-        budget = int(record["budget"])
-        key = (
-            str(record["experiment"]),
-            str(record["task"]),
-            str(record["condition_name"]),
-            str(record["condition_value"]),
-            str(record["split"]),
-            int(record["seed"]),
-            int(budget),
-            int(record["start_index"]),
-        )
-        best = float(np.min(record["curve"].train_loss[: budget + 1]))
-        ref[key] = min(ref.get(key, best), best)
+        for budget in tuple(int(v) for v in record.get("metric_budgets", (record["budget"],))):
+            key = (
+                str(record["experiment"]),
+                str(record["task"]),
+                str(record["condition_name"]),
+                str(record["condition_value"]),
+                str(record["split"]),
+                int(record["seed"]),
+                int(budget),
+                int(record["start_index"]),
+            )
+            best = float(np.min(record["curve"].train_loss[: budget + 1]))
+            ref[key] = min(ref.get(key, best), best)
 
     for record in records:
         curve: Curve = record["curve"]
-        budget = int(record["budget"])
+        curve_budget = int(record.get("curve_budget", record["budget"]))
         new_curve_rows = curve_rows(
-                curve,
-                curve_id=str(record["curve_id"]),
-                experiment=str(record["experiment"]),
-                split=str(record["split"]),
-                seed=int(record["seed"]),
-                rho=float(record["numeric_condition"]),
-                method=str(record["method"]),
-                optimizer=str(record["optimizer"]),
-                lr=float(record["lr"]),
-                start_index=int(record["start_index"]),
-                budget=budget,
-            )
+            curve,
+            curve_id=str(record["curve_id"]),
+            experiment=str(record["experiment"]),
+            split=str(record["split"]),
+            seed=int(record["seed"]),
+            rho=float(record["numeric_condition"]),
+            method=str(record["method"]),
+            optimizer=str(record["optimizer"]),
+            lr=float(record["lr"]),
+            start_index=int(record["start_index"]),
+            budget=curve_budget,
+        )
         for curve_row in new_curve_rows:
             curve_row["task"] = str(record["task"])
             curve_row["condition_name"] = str(record["condition_name"])
@@ -307,7 +347,7 @@ def _raw_records_to_tables(
                         "condition_name": str(record["condition_name"]),
                         "condition_value": str(record["condition_value"]),
                         "seed": int(record["seed"]),
-                        "budget": budget,
+                        "budget": curve_budget,
                         "method": str(record["method"]),
                         "optimizer": str(record["optimizer"]),
                         "start_index": int(record["start_index"]),
@@ -315,59 +355,60 @@ def _raw_records_to_tables(
                         "z_json": json.dumps([float(v) for v in values.tolist()]),
                     }
                 )
-        ref_key = (
-            str(record["experiment"]),
-            str(record["task"]),
-            str(record["condition_name"]),
-            str(record["condition_value"]),
-            str(record["split"]),
-            int(record["seed"]),
-            budget,
-            int(record["start_index"]),
-        )
-        threshold = None
-        if success_threshold_by_key is not None:
-            threshold = success_threshold_by_key.get(
-                (
-                    str(record["experiment"]),
-                    str(record["task"]),
-                    str(record["condition_name"]),
-                    str(record["condition_value"]),
-                    int(record["seed"]),
-                    budget,
-                )
+        for budget in tuple(int(v) for v in record.get("metric_budgets", (record["budget"],))):
+            ref_key = (
+                str(record["experiment"]),
+                str(record["task"]),
+                str(record["condition_name"]),
+                str(record["condition_value"]),
+                str(record["split"]),
+                int(record["seed"]),
+                budget,
+                int(record["start_index"]),
             )
-        metrics = curve_metrics(
-            curve,
-            budget=budget,
-            l_ref=ref[ref_key],
-            eps=float(cfg.aulc_eps),
-            success_threshold=threshold,
-        )
-        row = {
-            "curve_id": str(record["curve_id"]),
-            "experiment": str(record["experiment"]),
-            "task": str(record["task"]),
-            "condition_name": str(record["condition_name"]),
-            "condition_value": str(record["condition_value"]),
-            "numeric_condition": float(record["numeric_condition"]),
-            "split": str(record["split"]),
-            "candidate": bool(record["candidate"]),
-            "seed": int(record["seed"]),
-            "budget": budget,
-            "family": str(record["family"]),
-            "method": str(record["method"]),
-            "optimizer": str(record["optimizer"]),
-            "lr": float(record["lr"]),
-            "start_index": int(record["start_index"]),
-            "final_theta_json": (
-                json.dumps([float(v) for v in curve.final_theta.tolist()])
-                if curve.final_theta is not None and str(record["split"]) == "eval"
-                else ""
-            ),
-        }
-        row.update(metrics)
-        results_rows.append(row)
+            threshold = None
+            if success_threshold_by_key is not None:
+                threshold = success_threshold_by_key.get(
+                    (
+                        str(record["experiment"]),
+                        str(record["task"]),
+                        str(record["condition_name"]),
+                        str(record["condition_value"]),
+                        int(record["seed"]),
+                        budget,
+                    )
+                )
+            metrics = curve_metrics(
+                curve,
+                budget=budget,
+                l_ref=ref[ref_key],
+                eps=float(cfg.aulc_eps),
+                success_threshold=threshold,
+            )
+            row = {
+                "curve_id": str(record["curve_id"]),
+                "experiment": str(record["experiment"]),
+                "task": str(record["task"]),
+                "condition_name": str(record["condition_name"]),
+                "condition_value": str(record["condition_value"]),
+                "numeric_condition": float(record["numeric_condition"]),
+                "split": str(record["split"]),
+                "candidate": bool(record["candidate"]),
+                "seed": int(record["seed"]),
+                "budget": budget,
+                "family": str(record["family"]),
+                "method": str(record["method"]),
+                "optimizer": str(record["optimizer"]),
+                "lr": float(record["lr"]),
+                "start_index": int(record["start_index"]),
+                "final_theta_json": (
+                    json.dumps([float(v) for v in curve.final_theta.tolist()])
+                    if curve.final_theta is not None and str(record["split"]) == "eval" and budget == curve_budget
+                    else ""
+                ),
+            }
+            row.update(metrics)
+            results_rows.append(row)
     return results_rows, curve_table_rows, trajectory_rows
 
 
@@ -446,40 +487,72 @@ def _make_tuning_records(
     records: list[dict[str, Any]] = []
     label = _context_label(ctx)
     LOGGER.info(
-        "%s tuning start starts=%d budgets=%s sgd_lrs=%s adam_lrs=%s",
+        "%s tuning start starts=%d metric_budgets=%s run_budget=%d sgd_lrs=%s adam_lrs=%s",
         label,
         len(ctx.tune_items),
         tuple(int(v) for v in cfg.budgets),
+        int(max(cfg.budgets)),
         tuple(float(v) for v in cfg.sgd_lrs),
         tuple(float(v) for v in cfg.adam_lrs),
     )
-    for budget in cfg.budgets:
-        budget_started = time.time()
-        budget_curve_count = 0
-        for start_index, item in enumerate(ctx.tune_items):
-            if start_index == 0 or start_index + 1 == len(ctx.tune_items):
-                LOGGER.info("%s tuning budget=%d start=%d/%d", label, int(budget), start_index + 1, len(ctx.tune_items))
-            train_loss = ctx.train_loss_factory(item)
-            test_loss = ctx.test_loss_factory(item)
-            for family in FAMILIES:
-                for optimizer in OPTIMIZERS:
-                    for lr in _lr_grid(cfg, optimizer):
-                        method = _method_name(family, optimizer)
-                        curve = _run_method_curve(
-                            family=family,
-                            optimizer=optimizer,
-                            lr=float(lr),
-                            item=item,
-                            steps=int(budget),
-                            train_loss_fn=train_loss,
-                            test_loss_fn=test_loss,
-                            trained_flow=trained_flow,
-                            random_flow=random_flow,
-                            store_path=False,
+    run_budget = int(max(cfg.budgets))
+    metric_budgets = tuple(sorted({int(v) for v in cfg.budgets}))
+    if _is_batchable_context(ctx):
+        started = time.time()
+        train_loss = ctx.train_loss_factory(ctx.tune_items[0])
+        test_loss = ctx.test_loss_factory(ctx.tune_items[0])
+        starts = torch.stack([item.start for item in ctx.tune_items], dim=0)
+        for family in FAMILIES:
+            for optimizer in OPTIMIZERS:
+                lr_grid = tuple(float(v) for v in _lr_grid(cfg, optimizer))
+                theta_batch = torch.cat([starts for _ in lr_grid], dim=0)
+                lr_batch = torch.tensor(
+                    [lr for lr in lr_grid for _ in range(len(ctx.tune_items))],
+                    device=starts.device,
+                    dtype=starts.dtype,
+                )
+                LOGGER.info(
+                    "%s tuning batched family=%s optimizer=%s batch=%d chunk_size=%d run_budget=%d",
+                    label,
+                    family,
+                    optimizer,
+                    int(theta_batch.shape[0]),
+                    int(cfg.downstream_tuning_batch_size),
+                    run_budget,
+                )
+                curves: list[Curve] = []
+                for chunk in _batch_slices(int(theta_batch.shape[0]), int(cfg.downstream_tuning_batch_size)):
+                    if family == "direct":
+                        curves.extend(
+                            run_direct_curves_batched(
+                                train_loss_fn=train_loss,
+                                test_loss_fn=test_loss,
+                                theta0_batch=theta_batch[chunk],
+                                optimizer_name=optimizer,
+                                lrs=lr_batch[chunk],
+                                steps=run_budget,
+                            )
                         )
+                    else:
+                        flow = trained_flow if family == "trained_flow" else random_flow
+                        curves.extend(
+                            run_flow_curves_batched(
+                                train_loss_fn=train_loss,
+                                test_loss_fn=test_loss,
+                                flow=flow,
+                                theta0_batch=theta_batch[chunk],
+                                optimizer_name=optimizer,
+                                lrs=lr_batch[chunk],
+                                steps=run_budget,
+                            )
+                        )
+                method = _method_name(family, optimizer)
+                for lr_index, lr in enumerate(lr_grid):
+                    for start_index in range(len(ctx.tune_items)):
+                        curve = curves[lr_index * len(ctx.tune_items) + start_index]
                         records.append(
                             {
-                                "curve_id": _curve_id(ctx.experiment, ctx.task, "tune", ctx.seed, ctx.condition_value, budget, method, lr, start_index),
+                                "curve_id": _curve_id(ctx.experiment, ctx.task, "tune", ctx.seed, ctx.condition_value, run_budget, method, lr, start_index),
                                 "curve": curve,
                                 "experiment": ctx.experiment,
                                 "task": ctx.task,
@@ -489,7 +562,9 @@ def _make_tuning_records(
                                 "split": "tune",
                                 "candidate": True,
                                 "seed": int(ctx.seed),
-                                "budget": int(budget),
+                                "budget": run_budget,
+                                "curve_budget": run_budget,
+                                "metric_budgets": metric_budgets,
                                 "family": family,
                                 "method": method,
                                 "optimizer": optimizer,
@@ -497,14 +572,68 @@ def _make_tuning_records(
                                 "start_index": int(start_index),
                             }
                         )
-                        budget_curve_count += 1
         LOGGER.info(
-            "%s tuning budget=%d done curves=%d elapsed_s=%.1f",
+            "%s tuning batched done curves=%d metric_rows=%d elapsed_s=%.1f",
             label,
-            int(budget),
-            budget_curve_count,
-            time.time() - budget_started,
+            len(records),
+            len(records) * len(metric_budgets),
+            time.time() - started,
         )
+        return records
+    started = time.time()
+    curve_count = 0
+    for start_index, item in enumerate(ctx.tune_items):
+        if start_index == 0 or start_index + 1 == len(ctx.tune_items):
+            LOGGER.info("%s tuning run_budget=%d start=%d/%d", label, run_budget, start_index + 1, len(ctx.tune_items))
+        train_loss = ctx.train_loss_factory(item)
+        test_loss = ctx.test_loss_factory(item)
+        for family in FAMILIES:
+            for optimizer in OPTIMIZERS:
+                for lr in _lr_grid(cfg, optimizer):
+                    method = _method_name(family, optimizer)
+                    curve = _run_method_curve(
+                        family=family,
+                        optimizer=optimizer,
+                        lr=float(lr),
+                        item=item,
+                        steps=run_budget,
+                        train_loss_fn=train_loss,
+                        test_loss_fn=test_loss,
+                        trained_flow=trained_flow,
+                        random_flow=random_flow,
+                        store_path=False,
+                    )
+                    records.append(
+                        {
+                            "curve_id": _curve_id(ctx.experiment, ctx.task, "tune", ctx.seed, ctx.condition_value, run_budget, method, lr, start_index),
+                            "curve": curve,
+                            "experiment": ctx.experiment,
+                            "task": ctx.task,
+                            "condition_name": ctx.condition_name,
+                            "condition_value": str(ctx.condition_value),
+                            "numeric_condition": ctx.numeric_condition,
+                            "split": "tune",
+                            "candidate": True,
+                            "seed": int(ctx.seed),
+                            "budget": run_budget,
+                            "curve_budget": run_budget,
+                            "metric_budgets": metric_budgets,
+                            "family": family,
+                            "method": method,
+                            "optimizer": optimizer,
+                            "lr": float(lr),
+                            "start_index": int(start_index),
+                        }
+                    )
+                    curve_count += 1
+    LOGGER.info(
+        "%s tuning run_budget=%d done curves=%d metric_rows=%d elapsed_s=%.1f",
+        label,
+        run_budget,
+        curve_count,
+        curve_count * len(metric_budgets),
+        time.time() - started,
+    )
     LOGGER.info("%s tuning done curves=%d", label, len(records))
     return records
 
@@ -527,35 +656,119 @@ def _make_eval_records(
         & (selected_lrs["seed"] == int(ctx.seed))
     ]
     LOGGER.info("%s eval start selected_lr_rows=%d eval_starts=%d", label, len(selected), len(ctx.eval_items))
-    for selected_row in selected.itertuples(index=False):
+    if _is_batchable_context(ctx):
+        train_loss = ctx.train_loss_factory(ctx.eval_items[0])
+        test_loss = ctx.test_loss_factory(ctx.eval_items[0])
+        starts = torch.stack([item.start for item in ctx.eval_items], dim=0)
+        group_cols = ["family", "method", "optimizer", "selected_lr"]
+        for group_key, selected_group in selected.groupby(group_cols, dropna=False):
+            family, method, optimizer, selected_lr = group_key
+            metric_budgets = tuple(sorted({int(v) for v in selected_group["budget"].tolist()}))
+            run_budget = int(max(metric_budgets))
+            started = time.time()
+            lr_batch = torch.full((len(ctx.eval_items),), float(selected_lr), device=starts.device, dtype=starts.dtype)
+            LOGGER.info(
+                "%s eval batched method=%s run_budget=%d metric_budgets=%s batch=%d chunk_size=%d lr=%g",
+                label,
+                method,
+                run_budget,
+                metric_budgets,
+                int(starts.shape[0]),
+                int(cfg.downstream_eval_batch_size),
+                float(selected_lr),
+            )
+            curves: list[Curve] = []
+            for chunk in _batch_slices(int(starts.shape[0]), int(cfg.downstream_eval_batch_size)):
+                if family == "direct":
+                    curves.extend(
+                        run_direct_curves_batched(
+                            train_loss_fn=train_loss,
+                            test_loss_fn=test_loss,
+                            theta0_batch=starts[chunk],
+                            optimizer_name=str(optimizer),
+                            lrs=lr_batch[chunk],
+                            steps=run_budget,
+                        )
+                    )
+                else:
+                    flow = trained_flow if family == "trained_flow" else random_flow
+                    curves.extend(
+                        run_flow_curves_batched(
+                            train_loss_fn=train_loss,
+                            test_loss_fn=test_loss,
+                            flow=flow,
+                            theta0_batch=starts[chunk],
+                            optimizer_name=str(optimizer),
+                            lrs=lr_batch[chunk],
+                            steps=run_budget,
+                        )
+                    )
+            for start_index, curve in enumerate(curves):
+                records.append(
+                    {
+                        "curve_id": _curve_id(ctx.experiment, ctx.task, "eval", ctx.seed, ctx.condition_value, run_budget, method, selected_lr, start_index),
+                        "curve": curve,
+                        "experiment": ctx.experiment,
+                        "task": ctx.task,
+                        "condition_name": ctx.condition_name,
+                        "condition_value": str(ctx.condition_value),
+                        "numeric_condition": ctx.numeric_condition,
+                        "split": "eval",
+                        "candidate": False,
+                        "seed": int(ctx.seed),
+                        "budget": run_budget,
+                        "curve_budget": run_budget,
+                        "metric_budgets": metric_budgets,
+                        "family": str(family),
+                        "method": str(method),
+                        "optimizer": str(optimizer),
+                        "lr": float(selected_lr),
+                        "start_index": int(start_index),
+                    }
+                )
+            LOGGER.info(
+                "%s eval batched method=%s run_budget=%d done elapsed_s=%.1f",
+                label,
+                method,
+                run_budget,
+                time.time() - started,
+            )
+        LOGGER.info("%s eval batched done curves=%d", label, len(records))
+        return records
+    group_cols = ["family", "method", "optimizer", "selected_lr"]
+    for group_key, selected_group in selected.groupby(group_cols, dropna=False):
+        family, method, optimizer, selected_lr = group_key
+        metric_budgets = tuple(sorted({int(v) for v in selected_group["budget"].tolist()}))
+        run_budget = int(max(metric_budgets))
         row_started = time.time()
         LOGGER.info(
-            "%s eval method=%s budget=%d lr=%g starts=%d",
+            "%s eval method=%s run_budget=%d metric_budgets=%s lr=%g starts=%d",
             label,
-            selected_row.method,
-            int(selected_row.budget),
-            float(selected_row.selected_lr),
+            method,
+            run_budget,
+            metric_budgets,
+            float(selected_lr),
             len(ctx.eval_items),
         )
         for start_index, item in enumerate(ctx.eval_items):
             if start_index == 0 or start_index + 1 == len(ctx.eval_items):
                 LOGGER.info(
-                    "%s eval method=%s budget=%d start=%d/%d",
+                    "%s eval method=%s run_budget=%d start=%d/%d",
                     label,
-                    selected_row.method,
-                    int(selected_row.budget),
+                    method,
+                    run_budget,
                     start_index + 1,
                     len(ctx.eval_items),
                 )
             train_loss = ctx.train_loss_factory(item)
             test_loss = ctx.test_loss_factory(item)
-            store_path = bool(ctx.dim == 2 and int(start_index) < 3 and int(selected_row.budget) == int(max(cfg.budgets)))
+            store_path = bool(ctx.dim == 2 and int(start_index) < 3 and run_budget == int(max(cfg.budgets)))
             curve = _run_method_curve(
-                family=str(selected_row.family),
-                optimizer=str(selected_row.optimizer),
-                lr=float(selected_row.selected_lr),
+                family=str(family),
+                optimizer=str(optimizer),
+                lr=float(selected_lr),
                 item=item,
-                steps=int(selected_row.budget),
+                steps=run_budget,
                 train_loss_fn=train_loss,
                 test_loss_fn=test_loss,
                 trained_flow=trained_flow,
@@ -564,7 +777,7 @@ def _make_eval_records(
             )
             records.append(
                 {
-                    "curve_id": _curve_id(ctx.experiment, ctx.task, "eval", ctx.seed, ctx.condition_value, selected_row.budget, selected_row.method, start_index),
+                    "curve_id": _curve_id(ctx.experiment, ctx.task, "eval", ctx.seed, ctx.condition_value, run_budget, method, selected_lr, start_index),
                     "curve": curve,
                     "experiment": ctx.experiment,
                     "task": ctx.task,
@@ -574,19 +787,21 @@ def _make_eval_records(
                     "split": "eval",
                     "candidate": False,
                     "seed": int(ctx.seed),
-                    "budget": int(selected_row.budget),
-                    "family": str(selected_row.family),
-                    "method": str(selected_row.method),
-                    "optimizer": str(selected_row.optimizer),
-                    "lr": float(selected_row.selected_lr),
+                    "budget": run_budget,
+                    "curve_budget": run_budget,
+                    "metric_budgets": metric_budgets,
+                    "family": str(family),
+                    "method": str(method),
+                    "optimizer": str(optimizer),
+                    "lr": float(selected_lr),
                     "start_index": int(start_index),
                 }
             )
         LOGGER.info(
-            "%s eval method=%s budget=%d done elapsed_s=%.1f",
+            "%s eval method=%s run_budget=%d done elapsed_s=%.1f",
             label,
-            selected_row.method,
-            int(selected_row.budget),
+            method,
+            run_budget,
             time.time() - row_started,
         )
     LOGGER.info("%s eval done curves=%d", label, len(records))
@@ -698,30 +913,70 @@ def run_all_experiments(cfg: ExperimentConfig) -> ExperimentTables:
         tuple(int(v) for v in cfg.budgets),
     )
 
-    contexts = [
+    contexts = _interleave_contexts_by_experiment([
         ctx
         for seed in cfg.seeds
         for ctx in build_contexts_for_seed(cfg, seed=int(seed), device=device, dtype=dtype)
-    ]
-    LOGGER.info("planned contexts=%d", len(contexts))
+    ])
+    workers = min(max(1, int(cfg.parallel_contexts)), max(1, len(contexts)))
+    LOGGER.info("planned contexts=%d parallel_contexts=%d", len(contexts), workers)
     parts: list[tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]] = []
-    for context_index, ctx in enumerate(contexts, start=1):
-        context_started = time.time()
-        LOGGER.info("context %d/%d begin %s", context_index, len(contexts), _context_label(ctx))
-        parts.append(_run_context(ctx, cfg))
-        elapsed = time.time() - run_started
-        per_context = elapsed / float(context_index)
-        remaining = max(0, len(contexts) - context_index) * per_context
-        LOGGER.info(
-            "context %d/%d done context_elapsed_s=%.1f run_elapsed_s=%.1f avg_context_s=%.1f eta_s=%.1f eta_h=%.2f",
-            context_index,
-            len(contexts),
-            time.time() - context_started,
-            elapsed,
-            per_context,
-            remaining,
-            remaining / 3600.0,
-        )
+    if workers == 1:
+        for context_index, ctx in enumerate(contexts, start=1):
+            context_started = time.time()
+            LOGGER.info("context %d/%d begin %s", context_index, len(contexts), _context_label(ctx))
+            parts.append(_run_context(ctx, cfg))
+            elapsed = time.time() - run_started
+            per_context = elapsed / float(context_index)
+            remaining = max(0, len(contexts) - context_index) * per_context
+            LOGGER.info(
+                "context %d/%d done context_elapsed_s=%.1f run_elapsed_s=%.1f avg_context_s=%.1f eta_s=%.1f eta_h=%.2f",
+                context_index,
+                len(contexts),
+                time.time() - context_started,
+                elapsed,
+                per_context,
+                remaining,
+                remaining / 3600.0,
+            )
+    else:
+        LOGGER.info("parallel context execution enabled workers=%d", workers)
+        parts_by_index: dict[int, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="flow_ctx") as executor:
+            futures = {}
+            for context_index, ctx in enumerate(contexts, start=1):
+                LOGGER.info("context %d/%d queued %s", context_index, len(contexts), _context_label(ctx))
+                futures[executor.submit(_run_context, ctx, cfg)] = (context_index, ctx, time.time())
+            completed = 0
+            for future in as_completed(futures):
+                context_index, ctx, submitted_at = futures[future]
+                try:
+                    parts_by_index[context_index] = future.result()
+                except Exception:
+                    LOGGER.exception(
+                        "context %d/%d failed %s run_elapsed_s=%.1f",
+                        context_index,
+                        len(contexts),
+                        _context_label(ctx),
+                        time.time() - run_started,
+                    )
+                    raise
+                completed += 1
+                elapsed = time.time() - run_started
+                avg_completion_s = elapsed / float(completed)
+                remaining = max(0, len(contexts) - completed) * avg_completion_s
+                LOGGER.info(
+                    "context completed=%d/%d original_index=%d queue_elapsed_s=%.1f run_elapsed_s=%.1f avg_completion_s=%.1f eta_s=%.1f eta_h=%.2f",
+                    completed,
+                    len(contexts),
+                    context_index,
+                    time.time() - submitted_at,
+                    elapsed,
+                    avg_completion_s,
+                    remaining,
+                    remaining / 3600.0,
+                )
+        parts = [parts_by_index[index] for index in sorted(parts_by_index)]
 
     results = pd.concat([part[0] for part in parts], ignore_index=True) if parts else pd.DataFrame()
     curves = pd.concat([part[1] for part in parts], ignore_index=True) if parts else pd.DataFrame()
