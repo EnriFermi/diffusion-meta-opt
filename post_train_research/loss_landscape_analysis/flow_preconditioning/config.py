@@ -102,6 +102,8 @@ class ExperimentConfig:
     write_csv: bool = True
     write_parquet: bool = True
     save_figures: bool = True
+    progress_log_enabled: bool = True
+    log_level: str = "INFO"
 
 
 def config_to_dict(cfg: ExperimentConfig) -> dict[str, Any]:
