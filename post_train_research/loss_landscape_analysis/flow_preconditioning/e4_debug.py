@@ -11,6 +11,7 @@ import torch
 
 from .config import ExperimentConfig, config_to_dict, torch_dtype
 from .flow_experiment import make_flow
+from .optimization import Curve, LossFn
 from .probe_geometry import (
     ResidualThetaProbe,
     TensorFn,
@@ -290,3 +291,70 @@ def train_e4_debug_flow(state: E4DebugState) -> E4DebugResult:
     final_geometry.to_csv(state.output_dir / "final_geometry.csv", index=False)
     torch.save(flow.state_dict(), state.output_dir / "flow_state.pt")
     return E4DebugResult(flow=flow, history=history, final_geometry=final_geometry, output_dir=state.output_dir)
+
+
+def run_probe_metric_curve(
+    *,
+    train_loss_fn: LossFn,
+    test_loss_fn: LossFn,
+    probe: TensorFn,
+    theta0: torch.Tensor,
+    lr: float,
+    steps: int,
+    damping: float,
+    store_path: bool = False,
+) -> Curve:
+    theta = theta0.detach().clone().requires_grad_(True)
+    dim = int(theta.numel())
+    train_losses_device = torch.empty(int(steps) + 1, device=theta.device, dtype=torch.float64)
+    test_losses_device = torch.empty(int(steps) + 1, device=theta.device, dtype=torch.float64)
+    path = torch.empty(int(steps) + 1, dim, device=theta.device, dtype=torch.float64) if store_path else None
+    eye = torch.eye(dim, device=theta.device, dtype=theta.dtype)
+
+    for step in range(0, int(steps) + 1):
+        loss = train_loss_fn(theta)
+        train_losses_device[step] = loss.detach().to(dtype=torch.float64)
+        with torch.no_grad():
+            test_losses_device[step] = test_loss_fn(theta).detach().to(dtype=torch.float64)
+            if path is not None:
+                path[step] = theta.detach().to(dtype=torch.float64)
+        if step == int(steps):
+            break
+
+        grad = torch.autograd.grad(loss, theta)[0].detach()
+        jacobian = probe_jacobians_for_theta(probe, theta.detach().reshape(1, -1), create_graph=False).squeeze(0)
+        metric = jacobian.transpose(0, 1) @ jacobian
+        metric = metric + float(damping) * eye
+        direction = torch.linalg.solve(metric, grad.reshape(-1, 1)).reshape(-1)
+        theta = (theta.detach() - float(lr) * direction.detach()).requires_grad_(True)
+
+    return Curve(
+        train_loss=train_losses_device.detach().cpu().numpy(),
+        test_loss=test_losses_device.detach().cpu().numpy(),
+        final_theta=theta.detach().cpu().numpy(),
+        path=path.detach().cpu().numpy() if path is not None else None,
+    )
+
+
+def run_probe_metric_curves(
+    *,
+    train_loss_fn: LossFn,
+    test_loss_fn: LossFn,
+    probe: TensorFn,
+    theta0_batch: torch.Tensor,
+    lr: float,
+    steps: int,
+    damping: float,
+) -> list[Curve]:
+    return [
+        run_probe_metric_curve(
+            train_loss_fn=train_loss_fn,
+            test_loss_fn=test_loss_fn,
+            probe=probe,
+            theta0=theta0_batch[idx],
+            lr=float(lr),
+            steps=int(steps),
+            damping=float(damping),
+        )
+        for idx in range(int(theta0_batch.shape[0]))
+    ]

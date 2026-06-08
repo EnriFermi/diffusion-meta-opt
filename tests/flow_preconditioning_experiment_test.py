@@ -30,6 +30,7 @@ from post_train_research.loss_landscape_analysis.flow_preconditioning.contexts i
 from post_train_research.loss_landscape_analysis.flow_preconditioning.e4_debug import (
     E4DebugConfig,
     build_e4_debug_state,
+    run_probe_metric_curves,
     train_e4_debug_flow,
 )
 from post_train_research.loss_landscape_analysis.flow_preconditioning.runner import _select_lrs
@@ -403,3 +404,41 @@ def test_e4_geometry_debug_smoke_writes_outputs(tmp_path) -> None:
     assert (result.output_dir / "history.csv").is_file()
     assert (result.output_dir / "final_geometry.csv").is_file()
     assert (result.output_dir / "flow_state.pt").is_file()
+
+
+def test_probe_metric_curves_smoke(tmp_path) -> None:
+    debug_cfg = E4DebugConfig(
+        run_label="probe_metric_smoke",
+        artifact_root=str(tmp_path),
+        device="cpu",
+        seed=0,
+        flow_random_samples=2,
+        flow_trajectory_count=1,
+        flow_trajectory_steps=1,
+        heldout_geometry_samples=2,
+        train_eval_samples=1,
+        heldout_eval_samples=1,
+        train_points=8,
+        probe_points=8,
+        test_points=16,
+    )
+    state = build_e4_debug_state(debug_cfg)
+    starts = state.problem.sample_starts(2, seed=321)
+
+    curves = run_probe_metric_curves(
+        train_loss_fn=state.problem.train_loss,
+        test_loss_fn=state.problem.test_loss,
+        probe=state.probe,
+        theta0_batch=starts,
+        lr=1e-2,
+        steps=2,
+        damping=1e-3,
+    )
+
+    assert len(curves) == 2
+    for curve in curves:
+        assert curve.train_loss.shape == (3,)
+        assert curve.test_loss.shape == (3,)
+        assert curve.final_theta is not None
+        assert curve.final_theta.shape == (25,)
+        assert np.isfinite(curve.train_loss).all()
