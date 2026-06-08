@@ -22,6 +22,7 @@ class ExperimentConfig:
     device: str = _default_device()
     dtype: str = "float32"
 
+    experiments: tuple[str, ...] = ("E0", "E1", "E2", "E3", "E4")
     seeds: tuple[int, ...] = (0, 1, 2, 3, 4)
     k_tune: int = 8
     k_eval: int = 32
@@ -53,6 +54,7 @@ class ExperimentConfig:
     heldout_geometry_samples: int = 256
 
     flow_steps: int = 3000
+    e4_flow_steps: int = 0
     sanity_flow_steps: int = 2000
     flow_batch_size: int = 128
     flow_lr: float = 1e-3

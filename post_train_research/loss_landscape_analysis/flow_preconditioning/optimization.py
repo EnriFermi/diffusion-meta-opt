@@ -9,6 +9,7 @@ import torch
 
 
 LossFn = Callable[[torch.Tensor], torch.Tensor]
+BatchLossFn = Callable[[torch.Tensor], torch.Tensor]
 
 
 @dataclass(slots=True)
@@ -26,6 +27,13 @@ def _vmap_scalar_loss(loss_fn: LossFn, values: torch.Tensor) -> torch.Tensor:
         return vmap(loss_fn)(values)
     except Exception:
         return torch.stack([loss_fn(value) for value in values], dim=0)
+
+
+def _as_batch_losses(losses: torch.Tensor, batch: int) -> torch.Tensor:
+    values = losses.reshape(-1)
+    if int(values.shape[0]) != int(batch):
+        raise ValueError(f"batched loss must return [{batch}], got {tuple(losses.shape)}")
+    return values
 
 
 def _optimizer_name(name: str) -> str:
@@ -165,6 +173,25 @@ def run_direct_curves_batched(
     lrs: torch.Tensor,
     steps: int,
 ) -> list[Curve]:
+    return run_direct_curves_batched_loss(
+        train_loss_batch_fn=lambda values: _vmap_scalar_loss(train_loss_fn, values),
+        test_loss_batch_fn=lambda values: _vmap_scalar_loss(test_loss_fn, values),
+        theta0_batch=theta0_batch,
+        optimizer_name=optimizer_name,
+        lrs=lrs,
+        steps=steps,
+    )
+
+
+def run_direct_curves_batched_loss(
+    *,
+    train_loss_batch_fn: BatchLossFn,
+    test_loss_batch_fn: BatchLossFn,
+    theta0_batch: torch.Tensor,
+    optimizer_name: str,
+    lrs: torch.Tensor,
+    steps: int,
+) -> list[Curve]:
     optimizer_value = _optimizer_name(optimizer_name)
     theta = theta0_batch.detach().clone().requires_grad_(True)
     lr_values = lrs.detach().to(device=theta.device, dtype=theta.dtype).reshape(-1, 1)
@@ -173,10 +200,10 @@ def run_direct_curves_batched(
     test_losses_device = torch.empty(int(steps) + 1, batch, device=theta.device, dtype=torch.float64)
     opt_state: dict[str, torch.Tensor] = {}
     for step in range(0, int(steps) + 1):
-        losses = _vmap_scalar_loss(train_loss_fn, theta)
+        losses = _as_batch_losses(train_loss_batch_fn(theta), batch)
         train_losses_device[step] = losses.detach().to(dtype=torch.float64)
         with torch.no_grad():
-            test_losses_device[step] = _vmap_scalar_loss(test_loss_fn, theta).detach().to(dtype=torch.float64)
+            test_losses_device[step] = _as_batch_losses(test_loss_batch_fn(theta), batch).detach().to(dtype=torch.float64)
         if step == int(steps):
             break
         grad = torch.autograd.grad(losses.sum(), theta)[0]
@@ -217,6 +244,27 @@ def run_flow_curves_batched(
     lrs: torch.Tensor,
     steps: int,
 ) -> list[Curve]:
+    return run_flow_curves_batched_loss(
+        train_loss_batch_fn=lambda values: _vmap_scalar_loss(train_loss_fn, values),
+        test_loss_batch_fn=lambda values: _vmap_scalar_loss(test_loss_fn, values),
+        flow=flow,
+        theta0_batch=theta0_batch,
+        optimizer_name=optimizer_name,
+        lrs=lrs,
+        steps=steps,
+    )
+
+
+def run_flow_curves_batched_loss(
+    *,
+    train_loss_batch_fn: BatchLossFn,
+    test_loss_batch_fn: BatchLossFn,
+    flow: torch.nn.Module,
+    theta0_batch: torch.Tensor,
+    optimizer_name: str,
+    lrs: torch.Tensor,
+    steps: int,
+) -> list[Curve]:
     optimizer_value = _optimizer_name(optimizer_name)
     flow.eval()
     for param in flow.parameters():
@@ -231,10 +279,10 @@ def run_flow_curves_batched(
     opt_state: dict[str, torch.Tensor] = {}
     for step in range(0, int(steps) + 1):
         theta = flow.inverse(u)[0]
-        losses = _vmap_scalar_loss(train_loss_fn, theta)
+        losses = _as_batch_losses(train_loss_batch_fn(theta), batch)
         train_losses_device[step] = losses.detach().to(dtype=torch.float64)
         with torch.no_grad():
-            test_losses_device[step] = _vmap_scalar_loss(test_loss_fn, theta).detach().to(dtype=torch.float64)
+            test_losses_device[step] = _as_batch_losses(test_loss_batch_fn(theta), batch).detach().to(dtype=torch.float64)
         if step == int(steps):
             break
         grad = torch.autograd.grad(losses.sum(), u)[0]

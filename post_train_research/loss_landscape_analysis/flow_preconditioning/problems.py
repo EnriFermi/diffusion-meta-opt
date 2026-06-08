@@ -66,11 +66,32 @@ class Decoder2DProblem:
             dim=0,
         )
 
+    def decoder_batch(self, z: torch.Tensor) -> torch.Tensor:
+        if z.ndim != 2 or int(z.shape[1]) != self.dim:
+            raise ValueError(f"z must be [B,{self.dim}], got {tuple(z.shape)}")
+        z1, z2 = z[:, 0], z[:, 1]
+        radius = 2.0 + 0.4 * z1
+        return torch.stack(
+            [
+                radius * torch.cos(z2),
+                radius * torch.sin(z2),
+                0.25 * z2 + 0.3 * torch.sin(2.0 * z1),
+            ],
+            dim=-1,
+        )
+
     def probe(self, z: torch.Tensor) -> torch.Tensor:
         return self.decoder(z)
 
     def loss_for_target(self, z: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return 0.5 * (self.decoder(z) - target).pow(2).sum()
+
+    def loss_for_targets(self, z: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if targets.ndim != 2 or int(targets.shape[1]) != 3:
+            raise ValueError(f"targets must be [B,3], got {tuple(targets.shape)}")
+        if int(targets.shape[0]) != int(z.shape[0]):
+            raise ValueError(f"z and targets batch sizes differ: {tuple(z.shape)} vs {tuple(targets.shape)}")
+        return 0.5 * (self.decoder_batch(z) - targets).pow(2).sum(dim=-1)
 
     def sample_domain(self, count: int, *, seed: int) -> torch.Tensor:
         return _uniform(
