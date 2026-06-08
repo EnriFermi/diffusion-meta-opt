@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 
@@ -9,6 +10,9 @@ from post_train_research.big_vae_latent_flattening.flow import RealNVPConfig, Re
 
 from .config import ExperimentConfig
 from .probe_geometry import TensorFn, isometry_objective_from_jacobians, probe_jacobians_for_flow
+
+
+LOGGER = logging.getLogger("flow_preconditioning")
 
 
 def make_flow(dim: int, cfg: ExperimentConfig) -> RealNVPFlow:
@@ -67,6 +71,7 @@ def train_flow(
     cfg: ExperimentConfig,
     steps: int,
     seed: int,
+    log_label: str = "",
 ) -> FlowTrainingResult:
     if theta_samples.ndim != 2:
         raise ValueError(f"theta_samples must be [N,D], got {tuple(theta_samples.shape)}")
@@ -82,6 +87,16 @@ def train_flow(
     started = time.time()
     sample_count = int(theta_samples.shape[0])
     batch_size = min(max(1, int(cfg.flow_batch_size)), sample_count)
+    label = f"{log_label} " if log_label else ""
+    LOGGER.info(
+        "%sflow_train start dim=%d samples=%d batch_size=%d steps=%d lr=%g",
+        label,
+        dim,
+        sample_count,
+        batch_size,
+        int(steps),
+        float(cfg.flow_lr),
+    )
     for step in range(1, int(steps) + 1):
         indices = torch.randint(0, sample_count, (batch_size,), generator=generator, device="cpu")
         batch = theta_samples.index_select(0, indices.to(device=theta_samples.device))
@@ -95,12 +110,26 @@ def train_flow(
         optimizer.step()
         if step == 1 or step % int(cfg.flow_log_every) == 0 or step == int(steps):
             with torch.no_grad():
+                loss_value = float(loss.detach().cpu().item())
+                grad_value = float(torch.as_tensor(grad_norm).detach().cpu().item())
+                elapsed = float(time.time() - started)
                 history.append(
                     {
                         "step": float(step),
-                        "loss": float(loss.detach().cpu().item()),
-                        "grad_norm": float(torch.as_tensor(grad_norm).detach().cpu().item()),
-                        "elapsed_s": float(time.time() - started),
+                        "loss": loss_value,
+                        "grad_norm": grad_value,
+                        "elapsed_s": elapsed,
                     }
                 )
-    return FlowTrainingResult(flow=flow, history=history, elapsed_s=float(time.time() - started))
+                LOGGER.info(
+                    "%sflow_train step=%d/%d loss=%.6g grad=%.6g elapsed_s=%.1f",
+                    label,
+                    step,
+                    int(steps),
+                    loss_value,
+                    grad_value,
+                    elapsed,
+                )
+    elapsed_total = float(time.time() - started)
+    LOGGER.info("%sflow_train done elapsed_s=%.1f", label, elapsed_total)
+    return FlowTrainingResult(flow=flow, history=history, elapsed_s=elapsed_total)

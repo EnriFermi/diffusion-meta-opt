@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import logging
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +29,7 @@ from .toy_mlp import seed_offset
 
 FAMILIES = ("direct", "trained_flow", "random_flow")
 OPTIMIZERS = ("sgd", "adam")
+LOGGER = logging.getLogger("flow_preconditioning")
 
 
 @dataclass(slots=True)
@@ -63,6 +67,38 @@ def _stable_int(*parts: object, modulo: int = 20_000) -> int:
     payload = "|".join(str(part) for part in parts)
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return int(digest[:12], 16) % int(modulo)
+
+
+def _log_level(cfg: ExperimentConfig) -> int:
+    return int(getattr(logging, str(cfg.log_level).strip().upper(), logging.INFO))
+
+
+def _configure_progress_logging(output_dir: Path, cfg: ExperimentConfig) -> None:
+    if not bool(cfg.progress_log_enabled):
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.setLevel(_log_level(cfg))
+    LOGGER.propagate = False
+    for handler in list(LOGGER.handlers):
+        if getattr(handler, "_flow_preconditioning_managed", False):
+            LOGGER.removeHandler(handler)
+            handler.close()
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    stream_handler._flow_preconditioning_managed = True  # type: ignore[attr-defined]
+    file_handler = logging.FileHandler(output_dir / "progress.log", mode="a", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    file_handler._flow_preconditioning_managed = True  # type: ignore[attr-defined]
+    LOGGER.addHandler(stream_handler)
+    LOGGER.addHandler(file_handler)
+
+
+def _context_label(ctx: ConditionContext) -> str:
+    return (
+        f"[{ctx.experiment} task={ctx.task} {ctx.condition_name}={ctx.condition_value} "
+        f"seed={ctx.seed}]"
+    )
 
 
 def _run_method_curve(
@@ -106,14 +142,18 @@ def _train_flows_and_geometry(
     cfg: ExperimentConfig,
 ) -> tuple[torch.nn.Module, torch.nn.Module, list[dict[str, object]], list[dict[str, object]]]:
     seed_for_flow = seed_offset(ctx.seed, 50_000 + _stable_int(ctx.experiment, ctx.task, ctx.condition_name, ctx.condition_value))
+    label = _context_label(ctx)
+    LOGGER.info("%s context flow+geometry start", label)
     flow_result = train_flow(
         probe=ctx.probe,
         theta_samples=ctx.flow_pool,
         cfg=cfg,
         steps=int(ctx.flow_steps),
         seed=int(seed_for_flow),
+        log_label=label,
     )
     trained_flow = freeze_flow(flow_result.flow)
+    LOGGER.info("%s random_flow build start", label)
     random_flow = freeze_flow(
         make_random_flow(
             ctx.dim,
@@ -125,6 +165,7 @@ def _train_flows_and_geometry(
     )
 
     geometry_rows: list[dict[str, object]] = []
+    LOGGER.info("%s geometry original start heldout_samples=%d", label, int(ctx.heldout_pool.shape[0]))
     theta_jac = probe_jacobians_for_theta(ctx.probe, ctx.heldout_pool, create_graph=False)
     geometry_rows.extend(
         geometry_rows_from_jacobians(
@@ -138,6 +179,7 @@ def _train_flows_and_geometry(
             rho=ctx.numeric_condition,
         )
     )
+    LOGGER.info("%s geometry trained_flow start", label)
     trained_jac, _ = probe_jacobians_for_flow(ctx.probe, trained_flow, ctx.heldout_pool, create_graph=False)
     geometry_rows.extend(
         geometry_rows_from_jacobians(
@@ -151,7 +193,9 @@ def _train_flows_and_geometry(
             rho=ctx.numeric_condition,
         )
     )
+    LOGGER.info("%s geometry random_flow start", label)
     random_jac, _ = probe_jacobians_for_flow(ctx.probe, random_flow, ctx.heldout_pool, create_graph=False)
+    LOGGER.info("%s coordinate_map trained_flow diagnostics start", label)
     geometry_rows.extend(
         geometry_rows_from_jacobians(
             random_jac,
@@ -164,6 +208,7 @@ def _train_flows_and_geometry(
             rho=ctx.numeric_condition,
         )
     )
+    LOGGER.info("%s coordinate_map random_flow diagnostics start", label)
     geometry_rows.extend(
         flow_coordinate_diagnostic_rows(
             trained_flow,
@@ -201,6 +246,7 @@ def _train_flows_and_geometry(
         }
         for row in flow_result.history
     ]
+    LOGGER.info("%s context flow+geometry done geometry_rows=%d", label, len(geometry_rows))
     return trained_flow, random_flow, geometry_rows, flow_history
 
 
@@ -398,8 +444,21 @@ def _make_tuning_records(
     cfg: ExperimentConfig,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    label = _context_label(ctx)
+    LOGGER.info(
+        "%s tuning start starts=%d budgets=%s sgd_lrs=%s adam_lrs=%s",
+        label,
+        len(ctx.tune_items),
+        tuple(int(v) for v in cfg.budgets),
+        tuple(float(v) for v in cfg.sgd_lrs),
+        tuple(float(v) for v in cfg.adam_lrs),
+    )
     for budget in cfg.budgets:
+        budget_started = time.time()
+        budget_curve_count = 0
         for start_index, item in enumerate(ctx.tune_items):
+            if start_index == 0 or start_index + 1 == len(ctx.tune_items):
+                LOGGER.info("%s tuning budget=%d start=%d/%d", label, int(budget), start_index + 1, len(ctx.tune_items))
             train_loss = ctx.train_loss_factory(item)
             test_loss = ctx.test_loss_factory(item)
             for family in FAMILIES:
@@ -438,6 +497,15 @@ def _make_tuning_records(
                                 "start_index": int(start_index),
                             }
                         )
+                        budget_curve_count += 1
+        LOGGER.info(
+            "%s tuning budget=%d done curves=%d elapsed_s=%.1f",
+            label,
+            int(budget),
+            budget_curve_count,
+            time.time() - budget_started,
+        )
+    LOGGER.info("%s tuning done curves=%d", label, len(records))
     return records
 
 
@@ -450,6 +518,7 @@ def _make_eval_records(
     cfg: ExperimentConfig,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    label = _context_label(ctx)
     selected = selected_lrs[
         (selected_lrs["experiment"] == ctx.experiment)
         & (selected_lrs["task"] == ctx.task)
@@ -457,8 +526,27 @@ def _make_eval_records(
         & (selected_lrs["condition_value"] == str(ctx.condition_value))
         & (selected_lrs["seed"] == int(ctx.seed))
     ]
+    LOGGER.info("%s eval start selected_lr_rows=%d eval_starts=%d", label, len(selected), len(ctx.eval_items))
     for selected_row in selected.itertuples(index=False):
+        row_started = time.time()
+        LOGGER.info(
+            "%s eval method=%s budget=%d lr=%g starts=%d",
+            label,
+            selected_row.method,
+            int(selected_row.budget),
+            float(selected_row.selected_lr),
+            len(ctx.eval_items),
+        )
         for start_index, item in enumerate(ctx.eval_items):
+            if start_index == 0 or start_index + 1 == len(ctx.eval_items):
+                LOGGER.info(
+                    "%s eval method=%s budget=%d start=%d/%d",
+                    label,
+                    selected_row.method,
+                    int(selected_row.budget),
+                    start_index + 1,
+                    len(ctx.eval_items),
+                )
             train_loss = ctx.train_loss_factory(item)
             test_loss = ctx.test_loss_factory(item)
             store_path = bool(ctx.dim == 2 and int(start_index) < 3 and int(selected_row.budget) == int(max(cfg.budgets)))
@@ -494,19 +582,50 @@ def _make_eval_records(
                     "start_index": int(start_index),
                 }
             )
+        LOGGER.info(
+            "%s eval method=%s budget=%d done elapsed_s=%.1f",
+            label,
+            selected_row.method,
+            int(selected_row.budget),
+            time.time() - row_started,
+        )
+    LOGGER.info("%s eval done curves=%d", label, len(records))
     return records
 
 
 def _run_context(ctx: ConditionContext, cfg: ExperimentConfig) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    label = _context_label(ctx)
+    started = time.time()
+    LOGGER.info(
+        "%s context start dim=%d flow_samples=%d heldout_samples=%d tune_starts=%d eval_starts=%d",
+        label,
+        int(ctx.dim),
+        int(ctx.flow_pool.shape[0]),
+        int(ctx.heldout_pool.shape[0]),
+        len(ctx.tune_items),
+        len(ctx.eval_items),
+    )
     trained_flow, random_flow, geometry_rows, flow_history = _train_flows_and_geometry(ctx, cfg)
     grid_rows = warped_grid_rows(ctx, trained_flow, random_flow, cfg)
+    if grid_rows:
+        LOGGER.info("%s warped_grid rows=%d", label, len(grid_rows))
     tuning_records = _make_tuning_records(ctx, trained_flow=trained_flow, random_flow=random_flow, cfg=cfg)
     tuning_results, tuning_curves, _ = _raw_records_to_tables(tuning_records, cfg=cfg, success_threshold_by_key=None)
     tuning_df = pd.DataFrame(tuning_results)
     selected_lrs = _select_lrs(tuning_df)
+    LOGGER.info("%s selected_lrs rows=%d", label, len(selected_lrs))
     thresholds = _success_thresholds(tuning_df, selected_lrs)
+    LOGGER.info("%s success_thresholds rows=%d", label, len(thresholds))
     eval_records = _make_eval_records(ctx, trained_flow=trained_flow, random_flow=random_flow, selected_lrs=selected_lrs, cfg=cfg)
     eval_results, eval_curves, trajectories = _raw_records_to_tables(eval_records, cfg=cfg, success_threshold_by_key=thresholds)
+    LOGGER.info(
+        "%s context done result_rows=%d curve_rows=%d geometry_rows=%d elapsed_s=%.1f",
+        label,
+        len(tuning_results) + len(eval_results),
+        len(tuning_curves) + len(eval_curves),
+        len(geometry_rows),
+        time.time() - started,
+    )
     return (
         pd.DataFrame(tuning_results + eval_results),
         pd.DataFrame(tuning_curves + eval_curves),
@@ -569,11 +688,40 @@ def run_all_experiments(cfg: ExperimentConfig) -> ExperimentTables:
     dtype = torch_dtype(cfg)
     output_dir = run_dir(cfg)
     output_dir.mkdir(parents=True, exist_ok=True)
+    _configure_progress_logging(output_dir, cfg)
+    run_started = time.time()
+    LOGGER.info(
+        "run start output_dir=%s device=%s seeds=%s budgets=%s",
+        output_dir,
+        cfg.device,
+        tuple(int(v) for v in cfg.seeds),
+        tuple(int(v) for v in cfg.budgets),
+    )
 
+    contexts = [
+        ctx
+        for seed in cfg.seeds
+        for ctx in build_contexts_for_seed(cfg, seed=int(seed), device=device, dtype=dtype)
+    ]
+    LOGGER.info("planned contexts=%d", len(contexts))
     parts: list[tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]] = []
-    for seed in cfg.seeds:
-        for ctx in build_contexts_for_seed(cfg, seed=int(seed), device=device, dtype=dtype):
-            parts.append(_run_context(ctx, cfg))
+    for context_index, ctx in enumerate(contexts, start=1):
+        context_started = time.time()
+        LOGGER.info("context %d/%d begin %s", context_index, len(contexts), _context_label(ctx))
+        parts.append(_run_context(ctx, cfg))
+        elapsed = time.time() - run_started
+        per_context = elapsed / float(context_index)
+        remaining = max(0, len(contexts) - context_index) * per_context
+        LOGGER.info(
+            "context %d/%d done context_elapsed_s=%.1f run_elapsed_s=%.1f avg_context_s=%.1f eta_s=%.1f eta_h=%.2f",
+            context_index,
+            len(contexts),
+            time.time() - context_started,
+            elapsed,
+            per_context,
+            remaining,
+            remaining / 3600.0,
+        )
 
     results = pd.concat([part[0] for part in parts], ignore_index=True) if parts else pd.DataFrame()
     curves = pd.concat([part[1] for part in parts], ignore_index=True) if parts else pd.DataFrame()
@@ -585,6 +733,7 @@ def run_all_experiments(cfg: ExperimentConfig) -> ExperimentTables:
     aggregate = aggregate_results(results, cfg)
     deltas = paired_deltas(results)
     interpretation = build_interpretation_markdown(results=results, geometry=geometry, cfg=cfg)
+    LOGGER.info("saving figures=%s", bool(cfg.save_figures))
     figures = save_figures(
         results=results,
         curves=curves,
@@ -595,6 +744,7 @@ def run_all_experiments(cfg: ExperimentConfig) -> ExperimentTables:
         warped_grids=warped_grids,
     ) if cfg.save_figures else {}
     payload = write_config(output_dir / "config.json", cfg)
+    LOGGER.info("writing tables output_dir=%s", output_dir)
     _write_tables(
         output_dir,
         cfg,
@@ -612,11 +762,22 @@ def run_all_experiments(cfg: ExperimentConfig) -> ExperimentTables:
     )
     (output_dir / "figures.json").write_text(json.dumps(figures, indent=2, sort_keys=True), encoding="utf-8")
     (output_dir / "interpretation.md").write_text(interpretation, encoding="utf-8")
+    LOGGER.info(
+        "run done elapsed_s=%.1f elapsed_h=%.2f results=%d curves=%d geometry=%d",
+        time.time() - run_started,
+        (time.time() - run_started) / 3600.0,
+        len(results),
+        len(curves),
+        len(geometry),
+    )
     return ExperimentTables(results, curves, geometry, selected_lrs, aggregate, deltas, trajectories, warped_grids, payload, output_dir, figures, interpretation)
 
 
 def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
     output_dir = run_dir(cfg)
+    _configure_progress_logging(output_dir, cfg)
     if bool(cfg.cache_first) and not bool(cfg.force_rerun) and _cache_is_valid(output_dir, cfg):
+        LOGGER.info("cache hit output_dir=%s", output_dir)
         return _load_tables(output_dir)
+    LOGGER.info("cache miss or force rerun output_dir=%s", output_dir)
     return run_all_experiments(cfg)
