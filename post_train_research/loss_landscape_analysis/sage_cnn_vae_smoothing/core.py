@@ -15,7 +15,6 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 
 from post_train_research.big_vae_latent_flattening.flow import RQSplineFlow, RQSplineFlowConfig
 from post_train_research.loss_landscape_analysis.flow_preconditioning.probe_geometry import (
-    exact_jacobians,
     isometry_objective_from_jacobians,
     metric_tensors_from_jacobians,
 )
@@ -390,6 +389,37 @@ def decode_weights(vae: WeightVAE, normalizer: WeightNormalizer, z: torch.Tensor
     return normalizer.denormalize(vae.decode_norm(z))
 
 
+def _forward_mode_jacobians(func, inputs: torch.Tensor, *, create_graph: bool) -> torch.Tensor:
+    if inputs.ndim != 2:
+        raise ValueError(f"inputs must be [B,D], got {tuple(inputs.shape)}")
+    try:
+        from torch.func import jacfwd, vmap
+
+        return vmap(jacfwd(func))(inputs)
+    except (ImportError, AttributeError) as exc:
+        rows: list[torch.Tensor] = []
+        for x in inputs:
+            x_req = x.detach().clone().requires_grad_(bool(create_graph))
+            try:
+                jac = torch.autograd.functional.jacobian(
+                    func,
+                    x_req,
+                    create_graph=bool(create_graph),
+                    strict=False,
+                    vectorize=True,
+                    strategy="forward-mode",
+                )
+            except TypeError as type_exc:
+                raise RuntimeError("decoder geometry requires torch.func.jacfwd or forward-mode autograd") from type_exc
+            rows.append(jac)
+        return torch.stack(rows, dim=0)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "forward-mode decoder Jacobian failed. This stage intentionally avoids reverse-mode jacrev "
+            "because the decoder output dimension is the full weight vector and reverse-mode can OOM."
+        ) from exc
+
+
 def decoder_jacobians(
     vae: WeightVAE,
     normalizer: WeightNormalizer,
@@ -405,7 +435,7 @@ def decoder_jacobians(
             z = flow.inverse(coord.unsqueeze(0))[0].squeeze(0)
         return decode_weights(vae, normalizer, z.unsqueeze(0)).squeeze(0)
 
-    return exact_jacobians(decoder_from_coord, samples, create_graph=bool(create_graph))
+    return _forward_mode_jacobians(decoder_from_coord, samples, create_graph=bool(create_graph))
 
 
 def geometry_metrics_from_jacobians(jacobians: torch.Tensor, *, eps: float = 1e-12) -> dict[str, float]:
