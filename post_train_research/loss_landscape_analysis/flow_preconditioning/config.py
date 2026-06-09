@@ -60,11 +60,24 @@ class ExperimentConfig:
     flow_lr: float = 1e-3
     flow_grad_clip_norm: float = 10.0
     flow_log_every: int = 100
+    flow_architecture: str = "rq_spline"
     flow_num_layers: int = 8
     flow_hidden_dim: int = 64
     flow_network_depth: int = 2
     flow_log_scale_clamp: float = 1.5
+    flow_spline_bins: int = 8
+    flow_spline_bound: float = 5.0
+    flow_spline_min_bin_width: float = 1e-3
+    flow_spline_min_bin_height: float = 1e-3
+    flow_spline_min_derivative: float = 1e-3
     flow_dropout: float = 0.0
+    flow_sanity_samples: int = 32
+    flow_sanity_condition_samples: int = 8
+    flow_sanity_compute_condition: bool = True
+    flow_sanity_max_roundtrip_error: float = 1e-4
+    flow_sanity_max_median_abs_displacement: float = 1e-3
+    flow_sanity_max_median_abs_logdet: float = 1e-3
+    flow_sanity_max_median_condition: float = 2.0
     random_flow_std: float = 1e-3
     random_flow_near_identity_noise_std: float = 0.0
 

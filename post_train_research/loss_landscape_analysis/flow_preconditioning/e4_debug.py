@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 
 from .config import ExperimentConfig, config_to_dict, torch_dtype
-from .flow_experiment import make_flow
+from .flow_experiment import assert_flow_architecture_sanity, make_flow
 from .optimization import Curve, LossFn
 from .probe_geometry import (
     ResidualThetaProbe,
@@ -43,10 +43,16 @@ class E4DebugConfig:
     flow_batch_size: int = 16
     flow_lr: float = 1e-3
     flow_grad_clip_norm: float = 10.0
+    flow_architecture: str = "rq_spline"
     flow_num_layers: int = 8
     flow_hidden_dim: int = 64
     flow_network_depth: int = 2
     flow_log_scale_clamp: float = 1.5
+    flow_spline_bins: int = 8
+    flow_spline_bound: float = 5.0
+    flow_spline_min_bin_width: float = 1e-3
+    flow_spline_min_bin_height: float = 1e-3
+    flow_spline_min_derivative: float = 1e-3
     flow_dropout: float = 0.0
     flow_random_samples: int = 128
     flow_trajectory_count: int = 8
@@ -115,10 +121,16 @@ def experiment_config_from_debug(debug_cfg: E4DebugConfig) -> ExperimentConfig:
         flow_lr=float(debug_cfg.flow_lr),
         flow_grad_clip_norm=float(debug_cfg.flow_grad_clip_norm),
         flow_log_every=max(1, int(debug_cfg.eval_every)),
+        flow_architecture=str(debug_cfg.flow_architecture),
         flow_num_layers=int(debug_cfg.flow_num_layers),
         flow_hidden_dim=int(debug_cfg.flow_hidden_dim),
         flow_network_depth=int(debug_cfg.flow_network_depth),
         flow_log_scale_clamp=float(debug_cfg.flow_log_scale_clamp),
+        flow_spline_bins=int(debug_cfg.flow_spline_bins),
+        flow_spline_bound=float(debug_cfg.flow_spline_bound),
+        flow_spline_min_bin_width=float(debug_cfg.flow_spline_min_bin_width),
+        flow_spline_min_bin_height=float(debug_cfg.flow_spline_min_bin_height),
+        flow_spline_min_derivative=float(debug_cfg.flow_spline_min_derivative),
         flow_dropout=float(debug_cfg.flow_dropout),
         save_figures=False,
         progress_log_enabled=False,
@@ -245,6 +257,7 @@ def train_e4_debug_flow(state: E4DebugState) -> E4DebugResult:
     debug_cfg = state.debug_cfg
     torch.manual_seed(int(debug_cfg.seed) + 50_000)
     flow = make_flow(MLP_DIM, cfg).to(device=state.flow_pool.device, dtype=state.flow_pool.dtype)
+    assert_flow_architecture_sanity(flow, state.flow_pool, cfg, log_label="[E4 debug]")
     optimizer = torch.optim.Adam(flow.parameters(), lr=float(debug_cfg.flow_lr))
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(debug_cfg.seed) + 50_017)
