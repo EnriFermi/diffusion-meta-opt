@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,30 @@ from post_train_research.loss_landscape_analysis.flow_preconditioning.probe_geom
 
 from .config import ExperimentConfig, torch_dtype
 from .progress import make_progress
+
+
+def load_torch_cache(path: Path) -> Any | None:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        broken_path = path.with_name(f"{path.name}.broken-{uuid.uuid4().hex[:8]}")
+        try:
+            path.rename(broken_path)
+            print(f"[cache] ignoring corrupt torch cache: {path} -> {broken_path} ({exc})", flush=True)
+        except OSError:
+            print(f"[cache] ignoring corrupt torch cache: {path} ({exc})", flush=True)
+        return None
+
+
+def atomic_torch_save(payload: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        torch.save(payload, tmp_path)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 class TinyCNN(nn.Module):
@@ -153,9 +178,10 @@ def generate_weight_pool(
     output_path: Path,
 ) -> tuple[torch.Tensor, pd.DataFrame, FlatSpec]:
     if output_path.is_file() and bool(cfg.cache_first) and not bool(cfg.force_rerun):
-        payload = torch.load(output_path, map_location="cpu", weights_only=False)
-        spec = FlatSpec(tuple(payload["spec"]["keys"]), tuple(tuple(s) for s in payload["spec"]["shapes"]), tuple(payload["spec"]["sizes"]))
-        return payload["weights"], pd.DataFrame(payload["records"]), spec
+        payload = load_torch_cache(output_path)
+        if payload is not None:
+            spec = FlatSpec(tuple(payload["spec"]["keys"]), tuple(tuple(s) for s in payload["spec"]["shapes"]), tuple(payload["spec"]["sizes"]))
+            return payload["weights"], pd.DataFrame(payload["records"]), spec
 
     device = torch.device(cfg.device)
     dtype = torch_dtype(cfg)
@@ -217,8 +243,7 @@ def generate_weight_pool(
         progress.close()
 
     weights = torch.stack(flats, dim=0)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
+    atomic_torch_save(
         {
             "weights": weights,
             "records": records,
@@ -488,17 +513,18 @@ class TrainedVAE:
 
 def train_weight_vae(cfg: ExperimentConfig, weights: torch.Tensor, *, output_path: Path) -> TrainedVAE:
     if output_path.is_file() and bool(cfg.cache_first) and not bool(cfg.force_rerun):
-        payload = torch.load(output_path, map_location="cpu", weights_only=False)
-        normalizer = WeightNormalizer.from_state_dict(payload["normalizer"])
-        vae = WeightVAE(weight_dim=int(weights.shape[1]), latent_dim=int(cfg.latent_dim), hidden_dim=int(cfg.vae_hidden_dim))
-        vae.load_state_dict(payload["model_state"])
-        return TrainedVAE(
-            vae=vae,
-            normalizer=normalizer,
-            train_indices=payload["train_indices"],
-            val_indices=payload["val_indices"],
-            metrics=pd.DataFrame(payload["metrics"]),
-        )
+        payload = load_torch_cache(output_path)
+        if payload is not None:
+            normalizer = WeightNormalizer.from_state_dict(payload["normalizer"])
+            vae = WeightVAE(weight_dim=int(weights.shape[1]), latent_dim=int(cfg.latent_dim), hidden_dim=int(cfg.vae_hidden_dim))
+            vae.load_state_dict(payload["model_state"])
+            return TrainedVAE(
+                vae=vae,
+                normalizer=normalizer,
+                train_indices=payload["train_indices"],
+                val_indices=payload["val_indices"],
+                metrics=pd.DataFrame(payload["metrics"]),
+            )
 
     device = torch.device(cfg.device)
     dtype = torch_dtype(cfg)
@@ -583,8 +609,7 @@ def train_weight_vae(cfg: ExperimentConfig, weights: torch.Tensor, *, output_pat
     finally:
         progress.close()
     vae.eval()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
+    atomic_torch_save(
         {
             "model_state": vae.detach().cpu().state_dict() if hasattr(vae, "detach") else {k: v.detach().cpu() for k, v in vae.state_dict().items()},
             "normalizer": normalizer.state_dict(),
@@ -702,10 +727,11 @@ def train_posthoc_flow(
     output_path: Path,
 ) -> tuple[torch.nn.Module, pd.DataFrame]:
     if output_path.is_file() and bool(cfg.cache_first) and not bool(cfg.force_rerun):
-        payload = torch.load(output_path, map_location="cpu", weights_only=False)
-        flow = make_rq_flow(cfg, int(z_train.shape[1]), device=z_train.device, dtype=z_train.dtype)
-        flow.load_state_dict(payload["flow_state"])
-        return flow, pd.DataFrame(payload["history"])
+        payload = load_torch_cache(output_path)
+        if payload is not None:
+            flow = make_rq_flow(cfg, int(z_train.shape[1]), device=z_train.device, dtype=z_train.dtype)
+            flow.load_state_dict(payload["flow_state"])
+            return flow, pd.DataFrame(payload["history"])
 
     flow = make_rq_flow(cfg, int(z_train.shape[1]), device=z_train.device, dtype=z_train.dtype)
     optimizer = torch.optim.Adam(flow.parameters(), lr=float(cfg.flow_lr))
@@ -760,8 +786,7 @@ def train_posthoc_flow(
             progress.update(1)
     finally:
         progress.close()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"flow_state": flow.state_dict(), "history": history}, output_path)
+    atomic_torch_save({"flow_state": flow.state_dict(), "history": history}, output_path)
     return flow, pd.DataFrame(history)
 
 

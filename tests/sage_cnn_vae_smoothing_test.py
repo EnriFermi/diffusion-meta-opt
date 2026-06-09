@@ -9,6 +9,7 @@ from post_train_research.loss_landscape_analysis.sage_cnn_vae_smoothing.config i
 from post_train_research.loss_landscape_analysis.sage_cnn_vae_smoothing.core import (
     WeightNormalizer,
     WeightVAE,
+    load_torch_cache,
     vae_loss,
     decoder_jacobians,
     decode_weights,
@@ -213,6 +214,17 @@ def test_sage_cnn_vae_smoothing_reg_coeff_runs_baseline_and_regularized(tmp_path
     assert (tables.output_dir / "vae_checkpoint_regularized.pt").is_file()
     assert (tables.output_dir / "flow_state_baseline.pt").is_file()
     assert (tables.output_dir / "flow_state_regularized.pt").is_file()
+
+
+def test_corrupt_torch_cache_is_renamed_and_ignored(tmp_path) -> None:
+    path = tmp_path / "broken.pt"
+    path.write_bytes(b"not a torch checkpoint")
+
+    payload = load_torch_cache(path)
+
+    assert payload is None
+    assert not path.exists()
+    assert list(tmp_path.glob("broken.pt.broken-*"))
 
 
 def test_sage_cnn_vae_smoothing_notebook_code_cells_compile() -> None:

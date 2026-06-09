@@ -20,6 +20,7 @@ from .core import (
     random_near_identity_flow,
     train_posthoc_flow,
     train_weight_vae,
+    atomic_torch_save,
 )
 from .downstream import DownstreamContext, tune_and_evaluate_downstream
 from .progress import make_progress
@@ -318,7 +319,7 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
             flow_history["vae_geometry_reg_coeff"] = float(reg_coeff)
             flow_history_frames.append(flow_history)
             random_flow = random_near_identity_flow(variant_cfg, int(variant_cfg.latent_dim), device=device, dtype=dtype)
-            torch.save(
+            atomic_torch_save(
                 {"flow_state": random_flow.state_dict()},
                 _variant_path(output_dir, "random_flow_state.pt", variant=variant, multi_variant=multi_variant),
             )
