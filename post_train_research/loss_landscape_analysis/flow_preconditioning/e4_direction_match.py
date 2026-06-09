@@ -145,6 +145,13 @@ def load_direction_targets(path: Path, *, device: torch.device, dtype: torch.dty
     )
 
 
+def _direction_targets_match_samples(targets: DirectionTargetCache, theta_samples: torch.Tensor) -> bool:
+    if tuple(targets.theta.shape) != tuple(theta_samples.shape):
+        return False
+    target_theta = targets.theta.detach().to(device=theta_samples.device, dtype=theta_samples.dtype)
+    return bool(torch.equal(target_theta, theta_samples.detach()))
+
+
 def load_or_compute_direction_targets(
     *,
     state: E4DebugState,
@@ -160,7 +167,9 @@ def load_or_compute_direction_targets(
         metric_alpha=float(metric_alpha),
     )
     if path.is_file() and not bool(force_recompute):
-        return load_direction_targets(path, device=theta_samples.device, dtype=theta_samples.dtype)
+        cached = load_direction_targets(path, device=theta_samples.device, dtype=theta_samples.dtype)
+        if _direction_targets_match_samples(cached, theta_samples):
+            return cached
     targets = compute_direction_targets(
         train_loss_fn=state.problem.train_loss,
         probe=state.probe,

@@ -45,6 +45,7 @@ from post_train_research.loss_landscape_analysis.flow_preconditioning.e4_debug i
 from post_train_research.loss_landscape_analysis.flow_preconditioning.e4_direction_match import (
     compute_direction_targets,
     direction_match_loss,
+    load_or_compute_direction_targets,
     train_direction_match_flow,
 )
 from post_train_research.loss_landscape_analysis.flow_preconditioning.runner import _select_lrs
@@ -565,6 +566,44 @@ def test_e4_direction_match_targets_and_training_smoke(tmp_path) -> None:
     assert (result.output_dir / "history.csv").is_file()
     assert (result.output_dir / "target_summary.csv").is_file()
     assert (result.output_dir / "flow_state.pt").is_file()
+
+
+def test_e4_direction_match_target_cache_invalidates_when_samples_change(tmp_path) -> None:
+    debug_cfg = E4DebugConfig(
+        run_label="e4_direction_match_cache_smoke",
+        artifact_root=str(tmp_path),
+        device="cpu",
+        seed=0,
+        rho=1e-1,
+        flow_random_samples=2,
+        flow_trajectory_count=0,
+        heldout_geometry_samples=2,
+        train_eval_samples=1,
+        heldout_eval_samples=1,
+        train_points=8,
+        probe_points=8,
+        test_points=16,
+    )
+    state = build_e4_debug_state(debug_cfg)
+
+    first = load_or_compute_direction_targets(
+        state=state,
+        theta_samples=state.flow_pool[:2],
+        metric_alpha=1e-3,
+        split="train",
+        force_recompute=True,
+    )
+    second = load_or_compute_direction_targets(
+        state=state,
+        theta_samples=state.flow_pool[:1],
+        metric_alpha=1e-3,
+        split="train",
+        force_recompute=False,
+    )
+
+    assert tuple(first.theta.shape) == (2, MLP_DIM)
+    assert tuple(second.theta.shape) == (1, MLP_DIM)
+    assert torch.equal(second.theta, state.flow_pool[:1])
 
 
 def test_probe_metric_curves_smoke(tmp_path) -> None:
