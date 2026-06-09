@@ -54,6 +54,17 @@ def direction_match_variant_slug(*, rho: float, metric_alpha: float, scale_beta:
     return f"rho{_float_token(rho)}_alpha{_float_token(metric_alpha)}_beta{_float_token(scale_beta)}"
 
 
+def _maybe_tqdm(iterable, *, enabled: bool, desc: str):
+    if not bool(enabled):
+        return iterable
+    try:
+        from tqdm.auto import tqdm
+
+        return tqdm(iterable, desc=desc, dynamic_ncols=True, leave=True)
+    except Exception:
+        return iterable
+
+
 def direction_target_cache_path(output_dir: Path, *, split: str, rho: float, metric_alpha: float) -> Path:
     return output_dir / f"direction_targets_{split}_rho{_float_token(rho)}_alpha{_float_token(metric_alpha)}.pt"
 
@@ -368,6 +379,7 @@ def train_direction_match_flow(
     heldout_targets: DirectionTargetCache,
     scale_beta: float,
     seed_offset: int = 70_000,
+    progress: bool = True,
 ) -> DirectionMatchResult:
     if float(train_targets.metric_alpha) != float(heldout_targets.metric_alpha):
         raise ValueError("train and heldout targets must use the same metric_alpha")
@@ -424,7 +436,12 @@ def train_direction_match_flow(
         )
     )
     flow.train()
-    for step in range(1, int(debug_cfg.flow_steps) + 1):
+    step_iter = _maybe_tqdm(
+        range(1, int(debug_cfg.flow_steps) + 1),
+        enabled=bool(progress),
+        desc=f"E4 direction {variant_slug}",
+    )
+    for step in step_iter:
         indices = torch.randint(0, sample_count, (batch_size,), generator=generator, device="cpu").to(device=train_targets.theta.device)
         batch_targets = subset_direction_targets(train_targets, indices)
         optimizer.zero_grad(set_to_none=True)
@@ -439,6 +456,14 @@ def train_direction_match_flow(
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(flow.parameters(), float(debug_cfg.flow_grad_clip_norm))
         optimizer.step()
+        if hasattr(step_iter, "set_postfix"):
+            step_iter.set_postfix(
+                loss=f"{batch_metrics['loss']:.4g}",
+                dir=f"{batch_metrics['dir_loss']:.4g}",
+                cos=f"{batch_metrics['cos_median']:.3f}",
+                scale=f"{batch_metrics['scale_loss']:.3g}",
+                grad=f"{float(torch.as_tensor(grad_norm).detach().cpu().item()):.3g}",
+            )
         if step == 1 or step % eval_every == 0 or step == int(debug_cfg.flow_steps):
             batch_metrics["grad_norm"] = float(torch.as_tensor(grad_norm).detach().cpu().item())
             row = _snapshot_direction_match(
