@@ -24,6 +24,10 @@ from .downstream import DownstreamContext, tune_and_evaluate_downstream
 from .progress import make_progress
 
 
+def _set_stage(progress, index: int, total: int, name: str) -> None:
+    progress.set_description(f"pipeline {index}/{total} {name}")
+
+
 @dataclass(slots=True)
 class ExperimentTables:
     vae_metrics: pd.DataFrame
@@ -88,32 +92,39 @@ def _vae_quality_rows(
     eval_indices = trained.val_indices[: min(16, int(trained.val_indices.numel()))]
     if int(eval_indices.numel()) == 0:
         eval_indices = trained.train_indices[: min(16, int(trained.train_indices.numel()))]
-    for local_idx, idx in enumerate(eval_indices.tolist()):
-        w = weights_device[int(idx)]
-        z = encode_weights(vae, trained.normalizer, w.reshape(1, -1)).squeeze(0)
-        recon = decode_weights(vae, trained.normalizer, z.reshape(1, -1)).squeeze(0)
-        z_roundtrip = encode_weights(vae, trained.normalizer, recon.reshape(1, -1)).squeeze(0)
-        raw_train_loss, raw_train_acc = evaluate_flat_model(w, images=train_images, labels=train_labels, spec=spec)
-        dec_train_loss, dec_train_acc = evaluate_flat_model(recon, images=train_images, labels=train_labels, spec=spec)
-        raw_test_loss, raw_test_acc = evaluate_flat_model(w, images=test_images, labels=test_labels, spec=spec)
-        dec_test_loss, dec_test_acc = evaluate_flat_model(recon, images=test_images, labels=test_labels, spec=spec)
-        rows.append(
-            {
-                "sample_index": int(local_idx),
-                "weight_index": int(idx),
-                "reconstruction_mse": float((recon - w).square().mean().detach().cpu().item()),
-                "reconstruction_rel_l2": float(((recon - w).float().norm() / w.float().norm().clamp_min(1e-12)).detach().cpu().item()),
-                "latent_roundtrip_l2": float((z_roundtrip - z).float().norm().detach().cpu().item()),
-                "raw_train_loss": raw_train_loss,
-                "raw_train_acc": raw_train_acc,
-                "decoded_train_loss": dec_train_loss,
-                "decoded_train_acc": dec_train_acc,
-                "raw_test_loss": raw_test_loss,
-                "raw_test_acc": raw_test_acc,
-                "decoded_test_loss": dec_test_loss,
-                "decoded_test_acc": dec_test_acc,
-            }
-        )
+    progress = make_progress(cfg, total=int(eval_indices.numel()), desc="VAE quality eval")
+    try:
+        for local_idx, idx in enumerate(eval_indices.tolist()):
+            w = weights_device[int(idx)]
+            z = encode_weights(vae, trained.normalizer, w.reshape(1, -1)).squeeze(0)
+            recon = decode_weights(vae, trained.normalizer, z.reshape(1, -1)).squeeze(0)
+            z_roundtrip = encode_weights(vae, trained.normalizer, recon.reshape(1, -1)).squeeze(0)
+            raw_train_loss, raw_train_acc = evaluate_flat_model(w, images=train_images, labels=train_labels, spec=spec)
+            dec_train_loss, dec_train_acc = evaluate_flat_model(recon, images=train_images, labels=train_labels, spec=spec)
+            raw_test_loss, raw_test_acc = evaluate_flat_model(w, images=test_images, labels=test_labels, spec=spec)
+            dec_test_loss, dec_test_acc = evaluate_flat_model(recon, images=test_images, labels=test_labels, spec=spec)
+            reconstruction_rel_l2 = float(((recon - w).float().norm() / w.float().norm().clamp_min(1e-12)).detach().cpu().item())
+            rows.append(
+                {
+                    "sample_index": int(local_idx),
+                    "weight_index": int(idx),
+                    "reconstruction_mse": float((recon - w).square().mean().detach().cpu().item()),
+                    "reconstruction_rel_l2": reconstruction_rel_l2,
+                    "latent_roundtrip_l2": float((z_roundtrip - z).float().norm().detach().cpu().item()),
+                    "raw_train_loss": raw_train_loss,
+                    "raw_train_acc": raw_train_acc,
+                    "decoded_train_loss": dec_train_loss,
+                    "decoded_train_acc": dec_train_acc,
+                    "raw_test_loss": raw_test_loss,
+                    "raw_test_acc": raw_test_acc,
+                    "decoded_test_loss": dec_test_loss,
+                    "decoded_test_acc": dec_test_acc,
+                }
+            )
+            progress.set_postfix({"sample": f"{local_idx + 1}/{int(eval_indices.numel())}", "rel_l2": f"{reconstruction_rel_l2:.3g}", "decoded_test_acc": f"{dec_test_acc:.3f}"})
+            progress.update(1)
+    finally:
+        progress.close()
     train_history = trained.metrics.copy()
     train_history["sample_index"] = -1
     train_history["weight_index"] = -1
@@ -145,10 +156,20 @@ def _geometry_table(
         ("decoder_trained_nf", trained_flow, trained_flow(z_eval)[0].detach()),
         ("decoder_random_nf", random_flow, random_flow(z_eval)[0].detach()),
     ]
-    for coordinate, flow, samples in specs:
-        jac = decoder_jacobians(vae, trained.normalizer, flow, samples, create_graph=False)
-        metrics = geometry_metrics_from_jacobians(jac)
-        rows.append({"coordinate": coordinate, **metrics})
+    progress = make_progress(cfg, total=len(specs) * int(z_eval.shape[0]), desc="geometry jacobians")
+    try:
+        for coordinate, flow, samples in specs:
+            jacobian_chunks: list[torch.Tensor] = []
+            for sample_idx in range(int(samples.shape[0])):
+                progress.set_postfix({"coord": coordinate, "sample": f"{sample_idx + 1}/{int(samples.shape[0])}", "latent_dim": int(samples.shape[1])})
+                jacobian_chunks.append(decoder_jacobians(vae, trained.normalizer, flow, samples[sample_idx : sample_idx + 1], create_graph=False))
+                progress.update(1)
+            jac = torch.cat(jacobian_chunks, dim=0)
+            metrics = geometry_metrics_from_jacobians(jac)
+            rows.append({"coordinate": coordinate, **metrics})
+            progress.set_postfix({"coord": coordinate, "R": f"{metrics['isometry_objective']:.4g}", "cond50": f"{metrics['condition_median']:.4g}"})
+    finally:
+        progress.close()
     return pd.DataFrame(rows)
 
 
@@ -197,7 +218,7 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
     stage_progress = make_progress(cfg, total=8, desc="sage smoothing pipeline", leave=True)
 
     try:
-        stage_progress.set_description("load data")
+        _set_stage(stage_progress, 1, 8, "load data")
         train_images, train_labels, test_images, test_labels = load_vision_tensors(cfg)
         train_images = train_images.to(device=device, dtype=dtype)
         train_labels = train_labels.to(device=device)
@@ -205,7 +226,7 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
         test_labels = test_labels.to(device=device)
         stage_progress.update(1)
 
-        stage_progress.set_description("generate weights")
+        _set_stage(stage_progress, 2, 8, "generate weights")
         weights, weight_records, spec = generate_weight_pool(
             cfg,
             train_images=train_images,
@@ -217,7 +238,7 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
         weight_records.to_csv(output_dir / "weight_pool_records.csv", index=False)
         stage_progress.update(1)
 
-        stage_progress.set_description("train VAE")
+        _set_stage(stage_progress, 3, 8, "train VAE")
         trained = train_weight_vae(cfg, weights, output_path=output_dir / "vae_checkpoint.pt")
         trained.vae.to(device=device, dtype=dtype).eval()
         weights_device = weights.to(device=device, dtype=dtype)
@@ -225,7 +246,7 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
         z_train = z_all.index_select(0, trained.train_indices.to(device=device))
         stage_progress.update(1)
 
-        stage_progress.set_description("train NF")
+        _set_stage(stage_progress, 4, 8, "train NF")
         trained_flow, flow_history = train_posthoc_flow(
             cfg,
             vae=trained.vae,
@@ -238,7 +259,7 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
         torch.save({"flow_state": random_flow.state_dict()}, output_dir / "random_flow_state.pt")
         stage_progress.update(1)
 
-        stage_progress.set_description("VAE quality")
+        _set_stage(stage_progress, 5, 8, "VAE quality")
         vae_metrics = _vae_quality_rows(
             cfg=cfg,
             trained=trained,
@@ -251,11 +272,11 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
         )
         stage_progress.update(1)
 
-        stage_progress.set_description("geometry")
+        _set_stage(stage_progress, 6, 8, "geometry")
         geometry = _geometry_table(cfg=cfg, trained=trained, weights=weights, trained_flow=trained_flow, random_flow=random_flow)
         stage_progress.update(1)
 
-        stage_progress.set_description("downstream")
+        _set_stage(stage_progress, 7, 8, "downstream")
         start_indices = trained.val_indices
         if int(start_indices.numel()) < int(cfg.tune_starts) + int(cfg.eval_starts):
             start_indices = torch.arange(int(weights.shape[0]))
@@ -276,7 +297,7 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
         interpretation = _build_interpretation(vae_metrics, geometry, downstream_results)
         stage_progress.update(1)
 
-        stage_progress.set_description("write outputs")
+        _set_stage(stage_progress, 8, 8, "write outputs")
         vae_metrics.to_csv(output_dir / "vae_metrics.csv", index=False)
         geometry.to_csv(output_dir / "geometry.csv", index=False)
         selected_lrs.to_csv(output_dir / "selected_lrs.csv", index=False)
