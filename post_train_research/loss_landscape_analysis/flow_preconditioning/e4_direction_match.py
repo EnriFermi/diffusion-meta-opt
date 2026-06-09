@@ -323,6 +323,63 @@ def evaluate_direction_match(
     return {f"{prefix}_{key}": value for key, value in metrics.items()}
 
 
+def evaluate_direction_match_chunked(
+    flow: torch.nn.Module,
+    targets: DirectionTargetCache,
+    *,
+    scale_beta: float,
+    chunk_size: int,
+    prefix: str,
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    chunk_size = max(1, int(chunk_size))
+    flow_was_training = flow.training
+    flow.eval()
+    cos_values: list[torch.Tensor] = []
+    norm_ratio_values: list[torch.Tensor] = []
+    p_nf_norm_values: list[torch.Tensor] = []
+    p_metric_norm_values: list[torch.Tensor] = []
+    try:
+        for start in range(0, int(targets.theta.shape[0]), chunk_size):
+            end = min(start + chunk_size, int(targets.theta.shape[0]))
+            indices = torch.arange(start, end, device=targets.theta.device)
+            subset = subset_direction_targets(targets, indices)
+            p_nf, _inverse_jacobians, _u_samples = nf_preconditioner_direction(
+                flow,
+                subset.theta,
+                subset.grad,
+                create_graph=False,
+            )
+            p_nf_norm = p_nf.float().norm(dim=-1)
+            p_metric_norm = subset.p_metric.float().norm(dim=-1)
+            cos = F.cosine_similarity(p_nf, subset.p_metric, dim=-1, eps=float(eps)).detach().float().cpu()
+            norm_ratio = (p_metric_norm / p_nf_norm.clamp_min(float(eps))).detach().float().cpu()
+            cos_values.append(cos)
+            norm_ratio_values.append(norm_ratio)
+            p_nf_norm_values.append(p_nf_norm.detach().float().cpu())
+            p_metric_norm_values.append(p_metric_norm.detach().float().cpu())
+    finally:
+        flow.train(flow_was_training)
+    cosine = torch.cat(cos_values, dim=0)
+    norm_ratio = torch.cat(norm_ratio_values, dim=0)
+    p_nf_norm = torch.cat(p_nf_norm_values, dim=0)
+    p_metric_norm = torch.cat(p_metric_norm_values, dim=0)
+    dir_loss = 1.0 - cosine
+    scale_loss = torch.log((p_nf_norm + float(eps)) / (p_metric_norm + float(eps))).square()
+    loss = dir_loss + float(scale_beta) * scale_loss
+    return {
+        f"{prefix}_samples": float(cosine.numel()),
+        f"{prefix}_loss": float(loss.mean().item()),
+        f"{prefix}_dir_loss": float(dir_loss.mean().item()),
+        f"{prefix}_scale_loss": float(scale_loss.mean().item()),
+        f"{prefix}_cos_median": float(cosine.median().item()),
+        f"{prefix}_cos_mean": float(cosine.mean().item()),
+        f"{prefix}_norm_ratio_metric_to_nf_median": float(norm_ratio.median().item()),
+        f"{prefix}_p_nf_norm_median": float(p_nf_norm.median().item()),
+        f"{prefix}_p_metric_norm_median": float(p_metric_norm.median().item()),
+    }
+
+
 def _snapshot_direction_match(
     *,
     state: E4DebugState,
