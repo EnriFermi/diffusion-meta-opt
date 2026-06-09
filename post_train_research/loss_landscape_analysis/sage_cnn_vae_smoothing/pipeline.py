@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,19 +57,42 @@ def _read_existing(output_dir: Path) -> ExperimentTables:
 
 
 def _all_outputs_exist(output_dir: Path) -> bool:
+    config_path = output_dir / "config.json"
+    if not config_path.is_file():
+        return False
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    cfg_values = payload.get("config", {})
+    variants = _vae_variants_from_coeff(float(cfg_values.get("vae_geometry_reg_coeff", 0.0)))
+    multi_variant = len(variants) > 1
     required = (
         "config.json",
         "weight_pool.pt",
-        "vae_checkpoint.pt",
-        "flow_state.pt",
-        "random_flow_state.pt",
         "vae_metrics.csv",
         "geometry.csv",
         "selected_lrs.csv",
         "downstream_results.csv",
         "downstream_curves.csv",
     )
-    return all((output_dir / name).is_file() for name in required)
+    if not all((output_dir / name).is_file() for name in required):
+        return False
+    for variant, _reg_coeff in variants:
+        for name in ("vae_checkpoint.pt", "flow_state.pt", "random_flow_state.pt"):
+            if not _variant_path(output_dir, name, variant=variant, multi_variant=multi_variant).is_file():
+                return False
+    return True
+
+
+def _vae_variants_from_coeff(reg_coeff: float) -> tuple[tuple[str, float], ...]:
+    if float(reg_coeff) > 0.0:
+        return (("baseline", 0.0), ("regularized", float(reg_coeff)))
+    return (("baseline", 0.0),)
+
+
+def _variant_path(output_dir: Path, name: str, *, variant: str, multi_variant: bool) -> Path:
+    if not multi_variant:
+        return output_dir / name
+    path = Path(name)
+    return output_dir / f"{path.stem}_{variant}{path.suffix}"
 
 
 def _vae_quality_rows(
@@ -175,32 +199,46 @@ def _geometry_table(
 
 def _build_interpretation(vae_metrics: pd.DataFrame, geometry: pd.DataFrame, results: pd.DataFrame) -> str:
     quality = vae_metrics[vae_metrics.get("record_type", "") == "vae_quality"] if "record_type" in vae_metrics.columns else pd.DataFrame()
-    decoded_rel = float(quality["reconstruction_rel_l2"].median()) if not quality.empty else float("nan")
-    geom = geometry.set_index("coordinate") if not geometry.empty else pd.DataFrame()
-    latent_r = float(geom.loc["decoder_latent", "isometry_objective"]) if "decoder_latent" in geom.index else float("nan")
-    trained_r = float(geom.loc["decoder_trained_nf", "isometry_objective"]) if "decoder_trained_nf" in geom.index else float("nan")
-    grouped = results.groupby("method") if not results.empty else {}
-
-    def median_metric(method: str, column: str) -> float:
-        if method not in grouped.groups:
-            return float("nan")
-        return float(grouped.get_group(method)[column].median())
-
-    latent_aulc = median_metric("decoder_latent", "aulc")
-    trained_aulc = median_metric("decoder_trained_nf", "aulc")
-    random_aulc = median_metric("decoder_random_nf", "aulc")
-    raw_aulc = median_metric("raw", "aulc")
-    claim_help = trained_aulc < latent_aulc and trained_aulc < random_aulc
     lines = [
         "## Automatic Interpretation",
         "",
-        f"1. VAE reconstruction median relative L2: `{decoded_rel:.4g}`.",
-        f"2. Decoder geometry isometry objective: latent `{latent_r:.4g}`, trained NF `{trained_r:.4g}`.",
-        f"3. Median AULC: raw `{raw_aulc:.4g}`, decoder latent `{latent_aulc:.4g}`, trained NF `{trained_aulc:.4g}`, random NF `{random_aulc:.4g}`.",
-        f"4. Post-hoc smoothing claim allowed: `{bool(claim_help)}`.",
-        "5. Trained NF is considered helpful only if it beats both decoder latent and random near-identity NF under selected per-method LRs.",
-        "6. If decoded starts have high reconstruction mismatch, interpret downstream failures as VAE-quality limited before blaming smoothing.",
     ]
+    variants = ["baseline"]
+    if "vae_variant" in vae_metrics.columns:
+        variants = [str(v) for v in vae_metrics["vae_variant"].dropna().unique().tolist()]
+    for variant in variants:
+        qv = quality[quality.get("vae_variant", variant) == variant] if "vae_variant" in quality.columns else quality
+        gv = geometry[geometry.get("vae_variant", variant) == variant] if "vae_variant" in geometry.columns else geometry
+        rv = results[results.get("vae_variant", variant) == variant] if "vae_variant" in results.columns else results
+        decoded_rel = float(qv["reconstruction_rel_l2"].median()) if not qv.empty else float("nan")
+        geom = gv.set_index("coordinate") if not gv.empty else pd.DataFrame()
+        latent_r = float(geom.loc["decoder_latent", "isometry_objective"]) if "decoder_latent" in geom.index else float("nan")
+        trained_r = float(geom.loc["decoder_trained_nf", "isometry_objective"]) if "decoder_trained_nf" in geom.index else float("nan")
+        grouped = rv.groupby("method") if not rv.empty else {}
+
+        def median_metric(method: str, column: str) -> float:
+            if method not in grouped.groups:
+                return float("nan")
+            return float(grouped.get_group(method)[column].median())
+
+        latent_aulc = median_metric("decoder_latent", "aulc")
+        trained_aulc = median_metric("decoder_trained_nf", "aulc")
+        random_aulc = median_metric("decoder_random_nf", "aulc")
+        raw_aulc = median_metric("raw", "aulc")
+        claim_help = trained_aulc < latent_aulc and trained_aulc < random_aulc
+        lines.extend(
+            [
+                f"### `{variant}`",
+                "",
+                f"1. VAE reconstruction median relative L2: `{decoded_rel:.4g}`.",
+                f"2. Decoder geometry isometry objective: latent `{latent_r:.4g}`, trained NF `{trained_r:.4g}`.",
+                f"3. Median AULC: raw `{raw_aulc:.4g}`, decoder latent `{latent_aulc:.4g}`, trained NF `{trained_aulc:.4g}`, random NF `{random_aulc:.4g}`.",
+                f"4. Post-hoc smoothing claim allowed: `{bool(claim_help)}`.",
+                "5. Trained NF is considered helpful only if it beats both decoder latent and random near-identity NF under selected per-method LRs.",
+                "6. If decoded starts have high reconstruction mismatch, interpret downstream failures as VAE-quality limited before blaming smoothing.",
+                "",
+            ]
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -215,18 +253,23 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
     config_payload = write_config(cfg_path, cfg)
     device = torch.device(cfg.device)
     dtype = torch_dtype(cfg)
-    stage_progress = make_progress(cfg, total=8, desc="sage smoothing pipeline", leave=True)
+    variants = _vae_variants_from_coeff(float(cfg.vae_geometry_reg_coeff))
+    multi_variant = len(variants) > 1
+    stage_total = 2 + 5 * len(variants) + 1
+    stage_idx = 1
+    stage_progress = make_progress(cfg, total=stage_total, desc="sage smoothing pipeline", leave=True)
 
     try:
-        _set_stage(stage_progress, 1, 8, "load data")
+        _set_stage(stage_progress, stage_idx, stage_total, "load data")
         train_images, train_labels, test_images, test_labels = load_vision_tensors(cfg)
         train_images = train_images.to(device=device, dtype=dtype)
         train_labels = train_labels.to(device=device)
         test_images = test_images.to(device=device, dtype=dtype)
         test_labels = test_labels.to(device=device)
         stage_progress.update(1)
+        stage_idx += 1
 
-        _set_stage(stage_progress, 2, 8, "generate weights")
+        _set_stage(stage_progress, stage_idx, stage_total, "generate weights")
         weights, weight_records, spec = generate_weight_pool(
             cfg,
             train_images=train_images,
@@ -237,72 +280,128 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
         )
         weight_records.to_csv(output_dir / "weight_pool_records.csv", index=False)
         stage_progress.update(1)
+        stage_idx += 1
 
-        _set_stage(stage_progress, 3, 8, "train VAE")
-        trained = train_weight_vae(cfg, weights, output_path=output_dir / "vae_checkpoint.pt")
-        trained.vae.to(device=device, dtype=dtype).eval()
         weights_device = weights.to(device=device, dtype=dtype)
-        z_all = encode_weights(trained.vae, trained.normalizer, weights_device)
-        z_train = z_all.index_select(0, trained.train_indices.to(device=device))
-        stage_progress.update(1)
+        vae_metric_frames: list[pd.DataFrame] = []
+        geometry_frames: list[pd.DataFrame] = []
+        downstream_result_frames: list[pd.DataFrame] = []
+        downstream_curve_frames: list[pd.DataFrame] = []
+        selected_lr_frames: list[pd.DataFrame] = []
+        flow_history_frames: list[pd.DataFrame] = []
 
-        _set_stage(stage_progress, 4, 8, "train NF")
-        trained_flow, flow_history = train_posthoc_flow(
-            cfg,
-            vae=trained.vae,
-            normalizer=trained.normalizer,
-            z_train=z_train,
-            output_path=output_dir / "flow_state.pt",
-        )
-        flow_history.to_csv(output_dir / "flow_history.csv", index=False)
-        random_flow = random_near_identity_flow(cfg, int(cfg.latent_dim), device=device, dtype=dtype)
-        torch.save({"flow_state": random_flow.state_dict()}, output_dir / "random_flow_state.pt")
-        stage_progress.update(1)
+        for variant, reg_coeff in variants:
+            variant_cfg = replace(cfg, vae_geometry_reg_coeff=float(reg_coeff))
 
-        _set_stage(stage_progress, 5, 8, "VAE quality")
-        vae_metrics = _vae_quality_rows(
-            cfg=cfg,
-            trained=trained,
-            weights=weights,
-            spec=spec,
-            train_images=train_images,
-            train_labels=train_labels,
-            test_images=test_images,
-            test_labels=test_labels,
-        )
-        stage_progress.update(1)
+            _set_stage(stage_progress, stage_idx, stage_total, f"{variant}: train VAE")
+            trained = train_weight_vae(
+                variant_cfg,
+                weights,
+                output_path=_variant_path(output_dir, "vae_checkpoint.pt", variant=variant, multi_variant=multi_variant),
+            )
+            trained.vae.to(device=device, dtype=dtype).eval()
+            z_all = encode_weights(trained.vae, trained.normalizer, weights_device)
+            z_train = z_all.index_select(0, trained.train_indices.to(device=device))
+            stage_progress.update(1)
+            stage_idx += 1
 
-        _set_stage(stage_progress, 6, 8, "geometry")
-        geometry = _geometry_table(cfg=cfg, trained=trained, weights=weights, trained_flow=trained_flow, random_flow=random_flow)
-        stage_progress.update(1)
+            _set_stage(stage_progress, stage_idx, stage_total, f"{variant}: train NF")
+            trained_flow, flow_history = train_posthoc_flow(
+                variant_cfg,
+                vae=trained.vae,
+                normalizer=trained.normalizer,
+                z_train=z_train,
+                output_path=_variant_path(output_dir, "flow_state.pt", variant=variant, multi_variant=multi_variant),
+            )
+            flow_history = flow_history.copy()
+            flow_history["vae_variant"] = variant
+            flow_history["vae_geometry_reg_coeff"] = float(reg_coeff)
+            flow_history_frames.append(flow_history)
+            random_flow = random_near_identity_flow(variant_cfg, int(variant_cfg.latent_dim), device=device, dtype=dtype)
+            torch.save(
+                {"flow_state": random_flow.state_dict()},
+                _variant_path(output_dir, "random_flow_state.pt", variant=variant, multi_variant=multi_variant),
+            )
+            stage_progress.update(1)
+            stage_idx += 1
 
-        _set_stage(stage_progress, 7, 8, "downstream")
-        start_indices = trained.val_indices
-        if int(start_indices.numel()) < int(cfg.tune_starts) + int(cfg.eval_starts):
-            start_indices = torch.arange(int(weights.shape[0]))
-        starts = weights_device.index_select(0, start_indices.to(device=device))
-        ctx = DownstreamContext(
-            cfg=cfg,
-            spec=spec,
-            vae=trained.vae,
-            normalizer=trained.normalizer,
-            trained_flow=trained_flow,
-            random_flow=random_flow,
-            train_images=train_images,
-            train_labels=train_labels,
-            test_images=test_images,
-            test_labels=test_labels,
-        )
-        downstream_results, downstream_curves, selected_lrs = tune_and_evaluate_downstream(cfg=cfg, ctx=ctx, starts=starts)
+            _set_stage(stage_progress, stage_idx, stage_total, f"{variant}: VAE quality")
+            vae_metrics_variant = _vae_quality_rows(
+                cfg=variant_cfg,
+                trained=trained,
+                weights=weights,
+                spec=spec,
+                train_images=train_images,
+                train_labels=train_labels,
+                test_images=test_images,
+                test_labels=test_labels,
+            )
+            vae_metrics_variant["vae_variant"] = variant
+            vae_metrics_variant["vae_geometry_reg_coeff"] = float(reg_coeff)
+            vae_metric_frames.append(vae_metrics_variant)
+            stage_progress.update(1)
+            stage_idx += 1
+
+            _set_stage(stage_progress, stage_idx, stage_total, f"{variant}: geometry")
+            geometry_variant = _geometry_table(
+                cfg=variant_cfg,
+                trained=trained,
+                weights=weights,
+                trained_flow=trained_flow,
+                random_flow=random_flow,
+            )
+            geometry_variant["vae_variant"] = variant
+            geometry_variant["vae_geometry_reg_coeff"] = float(reg_coeff)
+            geometry_frames.append(geometry_variant)
+            stage_progress.update(1)
+            stage_idx += 1
+
+            _set_stage(stage_progress, stage_idx, stage_total, f"{variant}: downstream")
+            start_indices = trained.val_indices
+            if int(start_indices.numel()) < int(variant_cfg.tune_starts) + int(variant_cfg.eval_starts):
+                start_indices = torch.arange(int(weights.shape[0]))
+            starts = weights_device.index_select(0, start_indices.to(device=device))
+            ctx = DownstreamContext(
+                cfg=variant_cfg,
+                spec=spec,
+                vae=trained.vae,
+                normalizer=trained.normalizer,
+                trained_flow=trained_flow,
+                random_flow=random_flow,
+                train_images=train_images,
+                train_labels=train_labels,
+                test_images=test_images,
+                test_labels=test_labels,
+            )
+            downstream_results_variant, downstream_curves_variant, selected_lrs_variant = tune_and_evaluate_downstream(
+                cfg=variant_cfg,
+                ctx=ctx,
+                starts=starts,
+            )
+            for frame in (downstream_results_variant, downstream_curves_variant, selected_lrs_variant):
+                frame["vae_variant"] = variant
+                frame["vae_geometry_reg_coeff"] = float(reg_coeff)
+            downstream_result_frames.append(downstream_results_variant)
+            downstream_curve_frames.append(downstream_curves_variant)
+            selected_lr_frames.append(selected_lrs_variant)
+            stage_progress.update(1)
+            stage_idx += 1
+
+        vae_metrics = pd.concat(vae_metric_frames, ignore_index=True, sort=False)
+        geometry = pd.concat(geometry_frames, ignore_index=True, sort=False)
+        downstream_results = pd.concat(downstream_result_frames, ignore_index=True, sort=False)
+        downstream_curves = pd.concat(downstream_curve_frames, ignore_index=True, sort=False)
+        selected_lrs = pd.concat(selected_lr_frames, ignore_index=True, sort=False)
+        flow_history_all = pd.concat(flow_history_frames, ignore_index=True, sort=False) if flow_history_frames else pd.DataFrame()
         interpretation = _build_interpretation(vae_metrics, geometry, downstream_results)
-        stage_progress.update(1)
 
-        _set_stage(stage_progress, 8, 8, "write outputs")
+        _set_stage(stage_progress, stage_idx, stage_total, "write outputs")
         vae_metrics.to_csv(output_dir / "vae_metrics.csv", index=False)
         geometry.to_csv(output_dir / "geometry.csv", index=False)
         selected_lrs.to_csv(output_dir / "selected_lrs.csv", index=False)
         downstream_results.to_csv(output_dir / "downstream_results.csv", index=False)
         downstream_curves.to_csv(output_dir / "downstream_curves.csv", index=False)
+        flow_history_all.to_csv(output_dir / "flow_history.csv", index=False)
         (output_dir / "interpretation.md").write_text(interpretation, encoding="utf-8")
         stage_progress.update(1)
     finally:

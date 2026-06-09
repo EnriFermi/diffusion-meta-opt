@@ -9,6 +9,7 @@ from post_train_research.loss_landscape_analysis.sage_cnn_vae_smoothing.config i
 from post_train_research.loss_landscape_analysis.sage_cnn_vae_smoothing.core import (
     WeightNormalizer,
     WeightVAE,
+    vae_loss,
     decoder_jacobians,
     decode_weights,
     flat_to_state_dict,
@@ -57,6 +58,26 @@ def test_vae_decoder_weights_receive_latent_gradients() -> None:
 
     assert z.grad is not None
     assert torch.isfinite(z.grad).all()
+
+
+def test_bigvae_style_vae_loss_is_finite_and_differentiable() -> None:
+    spec = tiny_cnn_spec()
+    cfg = fast_config(device="cpu", latent_dim=4, vae_hidden_dim=16, vae_loss_kind="big_vae", bigvae_operator_probe_rows=2)
+    weights = torch.randn(3, spec.dim)
+    normalizer = WeightNormalizer.fit(weights)
+    vae = WeightVAE(weight_dim=spec.dim, latent_dim=4, hidden_dim=16)
+    x_norm = normalizer.normalize(weights)
+
+    recon, mu, logvar = vae(x_norm)
+    loss, row = vae_loss(cfg, x_norm, weights, recon, mu, logvar, normalizer=normalizer, spec=spec)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert row["bigvae_weight_loss"] >= 0.0
+    assert "behavioral_operator" in row
+    assert "structural" in row
+    assert "bias_mse" in row
+    assert any(param.grad is not None and torch.isfinite(param.grad).all() for param in vae.parameters())
 
 
 def test_decoder_geometry_jacobian_shape_and_finite_metrics() -> None:
@@ -135,6 +156,63 @@ def test_sage_cnn_vae_smoothing_smoke_writes_outputs(tmp_path, monkeypatch) -> N
         "downstream_curves.csv",
     ):
         assert (tables.output_dir / name).is_file()
+
+
+def test_sage_cnn_vae_smoothing_reg_coeff_runs_baseline_and_regularized(tmp_path, monkeypatch) -> None:
+    import post_train_research.loss_landscape_analysis.sage_cnn_vae_smoothing.pipeline as pipeline
+
+    def fake_loader(_cfg):
+        generator = torch.Generator().manual_seed(1)
+        train_images = torch.randn(12, 1, 28, 28, generator=generator)
+        train_labels = torch.randint(0, 10, (12,), generator=generator)
+        test_images = torch.randn(6, 1, 28, 28, generator=generator)
+        test_labels = torch.randint(0, 10, (6,), generator=generator)
+        return train_images, train_labels, test_images, test_labels
+
+    monkeypatch.setattr(pipeline, "load_vision_tensors", fake_loader)
+    cfg = fast_config(
+        run_label="reg_smoke",
+        artifact_root=str(tmp_path),
+        device="cpu",
+        cache_first=False,
+        force_rerun=True,
+        show_progress=False,
+        weight_runs=1,
+        weight_train_steps=1,
+        weight_snapshot_every=1,
+        cnn_batch_size=6,
+        latent_dim=2,
+        vae_hidden_dim=8,
+        vae_steps=1,
+        vae_batch_size=1,
+        bigvae_operator_probe_rows=1,
+        vae_geometry_reg_coeff=1e-4,
+        vae_geometry_reg_samples=1,
+        flow_steps=1,
+        flow_batch_size=1,
+        flow_num_layers=2,
+        flow_hidden_dim=8,
+        flow_network_depth=1,
+        flow_log_every=1,
+        geometry_eval_samples=1,
+        tune_starts=1,
+        eval_starts=1,
+        downstream_steps=1,
+        raw_lrs=(1e-3,),
+        latent_lrs=(1e-2,),
+        nf_lrs=(1e-2,),
+        save_figures=False,
+    )
+
+    tables = pipeline.run_or_load(cfg)
+
+    assert set(tables.vae_metrics["vae_variant"].dropna().unique().tolist()) == {"baseline", "regularized"}
+    assert set(tables.geometry["vae_variant"].dropna().unique().tolist()) == {"baseline", "regularized"}
+    assert set(tables.downstream_results["vae_variant"].dropna().unique().tolist()) == {"baseline", "regularized"}
+    assert (tables.output_dir / "vae_checkpoint_baseline.pt").is_file()
+    assert (tables.output_dir / "vae_checkpoint_regularized.pt").is_file()
+    assert (tables.output_dir / "flow_state_baseline.pt").is_file()
+    assert (tables.output_dir / "flow_state_regularized.pt").is_file()
 
 
 def test_sage_cnn_vae_smoothing_notebook_code_cells_compile() -> None:
