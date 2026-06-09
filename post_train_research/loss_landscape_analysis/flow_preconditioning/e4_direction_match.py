@@ -13,7 +13,6 @@ import torch.nn.functional as F
 
 from .e4_debug import (
     E4DebugState,
-    evaluate_debug_snapshot,
     evaluate_flow_geometry,
     evaluate_original_geometry,
 )
@@ -186,6 +185,17 @@ def direction_target_summary(targets: DirectionTargetCache) -> dict[str, float |
 def inverse_jacobians_for_flow(flow: torch.nn.Module, u_samples: torch.Tensor, *, create_graph: bool) -> torch.Tensor:
     if u_samples.ndim != 2:
         raise ValueError(f"u_samples must be [B,D], got {tuple(u_samples.shape)}")
+    try:
+        from torch.func import jacrev, vmap
+
+        def inverse_single(u: torch.Tensor) -> torch.Tensor:
+            return flow.inverse(u.unsqueeze(0))[0].squeeze(0)
+
+        jacobians = vmap(jacrev(inverse_single))(u_samples)
+        return jacobians if bool(create_graph) else jacobians.detach()
+    except Exception:
+        pass
+
     rows: list[torch.Tensor] = []
     for row_idx in range(int(u_samples.shape[0])):
         u = u_samples[row_idx]
@@ -299,18 +309,31 @@ def _snapshot_direction_match(
     flow: torch.nn.Module,
     train_targets: DirectionTargetCache,
     heldout_targets: DirectionTargetCache,
+    train_original_metrics: dict[str, float],
+    heldout_original_metrics: dict[str, float],
     scale_beta: float,
     step: int,
     batch_metrics: dict[str, float],
     elapsed_s: float,
 ) -> dict[str, float]:
-    row = evaluate_debug_snapshot(
-        state,
-        flow,
-        step=int(step),
-        batch_loss=float(batch_metrics.get("loss", float("nan"))),
-        elapsed_s=float(elapsed_s),
-    )
+    flow_was_training = flow.training
+    flow.eval()
+    try:
+        row: dict[str, Any] = {
+            "step": int(step),
+            "batch_loss": float(batch_metrics.get("loss", float("nan"))),
+            "elapsed_s": float(elapsed_s),
+        }
+        row.update(train_original_metrics)
+        row.update(evaluate_flow_geometry(state.probe, flow, state.train_eval_pool, prefix="train_flow"))
+        row.update(heldout_original_metrics)
+        row.update(evaluate_flow_geometry(state.probe, flow, state.heldout_eval_pool, prefix="heldout_flow"))
+        row["train_R_delta"] = row["train_flow_R"] - row["train_original_R"]
+        row["heldout_R_delta"] = row["heldout_flow_R"] - row["heldout_original_R"]
+        row["train_R_ratio"] = row["train_flow_R"] / max(row["train_original_R"], 1e-12)
+        row["heldout_R_ratio"] = row["heldout_flow_R"] / max(row["heldout_original_R"], 1e-12)
+    finally:
+        flow.train(flow_was_training)
     row["metric_alpha"] = float(train_targets.metric_alpha)
     row["scale_beta"] = float(scale_beta)
     row["batch_dir_loss"] = float(batch_metrics.get("dir_loss", float("nan")))
@@ -383,6 +406,8 @@ def train_direction_match_flow(
     eval_every = max(1, int(debug_cfg.eval_every))
     rows: list[dict[str, float]] = []
     started = time.time()
+    train_original_metrics = evaluate_original_geometry(state.probe, state.train_eval_pool, prefix="train_original")
+    heldout_original_metrics = evaluate_original_geometry(state.probe, state.heldout_eval_pool, prefix="heldout_original")
 
     rows.append(
         _snapshot_direction_match(
@@ -390,6 +415,8 @@ def train_direction_match_flow(
             flow=flow,
             train_targets=train_targets,
             heldout_targets=heldout_targets,
+            train_original_metrics=train_original_metrics,
+            heldout_original_metrics=heldout_original_metrics,
             scale_beta=float(scale_beta),
             step=0,
             batch_metrics={},
@@ -419,6 +446,8 @@ def train_direction_match_flow(
                 flow=flow,
                 train_targets=train_targets,
                 heldout_targets=heldout_targets,
+                train_original_metrics=train_original_metrics,
+                heldout_original_metrics=heldout_original_metrics,
                 scale_beta=float(scale_beta),
                 step=step,
                 batch_metrics=batch_metrics,
