@@ -42,6 +42,11 @@ from post_train_research.loss_landscape_analysis.flow_preconditioning.e4_debug i
     train_e4_debug_flow,
     trajectory_step_alignment_rows,
 )
+from post_train_research.loss_landscape_analysis.flow_preconditioning.e4_direction_match import (
+    compute_direction_targets,
+    direction_match_loss,
+    train_direction_match_flow,
+)
 from post_train_research.loss_landscape_analysis.flow_preconditioning.runner import _select_lrs
 from post_train_research.loss_landscape_analysis.flow_preconditioning.toy_mlp import (
     MLP_DIM,
@@ -485,6 +490,73 @@ def test_e4_geometry_debug_smoke_writes_outputs(tmp_path) -> None:
     assert set(result.final_geometry["coordinate"]) == {"original", "flow"}
     assert (result.output_dir / "history.csv").is_file()
     assert (result.output_dir / "final_geometry.csv").is_file()
+    assert (result.output_dir / "flow_state.pt").is_file()
+
+
+def test_e4_direction_match_targets_and_training_smoke(tmp_path) -> None:
+    debug_cfg = E4DebugConfig(
+        run_label="e4_direction_match_smoke",
+        artifact_root=str(tmp_path),
+        device="cpu",
+        seed=0,
+        rho=1e-1,
+        flow_steps=1,
+        eval_every=1,
+        flow_batch_size=1,
+        flow_num_layers=2,
+        flow_hidden_dim=8,
+        flow_network_depth=1,
+        flow_random_samples=2,
+        flow_trajectory_count=1,
+        flow_trajectory_steps=1,
+        heldout_geometry_samples=2,
+        train_eval_samples=1,
+        heldout_eval_samples=1,
+        train_points=8,
+        probe_points=8,
+        test_points=16,
+    )
+    state = build_e4_debug_state(debug_cfg)
+    train_targets = compute_direction_targets(
+        train_loss_fn=state.problem.train_loss,
+        probe=state.probe,
+        theta_samples=state.flow_pool[:2],
+        metric_alpha=1e-3,
+        rho=float(debug_cfg.rho),
+        split="train",
+    )
+    heldout_targets = compute_direction_targets(
+        train_loss_fn=state.problem.train_loss,
+        probe=state.probe,
+        theta_samples=state.heldout_pool[:2],
+        metric_alpha=1e-3,
+        rho=float(debug_cfg.rho),
+        split="heldout",
+    )
+
+    assert tuple(train_targets.grad.shape) == (2, MLP_DIM)
+    assert tuple(train_targets.probe_metric.shape) == (2, MLP_DIM, MLP_DIM)
+    assert tuple(train_targets.metric_preconditioner.shape) == (2, MLP_DIM, MLP_DIM)
+    assert tuple(train_targets.p_metric.shape) == (2, MLP_DIM)
+    assert torch.isfinite(train_targets.p_metric).all()
+
+    flow = make_flow(MLP_DIM, state.cfg).to(dtype=torch.float32)
+    loss, metrics = direction_match_loss(flow, train_targets, scale_beta=0.1, create_graph=True)
+    assert torch.isfinite(loss)
+    assert np.isfinite(float(metrics["cos_median"]))
+
+    result = train_direction_match_flow(
+        state=state,
+        train_targets=train_targets,
+        heldout_targets=heldout_targets,
+        scale_beta=0.1,
+    )
+
+    assert list(result.history["step"]) == [0, 1]
+    assert "direction_heldout_cos_median" in result.history.columns
+    assert set(result.final_geometry["coordinate"]) == {"original", "flow"}
+    assert (result.output_dir / "history.csv").is_file()
+    assert (result.output_dir / "target_summary.csv").is_file()
     assert (result.output_dir / "flow_state.pt").is_file()
 
 
