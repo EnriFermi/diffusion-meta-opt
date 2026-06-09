@@ -4,6 +4,12 @@ import numpy as np
 import pandas as pd
 import torch
 
+from post_train_research.big_vae_latent_flattening.flow import (
+    RQSplineFlow,
+    RQSplineFlowConfig,
+    RealNVPFlow,
+    flow_architecture_sanity,
+)
 from post_train_research.loss_landscape_analysis.flow_preconditioning import ExperimentConfig, run_or_load
 from post_train_research.loss_landscape_analysis.flow_preconditioning.config import torch_dtype
 from post_train_research.loss_landscape_analysis.flow_preconditioning.flow_experiment import make_flow
@@ -191,11 +197,84 @@ def test_default_config_contains_required_e0_e4_sweeps() -> None:
     cfg = ExperimentConfig()
 
     assert tuple(cfg.experiments) == ("E0", "E1", "E2", "E3", "E4")
+    assert cfg.flow_architecture == "rq_spline"
     assert set(cfg.e2_dims) >= {2, 4}
     assert {"rastrigin_abs", "rosenbrock_abs"}.issubset(set(cfg.e2_objectives))
     assert tuple(cfg.e2_gamma_values) == (0.3, 1.0, 3.0)
     assert tuple(cfg.e3_condition_numbers) == (1.0, 100.0, 10000.0)
     assert tuple(cfg.e4_rho_values) == (0.0, 1e-3, 1e-2, 5e-2)
+
+
+def test_make_flow_defaults_to_rq_spline_and_keeps_realnvp_baseline() -> None:
+    rq_flow = make_flow(5, _small_cfg(flow_num_layers=2, flow_hidden_dim=8, flow_network_depth=1))
+    realnvp_flow = make_flow(
+        5,
+        _small_cfg(flow_architecture="realnvp", flow_num_layers=2, flow_hidden_dim=8, flow_network_depth=1),
+    )
+
+    assert isinstance(rq_flow, RQSplineFlow)
+    assert isinstance(realnvp_flow, RealNVPFlow)
+
+
+def test_rq_spline_flow_identity_roundtrip_logdet_and_inverse_autograd() -> None:
+    flow = RQSplineFlow(
+        RQSplineFlowConfig(
+            dim=5,
+            num_layers=3,
+            hidden_dim=8,
+            network_depth=1,
+            num_bins=8,
+            bound=5.0,
+        )
+    )
+    x = torch.randn(7, 5, dtype=torch.float32).clamp(-2.0, 2.0)
+
+    u, log_det = flow(x)
+    x_reconstructed, inverse_log_det = flow.inverse(u)
+    metrics = flow_architecture_sanity(flow, x, compute_condition=True, condition_samples=3)
+
+    assert torch.allclose(u, x, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(x_reconstructed, x, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(log_det, torch.zeros_like(log_det), atol=1e-5, rtol=1e-5)
+    assert torch.allclose(log_det + inverse_log_det, torch.zeros_like(log_det), atol=1e-5, rtol=1e-5)
+    assert metrics["roundtrip_max_abs_error"] < 1e-5
+    assert metrics["median_abs_displacement"] < 1e-5
+    assert metrics["median_abs_logdet"] < 1e-5
+    assert metrics["median_condition"] < 1.01
+
+    u_req = u.detach().clone().requires_grad_(True)
+    x_inv, inv_log_det = flow.inverse(u_req)
+    loss = x_inv.square().sum() + inv_log_det.square().sum()
+    loss.backward()
+    assert u_req.grad is not None
+    assert torch.isfinite(u_req.grad).all()
+
+
+def test_rq_spline_flow_analytic_inverse_after_small_conditioner_perturbation() -> None:
+    torch.manual_seed(123)
+    flow = RQSplineFlow(
+        RQSplineFlowConfig(
+            dim=5,
+            num_layers=3,
+            hidden_dim=8,
+            network_depth=1,
+            num_bins=8,
+            bound=5.0,
+        )
+    )
+    with torch.no_grad():
+        for layer in flow.layers:
+            layer.final_linear.weight.normal_(0.0, 1e-3)
+            layer.final_linear.bias.normal_(0.0, 1e-3)
+
+    x = (torch.randn(9, 5, dtype=torch.float32) * 2.0).clamp(-4.5, 4.5)
+    u, log_det = flow(x)
+    x_reconstructed, inverse_log_det = flow.inverse(u)
+
+    assert torch.isfinite(u).all()
+    assert torch.isfinite(log_det).all()
+    assert torch.allclose(x_reconstructed, x, atol=3e-5, rtol=3e-5)
+    assert torch.allclose(log_det + inverse_log_det, torch.zeros_like(log_det), atol=3e-5, rtol=3e-5)
 
 
 def test_aulc_and_curve_metrics() -> None:

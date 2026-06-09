@@ -7,7 +7,13 @@ from dataclasses import dataclass
 
 import torch
 
-from post_train_research.big_vae_latent_flattening.flow import RealNVPConfig, RealNVPFlow
+from post_train_research.big_vae_latent_flattening.flow import (
+    RQSplineFlow,
+    RQSplineFlowConfig,
+    RealNVPConfig,
+    RealNVPFlow,
+    flow_architecture_sanity,
+)
 
 from .config import ExperimentConfig
 from .probe_geometry import TensorFn, isometry_objective_from_jacobians, probe_jacobians_for_flow
@@ -17,20 +23,42 @@ LOGGER = logging.getLogger("flow_preconditioning")
 _FLOW_INIT_LOCK = threading.Lock()
 
 
-def make_flow(dim: int, cfg: ExperimentConfig) -> RealNVPFlow:
-    return RealNVPFlow(
-        RealNVPConfig(
-            dim=int(dim),
-            num_layers=int(cfg.flow_num_layers),
-            hidden_dim=int(cfg.flow_hidden_dim),
-            network_depth=int(cfg.flow_network_depth),
-            log_scale_clamp=float(cfg.flow_log_scale_clamp),
-            dropout=float(cfg.flow_dropout),
+def flow_architecture_name(cfg: ExperimentConfig) -> str:
+    return str(getattr(cfg, "flow_architecture", "rq_spline")).strip().lower().replace("-", "_")
+
+
+def make_flow(dim: int, cfg: ExperimentConfig) -> torch.nn.Module:
+    architecture = flow_architecture_name(cfg)
+    if architecture in {"rq_spline", "rqspline", "rational_quadratic_spline", "spline"}:
+        return RQSplineFlow(
+            RQSplineFlowConfig(
+                dim=int(dim),
+                num_layers=int(cfg.flow_num_layers),
+                hidden_dim=int(cfg.flow_hidden_dim),
+                network_depth=int(cfg.flow_network_depth),
+                num_bins=int(cfg.flow_spline_bins),
+                bound=float(cfg.flow_spline_bound),
+                min_bin_width=float(cfg.flow_spline_min_bin_width),
+                min_bin_height=float(cfg.flow_spline_min_bin_height),
+                min_derivative=float(cfg.flow_spline_min_derivative),
+                dropout=float(cfg.flow_dropout),
+            )
         )
-    )
+    if architecture in {"realnvp", "affine", "affine_coupling"}:
+        return RealNVPFlow(
+            RealNVPConfig(
+                dim=int(dim),
+                num_layers=int(cfg.flow_num_layers),
+                hidden_dim=int(cfg.flow_hidden_dim),
+                network_depth=int(cfg.flow_network_depth),
+                log_scale_clamp=float(cfg.flow_log_scale_clamp),
+                dropout=float(cfg.flow_dropout),
+            )
+        )
+    raise ValueError(f"unknown flow architecture {cfg.flow_architecture!r}")
 
 
-def make_random_flow(dim: int, cfg: ExperimentConfig, *, device: torch.device, dtype: torch.dtype, seed: int) -> RealNVPFlow:
+def make_random_flow(dim: int, cfg: ExperimentConfig, *, device: torch.device, dtype: torch.dtype, seed: int) -> torch.nn.Module:
     flow = make_flow(int(dim), cfg).to(device=device, dtype=dtype)
     std = float(cfg.random_flow_near_identity_noise_std)
     if std <= 0.0:
@@ -38,11 +66,13 @@ def make_random_flow(dim: int, cfg: ExperimentConfig, *, device: torch.device, d
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
     with torch.no_grad():
-        for layer in flow.layers:
-            final_linear = None
-            for module in layer.net.modules():
-                if isinstance(module, torch.nn.Linear) and int(module.out_features) == 2 * int(dim):
-                    final_linear = module
+        for layer in getattr(flow, "layers", []):
+            final_linear = getattr(layer, "final_linear", None)
+            if not isinstance(final_linear, torch.nn.Linear):
+                final_linear = None
+                for module in layer.modules():
+                    if isinstance(module, torch.nn.Linear):
+                        final_linear = module
             if final_linear is None:
                 continue
             weight = torch.randn(final_linear.weight.shape, generator=generator, dtype=dtype) * std
@@ -61,9 +91,62 @@ def freeze_flow(flow: torch.nn.Module) -> torch.nn.Module:
 
 @dataclass(slots=True)
 class FlowTrainingResult:
-    flow: RealNVPFlow
+    flow: torch.nn.Module
     history: list[dict[str, float]]
     elapsed_s: float
+
+
+def assert_flow_architecture_sanity(
+    flow: torch.nn.Module,
+    samples: torch.Tensor,
+    cfg: ExperimentConfig,
+    *,
+    log_label: str = "",
+) -> dict[str, float]:
+    sample_count = min(max(1, int(cfg.flow_sanity_samples)), int(samples.shape[0]))
+    metrics = flow_architecture_sanity(
+        flow,
+        samples[:sample_count],
+        compute_condition=bool(cfg.flow_sanity_compute_condition),
+        condition_samples=max(1, int(cfg.flow_sanity_condition_samples)),
+    )
+    label = f"{log_label} " if log_label else ""
+    LOGGER.info(
+        "%sflow_architecture_sanity architecture=%s samples=%d roundtrip_max=%.6g median_abs_displacement=%.6g "
+        "median_abs_logdet=%.6g median_abs_logdet_roundtrip_sum=%.6g median_cond=%s",
+        label,
+        flow_architecture_name(cfg),
+        sample_count,
+        metrics["roundtrip_max_abs_error"],
+        metrics["median_abs_displacement"],
+        metrics["median_abs_logdet"],
+        metrics["median_abs_logdet_roundtrip_sum"],
+        f"{metrics['median_condition']:.6g}" if "median_condition" in metrics else "skipped",
+    )
+    failures: list[str] = []
+    if metrics["roundtrip_max_abs_error"] > float(cfg.flow_sanity_max_roundtrip_error):
+        failures.append(
+            f"roundtrip_max_abs_error={metrics['roundtrip_max_abs_error']:.6g} "
+            f"> {float(cfg.flow_sanity_max_roundtrip_error):.6g}"
+        )
+    if metrics["median_abs_displacement"] > float(cfg.flow_sanity_max_median_abs_displacement):
+        failures.append(
+            f"median_abs_displacement={metrics['median_abs_displacement']:.6g} "
+            f"> {float(cfg.flow_sanity_max_median_abs_displacement):.6g}"
+        )
+    if metrics["median_abs_logdet"] > float(cfg.flow_sanity_max_median_abs_logdet):
+        failures.append(
+            f"median_abs_logdet={metrics['median_abs_logdet']:.6g} "
+            f"> {float(cfg.flow_sanity_max_median_abs_logdet):.6g}"
+        )
+    if "median_condition" in metrics and metrics["median_condition"] > float(cfg.flow_sanity_max_median_condition):
+        failures.append(
+            f"median_condition={metrics['median_condition']:.6g} "
+            f"> {float(cfg.flow_sanity_max_median_condition):.6g}"
+        )
+    if failures:
+        raise RuntimeError(f"flow architecture sanity failed for {flow_architecture_name(cfg)}: {', '.join(failures)}")
+    return metrics
 
 
 def train_flow(
@@ -83,6 +166,7 @@ def train_flow(
     with _FLOW_INIT_LOCK:
         torch.manual_seed(int(seed))
         flow = make_flow(dim, cfg).to(device=device, dtype=dtype)
+    assert_flow_architecture_sanity(flow, theta_samples, cfg, log_label=log_label)
     optimizer = torch.optim.Adam(flow.parameters(), lr=float(cfg.flow_lr))
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed) + 17)
