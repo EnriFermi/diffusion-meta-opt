@@ -21,6 +21,10 @@ from .core import (
     train_posthoc_flow,
     train_weight_vae,
     atomic_torch_save,
+    flow_training_cache_key,
+    load_torch_cache,
+    vae_training_cache_key,
+    weight_pool_cache_key,
 )
 from .downstream import DownstreamContext, tune_and_evaluate_downstream
 from .progress import make_progress
@@ -57,13 +61,8 @@ def _read_existing(output_dir: Path) -> ExperimentTables:
     )
 
 
-def _all_outputs_exist(output_dir: Path) -> bool:
-    config_path = output_dir / "config.json"
-    if not config_path.is_file():
-        return False
-    payload = json.loads(config_path.read_text(encoding="utf-8"))
-    cfg_values = payload.get("config", {})
-    variants = _vae_variants_from_coeff(float(cfg_values.get("vae_geometry_reg_coeff", 0.0)))
+def _all_outputs_exist(output_dir: Path, cfg: ExperimentConfig) -> bool:
+    variants = _vae_variants_from_coeff(float(cfg.vae_geometry_reg_coeff))
     multi_variant = len(variants) > 1
     required = (
         "config.json",
@@ -76,10 +75,40 @@ def _all_outputs_exist(output_dir: Path) -> bool:
     )
     if not all((output_dir / name).is_file() for name in required):
         return False
+    weight_payload = load_torch_cache(output_dir / "weight_pool.pt")
+    if weight_payload is None:
+        return False
+    weight_key = weight_pool_cache_key(cfg)
+    if weight_payload.get("cache_key") != weight_key:
+        return False
+    weights = weight_payload.get("weights")
+    if not isinstance(weights, torch.Tensor):
+        return False
     for variant, _reg_coeff in variants:
-        for name in ("vae_checkpoint.pt", "flow_state.pt", "random_flow_state.pt"):
-            if not _variant_path(output_dir, name, variant=variant, multi_variant=multi_variant).is_file():
-                return False
+        variant_cfg = replace(cfg, vae_geometry_reg_coeff=float(_reg_coeff))
+        vae_path = _variant_path(output_dir, "vae_checkpoint.pt", variant=variant, multi_variant=multi_variant)
+        flow_path = _variant_path(output_dir, "flow_state.pt", variant=variant, multi_variant=multi_variant)
+        random_flow_path = _variant_path(output_dir, "random_flow_state.pt", variant=variant, multi_variant=multi_variant)
+        if not vae_path.is_file() or not flow_path.is_file() or not random_flow_path.is_file():
+            return False
+        vae_payload = load_torch_cache(vae_path)
+        flow_payload = load_torch_cache(flow_path)
+        random_flow_payload = load_torch_cache(random_flow_path)
+        if vae_payload is None or flow_payload is None or random_flow_payload is None:
+            return False
+        vae_key = vae_training_cache_key(variant_cfg, weights, upstream_cache_key=weight_key)
+        if vae_payload.get("cache_key") != vae_key:
+            return False
+        train_indices = vae_payload.get("train_indices")
+        if not isinstance(train_indices, torch.Tensor):
+            return False
+        z_shape = (int(train_indices.numel()), int(variant_cfg.latent_dim))
+        z_train_shape_only = torch.empty(z_shape)
+        flow_key = flow_training_cache_key(variant_cfg, z_train_shape_only, upstream_cache_key=vae_key)
+        if flow_payload.get("cache_key") != flow_key:
+            return False
+        if random_flow_payload.get("cache_key") != f"random-{flow_key}":
+            return False
     return True
 
 
@@ -247,7 +276,7 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
     output_dir = run_dir(cfg)
     cfg_path = output_dir / "config.json"
     cached_cfg = read_config(cfg_path)
-    if bool(cfg.cache_first) and not bool(cfg.force_rerun) and cached_cfg and cached_cfg.get("config_hash") == config_hash(cfg) and _all_outputs_exist(output_dir):
+    if bool(cfg.cache_first) and not bool(cfg.force_rerun) and cached_cfg and cached_cfg.get("config_hash") == config_hash(cfg) and _all_outputs_exist(output_dir, cfg):
         return _read_existing(output_dir)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -280,6 +309,7 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
             output_path=output_dir / "weight_pool.pt",
         )
         weight_records.to_csv(output_dir / "weight_pool_records.csv", index=False)
+        weight_cache_key = weight_pool_cache_key(cfg)
         stage_progress.update(1)
         stage_idx += 1
 
@@ -299,10 +329,12 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
                 variant_cfg,
                 weights,
                 output_path=_variant_path(output_dir, "vae_checkpoint.pt", variant=variant, multi_variant=multi_variant),
+                upstream_cache_key=weight_cache_key,
             )
             trained.vae.to(device=device, dtype=dtype).eval()
             z_all = encode_weights(trained.vae, trained.normalizer, weights_device)
             z_train = z_all.index_select(0, trained.train_indices.to(device=device))
+            vae_cache_key = vae_training_cache_key(variant_cfg, weights, upstream_cache_key=weight_cache_key)
             stage_progress.update(1)
             stage_idx += 1
 
@@ -313,14 +345,16 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
                 normalizer=trained.normalizer,
                 z_train=z_train,
                 output_path=_variant_path(output_dir, "flow_state.pt", variant=variant, multi_variant=multi_variant),
+                upstream_cache_key=vae_cache_key,
             )
+            flow_cache_key = flow_training_cache_key(variant_cfg, z_train, upstream_cache_key=vae_cache_key)
             flow_history = flow_history.copy()
             flow_history["vae_variant"] = variant
             flow_history["vae_geometry_reg_coeff"] = float(reg_coeff)
             flow_history_frames.append(flow_history)
             random_flow = random_near_identity_flow(variant_cfg, int(variant_cfg.latent_dim), device=device, dtype=dtype)
             atomic_torch_save(
-                {"flow_state": random_flow.state_dict()},
+                {"cache_key": f"random-{flow_cache_key}", "flow_state": random_flow.state_dict()},
                 _variant_path(output_dir, "random_flow_state.pt", variant=variant, multi_variant=multi_variant),
             )
             stage_progress.update(1)

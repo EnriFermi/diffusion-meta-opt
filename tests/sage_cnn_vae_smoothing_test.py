@@ -11,6 +11,7 @@ from post_train_research.loss_landscape_analysis.sage_cnn_vae_smoothing.core imp
     WeightVAE,
     load_torch_cache,
     vae_loss,
+    weight_pool_cache_key,
     decoder_jacobians,
     decode_weights,
     flat_to_state_dict,
@@ -225,6 +226,14 @@ def test_corrupt_torch_cache_is_renamed_and_ignored(tmp_path) -> None:
     assert payload is None
     assert not path.exists()
     assert list(tmp_path.glob("broken.pt.broken-*"))
+
+
+def test_weight_pool_cache_key_tracks_weight_generation_config() -> None:
+    base = fast_config(weight_runs=2, weight_train_steps=3, weight_snapshot_every=1)
+
+    assert weight_pool_cache_key(base) != weight_pool_cache_key(fast_config(weight_runs=3, weight_train_steps=3, weight_snapshot_every=1))
+    assert weight_pool_cache_key(base) != weight_pool_cache_key(fast_config(weight_runs=2, weight_train_steps=4, weight_snapshot_every=1))
+    assert weight_pool_cache_key(base) != weight_pool_cache_key(fast_config(weight_runs=2, weight_train_steps=3, weight_snapshot_every=2))
 
 
 def test_sage_cnn_vae_smoothing_notebook_code_cells_compile() -> None:
