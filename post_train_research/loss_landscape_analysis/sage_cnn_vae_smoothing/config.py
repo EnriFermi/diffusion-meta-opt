@@ -70,6 +70,7 @@ class ExperimentConfig:
     finite_penalty: float = 1e12
 
     save_figures: bool = True
+    show_progress: bool = True
 
 
 def fast_config(**overrides: Any) -> ExperimentConfig:

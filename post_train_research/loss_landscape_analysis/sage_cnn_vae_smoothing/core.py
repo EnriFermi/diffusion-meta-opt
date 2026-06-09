@@ -21,6 +21,7 @@ from post_train_research.loss_landscape_analysis.flow_preconditioning.probe_geom
 )
 
 from .config import ExperimentConfig, torch_dtype
+from .progress import make_progress
 
 
 class TinyCNN(nn.Module):
@@ -175,39 +176,45 @@ def generate_weight_pool(
         test_labels,
         batch_size=int(cfg.cnn_batch_size),
     )
-    for run_idx in range(int(cfg.weight_runs)):
-        torch.manual_seed(int(cfg.seed) + 1000 + run_idx)
-        model = TinyCNN().to(device=device, dtype=dtype)
-        optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.weight_lr))
-        loader_iter = iter(train_loader)
-        for step in range(int(cfg.weight_train_steps) + 1):
-            if step in snapshot_steps:
-                flat = state_dict_to_flat(model.state_dict(), spec).detach().cpu()
-                train_loss, train_acc = evaluate_flat_model(flat.to(device=device, dtype=dtype), images=train_images, labels=train_labels, spec=spec)
-                test_loss, test_acc = evaluate_flat_model(flat.to(device=device, dtype=dtype), images=test_images, labels=test_labels, spec=spec)
-                flats.append(flat)
-                records.append(
-                    {
-                        "run": int(run_idx),
-                        "step": int(step),
-                        "train_loss": train_loss,
-                        "train_acc": train_acc,
-                        "test_loss": test_loss,
-                        "test_acc": test_acc,
-                    }
-                )
-            if step == int(cfg.weight_train_steps):
-                break
-            try:
-                batch_images, batch_labels = next(loader_iter)
-            except StopIteration:
-                loader_iter = iter(train_loader)
-                batch_images, batch_labels = next(loader_iter)
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(batch_images)
-            loss = F.cross_entropy(logits, batch_labels)
-            loss.backward()
-            optimizer.step()
+    progress = make_progress(cfg, total=int(cfg.weight_runs) * (int(cfg.weight_train_steps) + 1), desc="weight pool")
+    try:
+        for run_idx in range(int(cfg.weight_runs)):
+            torch.manual_seed(int(cfg.seed) + 1000 + run_idx)
+            model = TinyCNN().to(device=device, dtype=dtype)
+            optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.weight_lr))
+            loader_iter = iter(train_loader)
+            for step in range(int(cfg.weight_train_steps) + 1):
+                if step in snapshot_steps:
+                    flat = state_dict_to_flat(model.state_dict(), spec).detach().cpu()
+                    train_loss, train_acc = evaluate_flat_model(flat.to(device=device, dtype=dtype), images=train_images, labels=train_labels, spec=spec)
+                    test_loss, test_acc = evaluate_flat_model(flat.to(device=device, dtype=dtype), images=test_images, labels=test_labels, spec=spec)
+                    flats.append(flat)
+                    records.append(
+                        {
+                            "run": int(run_idx),
+                            "step": int(step),
+                            "train_loss": train_loss,
+                            "train_acc": train_acc,
+                            "test_loss": test_loss,
+                            "test_acc": test_acc,
+                        }
+                    )
+                    progress.set_postfix({"run": run_idx, "step": step, "snapshots": len(flats), "test_acc": f"{test_acc:.3f}"})
+                progress.update(1)
+                if step == int(cfg.weight_train_steps):
+                    break
+                try:
+                    batch_images, batch_labels = next(loader_iter)
+                except StopIteration:
+                    loader_iter = iter(train_loader)
+                    batch_images, batch_labels = next(loader_iter)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(batch_images)
+                loss = F.cross_entropy(logits, batch_labels)
+                loss.backward()
+                optimizer.step()
+    finally:
+        progress.close()
 
     weights = torch.stack(flats, dim=0)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -334,22 +341,28 @@ def train_weight_vae(cfg: ExperimentConfig, weights: torch.Tensor, *, output_pat
     metrics: list[dict[str, float]] = []
     train_indices_device = train_indices.to(device=device)
     batch_size = min(max(1, int(cfg.vae_batch_size)), int(train_indices.numel()))
-    for step in range(1, int(cfg.vae_steps) + 1):
-        batch_pos = torch.randint(0, int(train_indices.numel()), (batch_size,), generator=generator, device="cpu").to(device=device)
-        batch = x_norm.index_select(0, train_indices_device.index_select(0, batch_pos))
-        vae.train()
-        optimizer.zero_grad(set_to_none=True)
-        recon, mu, logvar = vae(batch)
-        loss, row = vae_loss(batch, recon, mu, logvar, beta_kl=float(cfg.beta_kl))
-        loss.backward()
-        optimizer.step()
-        if step == 1 or step % max(1, int(cfg.vae_steps) // 20) == 0 or step == int(cfg.vae_steps):
-            vae.eval()
-            with torch.no_grad():
-                val = x_norm.index_select(0, val_indices.to(device=device))
-                recon_val, mu_val, logvar_val = vae(val)
-                _loss_val, val_row = vae_loss(val, recon_val, mu_val, logvar_val, beta_kl=float(cfg.beta_kl))
-            metrics.append({"step": float(step), **{f"train_{k}": v for k, v in row.items()}, **{f"val_{k}": v for k, v in val_row.items()}})
+    progress = make_progress(cfg, total=int(cfg.vae_steps), desc="weight VAE")
+    try:
+        for step in range(1, int(cfg.vae_steps) + 1):
+            batch_pos = torch.randint(0, int(train_indices.numel()), (batch_size,), generator=generator, device="cpu").to(device=device)
+            batch = x_norm.index_select(0, train_indices_device.index_select(0, batch_pos))
+            vae.train()
+            optimizer.zero_grad(set_to_none=True)
+            recon, mu, logvar = vae(batch)
+            loss, row = vae_loss(batch, recon, mu, logvar, beta_kl=float(cfg.beta_kl))
+            loss.backward()
+            optimizer.step()
+            if step == 1 or step % max(1, int(cfg.vae_steps) // 20) == 0 or step == int(cfg.vae_steps):
+                vae.eval()
+                with torch.no_grad():
+                    val = x_norm.index_select(0, val_indices.to(device=device))
+                    recon_val, mu_val, logvar_val = vae(val)
+                    _loss_val, val_row = vae_loss(val, recon_val, mu_val, logvar_val, beta_kl=float(cfg.beta_kl))
+                metrics.append({"step": float(step), **{f"train_{k}": v for k, v in row.items()}, **{f"val_{k}": v for k, v in val_row.items()}})
+                progress.set_postfix({"loss": f"{row['loss']:.4g}", "recon": f"{row['recon_mse']:.4g}", "val": f"{val_row['loss']:.4g}"})
+            progress.update(1)
+    finally:
+        progress.close()
     vae.eval()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -451,40 +464,52 @@ def train_posthoc_flow(
     sample_count = int(z_train.shape[0])
     batch_size = min(max(1, int(cfg.flow_batch_size)), sample_count)
     history: list[dict[str, float]] = []
-    for step in range(1, int(cfg.flow_steps) + 1):
-        idx_i = torch.randint(0, sample_count, (batch_size,), generator=generator, device="cpu").to(device=z_train.device)
-        idx_j = torch.randint(0, sample_count, (batch_size,), generator=generator, device="cpu").to(device=z_train.device)
-        z_i = z_train.index_select(0, idx_i)
-        z_j = z_train.index_select(0, idx_j)
-        u_i = flow(z_i)[0]
-        u_j = flow(z_j)[0]
-        alpha = (
-            torch.rand(batch_size, 1, generator=generator, device="cpu", dtype=z_train.dtype).to(device=z_train.device)
-            * (float(cfg.mixup_alpha_max) - float(cfg.mixup_alpha_min))
-            + float(cfg.mixup_alpha_min)
-        )
-        u_mix = alpha * u_i + (1.0 - alpha) * u_j
-        optimizer.zero_grad(set_to_none=True)
-        jac = decoder_jacobians(vae, normalizer, flow, u_mix, create_graph=True)
-        iso = isometry_objective_from_jacobians(jac, dim=int(z_train.shape[1]))
-        z_mix = flow.inverse(u_mix)[0]
-        z_norm = z_mix.square().mean()
-        loss = iso + float(cfg.flow_eta) * z_norm
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"non-finite posthoc flow loss at step {step}: {float(loss.detach().cpu().item())}")
-        loss.backward()
-        grad = torch.nn.utils.clip_grad_norm_(flow.parameters(), float(cfg.flow_grad_clip_norm))
-        optimizer.step()
-        if step == 1 or step % max(1, int(cfg.flow_log_every)) == 0 or step == int(cfg.flow_steps):
-            history.append(
-                {
-                    "step": float(step),
-                    "loss": float(loss.detach().cpu().item()),
-                    "isometry": float(iso.detach().cpu().item()),
-                    "z_norm": float(z_norm.detach().cpu().item()),
-                    "grad_norm": float(torch.as_tensor(grad).detach().cpu().item()),
-                }
+    progress = make_progress(cfg, total=int(cfg.flow_steps), desc="post-hoc NF")
+    try:
+        for step in range(1, int(cfg.flow_steps) + 1):
+            idx_i = torch.randint(0, sample_count, (batch_size,), generator=generator, device="cpu").to(device=z_train.device)
+            idx_j = torch.randint(0, sample_count, (batch_size,), generator=generator, device="cpu").to(device=z_train.device)
+            z_i = z_train.index_select(0, idx_i)
+            z_j = z_train.index_select(0, idx_j)
+            u_i = flow(z_i)[0]
+            u_j = flow(z_j)[0]
+            alpha = (
+                torch.rand(batch_size, 1, generator=generator, device="cpu", dtype=z_train.dtype).to(device=z_train.device)
+                * (float(cfg.mixup_alpha_max) - float(cfg.mixup_alpha_min))
+                + float(cfg.mixup_alpha_min)
             )
+            u_mix = alpha * u_i + (1.0 - alpha) * u_j
+            optimizer.zero_grad(set_to_none=True)
+            jac = decoder_jacobians(vae, normalizer, flow, u_mix, create_graph=True)
+            iso = isometry_objective_from_jacobians(jac, dim=int(z_train.shape[1]))
+            z_mix = flow.inverse(u_mix)[0]
+            z_norm = z_mix.square().mean()
+            loss = iso + float(cfg.flow_eta) * z_norm
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"non-finite posthoc flow loss at step {step}: {float(loss.detach().cpu().item())}")
+            loss.backward()
+            grad = torch.nn.utils.clip_grad_norm_(flow.parameters(), float(cfg.flow_grad_clip_norm))
+            optimizer.step()
+            if step == 1 or step % max(1, int(cfg.flow_log_every)) == 0 or step == int(cfg.flow_steps):
+                history.append(
+                    {
+                        "step": float(step),
+                        "loss": float(loss.detach().cpu().item()),
+                        "isometry": float(iso.detach().cpu().item()),
+                        "z_norm": float(z_norm.detach().cpu().item()),
+                        "grad_norm": float(torch.as_tensor(grad).detach().cpu().item()),
+                    }
+                )
+                progress.set_postfix(
+                    {
+                        "loss": f"{float(loss.detach().cpu().item()):.4g}",
+                        "iso": f"{float(iso.detach().cpu().item()):.4g}",
+                        "grad": f"{float(torch.as_tensor(grad).detach().cpu().item()):.3g}",
+                    }
+                )
+            progress.update(1)
+    finally:
+        progress.close()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"flow_state": flow.state_dict(), "history": history}, output_path)
     return flow, pd.DataFrame(history)

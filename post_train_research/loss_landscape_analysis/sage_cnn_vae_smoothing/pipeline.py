@@ -21,6 +21,7 @@ from .core import (
     train_weight_vae,
 )
 from .downstream import DownstreamContext, tune_and_evaluate_downstream
+from .progress import make_progress
 
 
 @dataclass(slots=True)
@@ -193,74 +194,98 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
     config_payload = write_config(cfg_path, cfg)
     device = torch.device(cfg.device)
     dtype = torch_dtype(cfg)
+    stage_progress = make_progress(cfg, total=8, desc="sage smoothing pipeline", leave=True)
 
-    train_images, train_labels, test_images, test_labels = load_vision_tensors(cfg)
-    train_images = train_images.to(device=device, dtype=dtype)
-    train_labels = train_labels.to(device=device)
-    test_images = test_images.to(device=device, dtype=dtype)
-    test_labels = test_labels.to(device=device)
+    try:
+        stage_progress.set_description("load data")
+        train_images, train_labels, test_images, test_labels = load_vision_tensors(cfg)
+        train_images = train_images.to(device=device, dtype=dtype)
+        train_labels = train_labels.to(device=device)
+        test_images = test_images.to(device=device, dtype=dtype)
+        test_labels = test_labels.to(device=device)
+        stage_progress.update(1)
 
-    weights, weight_records, spec = generate_weight_pool(
-        cfg,
-        train_images=train_images,
-        train_labels=train_labels,
-        test_images=test_images,
-        test_labels=test_labels,
-        output_path=output_dir / "weight_pool.pt",
-    )
-    weight_records.to_csv(output_dir / "weight_pool_records.csv", index=False)
-    trained = train_weight_vae(cfg, weights, output_path=output_dir / "vae_checkpoint.pt")
-    trained.vae.to(device=device, dtype=dtype).eval()
-    weights_device = weights.to(device=device, dtype=dtype)
-    z_all = encode_weights(trained.vae, trained.normalizer, weights_device)
-    z_train = z_all.index_select(0, trained.train_indices.to(device=device))
-    trained_flow, flow_history = train_posthoc_flow(
-        cfg,
-        vae=trained.vae,
-        normalizer=trained.normalizer,
-        z_train=z_train,
-        output_path=output_dir / "flow_state.pt",
-    )
-    flow_history.to_csv(output_dir / "flow_history.csv", index=False)
-    random_flow = random_near_identity_flow(cfg, int(cfg.latent_dim), device=device, dtype=dtype)
-    torch.save({"flow_state": random_flow.state_dict()}, output_dir / "random_flow_state.pt")
+        stage_progress.set_description("generate weights")
+        weights, weight_records, spec = generate_weight_pool(
+            cfg,
+            train_images=train_images,
+            train_labels=train_labels,
+            test_images=test_images,
+            test_labels=test_labels,
+            output_path=output_dir / "weight_pool.pt",
+        )
+        weight_records.to_csv(output_dir / "weight_pool_records.csv", index=False)
+        stage_progress.update(1)
 
-    vae_metrics = _vae_quality_rows(
-        cfg=cfg,
-        trained=trained,
-        weights=weights,
-        spec=spec,
-        train_images=train_images,
-        train_labels=train_labels,
-        test_images=test_images,
-        test_labels=test_labels,
-    )
-    geometry = _geometry_table(cfg=cfg, trained=trained, weights=weights, trained_flow=trained_flow, random_flow=random_flow)
-    start_indices = trained.val_indices
-    if int(start_indices.numel()) < int(cfg.tune_starts) + int(cfg.eval_starts):
-        start_indices = torch.arange(int(weights.shape[0]))
-    starts = weights_device.index_select(0, start_indices.to(device=device))
-    ctx = DownstreamContext(
-        cfg=cfg,
-        spec=spec,
-        vae=trained.vae,
-        normalizer=trained.normalizer,
-        trained_flow=trained_flow,
-        random_flow=random_flow,
-        train_images=train_images,
-        train_labels=train_labels,
-        test_images=test_images,
-        test_labels=test_labels,
-    )
-    downstream_results, downstream_curves, selected_lrs = tune_and_evaluate_downstream(cfg=cfg, ctx=ctx, starts=starts)
-    interpretation = _build_interpretation(vae_metrics, geometry, downstream_results)
+        stage_progress.set_description("train VAE")
+        trained = train_weight_vae(cfg, weights, output_path=output_dir / "vae_checkpoint.pt")
+        trained.vae.to(device=device, dtype=dtype).eval()
+        weights_device = weights.to(device=device, dtype=dtype)
+        z_all = encode_weights(trained.vae, trained.normalizer, weights_device)
+        z_train = z_all.index_select(0, trained.train_indices.to(device=device))
+        stage_progress.update(1)
 
-    vae_metrics.to_csv(output_dir / "vae_metrics.csv", index=False)
-    geometry.to_csv(output_dir / "geometry.csv", index=False)
-    selected_lrs.to_csv(output_dir / "selected_lrs.csv", index=False)
-    downstream_results.to_csv(output_dir / "downstream_results.csv", index=False)
-    downstream_curves.to_csv(output_dir / "downstream_curves.csv", index=False)
-    (output_dir / "interpretation.md").write_text(interpretation, encoding="utf-8")
+        stage_progress.set_description("train NF")
+        trained_flow, flow_history = train_posthoc_flow(
+            cfg,
+            vae=trained.vae,
+            normalizer=trained.normalizer,
+            z_train=z_train,
+            output_path=output_dir / "flow_state.pt",
+        )
+        flow_history.to_csv(output_dir / "flow_history.csv", index=False)
+        random_flow = random_near_identity_flow(cfg, int(cfg.latent_dim), device=device, dtype=dtype)
+        torch.save({"flow_state": random_flow.state_dict()}, output_dir / "random_flow_state.pt")
+        stage_progress.update(1)
+
+        stage_progress.set_description("VAE quality")
+        vae_metrics = _vae_quality_rows(
+            cfg=cfg,
+            trained=trained,
+            weights=weights,
+            spec=spec,
+            train_images=train_images,
+            train_labels=train_labels,
+            test_images=test_images,
+            test_labels=test_labels,
+        )
+        stage_progress.update(1)
+
+        stage_progress.set_description("geometry")
+        geometry = _geometry_table(cfg=cfg, trained=trained, weights=weights, trained_flow=trained_flow, random_flow=random_flow)
+        stage_progress.update(1)
+
+        stage_progress.set_description("downstream")
+        start_indices = trained.val_indices
+        if int(start_indices.numel()) < int(cfg.tune_starts) + int(cfg.eval_starts):
+            start_indices = torch.arange(int(weights.shape[0]))
+        starts = weights_device.index_select(0, start_indices.to(device=device))
+        ctx = DownstreamContext(
+            cfg=cfg,
+            spec=spec,
+            vae=trained.vae,
+            normalizer=trained.normalizer,
+            trained_flow=trained_flow,
+            random_flow=random_flow,
+            train_images=train_images,
+            train_labels=train_labels,
+            test_images=test_images,
+            test_labels=test_labels,
+        )
+        downstream_results, downstream_curves, selected_lrs = tune_and_evaluate_downstream(cfg=cfg, ctx=ctx, starts=starts)
+        interpretation = _build_interpretation(vae_metrics, geometry, downstream_results)
+        stage_progress.update(1)
+
+        stage_progress.set_description("write outputs")
+        vae_metrics.to_csv(output_dir / "vae_metrics.csv", index=False)
+        geometry.to_csv(output_dir / "geometry.csv", index=False)
+        selected_lrs.to_csv(output_dir / "selected_lrs.csv", index=False)
+        downstream_results.to_csv(output_dir / "downstream_results.csv", index=False)
+        downstream_curves.to_csv(output_dir / "downstream_curves.csv", index=False)
+        (output_dir / "interpretation.md").write_text(interpretation, encoding="utf-8")
+        stage_progress.update(1)
+    finally:
+        stage_progress.close()
     return ExperimentTables(
         vae_metrics=vae_metrics,
         geometry=geometry,
