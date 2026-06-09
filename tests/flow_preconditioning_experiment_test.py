@@ -544,6 +544,13 @@ def test_e4_direction_match_targets_and_training_smoke(tmp_path) -> None:
     loss, metrics = direction_match_loss(flow, train_targets, scale_beta=0.1, create_graph=True)
     assert torch.isfinite(loss)
     assert np.isfinite(float(metrics["cos_median"]))
+    loss.backward()
+    grad_total = sum(
+        float(param.grad.detach().abs().sum().cpu().item())
+        for param in flow.parameters()
+        if param.grad is not None
+    )
+    assert grad_total > 0.0
 
     result = train_direction_match_flow(
         state=state,
