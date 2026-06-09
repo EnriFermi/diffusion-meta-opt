@@ -369,15 +369,14 @@ def _safe_cosine(lhs: torch.Tensor, rhs: torch.Tensor, *, eps: float = 1e-12) ->
     return float((lhs_flat @ rhs_flat / denom.clamp_min(float(eps))).cpu().item())
 
 
-def preconditioner_alignment_row(
+def _preconditioner_vectors(
     *,
     train_loss_fn: LossFn,
     probe: TensorFn,
     flow: torch.nn.Module,
     theta: torch.Tensor,
     damping: float,
-    eps: float = 1e-12,
-) -> dict[str, float]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     theta_value = theta.detach().reshape(-1)
     dim = int(theta_value.numel())
     theta_req = theta_value.clone().requires_grad_(True)
@@ -402,12 +401,30 @@ def preconditioner_alignment_row(
         p_nf = inverse_jacobian @ (inverse_jacobian.transpose(0, 1) @ grad)
     finally:
         flow.train(flow_was_training)
+    return loss.detach(), grad, p_metric, p_nf
 
+
+def preconditioner_alignment_row(
+    *,
+    train_loss_fn: LossFn,
+    probe: TensorFn,
+    flow: torch.nn.Module,
+    theta: torch.Tensor,
+    damping: float,
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    loss, grad, p_metric, p_nf = _preconditioner_vectors(
+        train_loss_fn=train_loss_fn,
+        probe=probe,
+        flow=flow,
+        theta=theta,
+        damping=float(damping),
+    )
     grad_norm = grad.float().norm()
     metric_norm = p_metric.float().norm()
     nf_norm = p_nf.float().norm()
     return {
-        "loss": float(loss.detach().cpu().item()),
+        "loss": float(loss.cpu().item()),
         "grad_norm": float(grad_norm.cpu().item()),
         "p_metric_norm": float(metric_norm.cpu().item()),
         "p_nf_norm": float(nf_norm.cpu().item()),
@@ -448,6 +465,56 @@ def preconditioner_alignment_rows(
                 "start_index": int(start_index),
                 "step": int(steps[row_idx]),
                 **row,
+            }
+        )
+    return rows
+
+
+def trajectory_step_alignment_rows(
+    *,
+    train_loss_fn: LossFn,
+    probe: TensorFn,
+    flow: torch.nn.Module,
+    theta_path: torch.Tensor,
+    damping: float,
+    source: str,
+    start_index: int,
+    steps: list[int] | tuple[int, ...],
+    eps: float = 1e-12,
+) -> list[dict[str, float | int | str]]:
+    if theta_path.ndim != 2:
+        raise ValueError(f"theta_path must be [N,D], got {tuple(theta_path.shape)}")
+    if len(steps) != int(theta_path.shape[0]):
+        raise ValueError(f"steps length must match theta_path rows: {len(steps)} vs {int(theta_path.shape[0])}")
+    rows: list[dict[str, float | int | str]] = []
+    for row_idx in range(int(theta_path.shape[0]) - 1):
+        loss, grad, p_metric, p_nf = _preconditioner_vectors(
+            train_loss_fn=train_loss_fn,
+            probe=probe,
+            flow=flow,
+            theta=theta_path[row_idx],
+            damping=float(damping),
+        )
+        # Optimizers apply theta_next = theta - update. The descent-space step is therefore theta - theta_next.
+        descent_step = theta_path[row_idx].detach().reshape(-1) - theta_path[row_idx + 1].detach().reshape(-1)
+        step_norm = descent_step.float().norm()
+        metric_norm = p_metric.float().norm()
+        nf_norm = p_nf.float().norm()
+        rows.append(
+            {
+                "source": str(source),
+                "start_index": int(start_index),
+                "step": int(steps[row_idx]),
+                "next_step": int(steps[row_idx + 1]),
+                "loss": float(loss.cpu().item()),
+                "step_norm": float(step_norm.cpu().item()),
+                "grad_norm": float(grad.float().norm().cpu().item()),
+                "p_metric_norm": float(metric_norm.cpu().item()),
+                "p_nf_norm": float(nf_norm.cpu().item()),
+                "cos_step_p_metric": _safe_cosine(descent_step, p_metric, eps=eps),
+                "cos_step_p_nf": _safe_cosine(descent_step, p_nf, eps=eps),
+                "step_norm_over_p_metric_norm": float((step_norm / metric_norm.clamp_min(float(eps))).cpu().item()),
+                "step_norm_over_p_nf_norm": float((step_norm / nf_norm.clamp_min(float(eps))).cpu().item()),
             }
         )
     return rows
