@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
 import uuid
@@ -47,6 +49,106 @@ def atomic_torch_save(payload: Any, path: Path) -> None:
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
+
+
+def _stage_cache_key(stage: str, cfg: ExperimentConfig, keys: tuple[str, ...], *, extra: dict[str, Any] | None = None) -> str:
+    payload: dict[str, Any] = {"stage": stage, "extra": extra or {}}
+    payload["config"] = {key: getattr(cfg, key) for key in keys}
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+
+def _cache_payload_matches(payload: dict[str, Any], expected_key: str, path: Path) -> bool:
+    actual_key = payload.get("cache_key")
+    if actual_key == expected_key:
+        print(f"[cache] hit: {path}", flush=True)
+        return True
+    print(f"[cache] miss: {path} cache_key={actual_key!r} expected={expected_key!r}", flush=True)
+    return False
+
+
+def weight_pool_cache_key(cfg: ExperimentConfig) -> str:
+    return _stage_cache_key(
+        "weight_pool",
+        cfg,
+        (
+            "dataset_name",
+            "data_root",
+            "download",
+            "train_subset",
+            "test_subset",
+            "cnn_batch_size",
+            "weight_runs",
+            "weight_train_steps",
+            "weight_snapshot_every",
+            "weight_lr",
+            "seed",
+            "dtype",
+        ),
+    )
+
+
+def vae_training_cache_key(cfg: ExperimentConfig, weights: torch.Tensor, *, upstream_cache_key: str) -> str:
+    return _stage_cache_key(
+        "vae",
+        cfg,
+        (
+            "vae_train_fraction",
+            "latent_dim",
+            "vae_hidden_dim",
+            "vae_steps",
+            "vae_batch_size",
+            "vae_lr",
+            "vae_loss_kind",
+            "beta_kl",
+            "bigvae_operator_probe_rows",
+            "bigvae_patch_size",
+            "bigvae_behavioral_coef",
+            "bigvae_structural_coef",
+            "bigvae_bias_coef",
+            "bigvae_behavioral_lambda_operator",
+            "bigvae_behavioral_lambda_dir",
+            "bigvae_behavioral_lambda_scale",
+            "bigvae_behavioral_gamma",
+            "bigvae_behavioral_huber_delta",
+            "bigvae_struct_gamma",
+            "bigvae_struct_lambda_dir",
+            "bigvae_struct_lambda_scale",
+            "bigvae_struct_lambda_rec",
+            "bigvae_struct_lambda_rel",
+            "bigvae_struct_huber_delta",
+            "vae_geometry_reg_coeff",
+            "vae_geometry_reg_samples",
+            "vae_geometry_reg_detach_latents",
+            "seed",
+            "dtype",
+        ),
+        extra={"weights_shape": list(weights.shape), "upstream_cache_key": upstream_cache_key},
+    )
+
+
+def flow_training_cache_key(cfg: ExperimentConfig, z_train: torch.Tensor, *, upstream_cache_key: str) -> str:
+    return _stage_cache_key(
+        "posthoc_flow",
+        cfg,
+        (
+            "flow_steps",
+            "flow_batch_size",
+            "flow_lr",
+            "flow_grad_clip_norm",
+            "flow_num_layers",
+            "flow_hidden_dim",
+            "flow_network_depth",
+            "flow_spline_bins",
+            "flow_spline_bound",
+            "flow_eta",
+            "mixup_alpha_min",
+            "mixup_alpha_max",
+            "seed",
+            "dtype",
+        ),
+        extra={"z_train_shape": list(z_train.shape), "upstream_cache_key": upstream_cache_key},
+    )
 
 
 class TinyCNN(nn.Module):
@@ -177,9 +279,10 @@ def generate_weight_pool(
     test_labels: torch.Tensor,
     output_path: Path,
 ) -> tuple[torch.Tensor, pd.DataFrame, FlatSpec]:
+    cache_key = weight_pool_cache_key(cfg)
     if output_path.is_file() and bool(cfg.cache_first) and not bool(cfg.force_rerun):
         payload = load_torch_cache(output_path)
-        if payload is not None:
+        if payload is not None and _cache_payload_matches(payload, cache_key, output_path):
             spec = FlatSpec(tuple(payload["spec"]["keys"]), tuple(tuple(s) for s in payload["spec"]["shapes"]), tuple(payload["spec"]["sizes"]))
             return payload["weights"], pd.DataFrame(payload["records"]), spec
 
@@ -195,6 +298,14 @@ def generate_weight_pool(
     snapshot_every = max(1, int(cfg.weight_snapshot_every))
     snapshot_steps = set(range(0, int(cfg.weight_train_steps) + 1, snapshot_every))
     snapshot_steps.add(int(cfg.weight_train_steps))
+    expected_snapshots = int(cfg.weight_runs) * len(snapshot_steps)
+    print(
+        "[weight_pool] building "
+        f"runs={int(cfg.weight_runs)} train_steps={int(cfg.weight_train_steps)} "
+        f"snapshot_every={snapshot_every} snapshots_per_run={len(snapshot_steps)} "
+        f"expected_snapshots={expected_snapshots} output={output_path}",
+        flush=True,
+    )
     train_loader, _test_loader = make_tensor_loaders(
         train_images,
         train_labels,
@@ -243,8 +354,13 @@ def generate_weight_pool(
         progress.close()
 
     weights = torch.stack(flats, dim=0)
+    print(
+        f"[weight_pool] built snapshots={len(flats)} weights_shape={tuple(weights.shape)} records={len(records)} output={output_path}",
+        flush=True,
+    )
     atomic_torch_save(
         {
+            "cache_key": cache_key,
             "weights": weights,
             "records": records,
             "spec": {"keys": spec.keys, "shapes": spec.shapes, "sizes": spec.sizes},
@@ -511,10 +627,17 @@ class TrainedVAE:
     metrics: pd.DataFrame
 
 
-def train_weight_vae(cfg: ExperimentConfig, weights: torch.Tensor, *, output_path: Path) -> TrainedVAE:
+def train_weight_vae(
+    cfg: ExperimentConfig,
+    weights: torch.Tensor,
+    *,
+    output_path: Path,
+    upstream_cache_key: str = "",
+) -> TrainedVAE:
+    cache_key = vae_training_cache_key(cfg, weights, upstream_cache_key=upstream_cache_key)
     if output_path.is_file() and bool(cfg.cache_first) and not bool(cfg.force_rerun):
         payload = load_torch_cache(output_path)
-        if payload is not None:
+        if payload is not None and _cache_payload_matches(payload, cache_key, output_path):
             normalizer = WeightNormalizer.from_state_dict(payload["normalizer"])
             vae = WeightVAE(weight_dim=int(weights.shape[1]), latent_dim=int(cfg.latent_dim), hidden_dim=int(cfg.vae_hidden_dim))
             vae.load_state_dict(payload["model_state"])
@@ -611,6 +734,7 @@ def train_weight_vae(cfg: ExperimentConfig, weights: torch.Tensor, *, output_pat
     vae.eval()
     atomic_torch_save(
         {
+            "cache_key": cache_key,
             "model_state": vae.detach().cpu().state_dict() if hasattr(vae, "detach") else {k: v.detach().cpu() for k, v in vae.state_dict().items()},
             "normalizer": normalizer.state_dict(),
             "train_indices": train_indices,
@@ -725,10 +849,12 @@ def train_posthoc_flow(
     normalizer: WeightNormalizer,
     z_train: torch.Tensor,
     output_path: Path,
+    upstream_cache_key: str = "",
 ) -> tuple[torch.nn.Module, pd.DataFrame]:
+    cache_key = flow_training_cache_key(cfg, z_train, upstream_cache_key=upstream_cache_key)
     if output_path.is_file() and bool(cfg.cache_first) and not bool(cfg.force_rerun):
         payload = load_torch_cache(output_path)
-        if payload is not None:
+        if payload is not None and _cache_payload_matches(payload, cache_key, output_path):
             flow = make_rq_flow(cfg, int(z_train.shape[1]), device=z_train.device, dtype=z_train.dtype)
             flow.load_state_dict(payload["flow_state"])
             return flow, pd.DataFrame(payload["history"])
@@ -786,7 +912,7 @@ def train_posthoc_flow(
             progress.update(1)
     finally:
         progress.close()
-    atomic_torch_save({"flow_state": flow.state_dict(), "history": history}, output_path)
+    atomic_torch_save({"cache_key": cache_key, "flow_state": flow.state_dict(), "history": history}, output_path)
     return flow, pd.DataFrame(history)
 
 
