@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch.func import functional_call
 from torch.utils.data import DataLoader, Subset, TensorDataset
 
+from big_vae.models.big_weight_vae_parts.loss_mixin import BigWeightVAELossMixin
 from post_train_research.big_vae_latent_flattening.flow import RQSplineFlow, RQSplineFlowConfig
 from post_train_research.loss_landscape_analysis.flow_preconditioning.probe_geometry import (
     isometry_objective_from_jacobians,
@@ -292,11 +293,188 @@ class WeightVAE(nn.Module):
         return self.decode_norm(z), mu, logvar
 
 
-def vae_loss(x_norm: torch.Tensor, recon_norm: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor, *, beta_kl: float) -> tuple[torch.Tensor, dict[str, float]]:
+def _matrix_and_bias_blocks(flat_batch: torch.Tensor, spec: FlatSpec) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, torch.Tensor]]]:
+    matrix_blocks: list[tuple[str, torch.Tensor]] = []
+    bias_blocks: list[tuple[str, torch.Tensor]] = []
+    offset = 0
+    batch_size = int(flat_batch.shape[0])
+    for key, shape, size in zip(spec.keys, spec.shapes, spec.sizes, strict=True):
+        value = flat_batch[:, offset : offset + int(size)].reshape((batch_size, *shape))
+        offset += int(size)
+        if str(key).endswith(".weight") and len(shape) == 2:
+            matrix_blocks.append((key, value.transpose(1, 2).contiguous()))
+        elif str(key).endswith(".weight") and len(shape) == 4:
+            matrix_blocks.append((key, value.reshape(batch_size, int(shape[0]), -1).transpose(1, 2).contiguous()))
+        elif str(key).endswith(".bias") or len(shape) == 1:
+            bias_blocks.append((key, value.reshape(batch_size, -1)))
+        else:
+            bias_blocks.append((key, value.reshape(batch_size, -1)))
+    return matrix_blocks, bias_blocks
+
+
+def _normalized_bias_mse(
+    target_bias_blocks: list[tuple[str, torch.Tensor]],
+    recon_bias_blocks: list[tuple[str, torch.Tensor]],
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    terms: list[torch.Tensor] = []
+    for (target_key, target), (recon_key, recon) in zip(target_bias_blocks, recon_bias_blocks, strict=True):
+        if target_key != recon_key:
+            raise ValueError(f"bias block key mismatch: {target_key!r} vs {recon_key!r}")
+        denom = target.detach().pow(2).mean(dim=1).clamp_min(float(eps))
+        terms.append((recon - target).pow(2).mean(dim=1) / denom)
+    if not terms:
+        return target_bias_blocks[0][1].new_zeros(()) if target_bias_blocks else torch.tensor(0.0)
+    return torch.stack([term.mean() for term in terms]).mean()
+
+
+def bigvae_style_weight_loss(
+    cfg: ExperimentConfig,
+    *,
+    target_weights: torch.Tensor,
+    recon_weights: torch.Tensor,
+    spec: FlatSpec,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    target_matrices, target_biases = _matrix_and_bias_blocks(target_weights, spec)
+    recon_matrices, recon_biases = _matrix_and_bias_blocks(recon_weights, spec)
+    behavioral_terms: list[torch.Tensor] = []
+    operator_terms: list[torch.Tensor] = []
+    behavioral_dir_terms: list[torch.Tensor] = []
+    behavioral_scale_terms: list[torch.Tensor] = []
+    structural_terms: list[torch.Tensor] = []
+    struct_dir_terms: list[torch.Tensor] = []
+    struct_scale_terms: list[torch.Tensor] = []
+    struct_rec_terms: list[torch.Tensor] = []
+    struct_rel_terms: list[torch.Tensor] = []
+
+    for (target_key, W), (recon_key, W_hat) in zip(target_matrices, recon_matrices, strict=True):
+        if target_key != recon_key:
+            raise ValueError(f"matrix block key mismatch: {target_key!r} vs {recon_key!r}")
+        rows = max(1, int(cfg.bigvae_operator_probe_rows))
+        X = torch.randn((int(W.shape[0]), rows, int(W.shape[1])), device=W.device, dtype=W.dtype)
+        operator = BigWeightVAELossMixin.operator_recon_loss(X, W, W_hat)
+        if float(cfg.bigvae_behavioral_lambda_dir) != 0.0 or float(cfg.bigvae_behavioral_lambda_scale) != 0.0:
+            behavioral_dir, behavioral_scale = BigWeightVAELossMixin.operator_direction_scale_loss(
+                X,
+                W,
+                W_hat,
+                gamma=float(cfg.bigvae_behavioral_gamma),
+                huber_delta=float(cfg.bigvae_behavioral_huber_delta),
+            )
+        else:
+            behavioral_dir = operator.new_zeros(())
+            behavioral_scale = operator.new_zeros(())
+        behavioral = (
+            float(cfg.bigvae_behavioral_lambda_operator) * operator
+            + float(cfg.bigvae_behavioral_lambda_dir) * behavioral_dir
+            + float(cfg.bigvae_behavioral_lambda_scale) * behavioral_scale
+        )
+        structural, struct_details = BigWeightVAELossMixin.patch_structure_loss(
+            W,
+            W_hat,
+            patch_size=int(cfg.bigvae_patch_size),
+            gamma=float(cfg.bigvae_struct_gamma),
+            lambda_dir=float(cfg.bigvae_struct_lambda_dir),
+            lambda_scale=float(cfg.bigvae_struct_lambda_scale),
+            lambda_rec=float(cfg.bigvae_struct_lambda_rec),
+            lambda_rel=float(cfg.bigvae_struct_lambda_rel),
+            huber_delta=float(cfg.bigvae_struct_huber_delta),
+        )
+        behavioral_terms.append(behavioral)
+        operator_terms.append(operator)
+        behavioral_dir_terms.append(behavioral_dir)
+        behavioral_scale_terms.append(behavioral_scale)
+        structural_terms.append(structural)
+        struct_dir_terms.append(struct_details["L_dir"])
+        struct_scale_terms.append(struct_details["L_scale"])
+        struct_rec_terms.append(struct_details["L_rec"])
+        struct_rel_terms.append(struct_details["L_rel"])
+
+    zero = recon_weights.new_zeros(())
+    behavioral_loss = torch.stack(behavioral_terms).mean() if behavioral_terms else zero
+    operator_loss = torch.stack(operator_terms).mean() if operator_terms else zero
+    behavioral_dir_loss = torch.stack(behavioral_dir_terms).mean() if behavioral_dir_terms else zero
+    behavioral_scale_loss = torch.stack(behavioral_scale_terms).mean() if behavioral_scale_terms else zero
+    structural_loss = torch.stack(structural_terms).mean() if structural_terms else zero
+    struct_dir_loss = torch.stack(struct_dir_terms).mean() if struct_dir_terms else zero
+    struct_scale_loss = torch.stack(struct_scale_terms).mean() if struct_scale_terms else zero
+    struct_rec_loss = torch.stack(struct_rec_terms).mean() if struct_rec_terms else zero
+    struct_rel_loss = torch.stack(struct_rel_terms).mean() if struct_rel_terms else zero
+    bias_loss = _normalized_bias_mse(target_biases, recon_biases) if target_biases else zero
+    loss = (
+        float(cfg.bigvae_behavioral_coef) * behavioral_loss
+        + float(cfg.bigvae_structural_coef) * structural_loss
+        + float(cfg.bigvae_bias_coef) * bias_loss
+    )
+    return loss, {
+        "bigvae_weight_loss": loss.detach(),
+        "behavioral": behavioral_loss.detach(),
+        "behavioral_operator": operator_loss.detach(),
+        "behavioral_dir": behavioral_dir_loss.detach(),
+        "behavioral_scale": behavioral_scale_loss.detach(),
+        "structural": structural_loss.detach(),
+        "struct_L_dir": struct_dir_loss.detach(),
+        "struct_L_scale": struct_scale_loss.detach(),
+        "struct_L_rec": struct_rec_loss.detach(),
+        "struct_L_rel": struct_rel_loss.detach(),
+        "bias_mse": bias_loss.detach(),
+    }
+
+
+def vae_loss(
+    cfg: ExperimentConfig,
+    x_norm: torch.Tensor,
+    target_weights: torch.Tensor,
+    recon_norm: torch.Tensor,
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    *,
+    normalizer: WeightNormalizer,
+    spec: FlatSpec,
+) -> tuple[torch.Tensor, dict[str, float]]:
     recon = F.mse_loss(recon_norm, x_norm)
     kl = -0.5 * (1.0 + logvar - mu.square() - logvar.exp()).sum(dim=-1).mean()
-    loss = recon + float(beta_kl) * kl
-    return loss, {"loss": float(loss.detach().cpu().item()), "recon_mse": float(recon.detach().cpu().item()), "kl": float(kl.detach().cpu().item())}
+    loss_kind = str(cfg.vae_loss_kind).strip().lower()
+    if loss_kind in {"mse", "normalized_mse"}:
+        primary = recon
+        details: dict[str, torch.Tensor] = {
+            "bigvae_weight_loss": recon.detach(),
+            "behavioral": recon.new_zeros(()),
+            "behavioral_operator": recon.new_zeros(()),
+            "behavioral_dir": recon.new_zeros(()),
+            "behavioral_scale": recon.new_zeros(()),
+            "structural": recon.new_zeros(()),
+            "struct_L_dir": recon.new_zeros(()),
+            "struct_L_scale": recon.new_zeros(()),
+            "struct_L_rec": recon.new_zeros(()),
+            "struct_L_rel": recon.new_zeros(()),
+            "bias_mse": recon.new_zeros(()),
+        }
+    elif loss_kind in {"big_vae", "bigvae"}:
+        recon_weights = normalizer.denormalize(recon_norm)
+        primary, details = bigvae_style_weight_loss(cfg, target_weights=target_weights, recon_weights=recon_weights, spec=spec)
+    else:
+        raise ValueError(f"vae_loss_kind must be 'big_vae' or 'mse', got {cfg.vae_loss_kind!r}")
+    loss = primary + float(cfg.beta_kl) * kl
+    row = {
+        "loss": float(loss.detach().cpu().item()),
+        "recon_mse": float(recon.detach().cpu().item()),
+        "kl": float(kl.detach().cpu().item()),
+        "geometry_reg": 0.0,
+        "geometry_reg_coeff": float(cfg.vae_geometry_reg_coeff),
+    }
+    row.update({key: float(value.detach().cpu().item()) for key, value in details.items()})
+    return loss, row
+
+
+def vae_decoder_geometry_regularizer(
+    vae: WeightVAE,
+    normalizer: WeightNormalizer,
+    z_samples: torch.Tensor,
+) -> torch.Tensor:
+    jac = decoder_jacobians(vae, normalizer, None, z_samples, create_graph=True)
+    return isometry_objective_from_jacobians(jac, dim=int(z_samples.shape[1]))
 
 
 @dataclass(slots=True)
@@ -335,6 +513,8 @@ def train_weight_vae(cfg: ExperimentConfig, weights: torch.Tensor, *, output_pat
     normalizer = WeightNormalizer.fit(weights.index_select(0, train_indices))
     weights_device = weights.to(device=device, dtype=dtype)
     x_norm = normalizer.normalize(weights_device)
+    spec = tiny_cnn_spec()
+    torch.manual_seed(int(cfg.seed) + 2100)
     vae = WeightVAE(weight_dim=int(weights.shape[1]), latent_dim=int(cfg.latent_dim), hidden_dim=int(cfg.vae_hidden_dim)).to(device=device, dtype=dtype)
     optimizer = torch.optim.Adam(vae.parameters(), lr=float(cfg.vae_lr))
     metrics: list[dict[str, float]] = []
@@ -344,21 +524,61 @@ def train_weight_vae(cfg: ExperimentConfig, weights: torch.Tensor, *, output_pat
     try:
         for step in range(1, int(cfg.vae_steps) + 1):
             batch_pos = torch.randint(0, int(train_indices.numel()), (batch_size,), generator=generator, device="cpu").to(device=device)
-            batch = x_norm.index_select(0, train_indices_device.index_select(0, batch_pos))
+            batch_indices = train_indices_device.index_select(0, batch_pos)
+            batch = x_norm.index_select(0, batch_indices)
+            batch_raw = weights_device.index_select(0, batch_indices)
             vae.train()
             optimizer.zero_grad(set_to_none=True)
             recon, mu, logvar = vae(batch)
-            loss, row = vae_loss(batch, recon, mu, logvar, beta_kl=float(cfg.beta_kl))
+            loss, row = vae_loss(
+                cfg,
+                batch,
+                batch_raw,
+                recon,
+                mu,
+                logvar,
+                normalizer=normalizer,
+                spec=spec,
+            )
+            if float(cfg.vae_geometry_reg_coeff) > 0.0:
+                reg_count = min(max(1, int(cfg.vae_geometry_reg_samples)), int(mu.shape[0]))
+                z_reg = mu[:reg_count]
+                if bool(cfg.vae_geometry_reg_detach_latents):
+                    z_reg = z_reg.detach()
+                geometry_reg = vae_decoder_geometry_regularizer(vae, normalizer, z_reg)
+                loss = loss + float(cfg.vae_geometry_reg_coeff) * geometry_reg
+                row["loss"] = float(loss.detach().cpu().item())
+                row["geometry_reg"] = float(geometry_reg.detach().cpu().item())
+                row["geometry_reg_coeff"] = float(cfg.vae_geometry_reg_coeff)
             loss.backward()
             optimizer.step()
             if step == 1 or step % max(1, int(cfg.vae_steps) // 20) == 0 or step == int(cfg.vae_steps):
                 vae.eval()
                 with torch.no_grad():
-                    val = x_norm.index_select(0, val_indices.to(device=device))
+                    val_indices_device = val_indices.to(device=device)
+                    val = x_norm.index_select(0, val_indices_device)
+                    val_raw = weights_device.index_select(0, val_indices_device)
                     recon_val, mu_val, logvar_val = vae(val)
-                    _loss_val, val_row = vae_loss(val, recon_val, mu_val, logvar_val, beta_kl=float(cfg.beta_kl))
+                    _loss_val, val_row = vae_loss(
+                        cfg,
+                        val,
+                        val_raw,
+                        recon_val,
+                        mu_val,
+                        logvar_val,
+                        normalizer=normalizer,
+                        spec=spec,
+                    )
                 metrics.append({"step": float(step), **{f"train_{k}": v for k, v in row.items()}, **{f"val_{k}": v for k, v in val_row.items()}})
-                progress.set_postfix({"loss": f"{row['loss']:.4g}", "recon": f"{row['recon_mse']:.4g}", "val": f"{val_row['loss']:.4g}"})
+                progress.set_postfix(
+                    {
+                        "loss": f"{row['loss']:.4g}",
+                        "bigvae": f"{row['bigvae_weight_loss']:.4g}",
+                        "geom": f"{row['geometry_reg']:.4g}",
+                        "mse": f"{row['recon_mse']:.4g}",
+                        "val": f"{val_row['loss']:.4g}",
+                    }
+                )
             progress.update(1)
     finally:
         progress.close()
