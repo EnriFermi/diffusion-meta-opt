@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from .config import ExperimentConfig
 from .core import FlatSpec, WeightNormalizer, WeightVAE, decode_weights, encode_weights, finite_value, tiny_cnn_logits_from_flat
+from .progress import make_progress
 
 
 @dataclass(slots=True)
@@ -167,41 +168,50 @@ def tune_and_evaluate_downstream(
     selected_rows: list[dict[str, float | int | str]] = []
     curve_rows: list[dict[str, float | int | str | bool]] = []
     result_rows: list[dict[str, float | int | str | bool]] = []
+    total_curves = sum(len(_lr_grid_for_method(cfg, method)) * tune_count + eval_count for method in methods)
+    progress = make_progress(cfg, total=total_curves, desc="downstream LR/eval")
 
-    for method in methods:
-        for lr in _lr_grid_for_method(cfg, method):
-            lr_metrics: list[float] = []
-            for start_idx in range(tune_count):
+    try:
+        for method in methods:
+            for lr in _lr_grid_for_method(cfg, method):
+                lr_metrics: list[float] = []
+                for start_idx in range(tune_count):
+                    rows, metrics = run_downstream_curve(
+                        ctx=ctx,
+                        w0=starts[start_idx],
+                        method=method,
+                        lr=float(lr),
+                        steps=int(cfg.downstream_steps),
+                        start_index=int(start_idx),
+                        split="tune",
+                    )
+                    tuning_rows.append(metrics)
+                    lr_metrics.append(float(metrics["aulc"]))
+                    progress.set_postfix({"phase": "tune", "method": method, "lr": f"{float(lr):.1e}", "start": start_idx, "aulc": f"{float(metrics['aulc']):.4g}"})
+                    progress.update(1)
+                median_aulc = float(np.median(np.array(lr_metrics, dtype=np.float64))) if lr_metrics else float(cfg.finite_penalty)
+                selected_rows.append({"method": method, "candidate_lr": float(lr), "tuning_median_aulc": median_aulc})
+            method_candidates = [row for row in selected_rows if row["method"] == method]
+            best = min(method_candidates, key=lambda row: (float(row["tuning_median_aulc"]), float(row["candidate_lr"])))
+            best["selected"] = 1
+            selected_lr = float(best["candidate_lr"])
+            for eval_idx in range(eval_count):
+                start_idx = eval_start + eval_idx
                 rows, metrics = run_downstream_curve(
                     ctx=ctx,
                     w0=starts[start_idx],
                     method=method,
-                    lr=float(lr),
+                    lr=selected_lr,
                     steps=int(cfg.downstream_steps),
-                    start_index=int(start_idx),
-                    split="tune",
+                    start_index=int(eval_idx),
+                    split="eval",
                 )
-                tuning_rows.append(metrics)
-                lr_metrics.append(float(metrics["aulc"]))
-            median_aulc = float(np.median(np.array(lr_metrics, dtype=np.float64))) if lr_metrics else float(cfg.finite_penalty)
-            selected_rows.append({"method": method, "candidate_lr": float(lr), "tuning_median_aulc": median_aulc})
-        method_candidates = [row for row in selected_rows if row["method"] == method]
-        best = min(method_candidates, key=lambda row: (float(row["tuning_median_aulc"]), float(row["candidate_lr"])))
-        best["selected"] = 1
-        selected_lr = float(best["candidate_lr"])
-        for eval_idx in range(eval_count):
-            start_idx = eval_start + eval_idx
-            rows, metrics = run_downstream_curve(
-                ctx=ctx,
-                w0=starts[start_idx],
-                method=method,
-                lr=selected_lr,
-                steps=int(cfg.downstream_steps),
-                start_index=int(eval_idx),
-                split="eval",
-            )
-            curve_rows.extend(rows)
-            result_rows.append(metrics)
+                curve_rows.extend(rows)
+                result_rows.append(metrics)
+                progress.set_postfix({"phase": "eval", "method": method, "lr": f"{selected_lr:.1e}", "start": eval_idx, "aulc": f"{float(metrics['aulc']):.4g}"})
+                progress.update(1)
+    finally:
+        progress.close()
 
     selected = pd.DataFrame(selected_rows)
     if not selected.empty and "selected" not in selected.columns:
