@@ -65,6 +65,7 @@ class RuntimeConfig:
     dtype: str = "float32"
     seed: int = 0
     xla_preallocate: str = "false"
+    tensorflow_hide_gpus: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,4 +235,3 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     return copy.deepcopy(value)
-

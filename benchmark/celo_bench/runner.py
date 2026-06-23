@@ -172,6 +172,8 @@ def evaluate_task_optimizer(
     cfg: CeloBenchConfig,
 ) -> Mapping[str, Any]:
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", cfg.runtime.xla_preallocate)
+    if cfg.runtime.tensorflow_hide_gpus:
+        _hide_tensorflow_gpus()
     import jax
 
     from .eval_training import single_task_training_curves
@@ -192,6 +194,20 @@ def evaluate_task_optimizer(
         metrics_every=cfg.evaluation.metrics_every,
         summary_writer=None,
     )
+
+
+def _hide_tensorflow_gpus() -> None:
+    """Keep TensorFlow/TFDS preprocessing off GPU, matching upstream Celo eval."""
+    try:
+        import tensorflow as tf
+    except Exception:
+        return
+    try:
+        tf.config.experimental.set_visible_devices([], "GPU")
+    except RuntimeError:
+        # TensorFlow was already initialized. The run can still continue if TF
+        # does not touch GPU kernels; otherwise the user should set this earlier.
+        return
 
 
 def _run_curve(
