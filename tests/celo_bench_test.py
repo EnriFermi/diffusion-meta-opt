@@ -100,6 +100,18 @@ def test_runtime_defaults_hide_tensorflow_gpus() -> None:
     assert CeloBenchConfig().runtime.tensorflow_hide_gpus is True
 
 
+def test_adamw_full_config_is_full_benchmark() -> None:
+    import yaml
+
+    path = Path("conf/celo_bench/adamw_full.yaml")
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    cfg = CeloBenchConfig.from_mapping(payload)
+    assert cfg.task_names == CELO_PAPER_17_TASKS
+    assert cfg.evaluation.steps == 2000
+    assert cfg.evaluation.seeds == (0, 1, 2)
+    assert cfg.methods[0].kind == "adamw"
+
+
 def test_reserve_run_dir_collision_gets_suffix(tmp_path: Path) -> None:
     first_id, _ = reserve_run_dir(tmp_path, "smoke", timestamp="20260101_000000")
     second_id, _ = reserve_run_dir(tmp_path, "smoke", timestamp="20260101_000000")

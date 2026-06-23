@@ -36,6 +36,12 @@ Run the AdamW smoke config:
 scripts/launchers/benchmark/celo_bench.sh --config-name adamw_smoke
 ```
 
+Run the full 17-task AdamW benchmark:
+
+```sh
+scripts/launchers/benchmark/celo_bench.sh --config-name adamw_full
+```
+
 Artifacts are written to:
 
 ```text
