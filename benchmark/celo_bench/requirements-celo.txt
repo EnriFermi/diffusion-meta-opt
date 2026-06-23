@@ -17,7 +17,6 @@ tensorflow-probability>=0.25.0
 tf-keras>=2.19.0
 tqdm>=4.67.1
 wandb>=0.21.1
-git+https://github.com/google-research/vision_transformer.git#subdirectory=vit_jax
+vit_jax @ git+https://github.com/google-research/vision_transformer.git@0d03f554b83af02550407da1e8c702a7cb75e74b
 learned-optimization @ git+https://github.com/amoudgl/learned_optimization.git@aa69a8a78e8ae845365fe33d301b59e29eec539f
 celo @ git+https://github.com/amoudgl/celo.git@66d976116f39da286951f0c5e0a18eee8d1fd66b
-
