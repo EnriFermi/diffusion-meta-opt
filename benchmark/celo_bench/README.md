@@ -45,3 +45,7 @@ artifacts/celo_bench/runs/<timestamp>__<label>/
 The default task preset is `celo_paper_17`, with `steps=2000`,
 `seeds=[0,1,2]`, `eval_every=10`, `eval_batches=5`, `last_eval_batches=10`,
 and `metrics_every=10`.
+
+TensorFlow GPU visibility is disabled by default via
+`runtime.tensorflow_hide_gpus=true`, matching upstream Celo evaluation. TFDS
+data preprocessing then stays on CPU while JAX can use the GPU.

@@ -96,6 +96,10 @@ def test_config_hash_changes_for_benchmark_relevant_fields(tmp_path: Path) -> No
     assert config_hash(cfg) != config_hash(changed)
 
 
+def test_runtime_defaults_hide_tensorflow_gpus() -> None:
+    assert CeloBenchConfig().runtime.tensorflow_hide_gpus is True
+
+
 def test_reserve_run_dir_collision_gets_suffix(tmp_path: Path) -> None:
     first_id, _ = reserve_run_dir(tmp_path, "smoke", timestamp="20260101_000000")
     second_id, _ = reserve_run_dir(tmp_path, "smoke", timestamp="20260101_000000")

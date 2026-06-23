@@ -20,6 +20,7 @@ runtime:
   dtype: float32
   seed: 0
   xla_preallocate: "false"
+  tensorflow_hide_gpus: true
 
 tasks:
   preset: celo_paper_17
@@ -41,4 +42,3 @@ adam_reference:
 
 methods:
   items: []
-
