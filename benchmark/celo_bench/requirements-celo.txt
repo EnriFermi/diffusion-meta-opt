@@ -4,6 +4,7 @@ absl-py>=2.3.1
 dm-haiku>=0.0.14
 flax>=0.11.1
 gin-config>=0.5.0
+importlib-resources>=6.5.0
 jax>=0.7.1
 ml-collections>=1.1.0
 numpy>=1.26
