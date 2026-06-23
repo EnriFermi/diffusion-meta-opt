@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import sys
+import types
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -43,6 +45,7 @@ def import_object(import_path: str) -> Any:
     path = str(import_path).strip()
     if not path:
         raise ValueError("Import path must be non-empty")
+    _ensure_vision_transformer_compat()
     if ":" in path:
         module_name, attr_path = path.split(":", 1)
     else:
@@ -52,6 +55,23 @@ def import_object(import_path: str) -> Any:
     for part in attr_path.split("."):
         obj = getattr(obj, part)
     return obj
+
+
+def _ensure_vision_transformer_compat() -> None:
+    """Bridge current `vit_jax` package to older `vision_transformer.vit_jax` imports."""
+    if "vision_transformer.vit_jax" in sys.modules:
+        return
+    try:
+        vit_jax = importlib.import_module("vit_jax")
+    except Exception:
+        return
+    parent = sys.modules.get("vision_transformer")
+    if parent is None:
+        parent = types.ModuleType("vision_transformer")
+        parent.__path__ = []  # type: ignore[attr-defined]
+        sys.modules["vision_transformer"] = parent
+    setattr(parent, "vit_jax", vit_jax)
+    sys.modules["vision_transformer.vit_jax"] = vit_jax
 
 
 def build_task(name: str) -> Any:
@@ -117,4 +137,3 @@ def _default_registry() -> TaskRegistry:
 
 
 TASK_REGISTRY = _default_registry()
-

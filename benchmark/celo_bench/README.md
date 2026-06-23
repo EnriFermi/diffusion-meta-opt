@@ -13,6 +13,10 @@ Install the optional environment separately:
 pip install -r benchmark/celo_bench/requirements-celo.txt
 ```
 
+The upstream `google-research/vision_transformer` repository installs the
+package as `vit_jax`; this benchmark provides a compatibility alias for the
+older `vision_transformer.vit_jax` import used by `amoudgl/learned_optimization`.
+
 Run a dry run:
 
 ```sh
