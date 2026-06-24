@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import functools
 import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -29,6 +30,7 @@ def run_or_load(cfg: CeloBenchConfig) -> BenchTables:
             score_rows=_read_csv(output_dir / "scores.csv"),
             curve_rows=_read_csv(output_dir / "curves.csv"),
             selected_adam_rows=_read_csv(output_dir / "selected_adam.csv"),
+            skipped_rows=_read_csv(output_dir / "skipped.csv"),
         )
     return run_all(cfg, run_id=run_id, output_dir=output_dir)
 
@@ -46,11 +48,13 @@ def run_all(cfg: CeloBenchConfig, *, run_id: str | None = None, output_dir: Path
     cfg_digest = config_hash(cfg)
     logger.info("Celo benchmark starting: run_id=%s output_dir=%s config_hash=%s", run_id, output_dir, cfg_digest)
     logger.info(
-        "Resolved runtime: device=%s dtype=%s seed=%s xla_preallocate=%s",
+        "Resolved runtime: device=%s dtype=%s seed=%s xla_preallocate=%s tensorflow_hide_gpus=%s tfds_try_gcs_for_wikipedia=%s",
         cfg.runtime.device,
         cfg.runtime.dtype,
         cfg.runtime.seed,
         cfg.runtime.xla_preallocate,
+        cfg.runtime.tensorflow_hide_gpus,
+        cfg.runtime.tfds_try_gcs_for_wikipedia,
     )
     logger.info(
         "Evaluation protocol: tasks=%s seeds=%s steps=%s eval_every=%s eval_batches=%s last_eval_batches=%s score_split=%s",
@@ -69,6 +73,7 @@ def run_all(cfg: CeloBenchConfig, *, run_id: str | None = None, output_dir: Path
     score_rows: list[dict[str, Any]] = []
     curve_rows: list[dict[str, Any]] = []
     selected_adam_rows: list[dict[str, Any]] = []
+    skipped_rows: list[dict[str, Any]] = []
     final_scores: list[float] = []
     speedup_scores: list[float] = []
     planned_jobs = _planned_jobs(cfg)
@@ -82,9 +87,9 @@ def run_all(cfg: CeloBenchConfig, *, run_id: str | None = None, output_dir: Path
             "planned_jobs": planned_jobs,
             "ok": True,
         }
-        _write_outputs(output_dir, summary, score_rows, curve_rows, selected_adam_rows)
+        _write_outputs(output_dir, summary, score_rows, curve_rows, selected_adam_rows, skipped_rows)
         _write_layout(output_dir, run_id, cfg_digest)
-        return BenchTables(output_dir, summary, score_rows, curve_rows, selected_adam_rows)
+        return BenchTables(output_dir, summary, score_rows, curve_rows, selected_adam_rows, skipped_rows)
 
     progress_items = list(_task_seed_pairs(cfg))
     for task_name, seed in _progress(progress_items, enabled=cfg.benchmark.show_progress, desc="celo_bench"):
@@ -96,7 +101,21 @@ def run_all(cfg: CeloBenchConfig, *, run_id: str | None = None, output_dir: Path
             logger.info("Adam reference sweep: task=%s seed=%s lrs=%s", task_name, seed, list(cfg.adam_reference.lrs))
             for lr in cfg.adam_reference.lrs:
                 adapter = AdamOptimizerAdapter(float(lr))
-                metrics = _run_curve(cfg, task_name, adapter.name, adapter, seed, raw_dir, logger, metadata={"lr": lr})
+                try:
+                    metrics = _run_curve(cfg, task_name, adapter.name, adapter, seed, raw_dir, logger, metadata={"lr": lr})
+                except Exception as exc:
+                    if not cfg.benchmark.continue_on_task_error:
+                        raise
+                    logger.exception(
+                        "Skipping task/seed after Adam reference failure: task=%s seed=%s lr=%s",
+                        task_name,
+                        seed,
+                        lr,
+                    )
+                    skipped_rows.append(_error_row(task_name, seed, adapter.name, "adam_reference", exc, {"lr": lr}))
+                    best_adam_metrics = None
+                    best_adam_lr = None
+                    break
                 curve_rows.extend(_curve_rows(task_name, seed, adapter.name, metrics, cfg.evaluation.score_split, {"lr": lr}))
                 final_loss = final_loss_from_curve(metrics[cfg.evaluation.score_split], alpha=cfg.evaluation.ema_alpha)
                 if final_loss < best_adam_final:
@@ -121,7 +140,14 @@ def run_all(cfg: CeloBenchConfig, *, run_id: str | None = None, output_dir: Path
                 continue
             adapter = build_optimizer_adapter(method_spec)
             logger.info("Method eval starting: task=%s seed=%s method=%s", task_name, seed, method_spec.name)
-            metrics = _run_curve(cfg, task_name, method_spec.name, adapter, seed, raw_dir, logger)
+            try:
+                metrics = _run_curve(cfg, task_name, method_spec.name, adapter, seed, raw_dir, logger)
+            except Exception as exc:
+                if not cfg.benchmark.continue_on_task_error:
+                    raise
+                logger.exception("Skipping method after failure: task=%s seed=%s method=%s", task_name, seed, method_spec.name)
+                skipped_rows.append(_error_row(task_name, seed, method_spec.name, "method", exc, {}))
+                continue
             curve_rows.extend(_curve_rows(task_name, seed, method_spec.name, metrics, cfg.evaluation.score_split, {}))
             score = score_curve_pair(
                 xs=metrics["eval/xs"],
@@ -148,6 +174,7 @@ def run_all(cfg: CeloBenchConfig, *, run_id: str | None = None, output_dir: Path
         "steps": cfg.evaluation.steps,
         "score_split": cfg.evaluation.score_split,
         "planned_jobs": planned_jobs,
+        "skipped_curve_jobs": len(skipped_rows),
         "final_loss_score": final_summary,
         "speedup_score": speedup_summary,
         "files": {
@@ -155,13 +182,14 @@ def run_all(cfg: CeloBenchConfig, *, run_id: str | None = None, output_dir: Path
             "scores": str(output_dir / "scores.csv"),
             "curves": str(output_dir / "curves.csv"),
             "selected_adam": str(output_dir / "selected_adam.csv"),
+            "skipped": str(output_dir / "skipped.csv"),
         },
     }
     logger.info("Aggregation complete: final_loss_iqm=%.6g speedup_iqm=%.6g", final_summary["iqm"], speedup_summary["iqm"])
-    _write_outputs(output_dir, summary, score_rows, curve_rows, selected_adam_rows)
+    _write_outputs(output_dir, summary, score_rows, curve_rows, selected_adam_rows, skipped_rows)
     _write_layout(output_dir, run_id, cfg_digest)
     logger.info("Celo benchmark finished: summary=%s", output_dir / "summary.json")
-    return BenchTables(output_dir, summary, score_rows, curve_rows, selected_adam_rows)
+    return BenchTables(output_dir, summary, score_rows, curve_rows, selected_adam_rows, skipped_rows)
 
 
 def evaluate_task_optimizer(
@@ -174,6 +202,8 @@ def evaluate_task_optimizer(
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", cfg.runtime.xla_preallocate)
     if cfg.runtime.tensorflow_hide_gpus:
         _hide_tensorflow_gpus()
+    if cfg.runtime.tfds_try_gcs_for_wikipedia:
+        _enable_tfds_gcs_for_wikipedia()
     import jax
 
     from .eval_training import single_task_training_curves
@@ -208,6 +238,35 @@ def _hide_tensorflow_gpus() -> None:
         # TensorFlow was already initialized. The run can still continue if TF
         # does not touch GPU kernels; otherwise the user should set this earlier.
         return
+
+
+def _enable_tfds_gcs_for_wikipedia() -> None:
+    """Load the deprecated TFDS Wikipedia snapshot from TFDS' public GCS cache.
+
+    TFDS keeps the `wikipedia/20201201.en` builder config for reading existing
+    prepared datasets, but the raw Wikimedia dump URLs are no longer available.
+    Passing `try_gcs=True` lets TFDS fetch the prepared exact snapshot from the
+    public `tfds-data` bucket instead of rebuilding it from removed dumps.
+    """
+    try:
+        import tensorflow_datasets as tfds
+    except Exception:
+        return
+
+    original_load = tfds.load
+    if getattr(original_load, "_celo_wikipedia_gcs_patch", False):
+        return
+
+    @functools.wraps(original_load)
+    def patched_load(*args: Any, **kwargs: Any) -> Any:
+        dataset_name = args[0] if args else kwargs.get("name")
+        if dataset_name == "wikipedia/20201201.en":
+            kwargs.setdefault("try_gcs", True)
+        return original_load(*args, **kwargs)
+
+    patched_load._celo_wikipedia_gcs_patch = True  # type: ignore[attr-defined]
+    patched_load._celo_original_load = original_load  # type: ignore[attr-defined]
+    tfds.load = patched_load
 
 
 def _run_curve(
@@ -304,6 +363,25 @@ def _planned_jobs(cfg: CeloBenchConfig) -> dict[str, Any]:
     }
 
 
+def _error_row(
+    task_name: str,
+    seed: int,
+    method_name: str,
+    phase: str,
+    exc: Exception,
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "task": task_name,
+        "seed": seed,
+        "method": method_name,
+        "phase": phase,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        **{str(key): value for key, value in metadata.items()},
+    }
+
+
 def _task_seed_pairs(cfg: CeloBenchConfig) -> Iterable[tuple[str, int]]:
     for task_name in cfg.task_names:
         for seed in cfg.evaluation.seeds:
@@ -340,7 +418,7 @@ def _cache_valid(output_dir: Path, cfg: CeloBenchConfig) -> bool:
         return False
     if meta.get("config_hash") != config_hash(cfg):
         return False
-    return all((output_dir / name).is_file() for name in ("scores.csv", "curves.csv", "selected_adam.csv"))
+    return all((output_dir / name).is_file() for name in ("scores.csv", "curves.csv", "selected_adam.csv", "skipped.csv"))
 
 
 def _write_outputs(
@@ -349,11 +427,13 @@ def _write_outputs(
     score_rows: list[dict[str, Any]],
     curve_rows: list[dict[str, Any]],
     selected_adam_rows: list[dict[str, Any]],
+    skipped_rows: list[dict[str, Any]],
 ) -> None:
     write_json_file(output_dir / "summary.json", summary)
     _write_csv(output_dir / "scores.csv", score_rows)
     _write_csv(output_dir / "curves.csv", curve_rows)
     _write_csv(output_dir / "selected_adam.csv", selected_adam_rows)
+    _write_csv(output_dir / "skipped.csv", skipped_rows)
 
 
 def _write_layout(output_dir: Path, run_id: str, cfg_digest: str) -> None:
@@ -369,6 +449,7 @@ def _write_layout(output_dir: Path, run_id: str, cfg_digest: str) -> None:
             "scores": output_dir / "scores.csv",
             "curves": output_dir / "curves.csv",
             "selected_adam": output_dir / "selected_adam.csv",
+            "skipped": output_dir / "skipped.csv",
             "log": output_dir / "run.log",
         },
         dirs={"logs": output_dir / "logs", "raw": output_dir / "raw"},

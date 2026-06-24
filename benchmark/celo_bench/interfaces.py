@@ -42,4 +42,4 @@ class BenchTables:
     score_rows: list[dict[str, Any]]
     curve_rows: list[dict[str, Any]]
     selected_adam_rows: list[dict[str, Any]]
-
+    skipped_rows: list[dict[str, Any]] = field(default_factory=list)

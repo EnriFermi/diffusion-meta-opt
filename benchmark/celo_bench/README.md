@@ -42,6 +42,16 @@ Run the full 17-task AdamW benchmark:
 scripts/launchers/benchmark/celo_bench.sh --config-name adamw_full
 ```
 
+`adamw_full` keeps the exact 17-task list, runs the fragile Wikipedia task
+first, and has `benchmark.continue_on_task_error=true` so a dead external TFDS
+URL is recorded in `skipped.csv` instead of aborting the whole run.
+
+Run all currently downloadable tasks except the old Wikipedia snapshot:
+
+```sh
+scripts/launchers/benchmark/celo_bench.sh --config-name adamw_full_no_wikipedia
+```
+
 Artifacts are written to:
 
 ```text
@@ -58,11 +68,15 @@ data preprocessing then stays on CPU while JAX can use the GPU.
 
 The exact 17-task set includes `RNNLM_wikipediaen32k_Patch32_LSTM256_Embed128`,
 which uses TFDS `wikipedia/20201201.en` from the upstream
-`learned_optimization` code. If TFDS cannot download that old dump because the
-upstream mirror returns 404, provide a prebuilt TFDS cache via `TFDS_DATA_DIR`
-or run a config that intentionally excludes the Wikipedia task. The benchmark
-does not silently substitute a newer Wikipedia snapshot because that would
-change the protocol.
+`learned_optimization` code. TFDS no longer serves the raw 2020 Wikimedia dump
+from its old mirror, so `runtime.tfds_try_gcs_for_wikipedia=true` patches only
+that dataset load to use TFDS' public prepared GCS cache for the same
+`wikipedia/20201201.en/1.0.0` snapshot. This avoids substituting a newer
+Wikipedia dump. If the GCS cache/network is unavailable, provide a prebuilt TFDS
+cache via `TFDS_DATA_DIR` or run `--config-name adamw_full_no_wikipedia`. The
+`adamw_full` config keeps all 17 tasks but schedules the Wikipedia task first,
+so a remaining failure is recorded in `skipped.csv` and the rest of the run
+continues.
 
 Curve-level caching is enabled when `benchmark.cache_first=true`. If a long run
 fails, rerun with the same `benchmark.run_dir=/path/to/failed/run` to reuse

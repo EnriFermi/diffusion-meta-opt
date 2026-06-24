@@ -54,6 +54,7 @@ class BenchmarkConfig:
     run_dir: str = ""
     cache_first: bool = True
     force_rerun: bool = False
+    continue_on_task_error: bool = False
     show_progress: bool = True
     log_level: str = "INFO"
     dry_run: bool = False
@@ -66,6 +67,7 @@ class RuntimeConfig:
     seed: int = 0
     xla_preallocate: str = "false"
     tensorflow_hide_gpus: bool = True
+    tfds_try_gcs_for_wikipedia: bool = True
 
 
 @dataclass(frozen=True, slots=True)
