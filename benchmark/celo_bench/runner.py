@@ -223,8 +223,7 @@ def _run_curve(
     method_dir = raw_dir / slugify(task_name) / f"seed_{seed}" / slugify(method_name)
     method_dir.mkdir(parents=True, exist_ok=True)
     output_path = method_dir / f"metrics_unroll{cfg.evaluation.steps}.npz"
-    metrics = evaluate_task_optimizer(task_name=task_name, optimizer_adapter=adapter, seed=seed, cfg=cfg)
-    np.savez(output_path, **metrics)
+    manifest_path = method_dir / "manifest.json"
     manifest = {
         "task": task_name,
         "method": method_name,
@@ -233,9 +232,38 @@ def _run_curve(
         "metrics_path": str(output_path),
         "metadata": dict(metadata or {}),
     }
-    write_json_file(method_dir / "manifest.json", manifest)
+    if cfg.benchmark.cache_first and not cfg.benchmark.force_rerun:
+        cached = _load_cached_curve(output_path, manifest_path, manifest)
+        if cached is not None:
+            logger.info("Curve cache hit: task=%s seed=%s method=%s path=%s", task_name, seed, method_name, output_path)
+            return cached
+    metrics = evaluate_task_optimizer(task_name=task_name, optimizer_adapter=adapter, seed=seed, cfg=cfg)
+    np.savez(output_path, **metrics)
+    write_json_file(manifest_path, manifest)
     logger.info("Curve written: task=%s seed=%s method=%s path=%s", task_name, seed, method_name, output_path)
     return metrics
+
+
+def _load_cached_curve(output_path: Path, manifest_path: Path, expected_manifest: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    if not output_path.is_file() or not manifest_path.is_file():
+        return None
+    try:
+        manifest = _read_json(manifest_path)
+    except Exception:
+        return None
+    expected = dict(expected_manifest)
+    observed = dict(manifest)
+    # Keep metrics_path out of the semantic comparison so moved run roots can
+    # still reuse copied raw metrics when task/method/seed/protocol match.
+    expected.pop("metrics_path", None)
+    observed.pop("metrics_path", None)
+    if observed != expected:
+        return None
+    try:
+        with np.load(output_path, allow_pickle=False) as payload:
+            return {key: payload[key] for key in payload.files}
+    except Exception:
+        return None
 
 
 def _curve_rows(

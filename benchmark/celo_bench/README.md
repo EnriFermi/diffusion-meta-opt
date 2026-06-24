@@ -55,3 +55,15 @@ and `metrics_every=10`.
 TensorFlow GPU visibility is disabled by default via
 `runtime.tensorflow_hide_gpus=true`, matching upstream Celo evaluation. TFDS
 data preprocessing then stays on CPU while JAX can use the GPU.
+
+The exact 17-task set includes `RNNLM_wikipediaen32k_Patch32_LSTM256_Embed128`,
+which uses TFDS `wikipedia/20201201.en` from the upstream
+`learned_optimization` code. If TFDS cannot download that old dump because the
+upstream mirror returns 404, provide a prebuilt TFDS cache via `TFDS_DATA_DIR`
+or run a config that intentionally excludes the Wikipedia task. The benchmark
+does not silently substitute a newer Wikipedia snapshot because that would
+change the protocol.
+
+Curve-level caching is enabled when `benchmark.cache_first=true`. If a long run
+fails, rerun with the same `benchmark.run_dir=/path/to/failed/run` to reuse
+already written raw `.npz` curves.
