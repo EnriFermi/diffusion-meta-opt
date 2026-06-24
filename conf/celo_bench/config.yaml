@@ -11,6 +11,7 @@ benchmark:
   run_dir: ""
   cache_first: true
   force_rerun: false
+  continue_on_task_error: false
   show_progress: true
   log_level: INFO
   dry_run: false
@@ -21,6 +22,7 @@ runtime:
   seed: 0
   xla_preallocate: "false"
   tensorflow_hide_gpus: true
+  tfds_try_gcs_for_wikipedia: true
 
 tasks:
   preset: celo_paper_17

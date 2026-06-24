@@ -4,10 +4,33 @@ defaults:
 
 benchmark:
   run_label: adamw_full
+  continue_on_task_error: true
 
 tasks:
-  preset: celo_paper_17
-  enabled: null
+  preset: custom
+  # Keep the exact 17-task set, but run the fragile TFDS Wikipedia task first.
+  # runtime.tfds_try_gcs_for_wikipedia makes TFDS load wikipedia/20201201.en
+  # from the public prepared TFDS GCS cache instead of removed Wikimedia dumps.
+  # If that cache/network is unavailable, continue_on_task_error records it in
+  # skipped.csv and the run still completes for the remaining tasks.
+  enabled:
+    - RNNLM_wikipediaen32k_Patch32_LSTM256_Embed128
+    - ImageMLP_FashionMnist_Relu128x128
+    - ImageMLP_Cifar10_128x128x128_LayerNorm_Relu
+    - ImageMLP_Cifar10_128x128x128_Tanh_bs128
+    - Conv_Cifar10_32x64x64
+    - Conv_Cifar10_32x64x64_batchnorm
+    - Conv_Cifar10_32x64x64_layernorm
+    - Conv_Cifar100_32x64x64
+    - VIT_Cifar100_wideshallow
+    - VIT_Cifar100_skinnydeep
+    - TransformerLM_LM1B_MultiRuntime_0
+    - TransformerLM_LM1B_MultiRuntime_2
+    - TransformerLM_LM1B_MultiRuntime_5
+    - ImageMLPAE_Cifar10_128x32x128_bs256
+    - ImageMLPAE_Mnist_128x32x128_bs128
+    - RNNLM_lm1b32k_Patch32_LSTM256_Embed128
+    - LOpt_AdafacMLPLOpt_FashionMnist_50
 
 evaluation:
   steps: 2000

@@ -1,0 +1,26 @@
+defaults:
+  - adamw_full
+  - _self_
+
+benchmark:
+  run_label: adamw_full_no_wikipedia
+
+tasks:
+  preset: custom
+  enabled:
+    - ImageMLP_FashionMnist_Relu128x128
+    - ImageMLP_Cifar10_128x128x128_LayerNorm_Relu
+    - ImageMLP_Cifar10_128x128x128_Tanh_bs128
+    - Conv_Cifar10_32x64x64
+    - Conv_Cifar10_32x64x64_batchnorm
+    - Conv_Cifar10_32x64x64_layernorm
+    - Conv_Cifar100_32x64x64
+    - VIT_Cifar100_wideshallow
+    - VIT_Cifar100_skinnydeep
+    - TransformerLM_LM1B_MultiRuntime_0
+    - TransformerLM_LM1B_MultiRuntime_2
+    - TransformerLM_LM1B_MultiRuntime_5
+    - ImageMLPAE_Cifar10_128x32x128_bs256
+    - ImageMLPAE_Mnist_128x32x128_bs128
+    - RNNLM_lm1b32k_Patch32_LSTM256_Embed128
+    - LOpt_AdafacMLPLOpt_FashionMnist_50

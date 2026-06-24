@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+import sys
+import types
 from typing import Any
 
-import logging
 import numpy as np
 import pytest
 
@@ -101,16 +103,56 @@ def test_runtime_defaults_hide_tensorflow_gpus() -> None:
     assert CeloBenchConfig().runtime.tensorflow_hide_gpus is True
 
 
+def test_runtime_defaults_try_tfds_gcs_for_wikipedia() -> None:
+    assert CeloBenchConfig().runtime.tfds_try_gcs_for_wikipedia is True
+
+
+def test_tfds_wikipedia_gcs_patch_only_targets_old_wikipedia(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_load(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"args": args, "kwargs": dict(kwargs)})
+        return dict(kwargs)
+
+    fake_tfds = types.SimpleNamespace(load=fake_load)
+    monkeypatch.setitem(sys.modules, "tensorflow_datasets", fake_tfds)
+
+    runner._enable_tfds_gcs_for_wikipedia()
+
+    assert fake_tfds.load("wikipedia/20201201.en", split="train")["try_gcs"] is True
+    assert "try_gcs" not in fake_tfds.load("lm1b", split="train")
+    assert fake_tfds.load("wikipedia/20201201.en", split="train", try_gcs=False)["try_gcs"] is False
+    assert calls[0]["kwargs"]["try_gcs"] is True
+
+
+def test_default_config_is_strict_on_task_errors() -> None:
+    assert CeloBenchConfig().benchmark.continue_on_task_error is False
+
+
 def test_adamw_full_config_is_full_benchmark() -> None:
     import yaml
 
     path = Path("conf/celo_bench/adamw_full.yaml")
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     cfg = CeloBenchConfig.from_mapping(payload)
-    assert cfg.task_names == CELO_PAPER_17_TASKS
+    assert set(cfg.task_names) == set(CELO_PAPER_17_TASKS)
+    assert len(cfg.task_names) == len(CELO_PAPER_17_TASKS)
+    assert cfg.task_names[0] == "RNNLM_wikipediaen32k_Patch32_LSTM256_Embed128"
     assert cfg.evaluation.steps == 2000
     assert cfg.evaluation.seeds == (0, 1, 2)
+    assert cfg.benchmark.continue_on_task_error is True
     assert cfg.methods[0].kind == "adamw"
+
+
+def test_adamw_full_no_wikipedia_config_excludes_only_wikipedia() -> None:
+    import yaml
+
+    path = Path("conf/celo_bench/adamw_full_no_wikipedia.yaml")
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    cfg = CeloBenchConfig.from_mapping(payload)
+    excluded = set(CELO_PAPER_17_TASKS) - set(cfg.task_names)
+    assert excluded == {"RNNLM_wikipediaen32k_Patch32_LSTM256_Embed128"}
+    assert len(cfg.task_names) == 16
 
 
 def test_reserve_run_dir_collision_gets_suffix(tmp_path: Path) -> None:
@@ -210,6 +252,31 @@ def test_run_curve_reuses_matching_raw_metric_cache(tmp_path: Path, monkeypatch:
     monkeypatch.setattr(runner, "evaluate_task_optimizer", fail_eval)
     metrics = runner._run_curve(cfg, "FakeTask", "cached_method", Adapter(), 0, raw_dir, logging.getLogger("test"))
     np.testing.assert_allclose(metrics["eval/train/loss"], [3.0, 2.0, 1.0])
+
+
+def test_continue_on_task_error_records_skip_and_completes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_eval(**_: Any) -> dict[str, np.ndarray]:
+        raise RuntimeError("dead upstream dataset")
+
+    monkeypatch.setattr(runner, "evaluate_task_optimizer", fail_eval)
+    cfg = CeloBenchConfig(
+        benchmark=BenchmarkConfig(run_dir=str(tmp_path / "run"), show_progress=False, continue_on_task_error=True),
+        task_names=("BadTask",),
+        evaluation=EvaluationConfig(steps=20, seeds=(0,), eval_every=10, eval_batches=1, last_eval_batches=1),
+        adam_reference=AdamReferenceConfig(enabled=True, lrs=(0.1,)),
+        methods=(
+            OptimizerSpec(
+                name="fake_method",
+                kind="import_path",
+                import_path="tests.celo_bench_test:fake_optimizer_factory",
+            ),
+        ),
+    )
+    tables = runner.run_or_load(cfg)
+    assert tables.summary["ok"] is True
+    assert tables.summary["skipped_curve_jobs"] == 1
+    assert tables.skipped_rows[0]["task"] == "BadTask"
+    assert (tables.output_dir / "skipped.csv").read_text(encoding="utf-8")
 
 
 def test_real_task_imports_when_optional_celo_env_is_available() -> None:
