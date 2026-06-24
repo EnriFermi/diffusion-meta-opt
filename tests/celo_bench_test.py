@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import logging
 import numpy as np
 import pytest
 
@@ -173,6 +174,42 @@ def test_run_or_load_writes_artifacts_and_uses_matching_cache(tmp_path: Path, mo
     )
     with pytest.raises(AssertionError, match="cache should avoid"):
         runner.run_or_load(changed)
+
+
+def test_run_curve_reuses_matching_raw_metric_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = CeloBenchConfig(
+        benchmark=BenchmarkConfig(run_dir=str(tmp_path / "run"), show_progress=False, cache_first=True),
+        task_names=("FakeTask",),
+        evaluation=EvaluationConfig(steps=20, seeds=(0,), eval_every=10, eval_batches=1, last_eval_batches=1),
+    )
+    raw_dir = tmp_path / "run" / "raw"
+    method_dir = raw_dir / "faketask" / "seed_0" / "cached_method"
+    method_dir.mkdir(parents=True)
+    np.savez(
+        method_dir / "metrics_unroll20.npz",
+        **{"eval/xs": np.asarray([0, 10, 20]), "eval/train/loss": np.asarray([3.0, 2.0, 1.0])},
+    )
+    runner.write_json_file(
+        method_dir / "manifest.json",
+        {
+            "task": "FakeTask",
+            "method": "cached_method",
+            "seed": 0,
+            "steps": 20,
+            "metrics_path": str(method_dir / "metrics_unroll20.npz"),
+            "metadata": {},
+        },
+    )
+
+    def fail_eval(**_: Any) -> dict[str, np.ndarray]:
+        raise AssertionError("cached curve should be reused")
+
+    class Adapter:
+        name = "cached_method"
+
+    monkeypatch.setattr(runner, "evaluate_task_optimizer", fail_eval)
+    metrics = runner._run_curve(cfg, "FakeTask", "cached_method", Adapter(), 0, raw_dir, logging.getLogger("test"))
+    np.testing.assert_allclose(metrics["eval/train/loss"], [3.0, 2.0, 1.0])
 
 
 def test_real_task_imports_when_optional_celo_env_is_available() -> None:
