@@ -30,6 +30,14 @@ class ExperimentConfig:
     test_subset: int = 512
     cnn_batch_size: int = 64
 
+    weight_distribution: str = "tiny_cnn"
+    celo_tasks: tuple[str, ...] = ("mnist", "fashion_mnist", "svhn", "cifar10")
+    celo_image_size: int = 8
+    celo_hidden_dim: int = 32
+    celo_tau_min: float = 1e-3
+    celo_tau_max: float = 1e3
+    celo_adam_lrs: tuple[float, ...] = (1e-4, 3e-4, 1e-3, 3e-3, 1e-2)
+
     weight_runs: int = 16
     weight_train_steps: int = 80
     weight_snapshot_every: int = 10
@@ -38,6 +46,12 @@ class ExperimentConfig:
 
     latent_dim: int = 16
     vae_hidden_dim: int = 512
+    vae_arch: str = "weight_mlp"
+    tiny_bigvae_patch_size: int = 16
+    tiny_bigvae_token_dim: int = 16
+    tiny_bigvae_pos_dim: int = 8
+    tiny_bigvae_resampler_latents: int = 2
+    tiny_bigvae_attention_heads: int = 1
     vae_steps: int = 500
     vae_batch_size: int = 64
     vae_lr: float = 1e-3
@@ -109,6 +123,40 @@ def paperish_config(**overrides: Any) -> ExperimentConfig:
             "weight_runs": 64,
             "weight_train_steps": 200,
             "weight_snapshot_every": 10,
+            "vae_steps": 2000,
+            "flow_steps": 1000,
+            "geometry_eval_samples": 64,
+            "tune_starts": 8,
+            "eval_starts": 16,
+            "downstream_steps": 200,
+            "flow_eta": 0.2,
+        }
+    )
+    values.update(overrides)
+    return ExperimentConfig(**values)
+
+
+def celo_meta_config(**overrides: Any) -> ExperimentConfig:
+    values = asdict(ExperimentConfig())
+    values.update(
+        {
+            "run_label": "sage_cnn_vae_smoothing_celo_meta_adam",
+            "weight_distribution": "celo_meta_mlp",
+            "dataset_name": "celo_meta_mlp",
+            "train_subset": 4096,
+            "test_subset": 1024,
+            "cnn_batch_size": 64,
+            "weight_runs": 64,
+            "weight_train_steps": 2000,
+            "weight_snapshot_every": 50,
+            "latent_dim": 8,
+            "vae_hidden_dim": 32,
+            "vae_arch": "tiny_big_vae",
+            "tiny_bigvae_patch_size": 16,
+            "tiny_bigvae_token_dim": 16,
+            "tiny_bigvae_pos_dim": 8,
+            "tiny_bigvae_resampler_latents": 2,
+            "tiny_bigvae_attention_heads": 1,
             "vae_steps": 2000,
             "flow_steps": 1000,
             "geometry_eval_samples": 64,
