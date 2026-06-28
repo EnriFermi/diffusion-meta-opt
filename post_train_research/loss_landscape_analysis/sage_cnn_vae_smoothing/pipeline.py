@@ -11,16 +11,21 @@ import torch
 
 from .config import ExperimentConfig, config_hash, config_to_dict, read_config, run_dir, torch_dtype, write_config
 from .core import (
+    TaskTensorSet,
     decoder_jacobians,
     decode_weights,
     encode_weights,
     generate_weight_pool,
     geometry_metrics_from_jacobians,
+    load_celo_meta_task_tensors,
     load_vision_tensors,
+    move_task_tensors,
     random_near_identity_flow,
+    task_tensor_set_from_vision_tensors,
     train_posthoc_flow,
     train_weight_vae,
     atomic_torch_save,
+    evaluate_flat_model,
     flow_training_cache_key,
     load_torch_cache,
     vae_training_cache_key,
@@ -125,19 +130,58 @@ def _variant_path(output_dir: Path, name: str, *, variant: str, multi_variant: b
     return output_dir / f"{path.stem}_{variant}{path.suffix}"
 
 
+def _weight_distribution_name(cfg: ExperimentConfig) -> str:
+    value = str(cfg.weight_distribution).strip().lower()
+    if value in {"tiny", "tiny_cnn", "cnn", "fashion_mnist_tiny_cnn"}:
+        return "tiny_cnn"
+    if value in {"celo", "celo_meta", "celo_meta_mlp", "paper_meta_mlp"}:
+        return "celo_meta_mlp"
+    raise ValueError(f"unknown weight_distribution {cfg.weight_distribution!r}")
+
+
+def _load_task_tensors_for_pipeline(
+    cfg: ExperimentConfig,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, TaskTensorSet]:
+    distribution = _weight_distribution_name(cfg)
+    if distribution == "tiny_cnn":
+        train_images, train_labels, test_images, test_labels = load_vision_tensors(cfg)
+        task_tensors = {
+            "tiny_cnn": task_tensor_set_from_vision_tensors(
+                task_name="tiny_cnn",
+                train_images=train_images,
+                train_labels=train_labels,
+                test_images=test_images,
+                test_labels=test_labels,
+            )
+        }
+    elif distribution == "celo_meta_mlp":
+        task_tensors = load_celo_meta_task_tensors(cfg)
+    else:
+        raise AssertionError(f"unhandled distribution {distribution!r}")
+    return move_task_tensors(task_tensors, device=device, dtype=dtype)
+
+
+def _task_set_for_record(task_tensors: dict[str, TaskTensorSet], record: dict[str, Any]) -> TaskTensorSet:
+    task_name = str(record.get("task_name", "tiny_cnn"))
+    if task_name in task_tensors:
+        return task_tensors[task_name]
+    if len(task_tensors) == 1:
+        return next(iter(task_tensors.values()))
+    raise KeyError(f"task {task_name!r} not found in loaded task tensors")
+
+
 def _vae_quality_rows(
     *,
     cfg: ExperimentConfig,
     trained,
     weights: torch.Tensor,
     spec,
-    train_images: torch.Tensor,
-    train_labels: torch.Tensor,
-    test_images: torch.Tensor,
-    test_labels: torch.Tensor,
+    task_tensors: dict[str, TaskTensorSet],
+    weight_records: pd.DataFrame,
 ) -> pd.DataFrame:
-    from .core import evaluate_flat_model
-
     device = torch.device(cfg.device)
     dtype = torch_dtype(cfg)
     vae = trained.vae.to(device=device, dtype=dtype)
@@ -149,19 +193,25 @@ def _vae_quality_rows(
     progress = make_progress(cfg, total=int(eval_indices.numel()), desc="VAE quality eval")
     try:
         for local_idx, idx in enumerate(eval_indices.tolist()):
+            record = weight_records.iloc[int(idx)].to_dict() if not weight_records.empty else {"task_name": "tiny_cnn", "tau": 1.0}
+            task_set = _task_set_for_record(task_tensors, record)
+            tau = float(record.get("tau", 1.0))
             w = weights_device[int(idx)]
             z = encode_weights(vae, trained.normalizer, w.reshape(1, -1)).squeeze(0)
             recon = decode_weights(vae, trained.normalizer, z.reshape(1, -1)).squeeze(0)
             z_roundtrip = encode_weights(vae, trained.normalizer, recon.reshape(1, -1)).squeeze(0)
-            raw_train_loss, raw_train_acc = evaluate_flat_model(w, images=train_images, labels=train_labels, spec=spec)
-            dec_train_loss, dec_train_acc = evaluate_flat_model(recon, images=train_images, labels=train_labels, spec=spec)
-            raw_test_loss, raw_test_acc = evaluate_flat_model(w, images=test_images, labels=test_labels, spec=spec)
-            dec_test_loss, dec_test_acc = evaluate_flat_model(recon, images=test_images, labels=test_labels, spec=spec)
+            raw_train_loss, raw_train_acc = evaluate_flat_model(w, images=task_set.train_images, labels=task_set.train_labels, spec=spec, tau=tau)
+            dec_train_loss, dec_train_acc = evaluate_flat_model(recon, images=task_set.train_images, labels=task_set.train_labels, spec=spec, tau=tau)
+            raw_test_loss, raw_test_acc = evaluate_flat_model(w, images=task_set.test_images, labels=task_set.test_labels, spec=spec, tau=tau)
+            dec_test_loss, dec_test_acc = evaluate_flat_model(recon, images=task_set.test_images, labels=task_set.test_labels, spec=spec, tau=tau)
             reconstruction_rel_l2 = float(((recon - w).float().norm() / w.float().norm().clamp_min(1e-12)).detach().cpu().item())
             rows.append(
                 {
                     "sample_index": int(local_idx),
                     "weight_index": int(idx),
+                    "task_name": str(record.get("task_name", task_set.task_name)),
+                    "tau": tau,
+                    "source_lr": float(record.get("source_lr", float("nan"))),
                     "reconstruction_mse": float((recon - w).square().mean().detach().cpu().item()),
                     "reconstruction_rel_l2": reconstruction_rel_l2,
                     "latent_roundtrip_l2": float((z_roundtrip - z).float().norm().detach().cpu().item()),
@@ -283,6 +333,14 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
     config_payload = write_config(cfg_path, cfg)
     device = torch.device(cfg.device)
     dtype = torch_dtype(cfg)
+    print(
+        "[sage_smoothing] start "
+        f"run_label={cfg.run_label!r} distribution={cfg.weight_distribution!r} "
+        f"output_dir={output_dir} device={device} dtype={dtype} seed={int(cfg.seed)} "
+        f"cache_first={bool(cfg.cache_first)} force_rerun={bool(cfg.force_rerun)}",
+        flush=True,
+    )
+    print(f"[sage_smoothing] resolved_config={json.dumps(config_to_dict(cfg), sort_keys=True, default=str)}", flush=True)
     variants = _vae_variants_from_coeff(float(cfg.vae_geometry_reg_coeff))
     multi_variant = len(variants) > 1
     stage_total = 2 + 5 * len(variants) + 1
@@ -291,21 +349,22 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
 
     try:
         _set_stage(stage_progress, stage_idx, stage_total, "load data")
-        train_images, train_labels, test_images, test_labels = load_vision_tensors(cfg)
-        train_images = train_images.to(device=device, dtype=dtype)
-        train_labels = train_labels.to(device=device)
-        test_images = test_images.to(device=device, dtype=dtype)
-        test_labels = test_labels.to(device=device)
+        task_tensors = _load_task_tensors_for_pipeline(cfg, device=device, dtype=dtype)
+        print(
+            "[sage_smoothing] loaded tasks "
+            + ", ".join(
+                f"{name}:train={tuple(task.train_images.shape)} test={tuple(task.test_images.shape)}"
+                for name, task in task_tensors.items()
+            ),
+            flush=True,
+        )
         stage_progress.update(1)
         stage_idx += 1
 
         _set_stage(stage_progress, stage_idx, stage_total, "generate weights")
         weights, weight_records, spec = generate_weight_pool(
             cfg,
-            train_images=train_images,
-            train_labels=train_labels,
-            test_images=test_images,
-            test_labels=test_labels,
+            task_tensors=task_tensors,
             output_path=output_dir / "weight_pool.pt",
         )
         weight_records.to_csv(output_dir / "weight_pool_records.csv", index=False)
@@ -330,6 +389,7 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
                 weights,
                 output_path=_variant_path(output_dir, "vae_checkpoint.pt", variant=variant, multi_variant=multi_variant),
                 upstream_cache_key=weight_cache_key,
+                spec=spec,
             )
             trained.vae.to(device=device, dtype=dtype).eval()
             z_all = encode_weights(trained.vae, trained.normalizer, weights_device)
@@ -366,10 +426,8 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
                 trained=trained,
                 weights=weights,
                 spec=spec,
-                train_images=train_images,
-                train_labels=train_labels,
-                test_images=test_images,
-                test_labels=test_labels,
+                task_tensors=task_tensors,
+                weight_records=weight_records,
             )
             vae_metrics_variant["vae_variant"] = variant
             vae_metrics_variant["vae_geometry_reg_coeff"] = float(reg_coeff)
@@ -396,6 +454,11 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
             if int(start_indices.numel()) < int(variant_cfg.tune_starts) + int(variant_cfg.eval_starts):
                 start_indices = torch.arange(int(weights.shape[0]))
             starts = weights_device.index_select(0, start_indices.to(device=device))
+            start_positions = [int(v) for v in start_indices.detach().cpu().tolist()]
+            start_records = weight_records.iloc[start_positions].copy() if not weight_records.empty else pd.DataFrame()
+            if not start_records.empty:
+                start_records["source_weight_index"] = start_positions
+                start_records = start_records.reset_index(drop=True)
             ctx = DownstreamContext(
                 cfg=variant_cfg,
                 spec=spec,
@@ -403,15 +466,13 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
                 normalizer=trained.normalizer,
                 trained_flow=trained_flow,
                 random_flow=random_flow,
-                train_images=train_images,
-                train_labels=train_labels,
-                test_images=test_images,
-                test_labels=test_labels,
+                task_tensors=task_tensors,
             )
             downstream_results_variant, downstream_curves_variant, selected_lrs_variant = tune_and_evaluate_downstream(
                 cfg=variant_cfg,
                 ctx=ctx,
                 starts=starts,
+                start_records=start_records,
             )
             for frame in (downstream_results_variant, downstream_curves_variant, selected_lrs_variant):
                 frame["vae_variant"] = variant
@@ -438,6 +499,17 @@ def run_or_load(cfg: ExperimentConfig) -> ExperimentTables:
         downstream_curves.to_csv(output_dir / "downstream_curves.csv", index=False)
         flow_history_all.to_csv(output_dir / "flow_history.csv", index=False)
         (output_dir / "interpretation.md").write_text(interpretation, encoding="utf-8")
+        if not downstream_results.empty:
+            summary = downstream_results.groupby("method")["aulc"].median().to_dict()
+        else:
+            summary = {}
+        print(
+            "[sage_smoothing] wrote outputs "
+            f"dir={output_dir} vae_metrics={output_dir / 'vae_metrics.csv'} "
+            f"geometry={output_dir / 'geometry.csv'} downstream_results={output_dir / 'downstream_results.csv'} "
+            f"median_aulc_by_method={summary}",
+            flush=True,
+        )
         stage_progress.update(1)
     finally:
         stage_progress.close()

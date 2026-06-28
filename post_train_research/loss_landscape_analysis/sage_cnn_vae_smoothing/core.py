@@ -7,7 +7,7 @@ import random
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pandas as pd
 import torch
@@ -72,12 +72,19 @@ def weight_pool_cache_key(cfg: ExperimentConfig) -> str:
         "weight_pool",
         cfg,
         (
+            "weight_distribution",
             "dataset_name",
             "data_root",
             "download",
             "train_subset",
             "test_subset",
             "cnn_batch_size",
+            "celo_tasks",
+            "celo_image_size",
+            "celo_hidden_dim",
+            "celo_tau_min",
+            "celo_tau_max",
+            "celo_adam_lrs",
             "weight_runs",
             "weight_train_steps",
             "weight_snapshot_every",
@@ -96,6 +103,12 @@ def vae_training_cache_key(cfg: ExperimentConfig, weights: torch.Tensor, *, upst
             "vae_train_fraction",
             "latent_dim",
             "vae_hidden_dim",
+            "vae_arch",
+            "tiny_bigvae_patch_size",
+            "tiny_bigvae_token_dim",
+            "tiny_bigvae_pos_dim",
+            "tiny_bigvae_resampler_latents",
+            "tiny_bigvae_attention_heads",
             "vae_steps",
             "vae_batch_size",
             "vae_lr",
@@ -167,19 +180,52 @@ class TinyCNN(nn.Module):
         return self.fc2(h)
 
 
+class CeloMetaMLP(nn.Module):
+    def __init__(self, *, image_shape: tuple[int, int, int] = (1, 8, 8), hidden_dim: int = 32, num_classes: int = 10) -> None:
+        super().__init__()
+        self.image_shape = tuple(int(v) for v in image_shape)
+        input_dim = int(math.prod(self.image_shape))
+        self.fc1 = nn.Linear(input_dim, int(hidden_dim))
+        self.fc2 = nn.Linear(int(hidden_dim), int(num_classes))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x.reshape(x.shape[0], -1)
+        h = F.relu(self.fc1(h))
+        return self.fc2(h)
+
+
 @dataclass(frozen=True, slots=True)
 class FlatSpec:
     keys: tuple[str, ...]
     shapes: tuple[tuple[int, ...], ...]
     sizes: tuple[int, ...]
+    model_kind: str = "tiny_cnn"
+    image_shape: tuple[int, int, int] = (1, 28, 28)
+    hidden_dim: int = 0
+    num_classes: int = 10
 
     @property
     def dim(self) -> int:
         return int(sum(self.sizes))
 
 
-def tiny_cnn_spec() -> FlatSpec:
-    model = TinyCNN()
+@dataclass(frozen=True, slots=True)
+class TaskTensorSet:
+    task_name: str
+    train_images: torch.Tensor
+    train_labels: torch.Tensor
+    test_images: torch.Tensor
+    test_labels: torch.Tensor
+
+
+def _module_flat_spec(
+    model: nn.Module,
+    *,
+    model_kind: str,
+    image_shape: tuple[int, int, int],
+    hidden_dim: int,
+    num_classes: int,
+) -> FlatSpec:
     keys: list[str] = []
     shapes: list[tuple[int, ...]] = []
     sizes: list[int] = []
@@ -187,7 +233,73 @@ def tiny_cnn_spec() -> FlatSpec:
         keys.append(str(key))
         shapes.append(tuple(int(v) for v in value.shape))
         sizes.append(int(value.numel()))
-    return FlatSpec(tuple(keys), tuple(shapes), tuple(sizes))
+    return FlatSpec(
+        tuple(keys),
+        tuple(shapes),
+        tuple(sizes),
+        model_kind=str(model_kind),
+        image_shape=tuple(int(v) for v in image_shape),
+        hidden_dim=int(hidden_dim),
+        num_classes=int(num_classes),
+    )
+
+
+def tiny_cnn_spec() -> FlatSpec:
+    return _module_flat_spec(
+        TinyCNN(),
+        model_kind="tiny_cnn",
+        image_shape=(1, 28, 28),
+        hidden_dim=32,
+        num_classes=10,
+    )
+
+
+def celo_meta_mlp_spec(cfg: ExperimentConfig) -> FlatSpec:
+    image_size = int(cfg.celo_image_size)
+    hidden_dim = int(cfg.celo_hidden_dim)
+    return _module_flat_spec(
+        CeloMetaMLP(image_shape=(1, image_size, image_size), hidden_dim=hidden_dim, num_classes=10),
+        model_kind="celo_meta_mlp",
+        image_shape=(1, image_size, image_size),
+        hidden_dim=hidden_dim,
+        num_classes=10,
+    )
+
+
+def spec_to_payload(spec: FlatSpec) -> dict[str, Any]:
+    return {
+        "keys": spec.keys,
+        "shapes": spec.shapes,
+        "sizes": spec.sizes,
+        "model_kind": spec.model_kind,
+        "image_shape": spec.image_shape,
+        "hidden_dim": int(spec.hidden_dim),
+        "num_classes": int(spec.num_classes),
+    }
+
+
+def spec_from_payload(payload: Mapping[str, Any]) -> FlatSpec:
+    return FlatSpec(
+        tuple(str(v) for v in payload["keys"]),
+        tuple(tuple(int(x) for x in shape) for shape in payload["shapes"]),
+        tuple(int(v) for v in payload["sizes"]),
+        model_kind=str(payload.get("model_kind", "tiny_cnn")),
+        image_shape=tuple(int(v) for v in payload.get("image_shape", (1, 28, 28))),
+        hidden_dim=int(payload.get("hidden_dim", 32)),
+        num_classes=int(payload.get("num_classes", 10)),
+    )
+
+
+def _model_from_spec(spec: FlatSpec) -> nn.Module:
+    if spec.model_kind == "tiny_cnn":
+        return TinyCNN()
+    if spec.model_kind == "celo_meta_mlp":
+        return CeloMetaMLP(
+            image_shape=tuple(int(v) for v in spec.image_shape),
+            hidden_dim=int(spec.hidden_dim),
+            num_classes=int(spec.num_classes),
+        )
+    raise ValueError(f"unknown FlatSpec model_kind {spec.model_kind!r}")
 
 
 def state_dict_to_flat(state_dict: dict[str, torch.Tensor], spec: FlatSpec) -> torch.Tensor:
@@ -205,10 +317,15 @@ def flat_to_state_dict(flat: torch.Tensor, spec: FlatSpec) -> dict[str, torch.Te
     return state
 
 
-def tiny_cnn_logits_from_flat(flat: torch.Tensor, images: torch.Tensor, spec: FlatSpec) -> torch.Tensor:
-    model = TinyCNN().to(device=images.device, dtype=images.dtype)
-    state = flat_to_state_dict(flat.to(device=images.device, dtype=images.dtype), spec)
+def logits_from_flat(flat: torch.Tensor, images: torch.Tensor, spec: FlatSpec, *, tau: float = 1.0) -> torch.Tensor:
+    model = _model_from_spec(spec).to(device=images.device, dtype=images.dtype)
+    effective_flat = flat.to(device=images.device, dtype=images.dtype) * float(tau)
+    state = flat_to_state_dict(effective_flat, spec)
     return functional_call(model, state, (images,))
+
+
+def tiny_cnn_logits_from_flat(flat: torch.Tensor, images: torch.Tensor, spec: FlatSpec) -> torch.Tensor:
+    return logits_from_flat(flat, images, spec, tau=1.0)
 
 
 def _dataset_class(name: str):
@@ -243,6 +360,94 @@ def load_vision_tensors(cfg: ExperimentConfig) -> tuple[torch.Tensor, torch.Tens
     return train_images, train_labels.long(), test_images, test_labels.long()
 
 
+def _canonical_celo_task_name(name: str) -> str:
+    value = str(name).strip().lower().replace("-", "_")
+    aliases = {
+        "fashionmnist": "fashion_mnist",
+        "fashion_mnist": "fashion_mnist",
+        "mnist": "mnist",
+        "svhn": "svhn",
+        "cifar10": "cifar10",
+        "cifar_10": "cifar10",
+    }
+    if value not in aliases:
+        raise ValueError(f"celo task must be one of mnist, fashion_mnist, svhn, cifar10; got {name!r}")
+    return aliases[value]
+
+
+def _load_celo_dataset(name: str, *, root: Path, train: bool, download: bool, transform):
+    from torchvision import datasets
+
+    task_name = _canonical_celo_task_name(name)
+    if task_name == "mnist":
+        return datasets.MNIST(root=str(root), train=bool(train), download=bool(download), transform=transform)
+    if task_name == "fashion_mnist":
+        return datasets.FashionMNIST(root=str(root), train=bool(train), download=bool(download), transform=transform)
+    if task_name == "svhn":
+        return datasets.SVHN(root=str(root), split="train" if bool(train) else "test", download=bool(download), transform=transform)
+    if task_name == "cifar10":
+        return datasets.CIFAR10(root=str(root), train=bool(train), download=bool(download), transform=transform)
+    raise AssertionError(f"unhandled celo task {task_name!r}")
+
+
+def _tensor_subset(dataset, *, count: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+    sample_count = min(int(count), len(dataset))
+    if sample_count <= 0:
+        raise ValueError("train_subset and test_subset must select at least one sample")
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    indices = torch.randperm(len(dataset), generator=generator)[:sample_count].tolist()
+    loader = DataLoader(Subset(dataset, indices), batch_size=sample_count, shuffle=False)
+    images, labels = next(iter(loader))
+    return images, labels.long()
+
+
+def load_celo_meta_task_tensors(cfg: ExperimentConfig) -> dict[str, TaskTensorSet]:
+    from torchvision import transforms
+
+    image_size = int(cfg.celo_image_size)
+    transform = transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)),
+            transforms.Grayscale(num_output_channels=1),
+            transforms.ToTensor(),
+        ]
+    )
+    root = Path(cfg.data_root).expanduser().resolve()
+    task_sets: dict[str, TaskTensorSet] = {}
+    for task_idx, raw_name in enumerate(tuple(cfg.celo_tasks)):
+        task_name = _canonical_celo_task_name(raw_name)
+        train_set = _load_celo_dataset(task_name, root=root, train=True, download=bool(cfg.download), transform=transform)
+        test_set = _load_celo_dataset(task_name, root=root, train=False, download=bool(cfg.download), transform=transform)
+        train_images, train_labels = _tensor_subset(train_set, count=int(cfg.train_subset), seed=int(cfg.seed) + 10_000 + task_idx)
+        test_images, test_labels = _tensor_subset(test_set, count=int(cfg.test_subset), seed=int(cfg.seed) + 20_000 + task_idx)
+        task_sets[task_name] = TaskTensorSet(
+            task_name=task_name,
+            train_images=train_images,
+            train_labels=train_labels,
+            test_images=test_images,
+            test_labels=test_labels,
+        )
+    return task_sets
+
+
+def task_tensor_set_from_vision_tensors(
+    *,
+    task_name: str,
+    train_images: torch.Tensor,
+    train_labels: torch.Tensor,
+    test_images: torch.Tensor,
+    test_labels: torch.Tensor,
+) -> TaskTensorSet:
+    return TaskTensorSet(
+        task_name=str(task_name),
+        train_images=train_images,
+        train_labels=train_labels.long(),
+        test_images=test_images,
+        test_labels=test_labels.long(),
+    )
+
+
 def make_tensor_loaders(
     train_images: torch.Tensor,
     train_labels: torch.Tensor,
@@ -262,37 +467,104 @@ def evaluate_flat_model(
     images: torch.Tensor,
     labels: torch.Tensor,
     spec: FlatSpec,
+    tau: float = 1.0,
 ) -> tuple[float, float]:
     with torch.no_grad():
-        logits = tiny_cnn_logits_from_flat(flat, images, spec)
+        logits = logits_from_flat(flat, images, spec, tau=float(tau))
         loss = F.cross_entropy(logits, labels)
         acc = (logits.argmax(dim=-1) == labels).float().mean()
     return float(loss.detach().cpu().item()), float(acc.detach().cpu().item())
 
 
+def _weight_distribution_name(cfg: ExperimentConfig) -> str:
+    value = str(cfg.weight_distribution).strip().lower()
+    if value in {"tiny", "tiny_cnn", "cnn", "fashion_mnist_tiny_cnn"}:
+        return "tiny_cnn"
+    if value in {"celo", "celo_meta", "celo_meta_mlp", "paper_meta_mlp"}:
+        return "celo_meta_mlp"
+    raise ValueError("weight_distribution must be 'tiny_cnn' or 'celo_meta_mlp', got " f"{cfg.weight_distribution!r}")
+
+
+def _move_task_tensor_set(task_set: TaskTensorSet, *, device: torch.device, dtype: torch.dtype) -> TaskTensorSet:
+    return TaskTensorSet(
+        task_name=str(task_set.task_name),
+        train_images=task_set.train_images.to(device=device, dtype=dtype),
+        train_labels=task_set.train_labels.to(device=device),
+        test_images=task_set.test_images.to(device=device, dtype=dtype),
+        test_labels=task_set.test_labels.to(device=device),
+    )
+
+
+def move_task_tensors(
+    task_tensors: Mapping[str, TaskTensorSet],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, TaskTensorSet]:
+    return {str(name): _move_task_tensor_set(task_set, device=device, dtype=dtype) for name, task_set in task_tensors.items()}
+
+
+def _sample_batch(task_set: TaskTensorSet, *, batch_size: int, generator: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
+    sample_count = int(task_set.train_images.shape[0])
+    if sample_count <= 0:
+        raise ValueError(f"task {task_set.task_name!r} has no train samples")
+    count = min(max(1, int(batch_size)), sample_count)
+    indices = torch.randint(0, sample_count, (count,), generator=generator, device="cpu").to(device=task_set.train_images.device)
+    return task_set.train_images.index_select(0, indices), task_set.train_labels.index_select(0, indices)
+
+
+def _task_tensors_from_legacy_args(
+    *,
+    train_images: torch.Tensor | None,
+    train_labels: torch.Tensor | None,
+    test_images: torch.Tensor | None,
+    test_labels: torch.Tensor | None,
+) -> dict[str, TaskTensorSet]:
+    if train_images is None or train_labels is None or test_images is None or test_labels is None:
+        raise ValueError("tiny_cnn weight generation requires train_images/train_labels/test_images/test_labels or task_tensors")
+    return {
+        "tiny_cnn": task_tensor_set_from_vision_tensors(
+            task_name="tiny_cnn",
+            train_images=train_images,
+            train_labels=train_labels,
+            test_images=test_images,
+            test_labels=test_labels,
+        )
+    }
+
+
 def generate_weight_pool(
     cfg: ExperimentConfig,
     *,
-    train_images: torch.Tensor,
-    train_labels: torch.Tensor,
-    test_images: torch.Tensor,
-    test_labels: torch.Tensor,
+    train_images: torch.Tensor | None = None,
+    train_labels: torch.Tensor | None = None,
+    test_images: torch.Tensor | None = None,
+    test_labels: torch.Tensor | None = None,
+    task_tensors: Mapping[str, TaskTensorSet] | None = None,
     output_path: Path,
 ) -> tuple[torch.Tensor, pd.DataFrame, FlatSpec]:
     cache_key = weight_pool_cache_key(cfg)
     if output_path.is_file() and bool(cfg.cache_first) and not bool(cfg.force_rerun):
         payload = load_torch_cache(output_path)
         if payload is not None and _cache_payload_matches(payload, cache_key, output_path):
-            spec = FlatSpec(tuple(payload["spec"]["keys"]), tuple(tuple(s) for s in payload["spec"]["shapes"]), tuple(payload["spec"]["sizes"]))
+            spec = spec_from_payload(payload["spec"])
             return payload["weights"], pd.DataFrame(payload["records"]), spec
 
     device = torch.device(cfg.device)
     dtype = torch_dtype(cfg)
-    train_images = train_images.to(device=device, dtype=dtype)
-    train_labels = train_labels.to(device=device)
-    test_images = test_images.to(device=device, dtype=dtype)
-    test_labels = test_labels.to(device=device)
-    spec = tiny_cnn_spec()
+    distribution = _weight_distribution_name(cfg)
+    if task_tensors is None:
+        if distribution == "tiny_cnn":
+            task_tensors = _task_tensors_from_legacy_args(
+                train_images=train_images,
+                train_labels=train_labels,
+                test_images=test_images,
+                test_labels=test_labels,
+            )
+        else:
+            task_tensors = load_celo_meta_task_tensors(cfg)
+    task_tensors_device = move_task_tensors(task_tensors, device=device, dtype=dtype)
+
     flats: list[torch.Tensor] = []
     records: list[dict[str, Any]] = []
     snapshot_every = max(1, int(cfg.weight_snapshot_every))
@@ -301,55 +573,209 @@ def generate_weight_pool(
     expected_snapshots = int(cfg.weight_runs) * len(snapshot_steps)
     print(
         "[weight_pool] building "
+        f"distribution={distribution} "
         f"runs={int(cfg.weight_runs)} train_steps={int(cfg.weight_train_steps)} "
         f"snapshot_every={snapshot_every} snapshots_per_run={len(snapshot_steps)} "
         f"expected_snapshots={expected_snapshots} output={output_path}",
         flush=True,
     )
-    train_loader, _test_loader = make_tensor_loaders(
-        train_images,
-        train_labels,
-        test_images,
-        test_labels,
-        batch_size=int(cfg.cnn_batch_size),
-    )
     progress = make_progress(cfg, total=int(cfg.weight_runs) * (int(cfg.weight_train_steps) + 1), desc="weight pool")
     try:
-        for run_idx in range(int(cfg.weight_runs)):
-            torch.manual_seed(int(cfg.seed) + 1000 + run_idx)
-            model = TinyCNN().to(device=device, dtype=dtype)
-            optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.weight_lr))
-            loader_iter = iter(train_loader)
-            for step in range(int(cfg.weight_train_steps) + 1):
-                if step in snapshot_steps:
-                    flat = state_dict_to_flat(model.state_dict(), spec).detach().cpu()
-                    train_loss, train_acc = evaluate_flat_model(flat.to(device=device, dtype=dtype), images=train_images, labels=train_labels, spec=spec)
-                    test_loss, test_acc = evaluate_flat_model(flat.to(device=device, dtype=dtype), images=test_images, labels=test_labels, spec=spec)
-                    flats.append(flat)
-                    records.append(
-                        {
-                            "run": int(run_idx),
-                            "step": int(step),
-                            "train_loss": train_loss,
-                            "train_acc": train_acc,
-                            "test_loss": test_loss,
-                            "test_acc": test_acc,
-                        }
+        if distribution == "tiny_cnn":
+            spec = tiny_cnn_spec()
+            task_set = task_tensors_device.get("tiny_cnn") or next(iter(task_tensors_device.values()))
+            train_loader, _test_loader = make_tensor_loaders(
+                task_set.train_images,
+                task_set.train_labels,
+                task_set.test_images,
+                task_set.test_labels,
+                batch_size=int(cfg.cnn_batch_size),
+            )
+            for run_idx in range(int(cfg.weight_runs)):
+                torch.manual_seed(int(cfg.seed) + 1000 + run_idx)
+                model = TinyCNN().to(device=device, dtype=dtype)
+                optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.weight_lr))
+                loader_iter = iter(train_loader)
+                for step in range(int(cfg.weight_train_steps) + 1):
+                    if step in snapshot_steps:
+                        flat = state_dict_to_flat(model.state_dict(), spec).detach().cpu()
+                        train_loss, train_acc = evaluate_flat_model(
+                            flat.to(device=device, dtype=dtype),
+                            images=task_set.train_images,
+                            labels=task_set.train_labels,
+                            spec=spec,
+                            tau=1.0,
+                        )
+                        test_loss, test_acc = evaluate_flat_model(
+                            flat.to(device=device, dtype=dtype),
+                            images=task_set.test_images,
+                            labels=task_set.test_labels,
+                            spec=spec,
+                            tau=1.0,
+                        )
+                        flats.append(flat)
+                        records.append(
+                            {
+                                "run": int(run_idx),
+                                "step": int(step),
+                                "task_name": str(task_set.task_name),
+                                "tau": 1.0,
+                                "optimizer": "adam",
+                                "source_lr": float(cfg.weight_lr),
+                                "weight_distribution": distribution,
+                                "train_loss": train_loss,
+                                "train_acc": train_acc,
+                                "test_loss": test_loss,
+                                "test_acc": test_acc,
+                            }
+                        )
+                        progress.set_postfix({"run": run_idx, "step": step, "snapshots": len(flats), "test_acc": f"{test_acc:.3f}"})
+                    progress.update(1)
+                    if step == int(cfg.weight_train_steps):
+                        break
+                    try:
+                        batch_images, batch_labels = next(loader_iter)
+                    except StopIteration:
+                        loader_iter = iter(train_loader)
+                        batch_images, batch_labels = next(loader_iter)
+                    optimizer.zero_grad(set_to_none=True)
+                    logits = model(batch_images)
+                    loss = F.cross_entropy(logits, batch_labels)
+                    loss.backward()
+                    optimizer.step()
+        elif distribution == "celo_meta_mlp":
+            spec = celo_meta_mlp_spec(cfg)
+            task_names = tuple(_canonical_celo_task_name(name) for name in tuple(cfg.celo_tasks))
+            missing = [name for name in task_names if name not in task_tensors_device]
+            if missing:
+                raise ValueError(f"missing task tensors for Celo tasks: {missing}")
+            lr_grid = tuple(float(v) for v in tuple(cfg.celo_adam_lrs))
+            if not lr_grid:
+                raise ValueError("celo_adam_lrs must contain at least one LR")
+            tau_min = float(cfg.celo_tau_min)
+            tau_max = float(cfg.celo_tau_max)
+            if tau_min <= 0.0 or tau_max <= 0.0 or tau_max < tau_min:
+                raise ValueError(f"invalid tau range [{tau_min}, {tau_max}]")
+            rng = random.Random(int(cfg.seed) + 40_000)
+            batch_generator = torch.Generator(device="cpu")
+            batch_generator.manual_seed(int(cfg.seed) + 41_000)
+            log_tau_min = math.log(tau_min)
+            log_tau_max = math.log(tau_max)
+            print(
+                "[weight_pool] celo_meta_mlp setup "
+                f"tasks={task_names} image_shape={(1, int(cfg.celo_image_size), int(cfg.celo_image_size))} "
+                f"hidden_dim={int(cfg.celo_hidden_dim)} batch_size={int(cfg.cnn_batch_size)} "
+                f"adam_lrs={lr_grid} tau_log_uniform=[{tau_min:g}, {tau_max:g}]",
+                flush=True,
+            )
+            for run_idx in range(int(cfg.weight_runs)):
+                task_name = rng.choice(task_names)
+                source_lr = float(rng.choice(lr_grid))
+                tau = float(math.exp(rng.uniform(log_tau_min, log_tau_max)))
+                task_set = task_tensors_device[task_name]
+                torch.manual_seed(int(cfg.seed) + 50_000 + run_idx)
+                model = CeloMetaMLP(
+                    image_shape=tuple(int(v) for v in spec.image_shape),
+                    hidden_dim=int(spec.hidden_dim),
+                    num_classes=int(spec.num_classes),
+                ).to(device=device, dtype=dtype)
+                initial_flat = state_dict_to_flat(model.state_dict(), spec).to(device=device, dtype=dtype)
+                theta = (initial_flat / float(tau)).detach().clone().requires_grad_(True)
+                optimizer = torch.optim.Adam([theta], lr=source_lr)
+                for step in range(int(cfg.weight_train_steps) + 1):
+                    if step in snapshot_steps:
+                        flat = theta.detach().cpu()
+                        train_loss, train_acc = evaluate_flat_model(
+                            flat.to(device=device, dtype=dtype),
+                            images=task_set.train_images,
+                            labels=task_set.train_labels,
+                            spec=spec,
+                            tau=tau,
+                        )
+                        test_loss, test_acc = evaluate_flat_model(
+                            flat.to(device=device, dtype=dtype),
+                            images=task_set.test_images,
+                            labels=task_set.test_labels,
+                            spec=spec,
+                            tau=tau,
+                        )
+                        flats.append(flat)
+                        records.append(
+                            {
+                                "run": int(run_idx),
+                                "step": int(step),
+                                "task_name": task_name,
+                                "tau": tau,
+                                "optimizer": "adam",
+                                "source_lr": source_lr,
+                                "weight_distribution": distribution,
+                                "train_loss": train_loss,
+                                "train_acc": train_acc,
+                                "test_loss": test_loss,
+                                "test_acc": test_acc,
+                            }
+                        )
+                        progress.set_postfix(
+                            {
+                                "run": run_idx,
+                                "task": task_name,
+                                "step": step,
+                                "lr": f"{source_lr:.1e}",
+                                "tau": f"{tau:.1e}",
+                                "test_acc": f"{test_acc:.3f}",
+                            }
+                        )
+                    progress.update(1)
+                    if step == int(cfg.weight_train_steps):
+                        break
+                    batch_images, batch_labels = _sample_batch(
+                        task_set,
+                        batch_size=int(cfg.cnn_batch_size),
+                        generator=batch_generator,
                     )
-                    progress.set_postfix({"run": run_idx, "step": step, "snapshots": len(flats), "test_acc": f"{test_acc:.3f}"})
-                progress.update(1)
-                if step == int(cfg.weight_train_steps):
-                    break
-                try:
-                    batch_images, batch_labels = next(loader_iter)
-                except StopIteration:
-                    loader_iter = iter(train_loader)
-                    batch_images, batch_labels = next(loader_iter)
-                optimizer.zero_grad(set_to_none=True)
-                logits = model(batch_images)
-                loss = F.cross_entropy(logits, batch_labels)
-                loss.backward()
-                optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    logits = logits_from_flat(theta, batch_images, spec, tau=tau)
+                    loss = F.cross_entropy(logits, batch_labels)
+                    if not bool(torch.isfinite(loss).detach().cpu().item()):
+                        progress.set_postfix(
+                            {
+                                "run": run_idx,
+                                "task": task_name,
+                                "step": step,
+                                "lr": f"{source_lr:.1e}",
+                                "tau": f"{tau:.1e}",
+                                "status": "nonfinite_loss",
+                            }
+                        )
+                        break
+                    loss.backward()
+                    if theta.grad is None or not bool(torch.isfinite(theta.grad).all().detach().cpu().item()):
+                        progress.set_postfix(
+                            {
+                                "run": run_idx,
+                                "task": task_name,
+                                "step": step,
+                                "lr": f"{source_lr:.1e}",
+                                "tau": f"{tau:.1e}",
+                                "status": "nonfinite_grad",
+                            }
+                        )
+                        break
+                    optimizer.step()
+                    if not bool(torch.isfinite(theta).all().detach().cpu().item()):
+                        progress.set_postfix(
+                            {
+                                "run": run_idx,
+                                "task": task_name,
+                                "step": step,
+                                "lr": f"{source_lr:.1e}",
+                                "tau": f"{tau:.1e}",
+                                "status": "nonfinite_theta",
+                            }
+                        )
+                        break
+        else:
+            raise AssertionError(f"unhandled weight distribution {distribution!r}")
     finally:
         progress.close()
 
@@ -363,7 +789,7 @@ def generate_weight_pool(
             "cache_key": cache_key,
             "weights": weights,
             "records": records,
-            "spec": {"keys": spec.keys, "shapes": spec.shapes, "sizes": spec.sizes},
+            "spec": spec_to_payload(spec),
         },
         output_path,
     )
@@ -432,6 +858,188 @@ class WeightVAE(nn.Module):
         else:
             z = mu
         return self.decode_norm(z), mu, logvar
+
+
+class TinyBigWeightVAE(nn.Module):
+    """Very small BigVAE-like weight VAE.
+
+    It keeps the pipeline-level VAE API while replacing one dense
+    weight-vector encoder with shared patch token processing.
+    """
+
+    def __init__(
+        self,
+        *,
+        weight_dim: int,
+        latent_dim: int,
+        hidden_dim: int,
+        patch_size: int,
+        token_dim: int,
+        pos_dim: int,
+        resampler_latents: int,
+        attention_heads: int,
+    ) -> None:
+        super().__init__()
+        self.weight_dim = int(weight_dim)
+        self.latent_dim = int(latent_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.patch_size = max(1, int(patch_size))
+        self.token_dim = max(4, int(token_dim))
+        self.pos_dim = max(2, int(pos_dim))
+        self.resampler_latents = max(1, int(resampler_latents))
+        self.attention_heads = max(1, int(attention_heads))
+        if int(self.token_dim) % int(self.attention_heads) != 0:
+            raise ValueError(
+                f"tiny_bigvae_token_dim ({self.token_dim}) must be divisible by "
+                f"tiny_bigvae_attention_heads ({self.attention_heads})"
+            )
+        self.num_patches = int(math.ceil(float(self.weight_dim) / float(self.patch_size)))
+        self.padded_dim = int(self.num_patches * self.patch_size)
+
+        encoder_hidden = max(int(self.hidden_dim), int(self.token_dim))
+        self.patch_encoder = nn.Sequential(
+            nn.Linear(int(self.patch_size + self.pos_dim), encoder_hidden),
+            nn.GELU(),
+            nn.Linear(encoder_hidden, int(self.token_dim)),
+            nn.GELU(),
+        )
+        self.resampler_slots = nn.Parameter(torch.randn(int(self.resampler_latents), int(self.token_dim)) * 0.02)
+        self.resampler_q_norm = nn.LayerNorm(int(self.token_dim))
+        self.resampler_kv_norm = nn.LayerNorm(int(self.token_dim))
+        self.resampler_attn = nn.MultiheadAttention(
+            embed_dim=int(self.token_dim),
+            num_heads=int(self.attention_heads),
+            batch_first=True,
+        )
+        self.resampler_ffn = nn.Sequential(
+            nn.LayerNorm(int(self.token_dim)),
+            nn.Linear(int(self.token_dim), encoder_hidden),
+            nn.GELU(),
+            nn.Linear(encoder_hidden, int(self.token_dim)),
+        )
+        self.head_norm = nn.LayerNorm(int(self.token_dim))
+        self.head_attn = nn.MultiheadAttention(
+            embed_dim=int(self.token_dim),
+            num_heads=int(self.attention_heads),
+            batch_first=True,
+        )
+        self.head_ffn = nn.Sequential(
+            nn.LayerNorm(int(self.token_dim)),
+            nn.Linear(int(self.token_dim), encoder_hidden),
+            nn.GELU(),
+            nn.Linear(encoder_hidden, int(self.token_dim)),
+        )
+        self.token_norm = nn.LayerNorm(int(self.token_dim))
+        self.to_mu = nn.Linear(int(self.token_dim), int(self.latent_dim))
+        self.to_logvar = nn.Linear(int(self.token_dim), int(self.latent_dim))
+
+        self.latent_to_context = nn.Sequential(
+            nn.Linear(int(self.latent_dim), encoder_hidden),
+            nn.GELU(),
+            nn.Linear(encoder_hidden, int(self.token_dim)),
+        )
+        self.decoder_pos_proj = nn.Linear(int(self.pos_dim), int(self.token_dim))
+        self.patch_decoder = nn.Sequential(
+            nn.LayerNorm(int(self.token_dim)),
+            nn.Linear(int(self.token_dim), encoder_hidden),
+            nn.GELU(),
+            nn.Linear(encoder_hidden, int(self.patch_size)),
+        )
+
+    def _patch_positions(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        tau = (torch.arange(int(self.num_patches), device=device, dtype=torch.float32) + 0.5) / float(self.num_patches)
+        features = [tau]
+        half = max(1, int((self.pos_dim - 1) // 2))
+        for idx in range(half):
+            freq = float(2**idx) * math.pi
+            features.append(torch.sin(freq * tau))
+            if len(features) >= int(self.pos_dim):
+                break
+            features.append(torch.cos(freq * tau))
+            if len(features) >= int(self.pos_dim):
+                break
+        while len(features) < int(self.pos_dim):
+            features.append(tau.new_zeros(tau.shape))
+        return torch.stack(features[: int(self.pos_dim)], dim=-1).to(dtype=dtype)
+
+    def _patchify(self, x_norm: torch.Tensor) -> torch.Tensor:
+        if x_norm.ndim != 2:
+            raise ValueError(f"x_norm must be [B,D], got {tuple(x_norm.shape)}")
+        if int(x_norm.shape[1]) != int(self.weight_dim):
+            raise ValueError(f"x_norm dim must be {self.weight_dim}, got {int(x_norm.shape[1])}")
+        pad = int(self.padded_dim - self.weight_dim)
+        if pad > 0:
+            x_norm = F.pad(x_norm, (0, pad))
+        return x_norm.reshape(int(x_norm.shape[0]), int(self.num_patches), int(self.patch_size))
+
+    def encode(self, x_norm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        patches = self._patchify(x_norm)
+        pos = self._patch_positions(device=x_norm.device, dtype=x_norm.dtype).unsqueeze(0).expand(int(x_norm.shape[0]), -1, -1)
+        tokens = self.patch_encoder(torch.cat([patches, pos], dim=-1))
+        slots = self.resampler_slots.to(device=x_norm.device, dtype=x_norm.dtype).unsqueeze(0).expand(int(x_norm.shape[0]), -1, -1)
+        tokens_norm = self.resampler_kv_norm(tokens)
+        slot_update, _ = self.resampler_attn(
+            self.resampler_q_norm(slots),
+            tokens_norm,
+            tokens_norm,
+            need_weights=False,
+        )
+        slots = slots + slot_update
+        slots = slots + self.resampler_ffn(slots)
+        head_tokens = self.head_norm(slots)
+        head_update, _ = self.head_attn(head_tokens, head_tokens, head_tokens, need_weights=False)
+        slots = slots + head_update
+        slots = slots + self.head_ffn(slots)
+        pooled = self.token_norm(slots.mean(dim=1))
+        return self.to_mu(pooled), self.to_logvar(pooled).clamp(min=-12.0, max=8.0)
+
+    def decode_norm(self, z: torch.Tensor) -> torch.Tensor:
+        if z.ndim != 2:
+            raise ValueError(f"z must be [B,Z], got {tuple(z.shape)}")
+        if int(z.shape[1]) != int(self.latent_dim):
+            raise ValueError(f"z dim must be {self.latent_dim}, got {int(z.shape[1])}")
+        context = self.latent_to_context(z).unsqueeze(1)
+        pos = self._patch_positions(device=z.device, dtype=z.dtype)
+        pos_tokens = self.decoder_pos_proj(pos).unsqueeze(0)
+        patches = self.patch_decoder(context + pos_tokens)
+        flat = patches.reshape(int(z.shape[0]), int(self.padded_dim))
+        return flat[:, : int(self.weight_dim)]
+
+    def forward(self, x_norm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, logvar = self.encode(x_norm)
+        if self.training:
+            eps = torch.randn_like(mu)
+            z = mu + torch.exp(0.5 * logvar) * eps
+        else:
+            z = mu
+        return self.decode_norm(z), mu, logvar
+
+
+def _normalize_vae_arch(value: str) -> str:
+    arch = str(value).strip().lower()
+    if arch in {"weight_mlp", "mlp", "flat_mlp", "weight_vae"}:
+        return "weight_mlp"
+    if arch in {"tiny_big_vae", "tiny_bigvae", "mini_big_vae", "mini_bigvae"}:
+        return "tiny_big_vae"
+    raise ValueError(f"vae_arch must be 'weight_mlp' or 'tiny_big_vae', got {value!r}")
+
+
+def build_weight_vae(cfg: ExperimentConfig, *, weight_dim: int) -> nn.Module:
+    arch = _normalize_vae_arch(cfg.vae_arch)
+    if arch == "weight_mlp":
+        return WeightVAE(weight_dim=int(weight_dim), latent_dim=int(cfg.latent_dim), hidden_dim=int(cfg.vae_hidden_dim))
+    if arch == "tiny_big_vae":
+        return TinyBigWeightVAE(
+            weight_dim=int(weight_dim),
+            latent_dim=int(cfg.latent_dim),
+            hidden_dim=int(cfg.vae_hidden_dim),
+            patch_size=int(cfg.tiny_bigvae_patch_size),
+            token_dim=int(cfg.tiny_bigvae_token_dim),
+            pos_dim=int(cfg.tiny_bigvae_pos_dim),
+            resampler_latents=int(cfg.tiny_bigvae_resampler_latents),
+            attention_heads=int(cfg.tiny_bigvae_attention_heads),
+        )
+    raise AssertionError(f"unhandled vae_arch {arch!r}")
 
 
 def _matrix_and_bias_blocks(flat_batch: torch.Tensor, spec: FlatSpec) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, torch.Tensor]]]:
@@ -610,7 +1218,7 @@ def vae_loss(
 
 
 def vae_decoder_geometry_regularizer(
-    vae: WeightVAE,
+    vae: nn.Module,
     normalizer: WeightNormalizer,
     z_samples: torch.Tensor,
 ) -> torch.Tensor:
@@ -620,7 +1228,7 @@ def vae_decoder_geometry_regularizer(
 
 @dataclass(slots=True)
 class TrainedVAE:
-    vae: WeightVAE
+    vae: nn.Module
     normalizer: WeightNormalizer
     train_indices: torch.Tensor
     val_indices: torch.Tensor
@@ -633,13 +1241,14 @@ def train_weight_vae(
     *,
     output_path: Path,
     upstream_cache_key: str = "",
+    spec: FlatSpec | None = None,
 ) -> TrainedVAE:
     cache_key = vae_training_cache_key(cfg, weights, upstream_cache_key=upstream_cache_key)
     if output_path.is_file() and bool(cfg.cache_first) and not bool(cfg.force_rerun):
         payload = load_torch_cache(output_path)
         if payload is not None and _cache_payload_matches(payload, cache_key, output_path):
             normalizer = WeightNormalizer.from_state_dict(payload["normalizer"])
-            vae = WeightVAE(weight_dim=int(weights.shape[1]), latent_dim=int(cfg.latent_dim), hidden_dim=int(cfg.vae_hidden_dim))
+            vae = build_weight_vae(cfg, weight_dim=int(weights.shape[1]))
             vae.load_state_dict(payload["model_state"])
             return TrainedVAE(
                 vae=vae,
@@ -662,9 +1271,12 @@ def train_weight_vae(
     normalizer = WeightNormalizer.fit(weights.index_select(0, train_indices))
     weights_device = weights.to(device=device, dtype=dtype)
     x_norm = normalizer.normalize(weights_device)
-    spec = tiny_cnn_spec()
+    if spec is None:
+        spec = tiny_cnn_spec()
+        if int(spec.dim) != int(weights.shape[1]):
+            raise ValueError("train_weight_vae requires spec when weights are not TinyCNN-shaped")
     torch.manual_seed(int(cfg.seed) + 2100)
-    vae = WeightVAE(weight_dim=int(weights.shape[1]), latent_dim=int(cfg.latent_dim), hidden_dim=int(cfg.vae_hidden_dim)).to(device=device, dtype=dtype)
+    vae = build_weight_vae(cfg, weight_dim=int(weights.shape[1])).to(device=device, dtype=dtype)
     optimizer = torch.optim.Adam(vae.parameters(), lr=float(cfg.vae_lr))
     metrics: list[dict[str, float]] = []
     train_indices_device = train_indices.to(device=device)
@@ -747,14 +1359,14 @@ def train_weight_vae(
     return TrainedVAE(vae=vae, normalizer=normalizer, train_indices=train_indices, val_indices=val_indices, metrics=pd.DataFrame(metrics))
 
 
-def encode_weights(vae: WeightVAE, normalizer: WeightNormalizer, weights: torch.Tensor) -> torch.Tensor:
+def encode_weights(vae: nn.Module, normalizer: WeightNormalizer, weights: torch.Tensor) -> torch.Tensor:
     vae.eval()
     with torch.no_grad():
         mu, _logvar = vae.encode(normalizer.normalize(weights))
     return mu.detach()
 
 
-def decode_weights(vae: WeightVAE, normalizer: WeightNormalizer, z: torch.Tensor) -> torch.Tensor:
+def decode_weights(vae: nn.Module, normalizer: WeightNormalizer, z: torch.Tensor) -> torch.Tensor:
     return normalizer.denormalize(vae.decode_norm(z))
 
 
@@ -790,7 +1402,7 @@ def _forward_mode_jacobians(func, inputs: torch.Tensor, *, create_graph: bool) -
 
 
 def decoder_jacobians(
-    vae: WeightVAE,
+    vae: nn.Module,
     normalizer: WeightNormalizer,
     flow: torch.nn.Module | None,
     samples: torch.Tensor,
@@ -845,7 +1457,7 @@ def make_rq_flow(cfg: ExperimentConfig, dim: int, *, device: torch.device, dtype
 def train_posthoc_flow(
     cfg: ExperimentConfig,
     *,
-    vae: WeightVAE,
+    vae: nn.Module,
     normalizer: WeightNormalizer,
     z_train: torch.Tensor,
     output_path: Path,

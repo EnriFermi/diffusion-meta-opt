@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -10,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import ExperimentConfig
-from .core import FlatSpec, WeightNormalizer, WeightVAE, decode_weights, encode_weights, finite_value, tiny_cnn_logits_from_flat
+from .core import FlatSpec, TaskTensorSet, WeightNormalizer, decode_weights, encode_weights, finite_value, logits_from_flat
 from .progress import make_progress
 
 
@@ -18,24 +17,37 @@ from .progress import make_progress
 class DownstreamContext:
     cfg: ExperimentConfig
     spec: FlatSpec
-    vae: WeightVAE
+    vae: torch.nn.Module
     normalizer: WeightNormalizer
     trained_flow: torch.nn.Module
     random_flow: torch.nn.Module
-    train_images: torch.Tensor
-    train_labels: torch.Tensor
-    test_images: torch.Tensor
-    test_labels: torch.Tensor
+    task_tensors: dict[str, TaskTensorSet]
 
 
-def _flat_loss_and_acc(flat: torch.Tensor, ctx: DownstreamContext, *, split: str) -> tuple[torch.Tensor, torch.Tensor]:
+def _task_tensor_set(ctx: DownstreamContext, task_name: str) -> TaskTensorSet:
+    if task_name in ctx.task_tensors:
+        return ctx.task_tensors[task_name]
+    if len(ctx.task_tensors) == 1:
+        return next(iter(ctx.task_tensors.values()))
+    raise KeyError(f"task {task_name!r} not found in downstream task tensors")
+
+
+def _flat_loss_and_acc(
+    flat: torch.Tensor,
+    ctx: DownstreamContext,
+    *,
+    split: str,
+    task_name: str,
+    tau: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    task_set = _task_tensor_set(ctx, task_name)
     if split == "train":
-        images, labels = ctx.train_images, ctx.train_labels
+        images, labels = task_set.train_images, task_set.train_labels
     elif split == "test":
-        images, labels = ctx.test_images, ctx.test_labels
+        images, labels = task_set.test_images, task_set.test_labels
     else:
         raise ValueError(f"split must be train or test, got {split!r}")
-    logits = tiny_cnn_logits_from_flat(flat, images, ctx.spec)
+    logits = logits_from_flat(flat, images, ctx.spec, tau=float(tau))
     loss = F.cross_entropy(logits, labels)
     acc = (logits.argmax(dim=-1) == labels).float().mean()
     return loss, acc
@@ -80,6 +92,7 @@ def run_downstream_curve(
     lr: float,
     steps: int,
     start_index: int,
+    start_metadata: dict[str, Any],
     split: str,
 ) -> tuple[list[dict[str, float | int | str]], dict[str, float | int | str]]:
     value, mismatch = _start_for_method(w0, method, ctx)
@@ -88,11 +101,17 @@ def run_downstream_curve(
     rows: list[dict[str, float | int | str]] = []
     diverged = False
     threshold_step = -1
+    task_name = str(start_metadata.get("task_name", "tiny_cnn"))
+    tau = float(start_metadata.get("tau", 1.0))
+    source_weight_index = int(start_metadata.get("source_weight_index", start_index))
+    source_run = int(start_metadata.get("run", -1))
+    source_step = int(start_metadata.get("step", -1))
+    source_lr = float(start_metadata.get("source_lr", float("nan")))
     for step in range(int(steps) + 1):
         theta = _theta_for_method(value, method, ctx)
-        train_loss, train_acc = _flat_loss_and_acc(theta, ctx, split="train")
+        train_loss, train_acc = _flat_loss_and_acc(theta, ctx, split="train", task_name=task_name, tau=tau)
         with torch.no_grad():
-            test_loss, test_acc = _flat_loss_and_acc(theta.detach(), ctx, split="test")
+            test_loss, test_acc = _flat_loss_and_acc(theta.detach(), ctx, split="test", task_name=task_name, tau=tau)
         finite = bool(torch.isfinite(train_loss).detach().cpu().item()) and bool(torch.isfinite(test_loss).detach().cpu().item())
         if not finite:
             diverged = True
@@ -105,6 +124,12 @@ def run_downstream_curve(
                 "split": str(split),
                 "method": str(method),
                 "start_index": int(start_index),
+                "source_weight_index": int(source_weight_index),
+                "source_run": int(source_run),
+                "source_step": int(source_step),
+                "source_lr": float(source_lr),
+                "task_name": task_name,
+                "tau": float(tau),
                 "lr": float(lr),
                 "step": int(step),
                 "train_loss": train_loss_value,
@@ -128,6 +153,12 @@ def run_downstream_curve(
         "split": str(split),
         "method": str(method),
         "start_index": int(start_index),
+        "source_weight_index": int(source_weight_index),
+        "source_run": int(source_run),
+        "source_step": int(source_step),
+        "source_lr": float(source_lr),
+        "task_name": task_name,
+        "tau": float(tau),
         "lr": float(lr),
         "aulc": aulc,
         "final_train_loss": float(final["train_loss"]),
@@ -151,11 +182,31 @@ def _lr_grid_for_method(cfg: ExperimentConfig, method: str) -> tuple[float, ...]
     raise ValueError(f"unknown method {method!r}")
 
 
+def _start_metadata(start_records: pd.DataFrame | None, position: int, *, fallback_index: int) -> dict[str, Any]:
+    if start_records is None or start_records.empty or int(position) >= int(len(start_records)):
+        return {"task_name": "tiny_cnn", "tau": 1.0, "source_weight_index": int(fallback_index)}
+    row = start_records.iloc[int(position)].to_dict()
+    metadata: dict[str, Any] = {
+        "task_name": str(row.get("task_name", "tiny_cnn")),
+        "tau": float(row.get("tau", 1.0)),
+        "source_weight_index": int(row.get("source_weight_index", row.get("weight_index", fallback_index))),
+    }
+    for key in ("run", "step"):
+        if key in row and pd.notna(row[key]):
+            metadata[key] = int(row[key])
+    if "source_lr" in row and pd.notna(row["source_lr"]):
+        metadata["source_lr"] = float(row["source_lr"])
+    elif "lr" in row and pd.notna(row["lr"]):
+        metadata["source_lr"] = float(row["lr"])
+    return metadata
+
+
 def tune_and_evaluate_downstream(
     *,
     cfg: ExperimentConfig,
     ctx: DownstreamContext,
     starts: torch.Tensor,
+    start_records: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     methods = ("raw", "decoder_latent", "decoder_trained_nf", "decoder_random_nf")
     tune_count = min(int(cfg.tune_starts), int(starts.shape[0]))
@@ -176,6 +227,7 @@ def tune_and_evaluate_downstream(
             for lr in _lr_grid_for_method(cfg, method):
                 lr_metrics: list[float] = []
                 for start_idx in range(tune_count):
+                    metadata = _start_metadata(start_records, start_idx, fallback_index=start_idx)
                     rows, metrics = run_downstream_curve(
                         ctx=ctx,
                         w0=starts[start_idx],
@@ -183,6 +235,7 @@ def tune_and_evaluate_downstream(
                         lr=float(lr),
                         steps=int(cfg.downstream_steps),
                         start_index=int(start_idx),
+                        start_metadata=metadata,
                         split="tune",
                     )
                     tuning_rows.append(metrics)
@@ -197,6 +250,7 @@ def tune_and_evaluate_downstream(
             selected_lr = float(best["candidate_lr"])
             for eval_idx in range(eval_count):
                 start_idx = eval_start + eval_idx
+                metadata = _start_metadata(start_records, start_idx, fallback_index=start_idx)
                 rows, metrics = run_downstream_curve(
                     ctx=ctx,
                     w0=starts[start_idx],
@@ -204,6 +258,7 @@ def tune_and_evaluate_downstream(
                     lr=selected_lr,
                     steps=int(cfg.downstream_steps),
                     start_index=int(eval_idx),
+                    start_metadata=metadata,
                     split="eval",
                 )
                 curve_rows.extend(rows)
