@@ -939,6 +939,24 @@ class TinyBigWeightVAE(nn.Module):
             nn.Linear(encoder_hidden, int(self.token_dim)),
         )
         self.decoder_pos_proj = nn.Linear(int(self.pos_dim), int(self.token_dim))
+        self.decoder_attn_norm = nn.LayerNorm(int(self.token_dim))
+        self.decoder_qkv = nn.Linear(int(self.token_dim), int(3 * self.token_dim))
+        self.decoder_out_proj = nn.Linear(int(self.token_dim), int(self.token_dim))
+        self.decoder_ffn = nn.Sequential(
+            nn.LayerNorm(int(self.token_dim)),
+            nn.Linear(int(self.token_dim), encoder_hidden),
+            nn.GELU(),
+            nn.Linear(encoder_hidden, int(self.token_dim)),
+        )
+        self.decoder_scale_head = nn.Sequential(
+            nn.LayerNorm(int(self.token_dim)),
+            nn.Linear(int(self.token_dim), encoder_hidden),
+            nn.GELU(),
+            nn.Linear(encoder_hidden, 1),
+        )
+        self.output_eps = 1e-6
+        self.output_s_min = -3.0
+        self.output_s_max = 6.0
         self.patch_decoder = nn.Sequential(
             nn.LayerNorm(int(self.token_dim)),
             nn.Linear(int(self.token_dim), encoder_hidden),
@@ -1001,7 +1019,33 @@ class TinyBigWeightVAE(nn.Module):
         context = self.latent_to_context(z).unsqueeze(1)
         pos = self._patch_positions(device=z.device, dtype=z.dtype)
         pos_tokens = self.decoder_pos_proj(pos).unsqueeze(0)
-        patches = self.patch_decoder(context + pos_tokens)
+        tokens = context + pos_tokens
+        tokens_norm = self.decoder_attn_norm(tokens)
+        qkv = self.decoder_qkv(tokens_norm)
+        q, k, v = qkv.chunk(3, dim=-1)
+        batch_size, token_count, _ = q.shape
+        head_dim = int(self.token_dim // self.attention_heads)
+        q = q.reshape(batch_size, token_count, int(self.attention_heads), head_dim).transpose(1, 2)
+        k = k.reshape(batch_size, token_count, int(self.attention_heads), head_dim).transpose(1, 2)
+        v = v.reshape(batch_size, token_count, int(self.attention_heads), head_dim).transpose(1, 2)
+        attn = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(float(head_dim)), dim=-1)
+        update = torch.matmul(attn, v).transpose(1, 2).reshape(batch_size, token_count, int(self.token_dim))
+        tokens = tokens + self.decoder_out_proj(update)
+        tokens = tokens + self.decoder_ffn(tokens)
+        direction_patches = self.patch_decoder(tokens)
+        valid_mask = direction_patches.new_ones(int(self.padded_dim))
+        pad = int(self.padded_dim - self.weight_dim)
+        if pad > 0:
+            valid_mask[-pad:] = 0.0
+        valid_mask = valid_mask.reshape(1, int(self.num_patches), int(self.patch_size))
+        raw_direction = direction_patches * valid_mask
+        direction_norm = torch.linalg.vector_norm(raw_direction, ord=2, dim=-1, keepdim=True).clamp_min(float(self.output_eps))
+        direction = raw_direction / direction_norm
+        scale_logits = self.decoder_scale_head(tokens)
+        log_scale = float(self.output_s_min) + F.softplus(scale_logits - float(self.output_s_min))
+        log_scale = float(self.output_s_max) - F.softplus(float(self.output_s_max) - log_scale)
+        scale = torch.exp(log_scale)
+        patches = direction * scale * valid_mask
         flat = patches.reshape(int(z.shape[0]), int(self.padded_dim))
         return flat[:, : int(self.weight_dim)]
 

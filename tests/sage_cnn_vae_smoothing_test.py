@@ -181,6 +181,13 @@ def test_tiny_big_weight_vae_api_and_loss_are_differentiable() -> None:
     assert isinstance(vae, TinyBigWeightVAE)
     assert int(vae.resampler_latents) == 2
     assert int(vae.attention_heads) == 1
+    assert int(vae.decoder_qkv.out_features) == 3 * int(vae.token_dim)
+    assert int(vae.decoder_scale_head[-1].out_features) == 1
+    assert tuple(vae.decoder_scale_head(torch.randn(2, vae.num_patches, vae.token_dim)).shape) == (
+        2,
+        vae.num_patches,
+        1,
+    )
 
     x_norm = normalizer.normalize(weights)
     recon, mu, logvar = vae(x_norm)
@@ -194,6 +201,10 @@ def test_tiny_big_weight_vae_api_and_loss_are_differentiable() -> None:
     assert torch.isfinite(loss)
     assert row["bigvae_weight_loss"] >= 0.0
     assert any(param.grad is not None and torch.isfinite(param.grad).all() for param in vae.parameters())
+    assert vae.decoder_qkv.weight.grad is not None
+    assert torch.isfinite(vae.decoder_qkv.weight.grad).all()
+    assert vae.decoder_scale_head[-1].weight.grad is not None
+    assert torch.isfinite(vae.decoder_scale_head[-1].weight.grad).all()
 
 
 def test_decoder_geometry_jacobian_shape_and_finite_metrics() -> None:
