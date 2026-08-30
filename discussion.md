@@ -3380,3 +3380,44 @@ Targeted concept review of the rejected compander: `/home/coder/project/artifact
 - Exact implementation evidence is
   `/home/coder/project/projects/weight-vae/workspace/training/weightclip_benchmark/run_parallel_categorical_gptq_700m_production.py:501-551` and
   `:1101-1112`.
+
+## 2026-08-30 — Active WeightCLIP operator dataset uploaded to private Hugging Face storage
+
+- The user explicitly requested uploading the dataset, not merely documenting
+  its local location, and asked that another agent on another machine be able
+  to find and use it. The live categorical production trainer was not stopped
+  or modified.
+- The uploaded scope is exactly the active dataset referenced by the current
+  production pair manifest, not the full multi-generation local zoo. It
+  contains `weight_tile_bank-9020c363ee2005e8`,
+  `context_bank-234e31b2ec93af4f`, the immutable pair manifest, coverage, and
+  JSONL/Parquet permutation metadata: 3,622 payload files and
+  41,724,270,793 bytes (38.859 GiB).
+- The private Hub repository is
+  `https://huggingface.co/datasets/EnriFermi/weightclip-resnet18slim-operator-bank`.
+  The completed payload revision is
+  `3bc8cabb959f7dfd5682e9e36c6d69a51a00f444`; the final revision including
+  dataset metadata is `79d9b8c97362a3892d1f8475f71face6f9859b72`.
+- Upload used the resumable Hugging Face large-folder path with an exact
+  allowlist and two low-priority workers. One early uploader process was
+  resumably restarted so Xet cache lived on `/var/tmp` instead of the nearly
+  full project filesystem; only the uploader was stopped, never training.
+- Post-upload validation established that the repository remains private, all
+  3,622 payload paths have their expected remote sizes, and the downloaded
+  small manifests/coverage/permutation files match their frozen SHA-256 values.
+  A remote-manifest relocation smoke also produced an absolute-path resolved
+  manifest successfully without re-downloading the 38.9 GiB payload.
+- The original pair manifest is retained byte-for-byte for provenance. Because
+  its runtime paths are machine-specific, the new downloader creates a separate
+  resolved pair manifest and prints its new SHA-256. Only the top-level bank,
+  coverage, and permutation paths are rewritten; nested absolute provenance
+  paths remain historical metadata.
+- Discovery and machine-readable pin:
+  `/home/coder/project/projects/weight-vae/workspace/docs/weightclip_operator_dataset_hf.md`
+  and
+  `/home/coder/project/projects/weight-vae/workspace/conf/weightclip_benchmark/operator_dataset_remote_hf.json`.
+  Download helper:
+  `/home/coder/project/projects/weight-vae/workspace/scripts/download_weightclip_operator_dataset_from_hf.py`.
+  Access from another machine requires a Hugging Face token with read access to
+  the private repository. The current loader performs one full payload SHA scan
+  when opening the downloaded banks, so first open will read the full dataset.

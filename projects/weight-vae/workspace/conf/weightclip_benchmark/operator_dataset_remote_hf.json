@@ -1,0 +1,42 @@
+{
+  "schema": "weightclip_operator_dataset_remote_v1",
+  "repo_id": "EnriFermi/weightclip-resnet18slim-operator-bank",
+  "repo_type": "dataset",
+  "private": true,
+  "revision": "79d9b8c97362a3892d1f8475f71face6f9859b72",
+  "payload_revision": "3bc8cabb959f7dfd5682e9e36c6d69a51a00f444",
+  "source_contract": {
+    "pair_manifest": "operator_dataset-c478efe716506765.json",
+    "pair_manifest_sha256": "f3a26fc9772d43feabe138ef9fa5be5baf2f76323fb4f3079c12c5f65275f347",
+    "contract_sha256": "c478efe716506765af35236942e128d416472690d6dfc2cb5045bdfc359b562e",
+    "coverage": "coverage-c478efe716506765.json",
+    "coverage_sha256": "8d296699149a57ecf5fd6169f5c968a62e37574cfaccb61fd4b278a543d717f5",
+    "permutation_jsonl": "permutation_views-c478efe716506765.jsonl",
+    "permutation_jsonl_sha256": "78b22bdf1bf809ef8f14158c7ad3493b99a9912e3d1fd9f024cbcb5e5fc20187",
+    "permutation_parquet": "permutation_views-c478efe716506765.parquet",
+    "permutation_parquet_sha256": "06306ee9079c8ed0b63da96c7b2c5fd74b6eae8f8eca2d9ca7693ea343c65a9d"
+  },
+  "banks": {
+    "weight": {
+      "path": "weight_tile_bank-9020c363ee2005e8",
+      "manifest_sha256": "961c05bbc86ab45b25e899cafc8b6156edd9575e0ba36d6f579c91f05dc5d59b",
+      "content_sha256": "9020c363ee2005e88c5a9bc746e97c8620cf62c6fac94f4ed865b08bb7d9a19a",
+      "records": 135100,
+      "files": 793,
+      "bytes": 11181671316
+    },
+    "context": {
+      "path": "context_bank-234e31b2ec93af4f",
+      "manifest_sha256": "0fe067138413f4ad5c47138307f64e1a3c7ea5ed8015b2a7305012bb454afd4f",
+      "content_sha256": "234e31b2ec93af4f3bce294a5c09c202ae5c560d0faf2f5515c00ddfc3104bdd",
+      "records": 90300,
+      "files": 2825,
+      "bytes": 30517934053
+    }
+  },
+  "active_payload": {
+    "files": 3622,
+    "bytes": 41724270793
+  },
+  "download_script": "projects/weight-vae/workspace/scripts/download_weightclip_operator_dataset_from_hf.py"
+}
