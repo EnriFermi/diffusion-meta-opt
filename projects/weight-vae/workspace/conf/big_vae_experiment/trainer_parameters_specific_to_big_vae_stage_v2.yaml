@@ -1,0 +1,255 @@
+max_steps: 5000000
+grad_accum_steps: 1
+distributed: false
+device: "cuda:0"
+num_gpus: 1
+
+amp: true
+tf32: true
+cudnn_benchmark: true
+compile: true
+compile_mode: reduce-overhead
+compile_dynamic: false
+compile_stable_batch_shapes: true
+# When explicitly re-enabled, large slice batches can hit Inductor backward
+# CantSplit failures in dynamic mode. Keep a runtime safety cutoff.
+compile_dynamic_max_safe_slice_batch_size: 128
+# Keep torch.compile while avoiding inductor CUDAGraph output-buffer reuse issues.
+compile_disable_cudagraphs: true
+# Pull model artifacts up front to reduce collector cold-start stalls.
+predownload_models: true
+
+warmup_steps: 0
+min_lr_ratio: 0.1
+kl_beta: 0.0
+kl_schedule:
+  enabled: true
+  start_beta: 0.0
+  warmup_steps: 0
+  ramp_steps: 0
+latent_sampling_gate:
+  # Absolute global-step schedule. For AE -> VAE fine-tune, set start_step
+  # to the resumed checkpoint step if the gate should start small after resume.
+  enabled: false
+  start_step: ${train.kl_schedule.warmup_steps}
+  ramp_steps: ${train.kl_schedule.ramp_steps}
+  start_value: 1e-4
+  end_value: 1.0
+weight_decay: 0.01
+lr: 3e-5
+# Optional separate optimizer group for patch_tokenizer.blocks.*.alpha.
+# 0 disables the split and keeps the legacy single-lr optimizer.
+patch_tokenizer_alpha_lr: 0.0
+patch_tokenizer_alpha_weight_decay: 0.0
+
+behavioral_coef: 1.0
+structural_coef: 1.0
+contrastive_coef: 0.0
+behavioral_loss:
+  lambda_operator: 10.0
+  lambda_dir: 1.0
+  lambda_scale: 10.0
+  gamma: 0.5
+  huber_delta: 0.1
+struct_loss:
+  gamma: 0.5
+  lambda_scale: 10.0
+  lambda_rec: 0.0
+  lambda_dir: 1.0
+  lambda_rel: 0.0
+  huber_delta: 0.1
+
+
+grad_clip_norm: 5.0
+grad_clip_norm_by_part:
+  distribution_encoder: 0
+  patch_tokenizer: 0
+  encoder: 0
+  decoder: 0
+  big_vae_other: 0
+ 
+checkpoint_every: 10000
+checkpoint_dir: ${training_artifacts.big_vae_checkpoint_dir}
+resume_state:
+  enabled: true
+  auto_resume: true
+  save_every: ${train.checkpoint_every}
+  dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/resume_state
+  load_model_state: true
+  load_optimizer_state: true
+  load_scheduler_state: true
+  load_scaler_state: true
+  load_step: true
+
+stage: 1
+stage_base_T_patches: 2
+stage_base_d_out: 8
+stage_scale_factor: 2
+# Optional synthetic data mode for quick smoke/debug runs.
+# When enabled, train loop samples x and W from Normal and does not start collectors.
+synthetic_layer_source:
+  enabled: false
+  n_rows: 256
+  d_in: 256
+  d_out: 32
+  x_std: 1.0
+  w_std: 1.0
+# Optional one-batch overfit mode.
+# When enabled, train loop captures one already-sliced training batch once and
+# reuses it for the full run instead of reslicing on every micro-step.
+fixed_training_batch:
+  enabled: false
+  # When non-empty, save the exact captured batch for later diagnostics replay.
+  dump_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/fixed_training_batch.pt
+# Cap rows in x to reduce rare heavy samples that can stall steps.
+max_x_rows: 512
+steps_per_sample: 1
+slice_batch_size: 256
+# Optional mixed-source batch mode for big_vae.
+# Default path builds the whole batch from one source snapshot and reslices it.
+# When enabled, train loop pulls several ready snapshots, keeps only those that
+# can satisfy current curriculum shape, and assembles the batch round-robin.
+# This reduces gradient bias toward a single model/dataset pair, but increases
+# collector pressure roughly in proportion to `max_source_samples`.
+batch_source_mixing:
+  enabled: true
+  # Only round_robin is supported for now.
+  strategy: round_robin
+  # When enabled, source snapshots stay in the local pool until they run out of
+  # unseen slices, and slice selection consumes disjoint row/column groups
+  # without replacement. In this mode train.steps_per_sample no longer controls
+  # refresh cadence.
+  consume_slices_without_replacement: true
+  # none | model
+  uniqueness: none
+  # 0 -> use full slice_batch_size, i.e. aim for one source snapshot per batch item.
+  # Positive value -> cap the number of distinct source snapshots per refresh.
+  max_source_samples: 8
+offline_dataset:
+  enabled: true
+  # Full dataset root may also be overridden with BIG_VAE_OFFLINE_DATASET_DIR.
+  # Keep this separate from checkpoint_dir when running multiple trainings on
+  # the same prebuilt offline dataset.
+  root_dir: /home/coder/project/artifacts/training/checkpoints/weight_quantile_vae/stage_1/offline_dataset
+  # Optional runtime filter on the reader side. Unlike builder.enforce_stage_compatibility,
+  # this does not require rebuilding the offline dataset; it drops shape-incompatible
+  # record refs up front using chunk-index metadata before loading x/weight tensors.
+  runtime_enforce_stage_compatibility: true
+  # Optional DataLoader worker pool for the offline IterableDataset. 0 keeps the
+  # legacy single-process iterator path. Positive values enable multi-process IO.
+  loader_workers: 4
+  loader_prefetch_factor: 8
+  # Optional IPC batching between offline DataLoader workers and the main process.
+  # 1 keeps one SharedSample per queue transfer; larger values amortize worker IPC.
+  loader_batch_size: 4
+  loader_persistent_workers: true
+  # When distributed, true -> each rank consumes its own chunk shard.
+  # false -> only rank0 reads the offline dataset and other ranks receive tensors via broadcast.
+  shard_by_rank: true
+  shuffle_chunks: true
+  shuffle_records_within_chunk: true
+  repeat: true
+  weight_cache_size: 256
+  sampling:
+    # random -> plain shuffled chunk/record traversal
+    # balanced -> use each record once per epoch, but reorder epoch traversal to
+    # improve short-window diversity across selected metadata groups while keeping
+    # chunk-local access reasonably coherent
+    mode: balanced
+    group_keys: [dataset, model, layer_type, depth]
+    window_size_records: 2048
+    max_records_per_chunk_round: 64
+    x_chunk_cache_size: 64
+  analysis:
+    output_dir: ${train.offline_dataset.root_dir}/analysis
+    topk: 20
+    per_model_topk: 10
+  builder:
+    # Set one of target_size_gb / target_size_bytes when running the offline builder.
+    target_size_gb: 300
+    target_size_bytes: 0
+    overwrite_existing: false
+    # false -> keep all valid source shapes and let train_big_vae slice them later.
+    # true -> pre-filter to samples that already satisfy the current stage minima.
+    enforce_stage_compatibility: false
+    # Each x-chunk stores records that all reference deduplicated weights in weights/.
+    x_chunk_size_records: 128
+    max_samples_per_source: 512
+    max_seen_samples: 0
+    log_every_seen_samples: 1000
+offline_batch_prefetch:
+  enabled: true
+  queue_size: 24
+  pin_memory: true
+  # 0 -> auto min(16, available_cpu_cores) for CPU-side data assembly ops.
+  cpu_threads: 4
+  # 0 -> auto min(16, requested_source_samples_per_refresh) candidates per refill.
+  refill_fetch_batch_size: 8
+# Optional stage-specific cache of already sliced/padded BigVAE training items.
+# When enabled, train startup checks root_dir/manifest.json against the current
+# preslicing fingerprint. A cache miss builds exactly num_slices items from the
+# regular offline_dataset, then training reads these lightweight fixed-shape
+# records directly.
+preslicing:
+  enabled: true
+  root_dir: ${training_artifacts.big_vae_presliced_dataset_base_dir}/stage_${train.stage}/presliced_offline_dataset
+  # Required when enabled. This is the effective training-set size in slices.
+  num_slices: 200000
+  # 0 -> use train.max_x_rows. target_d_in/target_d_out default to the active
+  # curriculum shape: model.patch_size * max_T_patches and max_d_out.
+  target_x_rows: 0
+  target_d_in: 0
+  target_d_out: 0
+  chunk_size_slices: 128
+  log_every_slices: 10000
+  seed: ${data.seed}
+  shuffle_chunks: true
+  shuffle_slices_within_chunk: true
+  repeat: true
+  shard_by_rank: true
+  chunk_cache_size: 32
+  loader_workers: 8
+  loader_batch_size: 16
+  loader_prefetch_factor: 8
+  loader_persistent_workers: true
+resume_checkpoint: ""
+
+forensics:
+  stdio_redirect: false
+
+telemetry:
+  grad_layer_monitor:
+    enabled: true
+    every_steps: 5
+    # Empty means monitor all trainable layers.
+    include_prefixes: []
+    weights_only: true
+    topk_layers: 32
+    save_csv: true
+    reset_csv_on_start: true
+    csv_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/grad_layer_rms.csv
+    save_plot: false
+    plot_every_steps: 100
+    plot_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/grad_layer_rms.png
+    save_heatmap: false
+    heatmap_max_layers: 160
+    heatmap_path: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/grad_layer_rms_heatmap.png
+    log_scale: true
+  comet:
+    enabled: true
+    api_key: ${oc.env:COMET_API_KEY,""}
+    workspace: ${oc.env:COMET_WORKSPACE,""}
+    project_name: big_weight_vae_v2
+    experiment_name: ""
+    tags: []
+    offline_directory: ""
+    log_code: false
+  wandb:
+    enabled: true
+    project_name: big_weight_vae_v2
+    entity: ${oc.env:WANDB_ENTITY,""}
+    run_name: ""
+    tags: []
+    mode: ${oc.env:WANDB_MODE,"offline"}
+    dir: ${training_artifacts.big_vae_checkpoint_dir}/stage_${train.stage}/wandb
+    log_code: false

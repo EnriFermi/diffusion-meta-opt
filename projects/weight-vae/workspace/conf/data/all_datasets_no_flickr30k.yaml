@@ -1,0 +1,32 @@
+# Full raw-data profile for smoke: streaming-stable datasets except flickr30k.
+# Excluded from this profile:
+# - dtd_textures, wider_face: HF scripts require full-archive materialization.
+
+path: ${oc.env:DATA_ROOT,./data/datasets}
+seed: 42
+output_format: pil
+image_size: 224
+log_level: INFO
+max_loaded_models: 1
+
+dataset_config_dirs:
+  - conf/data/datasets
+
+enabled_datasets:
+  - bdd100k
+  - cc12m
+  - coco2017
+  - cord_v2
+  - doclaynet_v11
+  - docvqa_1200
+  - eurosat_rgb
+  - funsd
+  - mapillary_vistas_v2
+  - oxford_pets
+  - patchcamelyon
+  - relaion400m
+  - scene_parse_150
+  - stanford_cars
+  - visual_genome
+
+dataset_overrides: {}

@@ -1,0 +1,51 @@
+schema: weightclip_ae_v4_perirms_50k_v1
+
+base_resolved_config: /home/coder/project/projects/shared/storage/artifacts/weightclip_benchmark/ae_704m_lat384_feedback_v2_production_500k/config_resolved_v2.json
+output_root: /mnt/shared/weightclip_benchmark/ae_725m_lat384_perirms_qknorm_v4_structural_b128_fresh_50k
+run_id: weightclip_ae_725m_lat384_perirms_qknorm_v4_structural_b128_fresh_50k
+
+architecture_version: latent_feedback_perirms_qknorm_v4
+training_horizon_steps: 500000
+stop_after_step: 50000
+seed: 42
+grad_accum_steps: 4
+
+loss:
+  behavioral_coef: 0.0
+  structural_coef: 1.0
+  structural_lambda_dir: 1.0
+  structural_lambda_scale: 10.0
+  structural_lambda_rec: 0.0
+  structural_lambda_rel: 0.0
+
+gradient_noise_monitor:
+  enabled: true
+  run_at_start: true
+  every_steps: 1000
+  start_logical_index: 7000000
+  panel_size: 65536
+
+comet_tags:
+  - fresh
+  - structural-only
+  - deterministic-ae
+  - peri-rms
+  - qk-norm
+  - effective-batch-128
+  - gradient-noise-monitor
+  - 50k
+
+expected_production_contract:
+  slice_batch_size: 32
+  grad_accum_steps: 1
+  learning_rate: 5.0e-5
+  scheduler_name: constant
+  behavioral_coef: 1.0
+  behavioral_lambda_operator: 50.0
+  behavioral_lambda_dir: 1.0
+  behavioral_lambda_scale: 10.0
+  structural_coef: 1.0
+  structural_lambda_dir: 1.0
+  structural_lambda_scale: 10.0
+  structural_lambda_rec: 0.0
+  structural_lambda_rel: 0.0

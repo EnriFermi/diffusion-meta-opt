@@ -1,0 +1,35 @@
+schema: weightclip_ae_two_operator_progressive_bypass_v1
+output_root: /mnt/shared/weightclip_benchmark/ae_v5_two_operator_progressive_bypass
+seed: 260826
+max_steps: 500
+eval_every_steps: 25
+log_every_steps: 10
+
+learning_rates:
+  direct_hidden: 0.01
+  learnable_z: 0.01
+  learnable_z_plus_qpos: 0.01
+  encoder_linear_readout: 0.01
+
+# Exactly the structural-only objective used by the V5 plateau run.
+loss:
+  source: checkpoint.train.struct_loss
+  expected_lambda_dir: 1.0
+  expected_lambda_scale: 0.1
+
+early_success:
+  enabled: true
+  min_step: 100
+  consecutive_evals: 2
+  tile_dir_max: 0.05
+  tile_scale_max: 0.01
+  operator_nrmse_max: 0.1
+  swap_total_delta_min: 0.1
+
+# Same two complete canonical matrices and exact A_i/B_i tile identities as
+# the reviewed two-full-operator smoke. No production bank code is changed.
+selected_operators:
+  - checkpoint_sha256: 646f6c7e2e026c914fea50d43fa962ea1b5ba68a819f36d46a50df1117178e41
+    layer_key: layer3.0.conv2.weight
+  - checkpoint_sha256: 6ae94b4f94e14020ee02d689bc6c0153b9fce6e7447665b55006b1a4a929f3a0
+    layer_key: layer3.0.conv2.weight

@@ -1,0 +1,36 @@
+schema: weightclip_ae_two_operator_epsilon_fork_launcher_v1
+
+base_overfit_config: conf/weightclip_benchmark/ae_v5_two_operator_overfit_5000step.yaml
+source_resume_checkpoint: /mnt/shared/weightclip_benchmark/ae_v5_two_full_operator_overfit_5000step/checkpoints/train/weightclip_ae_v5_two_full_operator_overfit_5000step/stage_1/resume_state/step_0002500.pt
+source_resume_sha256: 1a923a0a29cd53ba756e765736b45406f7a99af54f69cef140dfb0075d184e49
+source_step: 2500
+additional_steps: 250
+checkpoint_every: 250
+log_every: 10
+eval_every_steps: 25
+
+# These are the six-decimal local-log aggregates over the exact original
+# continuation steps 2501..2510.  The eps=1e-8 control arm must reproduce them
+# before its result is accepted as the same-state/same-stream continuation.
+control_reference:
+  step: 2510
+  # Keep the active objective gate strict. mu_rms is recorded and must remain
+  # finite, but is diagnostic-only because identical BF16 replays vary there.
+  absolute_tolerance: 5.0e-6
+  metrics:
+    loss: 0.985084
+    struct_dir: 0.983995
+    struct_scale: 0.010890
+    mu_rms: 2.809577
+
+arms:
+  eps_1e-8:
+    target_optimizer_epsilon: 1.0e-8
+    output_root: /mnt/shared/weightclip_benchmark/ae_v5_two_op_eps_fork_step2500/eps_1e-8
+    run_id: weightclip_ae_v5_two_op_eps_fork_step2500_eps1e8
+    comet_enabled: false
+  eps_1e-12:
+    target_optimizer_epsilon: 1.0e-12
+    output_root: /mnt/shared/weightclip_benchmark/ae_v5_two_op_eps_fork_step2500/eps_1e-12
+    run_id: weightclip_ae_v5_two_op_eps_fork_step2500_eps1e12
+    comet_enabled: false

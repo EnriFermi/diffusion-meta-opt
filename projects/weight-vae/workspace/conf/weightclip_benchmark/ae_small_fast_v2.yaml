@@ -1,0 +1,56 @@
+# Fast 500k production variant.  This is a model override applied on top of
+# the existing operator-bank production config.
+model:
+  patch_size: 16
+  big_vae:
+    architecture_version: latent_feedback_postnorm_v2
+    d_model: 128
+    d_lat: 128
+    num_latents: 96
+    num_encoder_layers: 3
+    num_decoder_layers: 1
+    n_heads: 8
+    ffn_mult: 4.0
+    pos_fourier_dim: 64
+    latent_feedback_start_layer: 1
+    latent_feedback_attn_dim: 128
+    latent_feedback_n_heads: 8
+    decoder_query_conditioning_kind: mlp
+    decoder_query_conditioning_hidden_mult: 2.0
+    patch_tokenizer:
+      kind: residual
+      d_patch: 128
+      residual_hidden_dim: 256
+      residual_num_layers: 2
+      residual_dropout: 0.0
+    distribution_encoder:
+      k_s: 32
+      Kq: 64
+      d_var: 128
+      d_dist: 128
+      num_var_attn_layers: 2
+      var_attn_heads: 8
+      dcn_num_cross_layers: 2
+      dcn_deep_hidden: 128
+      dcn_deep_layers: 2
+      dropout: 0.0
+      use_covariance: true
+      patch_size_for_cov: 16
+    use_latent_sampling: false
+    use_encoder_mu_head: false
+    disable_z_shortcut: true
+    distribution_encoder_conditioning_kind: token_adapter
+    encoder:
+      self_attn_mode: full
+      cross_attend_only_cls: false
+
+train:
+  max_steps: 500000
+  lr: 3.0e-4
+  scheduler_name: constant
+  checkpoint_every: 10000
+  resume_state:
+    enabled: true
+    auto_resume: false
+    save_every: 1000
+

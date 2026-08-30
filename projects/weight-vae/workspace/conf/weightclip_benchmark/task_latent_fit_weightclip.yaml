@@ -1,0 +1,38 @@
+task_batch_size: 128
+decoder:
+  factory: big_vae.weightclip_benchmark.decoder_adapters.build_official_weightclip_tokenizer_only_decoder_adapter
+  checkpoint: /home/coder/project/projects/shared/storage/models/weightclip_official/aasefaw--WeightCLIP/cb672e6fe1b56e929705d1b6b2eb6635fcc1e604/checkpoints/resnet18/checkpoint.pt
+  kwargs:
+    official_repo: /home/coder/project/projects/shared/compatibility/external/weightclip
+    cache_dir: /home/coder/project/projects/shared/storage/models/weightclip_official
+    dataset_encoder_path: /home/coder/project/projects/shared/storage/models/weightclip_official/aasefaw--WeightCLIP/cb672e6fe1b56e929705d1b6b2eb6635fcc1e604/checkpoints/resnet18/dataset_encoder.pt
+    window_size: 512
+    device: cuda
+resnet:
+  width_mult: null
+  channels_in: null
+  num_classes: null
+  activation: relu
+  context_rows: 512
+  context_seed: 0
+  head_policy: original_frozen_source
+  bn_policy: original_frozen_source
+  dropout: 0.15
+fit:
+  steps: 500
+  learning_rate: 0.01
+  weight_decay: 0.0
+  grad_clip: 5.0
+  validation_interval: 25
+  log_interval: 10
+  device: cuda
+  dtype: float32
+  activation_conditioning: false
+  head_policy: original_frozen_source
+  bn_policy: original_frozen_source
+  head_policy_pending_confirmation: false
+  seed: 0
+  task_batch_size: 128
+  optimization_batches_per_step: 1
+  output_dir: artifacts/weightclip_benchmark/task_latents/weightclip
+  model_dropout: 0.15

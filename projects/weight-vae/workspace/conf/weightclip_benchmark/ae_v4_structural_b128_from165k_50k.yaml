@@ -1,0 +1,31 @@
+schema: weightclip_ae_v4_structural_warmup_v1
+
+source_resolved_config: /home/coder/project/projects/shared/storage/artifacts/weightclip_benchmark/ae_725m_lat384_perirms_qknorm_v4_50k/resolved_run_config_resume_0050000_to_0500000.json
+source_resume_checkpoint: /home/coder/project/projects/shared/storage/artifacts/weightclip_benchmark/ae_725m_lat384_perirms_qknorm_v4_structural_warmup_from159k/checkpoints/train/weightclip_ae_725m_lat384_perirms_qknorm_v4_structural_warmup_from159k/stage_1/resume_state/step_0165000.pt
+output_root: /mnt/shared/weightclip_benchmark/ae_725m_lat384_perirms_qknorm_v4_structural_b128_from165k_50k
+
+start_step: 165000
+stop_after_step: 215000
+training_horizon_steps: 500000
+run_id: weightclip_ae_725m_lat384_perirms_qknorm_v4_structural_b128_from165k_50k
+
+# Keep the physical production B32 and average four microbatches per optimizer
+# step.  The offset maps optimizer step 165k back to the exact saved data cursor.
+source_grad_accum_steps: 1
+grad_accum_steps: 4
+operator_stream_start_logical_index: 5280000
+
+loss:
+  behavioral_coef: 0.0
+  structural_coef: 1.0
+  structural_lambda_dir: 1.0
+  structural_lambda_scale: 10.0
+  structural_lambda_rec: 0.0
+  structural_lambda_rel: 0.0
+
+gradient_noise_monitor:
+  enabled: true
+  run_at_start: true
+  every_steps: 1000
+  start_logical_index: 7000000
+  panel_size: 65536

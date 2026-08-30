@@ -25,6 +25,7 @@ env/
 ENV/
 .env/
 .env.local
+*.env
 artifacts/
 checkpoints/
 data_tutorials/
@@ -137,3 +138,33 @@ dmypy.json
 # -----------------------------------------------------------------------------
 
 docs/*.json
+
+# -----------------------------------------------------------------------------
+# Canonical monorepo runtime and external worktrees
+# -----------------------------------------------------------------------------
+# The research-domain layout keeps large mutable payloads below projects/.
+# Track their manifests/reports, never the datasets, checkpoints, caches, or
+# embedded repositories themselves.
+/.cometml-runs/
+/projects/shared/storage/
+/projects/shared/runtime/
+/projects/weight-vae/runtime/
+/projects/unclassified/runtime/
+/projects/lsdl/source/data/
+/projects/weight-vae/workspace/.cometml-runs/
+/projects/weight-vae/workspace/.pytest_cache/
+/projects/weight-vae/workspace/.ruff_cache/
+/projects/weight-vae/workspace/train_big_vae.log
+/projects/weight-vae/workspace/post_train_research/**/artifacts/
+/projects/weight-vae/workspace/post_train_research/loss_landscape_analysis/data/
+
+# Independent embedded repositories are versioned and pushed from their own
+# Git roots, not as accidental gitlinks in this repository.
+/projects/cfm/source/
+/projects/cfm/baselines/bd3lms-upstream/
+/projects/cfm/semicat/working/
+/projects/cfm/semicat/fresh-20260711/
+/projects/cfm/semicat/clean-20260709/
+/projects/cfm/semicat/upstream-20260709/
+/projects/unclassified/guided-diffusion/
+/projects/shared/compatibility/external/weightclip/

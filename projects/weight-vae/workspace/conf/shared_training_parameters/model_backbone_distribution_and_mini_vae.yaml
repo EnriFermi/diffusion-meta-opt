@@ -1,0 +1,25 @@
+distribution:
+  k_s: 64
+  Kq: 128
+  d_var: 256
+  d_dist: 256
+  num_var_attn_layers: 6
+  var_attn_heads: 4
+  dcn_num_cross_layers: 3
+  dcn_deep_hidden: 128
+  dcn_deep_layers: 3
+  dropout: 0.0
+  use_covariance: true
+  # Keep covariance encoder input width aligned with the active model patch size.
+  patch_size_for_cov: ${..patch_size}
+
+mini_vae:
+  z_dim: 64
+  d_e: 128
+  pos_dim: 32
+  num_attn_layers_encoder: 2
+  num_layers_decoder: 2
+  n_heads: 4
+  d_patch: 64
+  dropout: 0.0
+  mlp_stub_hidden_dim: 256

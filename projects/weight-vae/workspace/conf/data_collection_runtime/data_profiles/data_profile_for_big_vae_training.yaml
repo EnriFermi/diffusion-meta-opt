@@ -1,0 +1,24 @@
+defaults:
+  - data_profile_common_settings
+  - _self_
+
+path: ${oc.env:DATA_ROOT,./data/datasets}
+
+enabled_datasets:
+  - bdd100k
+  - cc12m
+  - coco2017
+  - mapillary_vistas_v2
+  - relaion400m
+  - scene_parse_150
+  - visual_genome
+  - stanford_cars
+  - dtd_textures
+  - eurosat_rgb
+  - patchcamelyon
+  - oxford_pets
+  - wider_face
+  - doclaynet_v11
+  - cord_v2
+  - funsd
+  - docvqa_1200

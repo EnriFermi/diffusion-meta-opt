@@ -1,0 +1,769 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage[expansion=false]{microtype}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!55!black,citecolor=blue!55!black,urlcolor=blue!55!black]{hyperref}
+
+% ---- theorem environments ----
+\theoremstyle{plain}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+% ---- operators ----
+\DeclareMathOperator{\tr}{tr}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\vecop}{vec}
+\DeclareMathOperator{\sign}{sign}
+\DeclareMathOperator{\triu}{triu}
+\DeclareMathOperator{\rank}{rank}
+\DeclareMathOperator{\spn}{span}
+\DeclareMathOperator{\row}{row}
+\DeclareMathOperator{\Cov}{Cov}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\Loss}{\mathcal{L}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\Fnorm}[1]{\lVert #1 \rVert_F}
+\newcommand{\norm}[1]{\lVert #1 \rVert}
+\newcommand{\tHess}{\tilde{H}}
+\newcommand{\hh}{\hat{h}}
+\newcommand{\half}{\tfrac{1}{2}}
+
+\title{\bf Reparametrization as an Implicit Preconditioner:\\
+Surrogate Losses from Li's PSGD Criterion,\\ and the Branches That Do Not Work}
+\author{Technical report}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+A reparametrization $x=g_\phi(z)$ turns plain stochastic gradient descent (SGD) on the
+latent variable $z$ into \emph{preconditioned} SGD on the parameter $x$, with a
+data-dependent, positive-semidefinite \emph{implicit preconditioner}
+$P(z)=J(z)J(z)^{\!\top}$, where $J=\partial g_\phi/\partial z$ is the Jacobian of the map.
+We study how to train the $\sim\!10$--$20$M weights $\phi$ so that $P$ is a good
+preconditioner in the precise sense of Li's PSGD criterion~\cite{li2015}. Our organizing
+device is a reduction of the criterion to \emph{latent space}, where the implicit
+preconditioner is the identity and the entire problem collapses onto a single spectral
+target, $M(\phi):=\E[\hh\,\hh^{\!\top}]=I$, on second moments of finite-difference
+gradient perturbations. We prove a \emph{gap lemma} that identifies the exact,
+criterion-faithful objective $\mathrm{Gap}(\phi)=\Fnorm{M^{1/2}-I}^2$, observe that it
+admits no cheap unbiased estimator (the obstruction is $\tr M^{1/2}$), and adopt the
+design principle of building \emph{differentiable majorants} that share its unique zero.
+The bulk of the report is a documented sequence of \emph{natural but flawed} surrogates
+--- naive substitution, single-term losses, log-determinant barriers in the wrong space,
+correlated probes, adversarial/variational inverses, Cayley isometries, Newton
+distillation, and scale-invariant condition-number proxies --- each with a derivation and
+a precise diagnosis of why it fails. We then derive five admissible losses (a quadratic
+majorant, a Stein/Burg majorant with a sketched log-determinant, an exact
+conjugate-gradient reference, an exact closed form for invertible $g$, and a
+gradient-whitening instance) and analyze cost, stability, and fidelity for each. A
+verified hyperbolic $O(1,1)$ example shows that the latent criterion is strictly weaker
+than the parameter-space criterion for indefinite curvature yet remains operationally
+correct, reproducing Li's own non-uniqueness family.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%======================================================================
+\section{Setup and the implicit preconditioner}
+\label{sec:setup}
+
+Let $\Loss(x)=\E_\xi[\ell(x,\xi)]$ be the training objective on parameters $x\in\R^n$,
+with stochastic gradient $\hat g_x=\hat\nabla_x\Loss$. Introduce a differentiable
+reparametrization
+\begin{equation}
+  x = g_\phi(z), \qquad z\in\R^m,\qquad
+  J = J(z) = \frac{\partial g_\phi}{\partial z}\in\R^{n\times m},
+\end{equation}
+whose weights $\phi$ (order $10$--$20$M) are what we shall train. Plain SGD on $z$ reads
+$z^+ = z - \eta\,\hat\nabla_z\Loss$, and by the chain rule $\hat\nabla_z\Loss = J^{\!\top}\hat g_x$.
+Pushing the update back through $g_\phi$,
+\begin{equation}
+\label{eq:implicit-precond}
+  x^+ = g_\phi\!\big(z-\eta J^{\!\top}\hat g_x\big)
+      = x - \eta\, \underbrace{JJ^{\!\top}}_{=:P(z)}\hat g_x + O(\eta^2).
+\end{equation}
+Thus SGD in $z$ is, to first order, preconditioned SGD in $x$ with
+\begin{equation}
+\label{eq:P}
+  P(z) = J(z)J(z)^{\!\top}\ \succeq 0 .
+\end{equation}
+$P$ is automatically symmetric positive semidefinite; it is \emph{parametrized implicitly}
+by $\phi$ and \emph{varies with the operating point} $z$, which is exactly the point of
+departure from a fixed preconditioner. The design question is: \emph{what loss on $\phi$
+makes $P(z)$ a good preconditioner along the trajectory?}
+
+\paragraph{Notation.} Table~\ref{tab:notation} collects symbols used throughout.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Symbol & Meaning\\
+\midrule
+$\Loss(x)$, $\hat g_x$ & objective on $x\in\R^n$ and its stochastic gradient\\
+$x=g_\phi(z)$, $\phi$ & reparametrization / hypernetwork and its $\sim\!10$--$20$M weights\\
+$J=\partial g_\phi/\partial z\in\R^{n\times m}$ & Jacobian at the current $z$\\
+$P=JJ^{\!\top}\in\R^{n\times n}$ & implicit preconditioner, Eq.~\eqref{eq:P}\\
+$H_x=\nabla^2_x\Loss$ & Hessian in parameter space\\
+$G=J_f^{\!\top}\Lambda J_f$ & Gauss--Newton curvature, $J_f=\partial f/\partial x$, $\Lambda\succeq0$\\
+$\tHess$ & composite latent Hessian, Eq.~\eqref{eq:composite}\\
+$u\sim\N(0,I_m)$ & isotropic latent probe\\
+$\hh$ & finite-difference / HVP latent gradient perturbation, Eq.~\eqref{eq:hhat}\\
+$M(\phi)=\E[\hh\hh^{\!\top}]$ & second-moment matrix; master target $M=I$\\
+$c_3(P)$, $R_g,R_\theta$ & Li's criterion and the two probe covariances\\
+$\sg[\cdot]$ & stop-gradient\\
+\bottomrule
+\end{tabular}
+\caption{Notation.}
+\label{tab:notation}
+\end{table}
+
+%======================================================================
+\section{Background: Li's preconditioner criterion}
+\label{sec:li}
+
+We recall the criterion we must respect~\cite{li2015}. Let $\delta\theta$ be a small
+parameter perturbation and $\delta\hat g=\hat g(\theta+\delta\theta)-\hat g(\theta)
+=H_0\,\delta\theta+\varepsilon$ the associated (noisy) gradient change, with $\varepsilon$
+collecting stochastic and second-order error. Li proposes the criterion
+\begin{equation}
+\label{eq:c3}
+  c_3(P) \;=\; \E\!\big[\,\delta\hat g^{\!\top}P\,\delta\hat g
+                     \;+\; \delta\theta^{\!\top}P^{-1}\delta\theta\,\big].
+\end{equation}
+Setting the derivative to zero gives the Riccati-type stationarity condition
+\begin{equation}
+\label{eq:riccati}
+  P\,R_g\,P \;=\; R_\theta,
+  \qquad R_g=\E[\delta\hat g\,\delta\hat g^{\!\top}],\quad
+         R_\theta=\E[\delta\theta\,\delta\theta^{\!\top}],
+\end{equation}
+whose unique SPD solution (when $R_g^{1/2}R_\theta R_g^{1/2}$ has distinct eigenvalues)
+scales the stochastic gradient as $P\,R_g\,P=R_\theta$; compare with the deterministic
+secant identity $H_0^{-1}\delta g\,\delta g^{\!\top}H_0^{-1}=\delta\theta\,\delta\theta^{\!\top}$.
+Under isotropy ($R_\theta=\sigma_\theta^2 I$, $R_\varepsilon=\sigma_\varepsilon^2 I$) the
+closed form is
+\begin{equation}
+\label{eq:li-closed}
+  P \;=\; \sum_i \frac{1}{\sqrt{\lambda_i^2+\sigma_\varepsilon^2/\sigma_\theta^2}}\,u_iu_i^{\!\top},
+  \qquad H_0=\sum_i\lambda_i u_iu_i^{\!\top}.
+\end{equation}
+Three consequences matter for us. (i) In the noiseless limit $P\to|H_0|^{-1}$, the
+\emph{inverse absolute Hessian}, so the eigenvalues of $PH_0$ have unit modulus --- this is
+Li's ``small eigenvalue spread'' plus ``normalized amplitudes,'' which is what makes a
+normalized step $\mu\in(0,1)$ work without tuning. (ii) The sign of $H_0$ is preserved and
+never inverted, so saddles are handled gracefully; this is exactly why the secant/quasi-Newton
+criteria, which target $H_0^{-1}$, fail on indefinite problems. (iii) Noise \emph{damps} the
+preconditioner (the $\sigma_\varepsilon^2$ floor), a built-in annealing that Newton lacks.
+A crucial subtlety we will exploit: for indefinite $H_0$ the preconditioner with unit
+$|\lambda(PH_0)|$ is \emph{not unique}; Li exhibits the family
+\begin{equation}
+\label{eq:li-hyperbolic}
+  P=\frac{1}{\alpha^2-\beta^2}
+     \begin{pmatrix} \alpha^2+\beta^2 & 2\alpha\beta\\[2pt] 2\alpha\beta & \alpha^2+\beta^2\end{pmatrix},
+  \qquad |\alpha|\neq|\beta|,
+\end{equation}
+for $H_0=\diag(1,-1)$~\cite{li2015}.
+
+Li fits $P=Q^{\!\top}Q$ on a matrix Lie group (upper-triangular, affine, Kronecker,
+low-rank) by relative gradient descent, precisely because those $Q$ admit cheap inverses
+and equivariant updates~\cite{li2015,li2018,li2022,li2024,pooladzandi2024}. Our $P=JJ^{\!\top}$
+is a \emph{nonlinear, $z$-dependent} generalization: $J(z)$ plays the role of $Q^{\!\top}$,
+but with no group structure for a generic network. Everything below is the search for a
+loss on $\phi$ that fits $J$ by the criterion~\eqref{eq:c3} \emph{without} the tractable
+inverse that group structure would give.
+
+%======================================================================
+\section{Reduction to latent space: the master condition \texorpdfstring{$M=I$}{M=I}}
+\label{sec:reduction}
+
+Substituting $P=JJ^{\!\top}$ into~\eqref{eq:c3} directly is a dead end
+(\S\ref{sub:naive}). The key move is to state the criterion \emph{in $z$}, where the
+implicit preconditioner is the identity. SGD noise and steps live in $z$; isotropic probes
+therefore belong in $z$; and, as \S\ref{sec:indefinite} shows, the $x$-space solution is
+not even unique for indefinite curvature. Take probes $\delta z=\sigma u$,
+$u\sim\N(0,I_m)$, and, following Li, reuse the \emph{same} minibatch $\xi$ for both
+gradient evaluations:
+\begin{equation}
+\label{eq:hhat}
+  \hh \;:=\; \frac1\sigma\Big[\hat\nabla_z\Loss(z+\sigma u;\xi)-\hat\nabla_z\Loss(z;\xi)\Big]
+        \;\xrightarrow[\sigma\to0]{}\; \hat{\tHess}\,u ,
+\end{equation}
+where $\tHess$ is the \emph{composite} latent Hessian
+\begin{equation}
+\label{eq:composite}
+  \tHess \;=\; J^{\!\top}H_x J \;+\; \sum_{k=1}^n [\nabla_x\Loss]_k\,\nabla^2_z (g_\phi)_k .
+\end{equation}
+The second term is the curvature of $g_\phi$ itself; automatic double-backprop through
+$\Loss\circ g_\phi$ includes it, whereas a Gauss--Newton (GN) sandwich drops it (\S\ref{sub:A}).
+
+In $z$ the perturbation covariance is $R_{\theta,z}=\sigma^2 I_m$ (choose $\sigma$ as the
+unit of scale, $R_{\theta,z}=I$). Li's stationarity~\eqref{eq:riccati} for the latent
+implicit preconditioner $P_z$ at the candidate value $P_z=I$ reads $R_{g,z}=R_{\theta,z}$,
+i.e.
+\begin{equation}
+\label{eq:master}
+  \boxed{\;M(\phi)\;:=\;\E_{u,\xi,\,z\sim\text{traj.}}\!\big[\hh\,\hh^{\!\top}\big]\;=\;I_m.\;}
+\end{equation}
+This is the entire target. Note $M=\overline{\tHess}^{\,2}+\Cov$-terms from batch-to-batch
+curvature fluctuation, so \eqref{eq:master} carries the same noise damping as the closed
+form~\eqref{eq:li-closed}, and $M=I\Leftrightarrow|\lambda(\tHess)|\to1$ is precisely Li's
+properties (i)--(ii). The averaging is over the trajectory distribution of $z$, the
+minibatch $\xi$, and the probe $u$, taken online.
+
+\paragraph{Why $z$ and not $x$ (indefinite case).}
+\label{para:zx}
+We defer the full example to \S\ref{sec:indefinite}, but state the conclusion: in the
+indefinite case the $x$-space criterion pins $P=|H_x|^{-1}$ uniquely, whereas the $z$-space
+condition~\eqref{eq:master} is satisfied by a hyperbolic $O(p,q)$ family of implicit
+preconditioners of which $|H_x|^{-1}$ is one member. All members share $|\lambda(\tHess)|=1$,
+which is what governs convergence, so the $z$-condition is the operationally correct one ---
+and, as a bonus, it is the one that avoids the intractable inverse.
+
+%======================================================================
+\section{The gap lemma and the majorant principle}
+\label{sec:gap}
+
+We now identify the exact objective and its computational obstruction.
+
+\begin{lemma}[Gap lemma]
+\label{lem:gap}
+With isotropic probes, the latent criterion as a function of an SPD preconditioner $P$ is
+$c_z(P)=\tr(PM)+\tr(P^{-1})$. Its unique SPD minimizer is $P^\star=M^{-1/2}$ with value
+$2\tr M^{1/2}$, and the excess of the identity preconditioner over the optimum is
+\begin{equation}
+\label{eq:gap}
+  \mathrm{Gap}(\phi)\;:=\;c_z(I)-c_z(P^\star)
+  \;=\;\tr M - 2\tr M^{1/2} + m
+  \;=\;\Fnorm{M^{1/2}-I}^2 .
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+$\E[\hh^{\!\top}P\hh]=\tr(PM)$ and $\E[u^{\!\top}P^{-1}u]=\tr(P^{-1})$ give $c_z(P)$.
+Stationarity $\nabla_P c_z = M - P^{-2}=0$ yields $P^\star=M^{-1/2}$ (SPD branch), value
+$\tr(M^{1/2}M^{1/2})+\tr(M^{-1/2})$\,--- more directly $\tr(P^\star M)+\tr(P^{\star-1})
+=\tr M^{1/2}+\tr M^{1/2}=2\tr M^{1/2}$. Subtracting, $c_z(I)=\tr M+m$, so
+$\mathrm{Gap}=\tr M-2\tr M^{1/2}+m=\sum_i(\sqrt{\lambda_i}-1)^2=\Fnorm{M^{1/2}-I}^2$.
+\end{proof}
+
+Equation~\eqref{eq:gap} is not ``inspired by'' Li: it \emph{is} the deficit of his
+criterion evaluated at the implicit preconditioner, hence the ideal loss on $\phi$. The
+obstruction is the matrix square root: $\tr M^{1/2}$ has no cheap unbiased estimator
+(stochastic Lanczos quadrature is biased). This motivates the whole design.
+
+\begin{definition}[Majorant principle]
+\label{def:majorant}
+Call $\Psi\colon\{M\succeq0\}\to\R_{\ge0}$ a \emph{criterion majorant} if it is a spectral
+function $\Psi(M)=\sum_i\psi(\lambda_i)$ with $\psi\ge0$, $\psi(\lambda)\ge(\sqrt\lambda-1)^2$
+for all $\lambda\ge0$, $\psi(1)=0$, and $\psi$ admits a cheap unbiased (or low-bias)
+gradient estimator. A majorant shares the unique zero $M=I$ with $\mathrm{Gap}$ and upper
+bounds it, so driving $\Psi\to0$ drives the criterion to its optimum.
+\end{definition}
+
+The admissible losses of \S\ref{sec:accepted} are: two majorants (A, B) and three exact
+renderings (C, D exact; E an exact instance of a \emph{different} but legitimate criterion).
+Before those, we catalogue what does \emph{not} work, because the failures are where the
+constraints of the problem become visible.
+
+%======================================================================
+\section{A catalogue of rejected surrogates}
+\label{sec:rejected}
+
+Each subsection gives a candidate, its derivation, the precise reason it is rejected, and
+(where applicable) which admissible variant \emph{resurrects} the idea under an extra
+assumption. Table~\ref{tab:rejected} summarizes.
+
+%----------------------------------------------------------------------
+\subsection{Naive substitution $P=JJ^{\!\top}$ into $c_3$}
+\label{sub:naive}
+Plugging $P=JJ^{\!\top}$ into~\eqref{eq:c3} with $x$-space pairs $(\delta\theta,\delta\hat g)$:
+\begin{equation}
+  c_3(JJ^{\!\top})=\E\big[\,\norm{J^{\!\top}\delta\hat g}^2
+   +\delta\theta^{\!\top}(JJ^{\!\top})^{-1}\delta\theta\,\big].
+\end{equation}
+The first term is one vector--Jacobian product (VJP), cheap. The second requires applying
+$(JJ^{\!\top})^{-1}$, an $n\times n$ operator with $n\sim10^7$ defined only implicitly
+through a network; even iterative solves need many matrix--vector products, and $J$ itself
+is far too large to materialize. \textbf{Rejected:} intractable inverse. This is the wall
+that all subsequent ideas try to go around, and the reason we reduce to $z$
+(\S\ref{sec:reduction}), where the inverse term is $\tr(P_z^{-1})=\tr I=m$, a constant.
+
+%----------------------------------------------------------------------
+\subsection{Dropping the inverse term (single-term loss)}
+\label{sub:single}
+Keep only the cheap half: $\ell=\E\norm{J^{\!\top}h}^2$ in $x$, or $\E\norm{\tHess u}^2=\tr M$
+in $z$. This is minimized by $J\to0$ (equivalently $\tHess\to0$): the preconditioner
+collapses. \textbf{Rejected:} degenerate optimum. The lesson is structural --- the term
+$\delta\theta^{\!\top}P^{-1}\delta\theta$ is not decoration; it is the \emph{volume/anti-collapse
+barrier}, and every cheap surrogate must reproduce its effect somehow. This single fact
+organizes the rest of the design.
+
+%----------------------------------------------------------------------
+\subsection{A log-determinant barrier on the raw curvature (wrong power)}
+\label{sub:logdet-wrong}
+A natural replacement for $\delta\theta^{\!\top}P^{-1}\delta\theta$ is $-\log\det P$, giving
+$c(P)=\tr(PA)-\log\det P$ with $A=\E[hh^{\!\top}]$. Stationarity $A-P^{-1}=0$ yields
+$P=A^{-1}$. But in the noiseless quadratic case $A=\E[hh^{\!\top}]=\sigma^2 H^2$, so
+$P\propto H^{-2}$ --- the inverse Hessian \emph{squared}, off by a power from the target
+$|H|^{-1}=(H^2)^{-1/2}$. A scalar reweighting $\tr(PA)-\beta\log\det P$ does not help: it
+still gives $P\propto A^{-1}$ for every $\beta>0$. Recovering the correct power needs a
+form quadratic in $P$, e.g. $\tr(PAP)-\beta\log\det P\Rightarrow P\propto A^{-1/2}$, which
+reintroduces exactly the $P$-inside-quadratic structure of $c_3$ and its inverse.
+\textbf{Rejected in $x$-space:} wrong target unless one restores the intractable structure.
+\textbf{Resurrected in $z$-space (Variant~B):} after the reduction the target is $M=I$, not
+a power of $H$, so a Stein/Burg log-determinant on $M$ has the \emph{correct} fixed point.
+The same tool is wrong in one frame and right in another; the difference is precisely the
+$z$-reduction.
+
+%----------------------------------------------------------------------
+\subsection{Correlated probes: the free-lunch that isn't}
+\label{sub:correlated}
+Sample $v=Ju$ (push a latent probe through $J$) and require $J^{\!\top}h\approx u$ with
+$h=Hv$; this reads $J^{\!\top}HJ\,u\approx u$, i.e. $J^{\!\top}HJ\approx I$, apparently
+avoiding any inverse. But the barrier term with the \emph{same} correlated probe is
+\begin{equation}
+  v^{\!\top}(JJ^{\!\top})^{-1}v = u^{\!\top}J^{\!\top}(JJ^{\!\top})^{-1}J\,u = \norm{u}^2
+  \quad\text{on }\row(J),
+\end{equation}
+since $J^{\!\top}(JJ^{\!\top})^{-1}J$ is the orthogonal projector onto $\row(J)$. The
+barrier is \emph{constant}: its gradient in $\phi$ vanishes and it no longer prevents
+collapse. Li's derivation explicitly requires probe independence (his assumption
+$\E[\delta\theta\,\varepsilon^{\!\top}]=0$); correlating $v$ with $P$ violates it and
+destroys the barrier~\cite{li2015}. Moreover the retained forward condition $J^{\!\top}HJ=I$
+targets $\tHess=I$, missing the sign, whereas the indefinite-correct target is
+$\tHess^2=I$. \textbf{Rejected:} silently removes the anti-collapse term \emph{and} the sign
+information. The correct forward condition survives, but the barrier must be supplied by
+\emph{independent} probes (Variants~A, B).
+
+%----------------------------------------------------------------------
+\subsection{Variational / adversarial inverse}
+\label{sub:gan}
+Use the Fenchel dual $v^{\!\top}P^{-1}v=\max_w\big[2v^{\!\top}w-w^{\!\top}Pw\big]$, whose
+inner maximizer $w^\star=P^{-1}v$ is the conjugate-gradient (CG) solution. Amortize it with
+a second network $w_\psi(v)\approx P^{-1}v$ and solve the min--max game
+$\min_\phi\max_\psi$. Exact in the limit $w_\psi=P^{-1}v$. \textbf{Rejected:} min--max
+optimization is notoriously unstable to balance, and it adds a second $\sim\!10$M-parameter
+network whose fitting problem is as hard as the original. Medium complexity, high risk, no
+advantage over Variants~A/B. (If one insists on an explicit inverse, the honest and stable
+route is CG with implicit differentiation --- Variant~C --- not an adversary.)
+
+%----------------------------------------------------------------------
+\subsection{Cayley / square-root isometry}
+\label{sub:cayley}
+The target $JJ^{\!\top}=|H|^{-1}$ is equivalent to $K:=|H|^{1/2}J$ having orthonormal
+columns, $KK^{\!\top}=\Pi$; one could parametrize on the Stiefel/orthogonal manifold via a
+Cayley map. \textbf{Rejected in general:} extracting $|H|^{1/2}$ (a matrix square root of an
+$n\times n$ implicit operator) is as intractable as the inverse we set out to avoid.
+\textbf{Resurrected under Gauss--Newton (Variant~A, GN channel):} when $G=J_f^{\!\top}\Lambda J_f$
+with $\Lambda\succeq0$ known analytically (cross-entropy, MSE), a factor is free:
+$C=\Lambda^{1/2}J_f$, $G=C^{\!\top}C$, and the isometry condition $J^{\!\top}GJ=I$ becomes
+$(CJ)^{\!\top}(CJ)=I$, i.e. $M_{\!*}=CJ$ is a partial isometry --- tractable. The square-root
+idea fails without structure and succeeds with the GN factorization.
+
+%----------------------------------------------------------------------
+\subsection{Newton / CG distillation (= Li's secant criteria 1--2)}
+\label{sub:distill}
+Fit the preconditioner to reproduce the Newton step:
+$\min_\phi\E\big\Vert JJ^{\!\top}\hat g-\hat H^{-1}\hat g\big\Vert^2$, with $\hat H^{-1}\hat g$
+from CG. Two independent failures. \emph{(a) Under-determination:} each step constrains $P$
+only on the one-dimensional subspace $\spn(\hat g)$; off that line, $\phi$ is free to
+degenerate, so the fit is ill-posed almost everywhere. \emph{(b) Wrong target on
+nonconvex problems:} this is exactly Li's secant criterion~1 (or~2), which he proves gives
+an unbiased estimate of $H^{-1}$ (not $|H|^{-1}$), \emph{amplifies gradient noise}, and
+\emph{fails completely for indefinite Hessians}~\cite{li2015}. Distilling the Newton
+direction re-imports precisely the pathologies the criterion was built to escape.
+\textbf{Rejected:} under-determined and, on the nonconvex problems that motivate all of
+this, aimed at the wrong operator. The same objection kills cosine-similarity-to-Newton
+losses.
+
+%----------------------------------------------------------------------
+\subsection{Scale-invariant condition-number proxies}
+\label{sub:condnum}
+Minimize a spread functional such as $\tr(M)\,\tr(M^{-1})$ or the log-eigenvalue variance.
+These are invariant to $M\mapsto cM$: they measure conditioning but not \emph{scale}.
+Li's criterion crucially fixes the scale --- at the optimum of $c_3$ the two terms are
+equal, $\partial_\kappa c_3(\kappa P)|_{\kappa=1}=0$, which pins $|\lambda(PH)|\approx1$ and
+makes a normalized step $\mu\in(0,1)$ work. \textbf{Rejected:} discarding scale
+reintroduces the step-size tuning problem PSGD exists to remove. Scale is half of the
+criterion's content, not cosmetics.
+
+%----------------------------------------------------------------------
+\subsection{Direct $Q$-fitting on $GL$ for unstructured $J$}
+\label{sub:qfit}
+Mimic Li's own algorithm: update $Q$ by relative gradient descent on the fitting criterion,
+the update involving $Q$ and $Q^{-\top}$. This is efficient \emph{because} Li restricts $Q$
+to triangular/affine/Kronecker/low-rank groups with cheap inverses~\cite{li2018,li2022,li2024}.
+\textbf{Rejected for a generic network:} the Jacobian $J$ of a $10$M-parameter map has no
+such structure, and $Q^{-\top}$ for dense unstructured $J$ is the original intractable
+inverse. \textbf{Resurrected by architecture (Variant~D):} choose $g_\phi$ so that $J$ is
+structured and cheaply invertible (a normalizing flow), turning Li's group idea into a
+nonlinear, $z$-dependent one.
+
+\begin{table}[t]
+\centering
+\small
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}p{4.4cm} p{6.6cm} p{3.4cm}@{}}
+\toprule
+Rejected surrogate & Why it fails & Resurrected as\\
+\midrule
+Naive $c_3(JJ^{\!\top})$ (\S\ref{sub:naive}) & intractable $n\times n$ implicit inverse & reduce to $z$ (\S\ref{sec:reduction})\\
+Single term $\E\Vert J^{\!\top}h\Vert^2$ (\S\ref{sub:single}) & collapse $J\to0$; barrier lost & --- (motivates barrier)\\
+$\tr(PA)-\log\det P$ (\S\ref{sub:logdet-wrong}) & targets $A^{-1}\!\propto\!H^{-2}$, wrong power & Variant~B (in $z$)\\
+Correlated probes $v=Ju$ (\S\ref{sub:correlated}) & barrier becomes constant; sign lost & indep.\ probes (A,~B)\\
+Adversarial inverse (\S\ref{sub:gan}) & min--max instability; extra $10$M net & Variant~C (CG)\\
+Cayley isometry (\S\ref{sub:cayley}) & needs $|H|^{1/2}$, intractable & Variant~A (GN channel)\\
+Newton/CG distillation (\S\ref{sub:distill}) & 1-D under-determination; $=$ secant 1--2, fails indefinite & --- (anti-pattern)\\
+Cond.-number proxy (\S\ref{sub:condnum}) & scale-invariant; loses $|\lambda(PH)|\!\approx\!1$ & --- (anti-pattern)\\
+$Q$-fit on $GL$ (\S\ref{sub:qfit}) & $Q^{-\top}$ intractable for dense $J$ & Variant~D (flow)\\
+\bottomrule
+\end{tabular}
+\caption{Rejected surrogates, their failure modes, and where the idea returns under an
+extra assumption.}
+\label{tab:rejected}
+\end{table}
+
+%======================================================================
+\section{Admissible losses}
+\label{sec:accepted}
+
+All expectations below are taken online over the trajectory $z$, minibatch $\xi$, and probe
+$u$; the $\phi$-update is applied every $T$ steps (\S\ref{sec:deploy}).
+
+%----------------------------------------------------------------------
+\subsection{Variant A --- quadratic majorant (two-sample Frobenius)}
+\label{sub:A}
+\paragraph{Derivation.} Both $\mathrm{Gap}$ and $\Fnorm{M-I}^2$ are spectral functions of the
+same $M\succeq0$. Per eigenvalue,
+\begin{equation}
+\label{eq:A-majorant}
+  (\lambda-1)^2=(\sqrt\lambda-1)^2(\sqrt\lambda+1)^2\ \ge\ (\sqrt\lambda-1)^2 ,
+\end{equation}
+with equality only at $\lambda=0$; near $\lambda=1$, $(\sqrt\lambda+1)^2\approx4$, so
+$\Fnorm{M-I}^2\approx4\,\mathrm{Gap}$. Hence $\Psi_A(M)=\Fnorm{M-I}^2$ is a criterion
+majorant (Definition~\ref{def:majorant}) with the same unique zero $M=I$. An unbiased
+estimator uses two \emph{independent} probe/batch pairs:
+\begin{equation}
+\label{eq:A-est}
+  \hat\ell_A=(\hh_1^{\!\top}\hh_2)^2-\norm{\hh_1}^2-\norm{\hh_2}^2+m,
+  \qquad \E[\hat\ell_A]=\Fnorm{M-I}^2 ,
+\end{equation}
+because $\E\big\langle\hh_1\hh_1^{\!\top}-I,\ \hh_2\hh_2^{\!\top}-I\big\rangle=\Fnorm{M-I}^2$
+and, by independence, $\E[(\hh_1^{\!\top}\hh_2)^2]=\tr(M^2)=\Fnorm{M}^2$,
+$\E\norm{\hh_i}^2=\tr M$.
+
+\paragraph{Three channels for $\hh$.} (1) \emph{Finite difference}~\eqref{eq:hhat} on one
+batch --- Li's original pairs, including the $\nabla^2 g$ term. (2) \emph{HVP} by
+double-backprop through $\Loss\circ g_\phi$, giving $\hh=\tHess u$ with $M=\tHess^2$, so
+$M=I\Leftrightarrow|\tHess|=I$ --- \emph{captures negative curvature}. (3) \emph{Gauss--Newton}
+$\hh=J^{\!\top}J_f^{\!\top}\Lambda J_f J\,u$: PSD, stabler, but drops the sign and the
+$g$-curvature; use only if HVP is unstable. Because the square in $M$ already handles signs
+correctly, honest HVP pairs are preferred and cost no more than one HVP.
+
+\paragraph{Why good.} A faithful majorant with a common zero and $4\times$ local
+equivalence; inherits Li's noise damping through the batch-variance part of $M$; costs
+$\approx2$ extra gradient evaluations per pair (one reused from the training step). At
+$T=5$--$10$ the overhead is $10$--$20\%$, comfortable for $g_\phi$ at $10$--$20$M.
+
+\paragraph{Where bad.} (i) The estimator is quartic in $\hh$ --- heavy tails; use a
+normalized $\phi$-step (as Li normalizes his relative-gradient step), clipping, and EMA of
+statistics. (ii) \emph{No barrier.} The gradient of $\Fnorm{\tHess^2-I}^2$ is
+$4\tHess(\tHess^2-I)$, which vanishes on $\ker\tHess$: a collapsed direction ($\tHess v=0$)
+is a \emph{critical point} of the loss,
+\begin{equation}
+  4\tHess(\tHess^2-I)v=4\tHess(0-v)=-4\tHess v=0 ,
+\end{equation}
+so collapse is a saddle (finite escape force elsewhere), not the infinite barrier
+$\delta\theta^{\!\top}P^{-1}\delta\theta$ of the original. Variant~B fixes this. (iii) A
+$z$-space loss is \emph{blind to $x$-rank deficiency} (\S\ref{sub:rank}); enforce $m=n$.
+
+%----------------------------------------------------------------------
+\subsection{Variant B --- Stein/Burg majorant with a sketched log-determinant}
+\label{sub:B}
+\paragraph{Derivation.} Consider $\psi_B(\lambda)=\lambda-\ln\lambda-1$. The difference from
+the gap integrand is $h(\lambda)=2\sqrt\lambda-\ln\lambda-2$, with $h(1)=0$ and
+$h'(\lambda)=(\sqrt\lambda-1)/\lambda$, so $h$ is minimized at $\lambda=1$ where it equals
+$0$; hence $\psi_B\ge(\sqrt\lambda-1)^2$ everywhere with equality only at $\lambda=1$, and as
+$\lambda\to0$, $\psi_B\to+\infty$ (an \emph{infinite barrier}) while $\mathrm{Gap}\to1$.
+Thus
+\begin{equation}
+\label{eq:B-full}
+  \Psi_B(M)=\tr M-\log\det M-m
+\end{equation}
+is a criterion majorant with a \emph{stronger-than-required} barrier --- a deliberate
+conservatism against Variant~A's saddle. $\tr M$ is free (Hutchinson); $\log\det M$ for
+$m\sim10^7$ is not, and minibatch estimates of $M$ have rank $p\ll m$, making $\log\det$
+undefined. We therefore sketch: draw a random orthonormal $S\in\R^{m\times k}$ ($k\sim32$)
+and use
+\begin{equation}
+\label{eq:B-sketch}
+  \hat\ell_B=\tr M-\frac{m}{k}\log\det\!\big(S^{\!\top}MS\big).
+\end{equation}
+The fixed point is preserved \emph{in expectation}: at $M=I$,
+$\nabla_M\hat\ell_B=I-\frac{m}{k}S(S^{\!\top}S)^{-1}S^{\!\top}=I-\frac{m}{k}SS^{\!\top}$, and
+for a random $k$-dimensional projector $\E[SS^{\!\top}]=\frac{k}{m}I$, so
+$\E[\nabla_M\hat\ell_B]=I-I=0$. Resample $S$ each window so that over $O(m/k)$ windows the
+barrier illuminates every direction (Cauchy interlacing detects rank loss with probability
+$\to1$). Implementation is nearly free atop A: maintain an EMA
+$C\leftarrow(1-\rho)C+\rho\,(S^{\!\top}\hh)(S^{\!\top}\hh)^{\!\top}$ on the \emph{same} pairs,
+add $-\frac1k(S^{\!\top}\hh)^{\!\top}\bar C^{-1}(S^{\!\top}\hh)$ with stop-grad on $\bar C$;
+$M$ is PSD (a covariance), so the small $k\times k$ solve is safe.
+
+\paragraph{Verdict.} Not a standalone loss (biased off the fixed point; barrier only on the
+sketched slice) but a cheap, decisive insurance against Variant~A's degeneracy, added with
+a small weight. In closed form~\eqref{eq:B-full} it is the KL divergence between Gaussians
+with covariances $M$ and $I$; its per-eigenvalue weighting is more conservative than the
+gap.
+
+%----------------------------------------------------------------------
+\subsection{Variant C --- exact criterion via conjugate gradients (reference / audit)}
+\label{sub:C}
+\paragraph{Derivation.} The only obstacle to the exact $c_3(JJ^{\!\top})$ was the inverse
+term. Take $x$-space pairs $(v,\hat h_x=H_x v)$ and damp:
+\begin{equation}
+\label{eq:C}
+  \ell_C=\E\big[\norm{J^{\!\top}\hat h_x}^2\big]
+        +\E\big[v^{\!\top}(JJ^{\!\top}+\lambda I)^{-1}v\big].
+\end{equation}
+The gradient of the second term needs no explicit inverse: with
+$w=(JJ^{\!\top}+\lambda I)^{-1}v$,
+\begin{equation}
+  d\big[v^{\!\top}(JJ^{\!\top}+\lambda I)^{-1}v\big]
+   =-w^{\!\top}\,d(JJ^{\!\top})\,w
+   =-\,d\,\norm{J^{\!\top}\bar w}^2\Big|_{\bar w\text{ fixed}} .
+\end{equation}
+So solve $w$ by CG (each matvec is one JVP + one VJP through $g_\phi$; warm-start from the
+previous step gives $K\approx3$--$5$ iterations since $J$ drifts slowly), stop-grad $\bar w$,
+then backprop $-\norm{J^{\!\top}\bar w}^2$.
+
+\paragraph{Verdict.} Literally Li's criterion on the manifold $\{JJ^{\!\top}\}$ and the
+\emph{only} variant that sees $x$-rank loss (the inverse term blows up as $1/\lambda$ on
+$\ker$). But $K$ passes per probe and differentiation near a singular $J$ make it a poor
+per-step loss. Correct role: a periodic \emph{audit/correction} every few hundred steps atop
+A+B, and the ground truth for debugging. The damping $\lambda$ is mandatory and reads as a
+noise floor.
+
+%----------------------------------------------------------------------
+\subsection{Variant D --- invertible $g$: exact criterion in closed form}
+\label{sub:D}
+\paragraph{Derivation.} If $g_\phi$ is a coupling-flow bijection ($m=n$), then
+$(JJ^{\!\top})^{-1}v=J^{-\top}J^{-1}v$ costs one inverse pass, and
+\begin{equation}
+\label{eq:D}
+  \ell_D=\E\big[\norm{J^{\!\top}\hat h_x}^2+\norm{J^{-1}v}^2\big]
+\end{equation}
+is $c_3(JJ^{\!\top})$ with \emph{no approximation}. This is the structural analogue of Li's
+$P=Q^{\!\top}Q$ with triangular $Q$: triangular matrices form a Lie group and triangular
+systems solve by substitution, and Li fits $Q$ rather than $P$~\cite{li2015}; a coupling
+layer has a block-triangular Jacobian, so~\eqref{eq:D} is a nonlinear, $z$-dependent
+generalization of his construction. The loss self-stabilizes: $\norm{J^{-1}v}^2$ penalizes
+an ill-conditioned $J$, an intrinsic barrier, no sketch needed.
+
+\paragraph{Verdict.} If the architecture of $g$ is ours to choose, this is the best
+mathematical-honesty/stability trade-off. Costs: hard $m=n$, limited expressivity of flow
+blocks at $10$--$20$M, and an extra inverse pass.
+
+%----------------------------------------------------------------------
+\subsection{Variant E --- gradient whitening (cheapest instance)}
+\label{sub:E}
+\paragraph{Derivation.} In Li's later work the \emph{gradient-whitening} preconditioner
+replaces the pair $(v,h)$ by $(v,g)$ in the same criterion, with fixed point
+$P=(\E[\hat g\hat g^{\!\top}])^{-1/2}$~\cite{li2024,pooladzandi2024}. In $z$, ``$P_z=I$
+optimal'' $\Leftrightarrow A_z:=\E[\hat g_z\hat g_z^{\!\top}]=I$ (normalized probes), and the
+same two-sample estimator applies:
+\begin{equation}
+\label{eq:E}
+  \hat\ell_E=(\hat g_{z,1}^{\!\top}\hat g_{z,2})^2-\norm{\hat g_{z,1}}^2-\norm{\hat g_{z,2}}^2+m ,
+\end{equation}
+where $\hat g_{z,i}$ are ordinary training gradients on two microbatches --- the statistic
+is \emph{free}; we pay only a second backward for $\partial\hat g_z/\partial\phi$.
+
+\paragraph{Verdict.} The cheapest option and still an honest instance of Li's criterion ---
+but a \emph{different} one: it equalizes the second moment of gradients, not curvature, so
+it is ``full-matrix Adam'' grade, without the Newton normalization $|\lambda(PH)|\approx1$.
+Near convergence $\hat g\to0$ degenerates the statistic and $J$ is pulled up; damp with
+pairs $(u,\hat g_z+\epsilon u)$ (target $A_z+\epsilon^2 I$), which is why sparse-gradient
+PSGD implementations whiten the momentum rather than the raw gradient~\cite{li2024}. Good as
+a warmup or when second derivatives are forbidden. If $A_x$ is rank-deficient (gradients in
+a subspace), $A_z=J^{\!\top}A_xJ$ cannot be full rank either.
+
+%======================================================================
+\section{A unifying view}
+\label{sec:unify}
+
+The admissible family is organized by Lemma~\ref{lem:gap} and
+Definition~\ref{def:majorant}. Variants~A and~B are \emph{differentiable majorants} of the
+criterion gap that touch zero at $M=I$:
+\begin{equation}
+  \Fnorm{M-I}^2\ \ge\ \mathrm{Gap}(M)
+  \qquad\text{and}\qquad
+  \tr M-\log\det M-m\ \ge\ \mathrm{Gap}(M),
+\end{equation}
+proved eigenvalue-wise in~\eqref{eq:A-majorant} and \S\ref{sub:B}; A is tighter near the
+optimum (factor $4$), B is more conservative at collapse (infinite vs.\ unit barrier).
+Variants~C and~D compute the gap's optimum \emph{exactly} (C via CG with damping, D in
+closed form for bijective $g$), and thus alone perceive $x$-rank deficiency. Variant~E is
+the exact solution of a \emph{sibling} criterion (whitening, i.e.\ Fisher/natural-gradient
+grade). The rejected surrogates of \S\ref{sec:rejected} are exactly the attempts that either
+drop a term of the criterion (\S\ref{sub:single}, \S\ref{sub:condnum}), target the wrong
+operator or power (\S\ref{sub:logdet-wrong}, \S\ref{sub:distill}), or destroy the barrier by
+coupling probes to $P$ (\S\ref{sub:correlated}). Table~\ref{tab:variants} summarizes the
+admissible set.
+
+\begin{table}[t]
+\centering
+\small
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}l l l l l@{}}
+\toprule
+Loss & Fixed point & Relation to $c_3$ & Extra cost / pair & Anti-collapse\\
+\midrule
+A: $\Fnorm{M-I}^2$ & $M=I$ & majorant; $4\times$ local & $\approx2$ grad-eval & weak (saddle)\\
+B: $\tr-$sketch $\log\det$ & $M=I$ (in exp.) & majorant; harder barrier & $\approx0$ atop A & strong\\
+C: exact $c_3$ + CG & optimum, floor $\lambda$ & exact & $K(\text{JVP}{+}\text{VJP})$ & exact ($P^{-1}$)\\
+D: invertible $g$ & exact $c_3$ & exact; flow analogue of $Q$ & $\approx1$ inverse pass & built-in\\
+E: whitening $(v,g)$ & $A_z=I$ & exact, sibling criterion & $\approx0$ & needs $\epsilon$ damp\\
+\bottomrule
+\end{tabular}
+\caption{Admissible losses. Recommended default: A+B as the workhorse (honest HVP/FD pairs,
+GN only if unstable), C as a rare auditor, D when the architecture of $g$ is free, E as
+warmup or when HVP is unavailable.}
+\label{tab:variants}
+\end{table}
+
+%======================================================================
+\section{Indefinite curvature: the latent criterion is strictly weaker but correct}
+\label{sec:indefinite}
+
+We substantiate the claim of \S\ref{para:zx} with a verified example, and connect it to
+Li's own non-uniqueness family~\eqref{eq:li-hyperbolic}.
+
+Take $H=\diag(1,-1)$, so $|H|^{-1}=I$ and $H^2=I$. In $x$-space with isotropic
+\emph{parameter} probes, $R_g=HR_\theta H=H^2=I$, and~\eqref{eq:riccati} gives
+$P\cdot I\cdot P=I\Rightarrow P=I=|H|^{-1}$, \emph{unique}. Now consider the hyperbolic SPD
+family (eigenvalues $e^{\pm t}>0$)
+\begin{equation}
+  S(t)=\begin{pmatrix}\cosh t & \sinh t\\ \sinh t & \cosh t\end{pmatrix}
+      =\exp\!\Big(t\begin{psmallmatrix}0&1\\1&0\end{psmallmatrix}\Big),
+  \qquad S(t)^{1/2}=S(t/2).
+\end{equation}
+A direct computation gives $SH=\begin{psmallmatrix}\cosh t & -\sinh t\\ \sinh t & -\cosh t\end{psmallmatrix}$
+and $(SH)^2=I$ for all $t$. Set the implicit preconditioner $P=JJ^{\!\top}=S(t)$ by taking the
+symmetric root $J=S(t/2)$. Then the composite latent Hessian is $\tHess=J^{\!\top}HJ=S(t/2)HS(t/2)$, and using $HS(t)H=S(-t)$,
+\begin{equation}
+  \tHess^2=S(t/2)\,H\,S(t)\,H\,S(t/2)=S(t/2)\,S(-t)\,S(t/2)=S(0)=I
+  \qquad\text{for all }t .
+\end{equation}
+Hence the latent master condition $M=\tHess^2=I$~\eqref{eq:master} holds for the entire
+family $P=S(t)$, while the $x$-space criterion selects only $t=0$, i.e.\ $P=|H|^{-1}=I$. The
+family is exactly Li's~\eqref{eq:li-hyperbolic}: with $\alpha=\cosh(t/2),\ \beta=\sinh(t/2)$
+one has $\alpha^2-\beta^2=1$, $\alpha^2+\beta^2=\cosh t$, $2\alpha\beta=\sinh t$, so Li's $P$
+equals $S(t)$. The gauge is the indefinite-orthogonal group $O(1,1)$ (generally $O(p,q)$).
+
+The conclusion is that~\eqref{eq:master} is \emph{strictly weaker} than the $x$-space
+criterion in the indefinite case, but every member of the family satisfies
+$|\lambda(\tHess)|=1$ --- Li's properties (i)--(ii) --- which is what governs the convergence
+rate. Since SGD's steps and noise live in $z$, the operative object is $\tHess$, not the
+$x$-space $PH$; the latent criterion is therefore the correct one to enforce, and it is also
+the one that dispenses with the intractable inverse. For PSD or Gauss--Newton curvature the
+gauge collapses to the ordinary orthogonal group and the two criteria coincide up to an
+irrelevant rotation.
+
+%======================================================================
+\section{Deployment}
+\label{sec:deploy}
+
+The losses above are necessary but not sufficient; the surrounding machinery is what makes
+them behave.
+
+\paragraph{Stop-gradient through the operating point.}
+Because $x=g_\phi(z)$ depends on $\phi$, curvature and gradients inside the pairs must be
+evaluated at $\bar x=\sg[g_\phi(z)]$, letting the $\phi$-gradient flow \emph{only} through
+the $J$-path. Otherwise $\phi$ learns to ``teleport'' $x$ into flat regions --- lowering the
+loss without improving the preconditioner --- and simultaneously perturbs the trajectory. To
+retain the $g$-curvature term of~\eqref{eq:composite}, add it via double-backprop on
+$\big\langle\sg[\nabla_x\Loss],\,g_\phi(z)\big\rangle$.
+
+\paragraph{State consistency / function preservation.}
+A $\phi$-step moves $x=g_\phi(z)$ at fixed $z$. Either add a function-preserving penalty
+$\norm{g_{\phi^+}(z)-g_\phi(z)}^2$ (one forward), or adopt Variant~D and a pure-preconditioner
+mode with state $x$ and $z=g^{-1}(x)$ recovered on demand.
+
+\paragraph{Two timescales, normalization, initialization.}
+Update $\phi$ every $T$ steps with $1$--$4$ pairs; use a normalized/clipped $\phi$-step
+(mirroring Li's normalized relative-gradient step) and EMA of the matrix statistics.
+Initialize $g_\phi(z)=z+N_\phi(z)$ with a zero-initialized last layer, so $J\approx I$ and
+training starts as plain SGD with zero risk. Enforce $m=n$.
+
+\paragraph{Rank conditions.}
+\label{sub:rank}
+$JJ^{\!\top}=|H|^{-1}$ requires full rank, hence $m\ge n$ (else $v^{\!\top}P^{-1}v=\infty$ on
+$\ker$). If $m>n$, $\tilde G=J^{\!\top}GJ$ has rank $\le n<m$, so $\tilde G=I_m$ is unreachable
+and the best attainable is a projector with $n$ unit eigenvalues and $m-n$ zeros, a loss
+floor $m-n$ (the zeros are $\ker J$, harmless: no $x$-motion and no $z$-gradient there). If
+$m<n$, the frozen $x$-subspace makes the $x$-criterion infinite, and all $z$-space surrogates
+(A, B, E) are \emph{blind} to it because $P_z=I$ stays finite; only $x$-space objects (C, D)
+detect it. Use $m=n$.
+
+\paragraph{Integrability caveat.}
+$\mathrm{Gap}\equiv0$ globally would require $J(z)\approx|H(g(z))|^{-1/2}$ \emph{as the
+Jacobian field of a single chart} --- an over-determined integrability condition (a global
+isometry from flat $z$ to the metric $|H|$) that a curved metric cannot satisfy exactly.
+This is fine: the criterion is a comparator, and the loss returns the best approximate
+isometry. The $z$-dependence of $J$ is exactly what a constant $Q$ in PSGD lacks: pointwise
+adaptation of the preconditioner along the trajectory, amortized into the weights $\phi$.
+
+%======================================================================
+\section{Conclusion}
+The reparametrization $x=g_\phi(z)$ is preconditioned SGD with implicit preconditioner
+$P=JJ^{\!\top}$, and training $\phi$ ``well'' means, precisely, minimizing the deficit of
+Li's criterion at that preconditioner. Reducing the criterion to latent space collapses the
+problem onto the single spectral target $M=I$ and removes the intractable inverse; the gap
+lemma exhibits the exact objective $\Fnorm{M^{1/2}-I}^2$; and, since its square root is not
+cheaply estimable, the admissible losses are its differentiable majorants (A, B) together
+with exact renderings for tractable geometries (C, D) and a whitening sibling (E). The
+rejected branches --- naive substitution, single-term collapse, log-determinant in the wrong
+space, correlated probes, adversarial inverses, Cayley isometries, Newton distillation, and
+scale-invariant proxies --- are not detours but the map of the constraint set: each fails by
+dropping a piece of the criterion, targeting the wrong operator, or destroying the
+anti-collapse barrier, and several return once the missing structure (a $z$-reduction, a GN
+factorization, or an invertible architecture) is supplied. The recommended default is A+B as
+the workhorse, C as an occasional auditor, D when the architecture is free, and E as a
+warmup.
+
+\begin{thebibliography}{9}
+\small
+\bibitem{li2015} X.-L.~Li. \emph{Preconditioned stochastic gradient descent}.
+  arXiv:1512.04202, 2015. (General PSGD, the three criteria, and Kronecker preconditioners.)
+\bibitem{li2018} X.-L.~Li. \emph{Preconditioner on matrix Lie group for SGD}.
+  arXiv:1809.10232, 2018. (Affine Lie-group preconditioners.)
+\bibitem{li2022} X.-L.~Li. \emph{Black-box Lie-group preconditioners for SGD}.
+  arXiv:2211.04422, 2022. (Low-rank-approximation preconditioner.)
+\bibitem{li2024} X.-L.~Li. \emph{Stochastic Hessian fittings on Lie groups}.
+  arXiv:2402.11858, 2024. (Convexity of Hessian fitting; gradient whitening via $(v,g)$.)
+\bibitem{pooladzandi2024} O.~Pooladzandi and X.-L.~Li.
+  \emph{Curvature-informed SGD via general-purpose Lie-group preconditioners}.
+  arXiv:2402.04553, 2024. (Matrix-free and LRA preconditioners; noise-robust fitting.)
+\end{thebibliography}
+
+\end{document}

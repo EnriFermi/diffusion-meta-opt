@@ -1,0 +1,29 @@
+schema_version: 1
+status: plan_only_unapproved
+
+paths:
+  zoo_root: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo
+  final_zoo_manifest: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo/manifests/manifest.json
+  plan_output_root: /home/coder/project/projects/shared/storage/artifacts/weightclip_benchmark/zoo_retention_plans
+  quarantine_root: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo_quarantine
+
+policy:
+  name: raw_fp32_grid9_v1
+  # Initialization plus these one-based epoch files: nine states per lineage.
+  keep_initialization: true
+  keep_epochs_one_based: [1, 4, 8, 16, 24, 32, 44, 45]
+  expected_datasets: 10
+  expected_lineages_per_dataset: 50
+  expected_archived_states_per_lineage: 46
+  expected_all_checkpoint_states: 23000
+  expected_primary_checkpoint_states: 1000
+  primary_checkpoint_indices_zero_based: [43, 44]
+  require_forward_audit: true
+  preserve_all_non_candidate_files: true
+  preserve_rolling_resumes: true
+
+safety:
+  fail_if_zoo_builder_live: true
+  require_exact_final_manifest_sha256: true
+  apply_implementation_enabled: false
+  require_recovery_drill_before_reclaim: true

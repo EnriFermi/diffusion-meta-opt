@@ -1,0 +1,62 @@
+{
+  "schema": "parallel_categorical_gptq_prior_counts_v1",
+  "production_config": "/home/coder/project/projects/weight-vae/workspace/conf/weightclip_benchmark/direct_normalized_scaled_700m_parallel_categorical_gptq_production_500k.yaml",
+  "collection_protocol": {
+    "seed": 42,
+    "stream_start_index": 0,
+    "batch_size": 32,
+    "batch_count": 10,
+    "fit_batches": [1, 5],
+    "heldout_batches": [6, 10],
+    "fit_samples": 160,
+    "heldout_samples": 160,
+    "loader_workers_for_probe": 0,
+    "gptq_function": "training.weightclip_benchmark.run_parallel_categorical_gptq_700m_production._mask_aware_gptq_targets",
+    "gptq_bits": 4,
+    "gptq_damp_fraction": 0.01,
+    "note": "Exact emitted/permuted production samples and exact FP32 GPTQ target implementation. Opening the bank read approximately 42 GiB; reuse these counts for routine analysis."
+  },
+  "code_counts": {
+    "class_order_signed": [-7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7],
+    "fit_valid_count": 1540864,
+    "heldout_valid_count": 1551808,
+    "fit": [9577, 15189, 32931, 66381, 119678, 187322, 245546, 261369, 220931, 159788, 103202, 59207, 31663, 15510, 12570],
+    "heldout": [9827, 15151, 33539, 67237, 119474, 186465, 245079, 263297, 222302, 163066, 105102, 60888, 32228, 15844, 12309]
+  },
+  "scale_baselines": {
+    "fit_valid_count": 14144,
+    "heldout_valid_count": 13856,
+    "fit_support": [37, 216],
+    "heldout_support": [34, 216],
+    "fit_mode_class": 122,
+    "heldout_mode_class": 126,
+    "global_mode_heldout": {
+      "prediction_class": 122,
+      "accuracy": 0.03363163972286374,
+      "off_by_one_accuracy": 0.09750288683602772,
+      "mean_absolute_bin_error": 14.198542147806005,
+      "mean_squared_bin_error": 395.81704676674366,
+      "empirical_marginal_ordinal_loss": 0.01711717801385483
+    },
+    "coordinate_mode_heldout": {
+      "accuracy": 0.032188221709006926,
+      "off_by_one_accuracy": 0.09562644341801385,
+      "mean_absolute_bin_error": 14.596203810623557,
+      "mean_squared_bin_error": 414.4292003464203
+    },
+    "tile_row_mode_heldout": {
+      "accuracy": 0.029878752886836026,
+      "off_by_one_accuracy": 0.08747113163972287,
+      "mean_absolute_bin_error": 19.413467090069283,
+      "mean_squared_bin_error": 1075.196665704388
+    }
+  },
+  "validity": {
+    "same_data_contract": true,
+    "same_target_implementation": true,
+    "fit_heldout_disjoint_logical_windows": true,
+    "code_zero_fraction_fit": 0.1696249636567536,
+    "code_zero_fraction_heldout": 0.16967111910751845,
+    "limitation": "The prior probe uses logical samples 0..319 while the live snapshot averages later online batches. Agreement across all hard code metrics, loss, and entropy is therefore stronger than a same-batch comparison, but this is not a frozen per-example evaluation set."
+  }
+}

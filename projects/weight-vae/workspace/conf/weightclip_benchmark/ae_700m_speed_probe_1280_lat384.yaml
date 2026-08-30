@@ -1,0 +1,72 @@
+status: speed_probe_only
+
+base_model_config: ../big_vae_experiment/model_parameters_specific_to_big_vae_stage.yaml
+profile_output_dir: ../../artifacts/weightclip_benchmark/ae_scaling_profile_speed_probe_1280_lat384
+target_trainable_parameters: 700000000
+target_relative_tolerance: 0.01
+tile_shape: [128, 128]
+training_steps: 500000
+
+representation_rate_contract:
+  reference: official_weightclip_resnet18slim_sparse_codec
+  official_token_width: 288
+  official_latent_width: 192
+  official_window_tokens: 512
+  official_dataset_topologies: 10
+  official_valid_weight_scalars: 27977128
+  official_sparse_tokens_unpadded: 124264
+  official_padded_windows: 250
+  official_raw_valid_scalars_per_latent_scalar: 1.1726180416961738
+  official_padding_adjusted_valid_scalars_per_latent_scalar: 1.1383922526041668
+  operator_tiles_per_checkpoint: 193
+  operator_valid_weight_scalars_per_checkpoint: 2790240
+  operator_mean_valid_weight_scalars_per_tile: 14457.20207253886
+  selected_num_latents: 32
+  selected_d_lat: 384
+  selected_latent_scalars_per_tile: 12288
+  selected_valid_scalars_per_latent_scalar: 1.1765301165803108
+  relative_rate_error_vs_weightclip: 0.0335015139894887
+
+data_contract:
+  mode: operator_bank
+  seed: 42
+  pair_manifest: null
+  tile_rows: 128
+  tile_cols: 128
+  activation_rows: 512
+  permutation_views: 5
+  canonical_probability: 0.16666666666666666
+  hot_shards: 8
+  model_patch_size: 16
+  slice_batch_size: 32
+  loader_workers: 8
+  loader_batch_size: 1
+  loader_prefetch_factor: 2
+  max_inflight_bundles: 17
+  max_inflight_bundle_bytes: 134217728
+  max_active_strata: 256
+  max_active_bundle_bytes: 1610612736
+  loss_recipe:
+    behavioral_coef: 1.0
+    behavioral_lambda_operator: 50.0
+    behavioral_lambda_dir: 1.0
+    behavioral_lambda_scale: 10.0
+    structural_coef: 1.0
+    structural_lambda_dir: 1.0
+    structural_lambda_scale: 10.0
+    structural_lambda_rec: 0.0
+    structural_lambda_rel: 0.0
+
+production_launch_enabled_after_approval: false
+selected_candidate: null
+approval_file: null
+
+candidates:
+  - name: weightclip_gpu_1280_e10_d8_ffn3p9_l32_lat384
+    d_model: 1280
+    d_lat: 384
+    num_latents: 32
+    num_encoder_layers: 10
+    num_decoder_layers: 8
+    n_heads: 16
+    ffn_mult: 3.9

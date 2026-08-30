@@ -1,0 +1,25 @@
+CONDA_ENV_NAME=diff-meta-opt312 \
+RUN_LABEL=weight_quantile_vae_gpu0_square_VAE_step570k_ir_smoothing_stable \
+BIG_VAE_CHECKPOINT=/home/coder/project/artifacts/training/checkpoints/weight_quantile_vae_gpu0_square_VAE/stage_1/resume_state/step_0570000.pt \
+OFFLINE_ROOT=/home/coder/project/artifacts/training/checkpoints/weight_quantile_vae/stage_1/offline_dataset \
+STORAGE_ROOT=/home/coder/project/artifacts/big_vae/eval/latent_flattening/weight_quantile_vae_gpu0_square_VAE_step570k \
+DEVICE=cuda:0 \
+MAX_STEPS=3000 \
+LR=3e-5 \
+WEIGHT_DECAY=1e-6 \
+GRAD_CLIP_NORM=0.25 \
+BATCH_SIZE=1 \
+SOURCE_POOL_SIZE=1 \
+MAX_T_PATCHES=4 \
+MAX_D_OUT=64 \
+PROBES=1 \
+ETA=0.2 \
+FLOW_LAYERS=12 \
+FLOW_HIDDEN_DIM=512 \
+FLOW_NETWORK_DEPTH=2 \
+FLOW_LOG_SCALE_CLAMP=1.0 \
+Z_NORM_COEF=1e-4 \
+FORCE_MATH_ATTENTION=true \
+SKIP_NONFINITE_UPDATES=true \
+MAX_CONSECUTIVE_NONFINITE_STEPS=20 \
+scripts/launchers/post_train/latent_flattening.sh

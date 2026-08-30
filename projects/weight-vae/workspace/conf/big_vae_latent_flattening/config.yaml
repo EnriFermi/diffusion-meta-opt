@@ -1,0 +1,72 @@
+experiment:
+  run_label: ""
+  notes: "Post-hoc BigVAE latent flattening with an identity-initialized RealNVP flow."
+  tags:
+    - big_vae
+    - post_train
+    - latent_flattening
+
+storage:
+  root_dir: ${oc.env:BIG_VAE_LATENT_FLATTENING_ROOT,${oc.env:BIG_VAE_ARTIFACT_ROOT,./artifacts/big_vae}/eval/latent_flattening}
+  checkpoint_every_steps: 250
+  save_latest: true
+  save_final: true
+
+big_vae:
+  checkpoint: ""
+
+data:
+  offline_root: ""
+  shuffle_chunks: true
+  shuffle_records_within_chunk: true
+  repeat: true
+  seed: 42
+  sampling_mode: balanced
+  sampling_group_keys:
+    - dataset
+    - model
+    - layer_type
+    - depth
+  sampling_window_size_records: 2048
+  sampling_max_records_per_chunk_round: 8
+  weight_cache_size: 64
+  x_chunk_cache_size: 4
+  runtime_enforce_stage_compatibility: false
+  batch_size: 2
+  source_pool_size: 2
+  max_T_patches: 4
+  max_d_out: 16
+  max_x_rows: 0
+  stable_batch_shapes: true
+
+flow:
+  num_layers: 8
+  hidden_dim: 512
+  network_depth: 2
+  log_scale_clamp: 2.0
+  dropout: 0.0
+
+train:
+  device: auto
+  seed: 42
+  max_steps: 1000
+  lr: 1e-4
+  weight_decay: 1e-6
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1e-8
+  grad_clip_norm: 1.0
+  eta: 0.2
+  probes: 1
+  loss_scale: readme
+  iso_coef: 1.0
+  z_norm_coef: 1e-6
+  log_every_steps: 10
+  amp_encode: true
+  tf32: true
+  # Higher-order JVPs through the BigVAE decoder are not implemented for CUDA
+  # flash/mem-efficient SDPA kernels in current PyTorch builds.
+  force_math_attention: true
+  skip_nonfinite_updates: true
+  max_consecutive_nonfinite_steps: 20
+  nonfinite_debug_topk: 8

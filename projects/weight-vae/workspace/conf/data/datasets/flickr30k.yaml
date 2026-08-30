@@ -1,0 +1,39 @@
+name: flickr30k
+description: "Пользовательские фото с текстовыми описаниями; задачи image-text alignment и captioning."
+enabled: true
+gated: false
+sampling_weight: 1.0
+models:
+  - clip_vit_l14
+  - vit_base_p16_224
+collector_device: null
+
+hf:
+  repo: nlphuji/flickr30k
+  subset: null
+  split: test
+  streaming: false
+  shuffle_buffer: 10000
+  trust_remote_code: false
+
+schema:
+  image_mode: image_field
+  image_field: image
+  image_field_candidates: [image, img]
+  url_field: null
+  url_field_candidates: []
+  id_field: img_id
+  extra_fields: [caption]
+
+cache:
+  num_chunks_kept: 2
+  chunk_size_images: 256
+
+worker:
+  idle_sleep_s: 0.5
+  get_timeout_s: 5.0
+  request_timeout_s: 10
+  max_retries: 2
+  max_worker_restarts: 5
+
+licensing_note: "Use according to Flickr30k terms and HF repository card."

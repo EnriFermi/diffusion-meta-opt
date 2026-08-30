@@ -1,0 +1,64 @@
+enabled: true
+device: null
+# Optional prioritized list for collector GPU selection.
+# If `device` is null, runtime picks first available from this list.
+device_candidates: []
+# Prefer collector device different from train.device when possible.
+prefer_non_train_device: true
+# If no non-train device is available, allow using train.device from candidates.
+allow_train_device_fallback: true
+# Allow async collector even when collector.device == train.device.
+# Keep false by default to avoid train/collector contention on one GPU.
+allow_async_on_train_device: false
+mode: auto
+max_loaded_models: 1
+pin_gpu: false
+release_device_on_unload: true
+empty_cuda_cache_on_unload: true
+# If true, collector runs with local_files_only=true for HF assets.
+# Keep false for cold-start compatibility on fresh machines.
+runtime_local_only: false
+
+# round_robin_shuffled | weighted_random
+model_selection_strategy: round_robin_shuffled
+jobs_per_selected_model: 1
+
+# uniform_random | weighted_random
+dataset_sampling_strategy: weighted_random
+max_dataset_fraction_per_batch: 0.6
+
+num_inflight_jobs: 1
+status_emit_interval_s: 2.0
+status_queue_max_items: 2048
+
+diagnostics:
+  emit_resource_snapshot: true
+  resource_snapshot_max_children: 8
+  include_cgroup_on_failure: true
+  crash_report_enabled: true
+  crash_report_path: ${oc.select:training_artifacts.crashes_dir,./data/reports}/collector_crash_report.json
+  worker_status_enabled: true
+  worker_status_dir: ${oc.select:training_artifacts.reports_dir,./data/reports}/dataset_workers
+
+dataset_pool:
+  continue_on_create_failure: true
+  continue_on_start_failure: true
+  # If HF token is missing, disable gated datasets and keep training alive with the rest.
+  continue_on_missing_hf_token_for_gated_datasets: true
+  disable_dataset_on_runtime_failure: true
+  max_runtime_failures_before_disable: 3
+
+in_memory_buffer:
+  capacity_samples: 3000
+  fill_target_samples: 3000
+  low_watermark_samples: 1500
+
+interleaved_schedule:
+  collect_every_n_train_steps: 30
+  collector_jobs_per_cycle: 1
+
+layer_output_splitting:
+  # Mandatory positive integer.
+  # If layer rows N <= xy_samples_random_slice -> keep full x/y.
+  # If N > xy_samples_random_slice -> keep random linked x/y pairs of this size.
+  xy_samples_random_slice: 256

@@ -1,0 +1,78 @@
+from __future__ import annotations
+
+import logging
+from collections import Counter
+
+import hydra
+from omegaconf import DictConfig, OmegaConf
+
+from dataset import data_pipeline, setup_logging
+
+# Demo-only runtime knobs.
+# These values are intentionally local to this demo script and are NOT part of
+# the core data-pipeline Hydra runtime schema (train/model/data configs).
+DEMO_TARGET_SAMPLES = 200
+
+
+@hydra.main(version_base=None, config_path="../../conf", config_name="big_vae/train/default")
+def main(cfg: DictConfig) -> None:
+    setup_logging(cfg)
+    logger = logging.getLogger("dataset.shared.demo_end_to_end")
+
+    logger.info("Starting end-to-end shared dataset demo")
+    logger.debug("Config:\n%s", OmegaConf.to_yaml(cfg, resolve=True))
+
+    _log_demo_settings(logger, {"target_samples": DEMO_TARGET_SAMPLES})
+
+    with data_pipeline(cfg, logger=logger, emit_run_report=False) as (dataset, collector):
+        iterator = iter(dataset)
+        model_counts: Counter[str] = Counter()
+        layer_counts: Counter[str] = Counter()
+        dataset_mix_counts: Counter[str] = Counter()
+        job_mix_log: list[dict[str, int]] = []
+        step_idx = 0
+        while sum(model_counts.values()) < DEMO_TARGET_SAMPLES:
+            if not collector.is_async_mode:
+                collected_stats = dataset.maybe_collect(step_idx)
+                for item in collected_stats:
+                    job_mix_log.append(dict(item.dataset_mix))
+
+            sample = next(iterator)
+            model_counts[sample.model_name] += 1
+            layer_counts[sample.layer_name] += 1
+
+            image_meta = sample.meta.get("image_meta", [])
+            for item in image_meta:
+                dataset_name = item.get("dataset_name")
+                if dataset_name:
+                    dataset_mix_counts[str(dataset_name)] += 1
+
+            if sum(model_counts.values()) % 20 == 0:
+                logger.info(
+                    "consumed=%s cache=%s model_counts=%s",
+                    sum(model_counts.values()),
+                    collector.cache_size(),
+                    dict(model_counts),
+                )
+
+            step_idx += 1
+        logger.info("Final cache size: %s", collector.cache_size())
+        logger.info("Model switching frequency: %s", dict(model_counts))
+        logger.info("Top layers: %s", layer_counts.most_common(5))
+        logger.info("Dataset mix distribution (from sample meta): %s", dict(dataset_mix_counts))
+        if job_mix_log:
+            logger.info("Dataset mix per interleaved collector job: %s", job_mix_log[:20])
+
+
+def _log_demo_settings(logger: logging.Logger, values: dict[str, int]) -> None:
+    logger.info("Demo-only settings (not part of core runtime config):")
+    logger.info("+---------------------+--------+")
+    logger.info("| parameter           | value  |")
+    logger.info("+---------------------+--------+")
+    for key, value in values.items():
+        logger.info("| %-19s | %-6s |", key, value)
+    logger.info("+---------------------+--------+")
+
+
+if __name__ == "__main__":
+    main()

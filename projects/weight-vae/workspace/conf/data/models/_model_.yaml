@@ -1,0 +1,120 @@
+# ================================================================
+# ШАБЛОН КОНФИГА МОДЕЛИ ДЛЯ dataset/models
+# ================================================================
+# Этот файл — шаблон-документация.
+# Скопируйте его в новый файл, например:
+#   conf/data/models/my_model.yaml
+# и заполните значения.
+
+# Уникальное имя модели (используется в dataset.models: [...]).
+name: my_model
+
+# Провайдер раннера.
+# В текущей кодовой базе основной провайдер: transformers.
+# Возможные будущие: timm, open_clip.
+provider: transformers
+
+# Идентификатор модели на HF Hub.
+hf_repo: org_or_user/model_name
+
+# Ревизия (branch/tag/commit) или null.
+revision: null
+
+# true, если модель gated.
+# Тогда cfg.hf.token обязателен + доступ к модели в HF.
+gated: false
+
+# Поддиректория кэша модели относительно data.path.
+# Должна быть стабильной, чтобы переиспользовать локальные веса.
+cache_subdir: models/${.name}
+
+# Размер batch на один inference job коллектора.
+# ВАЖНО: напрямую влияет на объём LayerIO за job и скорость заполнения кэша.
+batch_size: 32
+
+# Вес модели при model-first планировании (policy=weighted).
+sampling_weight: 1.0
+
+# Базовый device из конфига модели.
+# На практике collector может переопределить device во время выполнения.
+device: auto  # auto | cuda:1 | cpu
+
+# Точность инференса.
+# float16 быстрее/экономнее на GPU, float32 стабильнее и тяжелее.
+dtype: float16  # float16 | float32
+
+# Режим прогона модели:
+# - vision_only: только vision часть (полезно для CLIP/SigLIP/GroundingDINO-vision flow)
+# - encoder_only: только encoder (полезно для enc-dec моделей)
+# - full: полный forward
+run_mode: vision_only
+
+preprocess:
+  # Как выбирать препроцессор:
+  # auto -> AutoProcessor/AutoImageProcessor по раннеру
+  processor: auto
+
+  # Опциональный override размера входа (если поддержано раннером).
+  image_size: null
+
+hook_filter:
+  # Regex для включения слоёв nn.Linear.
+  # Пример для CLIP vision-only:
+  #   "^vision_model\\."
+  include_regex: null
+
+  # Regex для исключения слоёв.
+  # Пример: исключить projection head:
+  #   "projection"
+  exclude_regex: null
+
+limits:
+  # Ограничение числа строк на слой после flatten(..., D)->(N,D).
+  # Защищает от OOM и чрезмерного IPC.
+  max_records_per_layer: 200000
+
+  # Ограничить число захуканных линейных слоёв (null = без лимита).
+  max_layers: null
+
+inference:
+  # Опциональные флаги инференса (если поддержаны вашим раннером).
+  autocast: true
+  torch_compile: false
+
+  # Опционально: backend attention, если поддерживается.
+  # null | sdpa | flash_attention_2
+  attention_implementation: null
+
+# Технические/эксплуатационные заметки.
+notes: "Опишите особенности модели, ограничения VRAM, known issues."
+
+# ----------------------------------------------------------------
+# Как этот конфиг используется в пайплайне
+# ----------------------------------------------------------------
+# 1) CompatibilityIndex собирает union моделей из dataset YAML (поле models).
+# 2) CollectorService на старте может вызвать predownload_models() для union-множества.
+# 3) ModelPool загружает модель на collector.device и держит LRU cap=1.
+# 4) Хуки nn.Linear формируют LayerIORecord:
+#    - inputs: (N, D), CPU float32
+#    - outputs: (N, D), CPU float32
+#    - weight: snapshot Linear.weight
+# 5) Atomizer режет LayerIORecord на SharedSample (row/chunk) для кэша.
+
+# ----------------------------------------------------------------
+# Мини-примеры (как комментарии)
+# ----------------------------------------------------------------
+# CLIP:
+# name: clip_vit_b32
+# provider: transformers
+# hf_repo: openai/clip-vit-base-patch32
+# run_mode: vision_only
+# hook_filter:
+#   include_regex: "^vision_model\\."
+
+# DINOv2:
+# name: dinov2_base
+# provider: transformers
+# hf_repo: facebook/dinov2-base
+# run_mode: encoder_only
+# hook_filter:
+#   include_regex: null

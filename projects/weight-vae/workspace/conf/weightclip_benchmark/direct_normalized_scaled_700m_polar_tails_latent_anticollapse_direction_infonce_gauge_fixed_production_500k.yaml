@@ -1,0 +1,85 @@
+schema: weightclip_direct_normalized_scaled_700m_polar_tails_latent_anticollapse_direction_infonce_gauge_fixed_production_v1
+objective: behavioral_direction_scale_plus_structural
+output_root: /mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_latent_anticollapse_direction_infonce_gauge_fixed_500k_v1
+device: cuda:0
+seed: 42
+steps: 500000
+batch_size: 32
+learning_rate: 0.00005
+scheduler: constant
+betas: [0.9, 0.999]
+eps: 0.00000001
+weight_decay: 0.01
+grad_clip_norm: 5.0
+tf32: true
+log_every: 10
+gradient_log_every: 100
+plot_every: 1000
+
+architecture:
+  input_values_per_token: 32
+  output_patch_size: 16
+  shared_decoder_depth: 5
+  direction_tail_depth: 1
+  scale_tail_depth: 1
+  log_scale_min: -3.0
+  log_scale_max: 6.0
+  initial_log_radius: -2.0
+  gradient_routing: coordinate_owned_stop_gradient
+
+normalization:
+  kind: per_output_maxabs_q7_continuous
+  qmax: 7.0
+  log2_scale_mean: -6.328672409057617
+  log2_scale_std: 0.5959522128105164
+
+loss:
+  behavioral_coef: 1.0
+  behavioral_operator: 0.0
+  behavioral_direction: 1.0
+  behavioral_scale: 10.0
+  structural_coef: 1.0
+  structural_direction: 1.0
+  structural_scale: 10.0
+  structural_reconstruction: 0.0
+  structural_relational: 0.0
+
+latent_anticollapse:
+  kind: two_way_centered_rms_hinge
+  margin: 0.10
+  coefficient: 1.0
+  eps: 0.000001
+  detach_denominator: true
+  batch_scope: full_physical_batch
+
+direction_contrastive:
+  kind: same_layout_prediction_target_infonce
+  temperature: 0.10
+  coefficient: 1.0
+  target_detached: true
+  group_reduction: equal_group_mean
+  minimum_group_size: 2
+
+direction_gauge_constraint:
+  kind: nonaffine_rmsnorm_frobenius_sphere
+  frobenius_radius: seed42_initial_composite
+  retraction_after_optimizer_step: true
+  project_first_moment_tangent: true
+  weight_decay: 0.0
+
+operator_bank:
+  pair_manifest: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo/operator_dataset/operator_dataset-c478efe716506765.json
+  pair_manifest_sha256: f3a26fc9772d43feabe138ef9fa5be5baf2f76323fb4f3079c12c5f65275f347
+  permutation_views: true
+  canonical_probability: 0.16666666666666666
+  hot_shards: 8
+  loader_workers: 8
+  loader_batch_size: 1
+  loader_prefetch_factor: 2
+  max_active_strata: 256
+  max_active_bundle_bytes: 1610612736
+
+resume_checkpoint: /dev/shm/weightclip_direct_normalized_scaled_700m_p32_polar_tails_latent_anticollapse_direction_infonce_gauge_fixed_500k_v1/resume_latest.pt
+resume_save_every: 1000
+persistent_model_checkpoint: /var/tmp/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_latent_anticollapse_direction_infonce_gauge_fixed_500k_v1/model_latest.pt
+model_save_every: 10000

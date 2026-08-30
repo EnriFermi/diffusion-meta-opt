@@ -1,0 +1,159 @@
+{
+  "schema": "parallel_categorical_current_state_trajectory_v1",
+  "source_before": {
+    "metrics": {
+      "path": "/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_gptq_categorical_parallel_500k_v1/train_metrics.jsonl",
+      "size": 41607982,
+      "mtime_ns": 1788085350529695692
+    },
+    "gradients": {
+      "path": "/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_gptq_categorical_parallel_500k_v1/gradient_telemetry.jsonl",
+      "size": 2825577,
+      "mtime_ns": 1788085144391650513
+    },
+    "resolved_config": {
+      "path": "/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_gptq_categorical_parallel_500k_v1/resolved_config.json",
+      "size": 5125,
+      "mtime_ns": 1788027202940302908
+    }
+  },
+  "source_after": {
+    "metrics": {
+      "path": "/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_gptq_categorical_parallel_500k_v1/train_metrics.jsonl",
+      "size": 41607982,
+      "mtime_ns": 1788085350529695692
+    },
+    "gradients": {
+      "path": "/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_gptq_categorical_parallel_500k_v1/gradient_telemetry.jsonl",
+      "size": 2825577,
+      "mtime_ns": 1788085144391650513
+    },
+    "resolved_config": {
+      "path": "/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_gptq_categorical_parallel_500k_v1/resolved_config.json",
+      "size": 5125,
+      "mtime_ns": 1788027202940302908
+    }
+  },
+  "read": {
+    "metrics": {
+      "partial_tail_skipped": false
+    },
+    "gradients": {
+      "partial_tail_skipped": false
+    }
+  },
+  "rows": {
+    "metrics": 9860,
+    "gradients": 986
+  },
+  "steps": {
+    "first_metric": 1,
+    "latest_metric": 98590,
+    "latest_gradient": 98500,
+    "latest_complete_1k_bin": 98000
+  },
+  "validity": {
+    "duplicate_metric_steps": 0,
+    "duplicate_gradient_steps": 0,
+    "missing_expected_metric_steps": [],
+    "missing_expected_gradient_steps": [],
+    "all_logged_metric_numeric_finite": true,
+    "all_defined_local_rates_finite": true,
+    "all_gradient_numeric_finite": true,
+    "max_loss_identity_abs_error": 1.4901161193847656e-08,
+    "max_cursor_abs_error": 0,
+    "learning_rates": [
+      5e-05
+    ],
+    "metric_schemas": [
+      "weightclip_parallel_categorical_gptq_700m_production_v1"
+    ],
+    "gradient_schemas": [
+      "weightclip_parallel_categorical_gptq_700m_production_v1"
+    ],
+    "elapsed_monotonic": true
+  },
+  "clipping": {
+    "threshold": 5.0,
+    "steps_at_or_above_threshold": 0,
+    "max_pre_clip_norm": 2.4720540046691895,
+    "late_5k_p99_pre_clip_norm": 0.06653646379709244
+  },
+  "runtime": {
+    "latest_cumulative_steps_per_second": 1.6955156685814603,
+    "late_5k_local_steps_per_second_median": 1.8091590450123314,
+    "late_5k_tokenizer_seconds_median": 0.021364321932196617,
+    "cuda_peak_gib": 13.846033573150635
+  },
+  "phase_detection": {
+    "method": "joint robust-1k-bin piecewise-linear dynamic programming",
+    "metrics": [
+      "code_ordinal_loss",
+      "scale_ordinal_loss",
+      "hard_decode_raw_nrmse",
+      "diagnostic_old_behavioral_direction",
+      "diagnostic_old_structural_direction",
+      "diagnostic_old_direction_contrastive_loss",
+      "diagnostic_old_latent_interaction_rms_ratio",
+      "diagnostic_old_latent_rms",
+      "diagnostic_old_behavioral_operator_actual",
+      "grad_norm_pre_clip"
+    ],
+    "standardization": "median / (1.4826 * MAD)",
+    "minimum_segment_bins": 5,
+    "penalties": [
+      25.0,
+      30.0,
+      35.0,
+      40.0
+    ],
+    "segment_ends_by_penalty": {
+      "25.0": [
+        8000,
+        17000,
+        32000,
+        55000,
+        80000,
+        98000
+      ],
+      "30.0": [
+        8000,
+        17000,
+        32000,
+        89000,
+        98000
+      ],
+      "35.0": [
+        8000,
+        17000,
+        32000,
+        98000
+      ],
+      "40.0": [
+        8000,
+        17000,
+        32000,
+        98000
+      ]
+    },
+    "nonterminal_breakpoint_support": {
+      "8000": 4,
+      "17000": 4,
+      "32000": 4,
+      "55000": 1,
+      "80000": 1,
+      "89000": 1
+    },
+    "stable_breakpoints": [
+      8000,
+      17000,
+      32000
+    ]
+  },
+  "notes": [
+    "All diagnostic_old_* quantities are detached and do not contribute to backward.",
+    "Robust plots use medians in complete 1000-step bins; the live partial tail is excluded.",
+    "latent_interaction_rms_estimate is ratio * total latent RMS; the logged ratio alone can fall when the denominator inflates.",
+    "Per-parameter gradient RMS values across groups are not aggregate gradient-energy shares."
+  ]
+}

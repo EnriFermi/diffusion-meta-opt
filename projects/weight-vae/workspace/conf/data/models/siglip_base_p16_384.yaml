@@ -1,0 +1,22 @@
+name: siglip_base_p16_384
+provider: transformers
+runner: hf_siglip_runner
+model_family: siglip
+hf_repo: google/siglip-base-patch16-384
+revision: null
+gated: false
+cache_subdir: models/${.name}
+batch_size: 24
+sampling_weight: 1.0
+device: auto
+dtype: float16
+run_mode: vision_only
+hook_filter:
+  include_regex: "^vision_model\\."
+  exclude_regex: null
+limits:
+  max_records_per_layer: 200000
+  max_layers: null
+preprocess:
+  processor: auto
+trust_remote_code: false

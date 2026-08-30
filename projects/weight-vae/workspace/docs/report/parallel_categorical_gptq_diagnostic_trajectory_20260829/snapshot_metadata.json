@@ -1,0 +1,15 @@
+{
+  "schema": "parallel_categorical_gptq_diagnostic_trajectory_v1",
+  "source": "/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_gptq_categorical_parallel_500k_v1/train_metrics.jsonl",
+  "source_size": 1545338,
+  "source_mtime_ns": 1788030046635941089,
+  "rows": 367,
+  "first_step": 1,
+  "latest_step": 3660,
+  "plateau_start": 510,
+  "notes": [
+    "All old losses are detached diagnostics and do not contribute to backward.",
+    "Contrastive chance top-1 is exact for random ranking: group_count / eligible_samples.",
+    "Signature-fixed slopes condition on eligible count, group count, and min/median/max group size."
+  ]
+}

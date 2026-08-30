@@ -1,0 +1,33 @@
+schema: weightclip_ae_two_operator_decoder_ladder_v1
+output_root: /mnt/shared/weightclip_benchmark/ae_v5_two_operator_decoder_ladder_step2500
+seed: 260827
+max_steps: 100
+eval_every_steps: 10
+log_every_steps: 10
+learning_rate: 0.01
+
+# Two head-boundary arms are repeated with and without the default Adam epsilon
+# floor. Prefix depths use the floor-free value to expose the decoder Jacobian.
+eps_sensitivity: [1.0e-8, 1.0e-12]
+prefix_adam_eps: 1.0e-12
+prefix_depths: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+
+loss:
+  source: checkpoint.train.struct_loss
+  expected_lambda_dir: 1.0
+  expected_lambda_scale: 0.1
+
+early_success:
+  enabled: true
+  min_step: 20
+  consecutive_evals: 2
+  tile_dir_max: 0.05
+  tile_scale_max: 0.01
+  operator_nrmse_max: 0.1
+  swap_total_delta_min: 0.1
+
+selected_operators:
+  - checkpoint_sha256: 646f6c7e2e026c914fea50d43fa962ea1b5ba68a819f36d46a50df1117178e41
+    layer_key: layer3.0.conv2.weight
+  - checkpoint_sha256: 6ae94b4f94e14020ee02d689bc6c0153b9fce6e7447665b55006b1a4a929f3a0
+    layer_key: layer3.0.conv2.weight

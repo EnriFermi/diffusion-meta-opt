@@ -1,0 +1,24 @@
+schema_version: 2
+kind: artifact_driven_stage_dg_pipeline
+dag_output: /home/coder/project/projects/shared/storage/artifacts/weightclip_benchmark/stage_dg_dag.json
+paths:
+  artifact_root: /home/coder/project/projects/shared/storage/artifacts/weightclip_benchmark
+  config_root: /home/coder/project/projects/weight-vae/workspace/conf/weightclip_benchmark
+  zoo_config: /home/coder/project/projects/weight-vae/workspace/conf/weightclip_benchmark/zoo.yaml
+  evaluation_config: /home/coder/project/projects/weight-vae/workspace/conf/weightclip_benchmark/evaluation.yaml
+  ours_fit_config: /home/coder/project/projects/weight-vae/workspace/conf/weightclip_benchmark/task_latent_fit.yaml
+  weightclip_fit_config: /home/coder/project/projects/weight-vae/workspace/conf/weightclip_benchmark/task_latent_fit_weightclip.yaml
+  checkpoint_manifest: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo/manifests/checkpoint_manifest.jsonl
+  # Must exactly match `paths.bank_root` in operator_dataset.yaml.  The
+  # resolver consumes the immutable build_state and pair manifest produced by
+  # that builder; a sibling path would silently dead-end the Stage-D/G DAG.
+  operator_bank_root: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo/operator_dataset
+  # The only intentionally absent input: created solely after explicit user
+  # approval of one completed deterministic AE checkpoint.
+  ae_seal: /home/coder/project/projects/shared/storage/artifacts/weightclip_benchmark/ours_codec_seal.json
+resolver_command:
+  - python
+  - -m
+  - training.weightclip_benchmark.resolve_stage_dg_dag
+  - --config
+  - /home/coder/project/projects/weight-vae/workspace/conf/weightclip_benchmark/stage_dg_pipeline.yaml

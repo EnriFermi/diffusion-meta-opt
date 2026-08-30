@@ -1,0 +1,24 @@
+name: grounding_dino_tiny
+provider: transformers
+runner: hf_dense_runner
+model_family: dense
+architecture: grounding_dino
+hf_repo: IDEA-Research/grounding-dino-tiny
+revision: null
+gated: false
+cache_subdir: models/${.name}
+batch_size: 8
+sampling_weight: 1.0
+device: auto
+dtype: float32
+run_mode: vision_only
+dummy_text_prompt: "object"
+hook_filter:
+  include_regex: null
+  exclude_regex: null
+limits:
+  max_records_per_layer: 120000
+  max_layers: null
+preprocess:
+  processor: auto
+trust_remote_code: false

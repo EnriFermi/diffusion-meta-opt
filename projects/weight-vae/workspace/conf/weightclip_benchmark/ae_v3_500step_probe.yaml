@@ -1,0 +1,20 @@
+schema: weightclip_ae_v3_500step_probe_v1
+
+base_resolved_config: /home/coder/project/projects/shared/storage/artifacts/weightclip_benchmark/ae_704m_lat384_feedback_v2_production_500k/config_resolved_v2.json
+output_root: /home/coder/project/projects/shared/storage/artifacts/weightclip_benchmark/ae_725m_lat384_prenorm_v3_probe_500
+
+architecture_version: latent_feedback_prenorm_v3
+steps: 500
+slice_batch_size: 32
+grad_accum_steps: 1
+learning_rate: 5.0e-5
+weight_decay: 0.01
+weight_decay_2d_only: true
+scheduler_name: constant
+seed: 42
+
+log_every: 10
+gradient_monitor_every: 10
+checkpoint_every: 500
+resume_state_every: 500
+

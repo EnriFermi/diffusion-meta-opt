@@ -1,0 +1,65 @@
+{
+  "method": "joint robust-1k-bin piecewise-linear dynamic programming",
+  "metrics": [
+    "code_ordinal_loss",
+    "scale_ordinal_loss",
+    "hard_decode_raw_nrmse",
+    "diagnostic_old_behavioral_direction",
+    "diagnostic_old_structural_direction",
+    "diagnostic_old_direction_contrastive_loss",
+    "diagnostic_old_latent_interaction_rms_ratio",
+    "diagnostic_old_latent_rms",
+    "diagnostic_old_behavioral_operator_actual",
+    "grad_norm_pre_clip"
+  ],
+  "standardization": "median / (1.4826 * MAD)",
+  "minimum_segment_bins": 5,
+  "penalties": [
+    25.0,
+    30.0,
+    35.0,
+    40.0
+  ],
+  "segment_ends_by_penalty": {
+    "25.0": [
+      8000,
+      17000,
+      32000,
+      55000,
+      80000,
+      98000
+    ],
+    "30.0": [
+      8000,
+      17000,
+      32000,
+      89000,
+      98000
+    ],
+    "35.0": [
+      8000,
+      17000,
+      32000,
+      98000
+    ],
+    "40.0": [
+      8000,
+      17000,
+      32000,
+      98000
+    ]
+  },
+  "nonterminal_breakpoint_support": {
+    "8000": 4,
+    "17000": 4,
+    "32000": 4,
+    "55000": 1,
+    "80000": 1,
+    "89000": 1
+  },
+  "stable_breakpoints": [
+    8000,
+    17000,
+    32000
+  ]
+}

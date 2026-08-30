@@ -1,0 +1,39 @@
+paths:
+  checkpoint_manifest: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo/manifests/checkpoint_manifest.jsonl
+  dataset_pt_root: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo/dataset_pts
+  bank_root: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo/operator_dataset
+
+protocol:
+  tile_rows: 128
+  tile_cols: 128
+  activation_rows: 512
+  quantiles: 16
+  context_shard_records: 256
+  weight_shard_records: 512
+  checkpoint_splits: [train]
+  primary_checkpoint_indices: [43, 44]
+  permutation_views: 5
+  raw_dtype: float32
+  bank_dtype: float32
+
+capture:
+  train_images_per_checkpoint: 64
+  batch_size: 64
+  # The exact GPU/Torch/CUDA identity is persisted in the immutable bank
+  # contract. Raw rows and finalized arrays remain float32 CPU/NPY data.
+  context_summary_device: cuda:0
+  # Measured optimum for the small batched quantile/covariance reductions on
+  # the production H100 host. The effective value is hash-bound in the bank.
+  context_summary_cpu_threads: 4
+
+permutations:
+  equivalence_images: 8
+  atol: 0.00002
+  rtol: 0.00002
+
+loader:
+  batch_size: 8
+  workers: 8
+  prefetch_factor: 4
+  hot_shards: 8
+  profile_warmup_steps: 50

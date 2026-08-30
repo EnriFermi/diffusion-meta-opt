@@ -1,0 +1,40 @@
+defaults:
+  - /shared_runtime_environment: big_vae_artifacts
+  - _self_
+
+hydra:
+  job:
+    name: build_big_vae_latent_diffusion_dataset
+
+latent_diffusion_prior:
+  big_vae_checkpoint: ${oc.env:BIG_VAE_CHECKPOINT,${training_artifacts.big_vae_checkpoint_dir}/stage_1/latest.pt}
+latent_diffusion_dataset:
+  root_dir: ${oc.env:BIG_VAE_LATENT_DIFFUSION_DATASET_DIR,${training_artifacts.latent_diffusion_dataset_dir}/stage_1}
+  source_big_vae_offline_root: ${oc.env:BIG_VAE_OFFLINE_DATASET_DIR,${training_artifacts.big_vae_offline_dataset_base_dir}/stage_1/offline_dataset}
+  device: cuda:1
+  source:
+    shuffle_chunks: false
+    shuffle_records_within_chunk: false
+    seed: 42
+    weight_cache_size: 64
+    sampling_mode: random
+    sampling_group_keys: [dataset, model, layer_type, depth]
+    sampling_window_size: 2048
+    sampling_max_records_per_chunk_round: 8
+    x_chunk_cache_size: 4
+  builder:
+    overwrite_existing: true
+    chunk_size_records: 128
+    batch_size: 8
+    encode_batch_size: 1
+    target_T_patches: 4
+    target_d_out: 64
+    max_latent_records: 250000
+    max_slices_per_source_record: 1
+    distribution_match:
+      mode: source_proportional_joint
+      group_keys: [dataset, model, layer_type, layer]
+    store_decoder_aux_tensors: true
+    seed: 42
+    log_every_batches: 100
+    max_records: 0

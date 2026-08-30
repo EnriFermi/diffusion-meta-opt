@@ -1,0 +1,14 @@
+schema: weightclip_ae_v10_exact64_orthogonal_complement_v2
+base_run_config: conf/weightclip_benchmark/ae_v6_mandatory_bridge_posfilm_structural_b128_scale01_fresh_50k.yaml
+output_root: /mnt/shared/weightclip_benchmark/ae_v10_exact64_orthogonal_complement_v2_1984step
+run_id: weightclip_ae_v10_exact64_orthogonal_complement_v2_1984step
+seed: 42
+layer_key: layer3.0.conv2.weight
+operator_count: 64
+steps: 1984
+physical_batch: 6
+grad_accum_steps: 3
+eval_every_steps: 256
+eval_batch_size: 8
+log_every: 10
+comet_enabled: false

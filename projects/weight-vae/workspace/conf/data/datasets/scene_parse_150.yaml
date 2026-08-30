@@ -1,0 +1,42 @@
+name: scene_parse_150
+description: "Сценовые изображения ADE20K; задачи scene parsing и semantic segmentation."
+enabled: true
+gated: false
+sampling_weight: 1.0
+models:
+  - swinv2_base
+  - mask2former_swin_base
+  - grounding_dino_tiny
+  - deit_base
+  - beit_base
+collector_device: null
+
+hf:
+  repo: zhoubolei/scene_parse_150
+  subset: null
+  split: train
+  streaming: true
+  shuffle_buffer: 10000
+  trust_remote_code: true
+
+schema:
+  image_mode: image_field
+  image_field: image
+  image_field_candidates: [image, img]
+  url_field: null
+  url_field_candidates: []
+  id_field: null
+  extra_fields: []
+
+cache:
+  num_chunks_kept: 2
+  chunk_size_images: 256
+
+worker:
+  idle_sleep_s: 0.5
+  get_timeout_s: 5.0
+  request_timeout_s: 10
+  max_retries: 2
+  max_worker_restarts: 5
+
+licensing_note: "Use according to ADE20K/SceneParse150 terms in repository card."

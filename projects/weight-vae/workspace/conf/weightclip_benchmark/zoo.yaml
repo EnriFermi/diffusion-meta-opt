@@ -1,0 +1,36 @@
+paths:
+  official_train_archive: /home/coder/project/projects/shared/storage/data/weightclip_tans_raw/raw_m_train.tar.gz
+  official_ood_archive: /home/coder/project/projects/shared/storage/data/weightclip_tans_raw/raw_m_test.tar.gz
+  ood_dataset_pt_root: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo/ood_dataset_pts
+  cifar10_download_root: /home/coder/project/projects/shared/storage/data/weightclip_tans_raw/torchvision
+  dataset_pt_root: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo/dataset_pts
+  zoo_root: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo/checkpoints
+  manifest_root: /home/coder/project/projects/shared/storage/data/weightclip_resnet18slim_zoo/manifests
+  completed_land_use_probe: /home/coder/project/projects/shared/storage/artifacts/weightclip_protocol_probe_20260818
+  completed_land_use_probe_dataset: /home/coder/project/projects/shared/storage/data/weightclip_tans_raw/dataset_pts/land-cover-class-0-10/dataset.pt
+
+ood_materialization:
+  official_archive_sha256: 38bb8b7b03fad9b2291ffc521d708525d01c9297d668d63d3619f605df210eb3
+  cifar10_download: true
+  cifar10_validation_fraction: 0.1
+  cifar10_split_seed: 0
+
+protocol:
+  lineages_per_dataset: 50
+  epochs: 45
+  scheduler_epochs: 50
+  primary_checkpoint_indices: [43, 44]
+  archive_initialization: true
+  archive_every_epoch: true
+  lineage_split: [35, 7, 8]
+  lr_candidates: [0.05, 0.07, 0.1, 0.2, 0.3, 0.5, 0.7]
+  lr_sweep_seeds: 2
+  batch_size: 256
+  momentum: 0.9
+  weight_decay: 0.0005
+  dropout: 0.15
+  width_mult: 0.5
+  init_type: normal
+  grad_clip: 0.0
+  models_per_gpu: 4
+  seed_namespace: weightclip-resnet18slim-zoo-v1

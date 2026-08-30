@@ -1,0 +1,79 @@
+patch_size: 16
+beta: 0.001
+
+big_vae:
+  # legacy_v1: exact historical architecture/checkpoint layout.
+  # latent_feedback_postnorm_v2: shared latent->all-weight-token attention from
+  # encoder layer 1 onward, post-block encoder/decoder LayerNorms, and the
+  # normalized query stream for both output heads.
+  architecture_version: legacy_v1
+  latent_feedback_start_layer: 1
+  latent_feedback_attn_dim: 512
+  latent_feedback_n_heads: 16
+  distribution_encoder:
+    k_s: 64
+    Kq: 128
+    d_var: 256
+    d_dist: 256
+    num_var_attn_layers: 6
+    var_attn_heads: 4
+    dcn_num_cross_layers: 3
+    dcn_deep_hidden: 128
+    dcn_deep_layers: 3
+    dropout: 0.0
+    use_covariance: true
+    patch_size_for_cov: 16
+  patch_tokenizer:
+    # residual | conditioned_mlp
+    kind: conditioned_mlp
+    d_patch: 64
+    # null -> implementation default: 4 * d_patch
+    hidden_dim: null
+    # null -> implementation default: min(64, max(16, d_patch // 2))
+    cond_proj_dim: null
+    num_blocks: 2
+    # null -> inherit big_vae.dropout
+    dropout: null
+    # Used only when kind=residual.
+    residual_hidden_dim: 256
+    residual_num_layers: 3
+    residual_dropout: 0.0
+  d_model: 128
+  d_lat: 128
+  num_latents: 32
+  # true -> VAE (sampling + KL), false -> AE (deterministic z, KL term forced to 0 in train loop)
+  use_latent_sampling: true
+  # When true, keep a deterministic encoder mu-head active even if use_latent_sampling=false.
+  use_encoder_mu_head: true
+  # When false, feed raw encoder latent slots into to_mu/to_logvar instead of LayerNorm-normalized slots.
+  normalize_latent_slots_before_mu: true
+  # gaussian -> standard Normal prior
+  # vamp -> VampPrior-style learned mixture prior in latent space
+  latent_prior_kind: vamp
+  # Number of pseudo-components for latent_prior_kind=vamp.
+  vamp_prior_K: 64
+  # linear -> current single linear projection for decoder query conditioning
+  # mlp -> decoder-only MLP over [positional_query_base, dist_patch_by_patch]
+  decoder_query_conditioning_kind: mlp
+  decoder_query_conditioning_hidden_mult: 2.0
+  # raw -> legacy unnormalized integer coordinates for 2D RoPE
+  # normalized_center -> centered coordinates (i + 0.5) / size for better size stability
+  rope_2d_coord_kind: normalized_center
+  # Posterior std is gate * exp(0.5 * logvar_head(...)); this floor keeps KL finite at gate ~= 0.
+  latent_sampling_min_std: 1e-4
+  latent_sampling_logvar_min: -2
+  latent_sampling_logvar_max: 2
+  num_encoder_layers: 15
+  num_decoder_layers: 6
+  n_heads: 8
+  ffn_mult: 4.0
+  dropout: 0.0
+  pos_fourier_dim: 256
+  disable_z_shortcut: true
+  disable_distribution_encoder: false
+  # legacy -> existing pooled-var injection + latent delta
+  # token_adapter -> per-layer gated residual conditioning on dist_patch_by_patch
+  distribution_encoder_conditioning_kind: token_adapter
+  encoder:
+    self_attn_mode: full
+    cross_attend_only_cls: false

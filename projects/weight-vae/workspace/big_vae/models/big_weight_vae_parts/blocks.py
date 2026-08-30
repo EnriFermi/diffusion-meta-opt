@@ -1,0 +1,510 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from big_vae.models.distribution_encoder import DistributionConfig, InputDistributionEncodingModule
+from big_vae.models.mini_patch_vae import MiniVAEConfig
+from big_vae.models.patch_tokenizers import MixerPatchTokenizer, PatchConditionedMLPTokenizer, ResidualPatchTokenizer
+from big_vae.models.vae_shared import (
+    CrossAttnBlock,
+    MLP,
+    NonAffineRMSNorm,
+    PerceiverResamplerBlock,
+    _apply_sequence_mask,
+    _decode_direction_and_logscale,
+    _key_padding_to_attn_bias,
+    _rope_attention,
+    sinusoidal_embedding,
+)
+
+from big_vae.models.big_weight_vae_parts.config import *
+
+class LocalOutputSelfAttentionBlock(nn.Module):
+    """Local attention within one output-column token group, with RoPE on patch positions."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        ffn_mult: float,
+        dropout: float,
+        self_attn_mode: str,
+        *,
+        qk_norm: bool = False,
+        peri_rms_residual: bool = False,
+        residual_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if self_attn_mode not in {"full", "cls_only"}:
+            raise ValueError(f"encoder.self_attn_mode must be 'full' or 'cls_only', got {self_attn_mode}")
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+
+        self.self_attn_mode = self_attn_mode
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.norm_attn = nn.LayerNorm(d_model)
+        self.norm_ffn = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.attn_prob_dropout_p = float(dropout)
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        hidden = max(1, int(d_model * ffn_mult))
+        self.ffn = MLP(d_model, hidden, d_model, dropout=dropout)
+        self.qk_norm_enabled = bool(qk_norm)
+        self.peri_rms_residual = bool(peri_rms_residual)
+        self.residual_scale = float(residual_scale)
+        if self.residual_scale <= 0.0:
+            raise ValueError(f"residual_scale must be positive, got {residual_scale}")
+        self.q_norm_projected = NonAffineRMSNorm(self.head_dim) if self.qk_norm_enabled else nn.Identity()
+        self.k_norm_projected = NonAffineRMSNorm(self.head_dim) if self.qk_norm_enabled else nn.Identity()
+        self.attn_return_norm = NonAffineRMSNorm(d_model) if self.peri_rms_residual else nn.Identity()
+        self.ffn_return_norm = NonAffineRMSNorm(d_model) if self.peri_rms_residual else nn.Identity()
+
+    def forward(self, tokens: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
+        B, S, _ = tokens.shape
+        h = self.norm_attn(tokens)
+        pos = torch.arange(S, device=tokens.device, dtype=torch.float32)
+        attn_mask = (
+            _key_padding_to_attn_bias(token_mask.to(device=tokens.device, dtype=torch.bool), dtype=h.dtype)
+            if token_mask is not None
+            else None
+        )
+
+        q_all = self.q_proj(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k_all = self.k_proj(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        v_all = self.v_proj(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        q_all = self.q_norm_projected(q_all)
+        k_all = self.k_norm_projected(k_all)
+
+        if self.self_attn_mode == "full":
+            attn_out = _rope_attention(
+                q=q_all,
+                k=k_all,
+                v=v_all,
+                q_pos=pos,
+                k_pos=pos,
+                dropout_p=self.attn_prob_dropout_p,
+                training=self.training,
+                attn_mask=attn_mask,
+            )
+        else:
+            cls_out = _rope_attention(
+                q=q_all[:, :, 0:1, :],
+                k=k_all,
+                v=v_all,
+                q_pos=pos[0:1],
+                k_pos=pos,
+                dropout_p=self.attn_prob_dropout_p,
+                training=self.training,
+                attn_mask=attn_mask,
+            )
+            patch_out = _rope_attention(
+                q=q_all[:, :, 1:, :],
+                k=k_all[:, :, 0:1, :],
+                v=v_all[:, :, 0:1, :],
+                q_pos=pos[1:],
+                k_pos=pos[0:1],
+                dropout_p=self.attn_prob_dropout_p,
+                training=self.training,
+            )
+            attn_out = torch.cat([cls_out, patch_out], dim=2)
+
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.d_model)
+        attn_return = self.dropout(self.out_proj(attn_out))
+        if self.peri_rms_residual:
+            attn_return = self.attn_return_norm(attn_return) * self.residual_scale
+        tokens = tokens + attn_return
+        tokens = _apply_sequence_mask(tokens, token_mask)
+        ffn_return = self.dropout(self.ffn(self.norm_ffn(tokens)))
+        if self.peri_rms_residual:
+            ffn_return = self.ffn_return_norm(ffn_return) * self.residual_scale
+        tokens = tokens + ffn_return
+        return _apply_sequence_mask(tokens, token_mask)
+
+
+class TokenConditioningAdapter(nn.Module):
+    """Token-wise residual conditioning for encoder patch tokens."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        d_y: int,
+        dropout: float,
+        d_hidden: int | None = None,
+        d_gate: int | None = None,
+        single_gate_v3: bool = False,
+        peri_rms_residual: bool = False,
+        residual_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        hidden_dim = int(d_hidden) if d_hidden is not None else int(4 * d_model)
+        gate_dim = int(d_gate) if d_gate is not None else int(d_model)
+
+        self.y_proj = nn.Linear(d_y, d_model)
+        self.h_norm = nn.LayerNorm(d_model)
+        self.c_norm = nn.LayerNorm(d_model)
+
+        self.mix_h = nn.Linear(d_model, hidden_dim)
+        self.mix_c = nn.Linear(d_model, hidden_dim)
+        self.mix_out = nn.Linear(hidden_dim, d_model)
+
+        self.gate_h = nn.Linear(d_model, gate_dim)
+        self.gate_c = nn.Linear(d_model, gate_dim)
+        self.gate_out = nn.Linear(gate_dim, d_model)
+
+        self.single_gate_v3 = bool(single_gate_v3)
+        if self.single_gate_v3:
+            self.register_parameter("alpha", None)
+        else:
+            self.alpha = nn.Parameter(torch.full((1,), 1e-3))
+        self.conditioning_dropout = nn.Dropout(dropout)
+        self.peri_rms_residual = bool(peri_rms_residual)
+        self.residual_scale = float(residual_scale)
+        if self.residual_scale <= 0.0:
+            raise ValueError(f"residual_scale must be positive, got {residual_scale}")
+        self.return_norm = NonAffineRMSNorm(d_model) if self.peri_rms_residual else nn.Identity()
+
+        if self.single_gate_v3:
+            nn.init.zeros_(self.gate_out.weight)
+            nn.init.constant_(self.gate_out.bias, math.log(0.2 / 0.8))
+        else:
+            nn.init.zeros_(self.mix_out.weight)
+            nn.init.zeros_(self.mix_out.bias)
+            nn.init.constant_(self.gate_out.bias, -2.0)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        y_ctx: torch.Tensor,
+        map_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        if h.ndim != 3:
+            raise ValueError(f"h must be [B, T_x, d_model], got {tuple(h.shape)}")
+        if y_ctx.ndim != 3:
+            raise ValueError(f"y_ctx must be [B, T_y, d_y], got {tuple(y_ctx.shape)}")
+        if map_idx.ndim != 2:
+            raise ValueError(f"map_idx must be [B, T_x], got {tuple(map_idx.shape)}")
+        if int(h.shape[0]) != int(y_ctx.shape[0]) or int(h.shape[0]) != int(map_idx.shape[0]):
+            raise ValueError(
+                "Batch size mismatch between h, y_ctx, and map_idx: "
+                f"{tuple(h.shape)}, {tuple(y_ctx.shape)}, {tuple(map_idx.shape)}"
+            )
+        if int(h.shape[1]) != int(map_idx.shape[1]):
+            raise ValueError(
+                f"map_idx token length must match h token length, got {tuple(map_idx.shape)} vs {tuple(h.shape)}"
+            )
+
+        gather_idx = map_idx.to(device=y_ctx.device, dtype=torch.long).clamp(min=0, max=max(0, int(y_ctx.shape[1]) - 1))
+        y_match = y_ctx.gather(dim=1, index=gather_idx.unsqueeze(-1).expand(-1, -1, int(y_ctx.shape[2])))
+
+        c = self.y_proj(y_match)
+        c = self.conditioning_dropout(c)
+
+        h_n = self.h_norm(h)
+        c_n = self.c_norm(c)
+
+        mixed = F.gelu(self.mix_h(h_n) + self.mix_c(c_n))
+        residual = self.mix_out(mixed)
+        if self.peri_rms_residual:
+            residual = self.return_norm(residual) * self.residual_scale
+
+        gate_in = F.gelu(self.gate_h(h_n) + self.gate_c(c_n))
+        gate = torch.sigmoid(self.gate_out(gate_in))
+        if self.single_gate_v3:
+            return h + gate * residual
+        assert self.alpha is not None
+        return h + self.alpha * gate * residual
+
+
+class LatentEncoderLayer(nn.Module):
+    """
+    One big-encoder block:
+    1) local per-output attention over [CLS_o, patches_o]
+    2) Perceiver Resampler over the resulting tokens
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_lat: int,
+        n_heads: int,
+        ffn_mult: float,
+        dropout: float,
+        self_attn_mode: str,
+        use_rope_2d: bool = False,
+        rope_2d_coord_kind: str = "normalized_center",
+        qk_norm: bool = False,
+        peri_rms_residual: bool = False,
+        weight_residual_scale: float = 1.0,
+        latent_residual_scale: float = 1.0,
+        mandatory_cross_refresh: bool = False,
+        cross_refresh_rms: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if d_lat % n_heads != 0:
+            raise ValueError(f"d_lat ({d_lat}) must be divisible by n_heads ({n_heads})")
+        self.rope_2d_coord_kind = _normalize_rope_2d_coord_kind(rope_2d_coord_kind)
+
+        self.local_block = LocalOutputSelfAttentionBlock(
+            d_model=d_model,
+            n_heads=n_heads,
+            ffn_mult=ffn_mult,
+            dropout=dropout,
+            self_attn_mode=self_attn_mode,
+            qk_norm=qk_norm,
+            peri_rms_residual=peri_rms_residual,
+            residual_scale=weight_residual_scale,
+        )
+        self.perceiver_block = PerceiverResamplerBlock(
+            d_latent=d_lat,
+            d_token=d_model,
+            n_heads=n_heads,
+            dropout=dropout,
+            use_rope_2d=use_rope_2d,
+            qk_norm=qk_norm,
+            peri_rms_residual=peri_rms_residual,
+            residual_scale=latent_residual_scale,
+            mandatory_cross_refresh=mandatory_cross_refresh,
+            cross_refresh_rms=cross_refresh_rms,
+        )
+
+    def forward(
+        self,
+        tokens_by_output: torch.Tensor,
+        latents: torch.Tensor,
+        cross_attend_only_cls: bool,
+        patch_conditioner: TokenConditioningAdapter | None = None,
+        patch_conditioning_ctx: torch.Tensor | None = None,
+        patch_conditioning_map_idx: torch.Tensor | None = None,
+        token_valid_mask: torch.Tensor | None = None,
+        output_valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, d_out, L_local, d_model = tokens_by_output.shape
+
+        local_in = tokens_by_output.reshape(B * d_out, L_local, d_model)
+        local_mask = token_valid_mask.reshape(B * d_out, L_local) if token_valid_mask is not None else None
+        local_out = self.local_block(local_in, token_mask=local_mask)
+        tokens = local_out.reshape(B, d_out, L_local, d_model)
+        if patch_conditioner is not None:
+            if patch_conditioning_ctx is None or patch_conditioning_map_idx is None:
+                raise ValueError("patch conditioning context and map_idx are required when patch_conditioner is set")
+            patch_tokens = tokens[:, :, 1:, :].reshape(B * d_out, L_local - 1, d_model)
+            patch_tokens = patch_conditioner(
+                h=patch_tokens,
+                y_ctx=patch_conditioning_ctx,
+                map_idx=patch_conditioning_map_idx,
+            )
+            if local_mask is not None:
+                patch_tokens = _apply_sequence_mask(patch_tokens, local_mask[:, 1:])
+            tokens = torch.cat(
+                [
+                    tokens[:, :, :1, :],
+                    patch_tokens.reshape(B, d_out, L_local - 1, d_model),
+                ],
+                dim=2,
+            )
+
+        device = tokens.device
+        if cross_attend_only_cls:
+            kv = tokens[:, :, 0, :]
+            token_pos_o = _make_rope_axis_positions(
+                d_out,
+                device=device,
+                coord_kind=self.rope_2d_coord_kind,
+            )
+            token_pos_t = _make_rope_positions(
+                torch.zeros(d_out, device=device, dtype=torch.float32),
+                axis_size=L_local,
+                coord_kind=self.rope_2d_coord_kind,
+            )
+            kv_mask = output_valid_mask
+        else:
+            kv = tokens.reshape(B, d_out * L_local, d_model)
+            token_pos_o = _make_rope_positions(
+                torch.arange(d_out, device=device, dtype=torch.float32).repeat_interleave(L_local),
+                axis_size=d_out,
+                coord_kind=self.rope_2d_coord_kind,
+            )
+            token_pos_t = _make_rope_positions(
+                torch.arange(L_local, device=device, dtype=torch.float32).repeat(d_out),
+                axis_size=L_local,
+                coord_kind=self.rope_2d_coord_kind,
+            )
+            kv_mask = None if token_valid_mask is None else token_valid_mask.reshape(B, d_out * L_local)
+            if kv_mask is not None and output_valid_mask is not None:
+                kv_mask = kv_mask & output_valid_mask.unsqueeze(-1).expand(-1, -1, L_local).reshape(B, d_out * L_local)
+
+        L = latents.shape[1]
+        latent_pos = (torch.arange(L, device=device, dtype=torch.float32) + 0.5) / max(float(L), 1.0)
+        latents = self.perceiver_block(
+            latents=latents,
+            tokens=kv,
+            latent_pos=latent_pos,
+            token_pos=token_pos_o,
+            token_pos2=token_pos_t,
+            token_mask=kv_mask,
+        )
+        return tokens, latents
+
+
+class LatentToWeightFeedback(nn.Module):
+    """Shared latent -> all-weight-token cross-attention used between encoder layers."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        d_lat: int,
+        attn_dim: int,
+        n_heads: int,
+        dropout: float,
+        qk_norm: bool = False,
+        peri_rms_residual: bool = False,
+        residual_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if attn_dim <= 0 or attn_dim % n_heads != 0:
+            raise ValueError(
+                f"latent feedback attn_dim ({attn_dim}) must be positive and divisible by n_heads ({n_heads})"
+            )
+        self.q_norm = nn.LayerNorm(d_model)
+        self.kv_norm = nn.LayerNorm(d_lat)
+        self.q_in = nn.Linear(d_model, attn_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=attn_dim,
+            num_heads=n_heads,
+            kdim=d_lat,
+            vdim=d_lat,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.out = nn.Linear(attn_dim, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.attn_dim = int(attn_dim)
+        self.n_heads = int(n_heads)
+        self.head_dim = self.attn_dim // self.n_heads
+        self.qk_norm_enabled = bool(qk_norm)
+        self.peri_rms_residual = bool(peri_rms_residual)
+        self.residual_scale = float(residual_scale)
+        if self.residual_scale <= 0.0:
+            raise ValueError(f"residual_scale must be positive, got {residual_scale}")
+        self.q_norm_projected = NonAffineRMSNorm(self.head_dim) if self.qk_norm_enabled else nn.Identity()
+        self.k_norm_projected = NonAffineRMSNorm(self.head_dim) if self.qk_norm_enabled else nn.Identity()
+        self.return_norm = NonAffineRMSNorm(d_model) if self.peri_rms_residual else nn.Identity()
+
+    def _qk_normalized_attention(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        q_weight = self.attn.q_proj_weight
+        k_weight = self.attn.k_proj_weight
+        v_weight = self.attn.v_proj_weight
+        if q_weight is None or k_weight is None or v_weight is None:
+            raise RuntimeError("v4 feedback expects separate Q/K/V projection weights")
+        projection_bias = self.attn.in_proj_bias
+        if projection_bias is None:
+            q_bias = k_bias = v_bias = None
+        else:
+            q_bias, k_bias, v_bias = projection_bias.chunk(3)
+        batch_size, query_length, _ = q.shape
+        key_length = int(kv.shape[1])
+        q_projected = F.linear(q, q_weight, q_bias)
+        k_projected = F.linear(kv, k_weight, k_bias)
+        v_projected = F.linear(kv, v_weight, v_bias)
+        q_heads = q_projected.view(batch_size, query_length, self.n_heads, self.head_dim).transpose(1, 2)
+        k_heads = k_projected.view(batch_size, key_length, self.n_heads, self.head_dim).transpose(1, 2)
+        v_heads = v_projected.view(batch_size, key_length, self.n_heads, self.head_dim).transpose(1, 2)
+        q_heads = self.q_norm_projected(q_heads)
+        k_heads = self.k_norm_projected(k_heads)
+        attention_dropout = float(self.attn.dropout) if self.training else 0.0
+        output = F.scaled_dot_product_attention(
+            q_heads,
+            k_heads,
+            v_heads,
+            dropout_p=attention_dropout,
+            is_causal=False,
+        )
+        output = output.transpose(1, 2).contiguous().view(batch_size, query_length, self.attn_dim)
+        return F.linear(output, self.attn.out_proj.weight, self.attn.out_proj.bias)
+
+    def forward(
+        self,
+        tokens_by_output: torch.Tensor,
+        latents: torch.Tensor,
+        *,
+        token_valid_mask: torch.Tensor | None = None,
+        output_valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, d_out, local_length, d_model = tokens_by_output.shape
+        flat_tokens = tokens_by_output.reshape(B, d_out * local_length, d_model)
+        q = self.q_in(self.q_norm(flat_tokens))
+        kv = self.kv_norm(latents)
+        if self.qk_norm_enabled:
+            feedback = self._qk_normalized_attention(q, kv)
+        else:
+            feedback, _ = self.attn(q, kv, kv, need_weights=False)
+        feedback_return = self.dropout(self.out(feedback))
+        if self.peri_rms_residual:
+            feedback_return = self.return_norm(feedback_return) * self.residual_scale
+        flat_tokens = flat_tokens + feedback_return
+
+        flat_mask: torch.Tensor | None = None
+        if token_valid_mask is not None:
+            flat_mask = token_valid_mask.reshape(B, d_out * local_length)
+        if output_valid_mask is not None:
+            output_mask = output_valid_mask.unsqueeze(-1).expand(-1, -1, local_length).reshape(
+                B, d_out * local_length
+            )
+            flat_mask = output_mask if flat_mask is None else flat_mask & output_mask
+        flat_tokens = _apply_sequence_mask(flat_tokens, flat_mask)
+        return flat_tokens.reshape(B, d_out, local_length, d_model)
+
+
+class DecoderCrossBlock(nn.Module):
+    """Decoder block with query-to-latent cross-attention only."""
+
+    def __init__(self, d_model: int, d_lat: int, n_heads: int, ffn_mult: float, dropout: float) -> None:
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_lat)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            kdim=d_lat,
+            vdim=d_lat,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.norm_ffn = nn.LayerNorm(d_model)
+        hidden = max(1, int(d_model * ffn_mult))
+        self.ffn = MLP(d_model, hidden, d_model, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, q_tokens: torch.Tensor, z_latents: torch.Tensor) -> torch.Tensor:
+        q = self.norm_q(q_tokens)
+        kv = self.norm_kv(z_latents)
+        cross_out, _ = self.cross_attn(q, kv, kv, need_weights=False)
+        q_tokens = q_tokens + self.dropout(cross_out)
+        q_tokens = q_tokens + self.dropout(self.ffn(self.norm_ffn(q_tokens)))
+        return q_tokens
+
+__all__ = [
+    'LocalOutputSelfAttentionBlock',
+    'TokenConditioningAdapter',
+    'LatentEncoderLayer',
+    'LatentToWeightFeedback',
+    'DecoderCrossBlock',
+]

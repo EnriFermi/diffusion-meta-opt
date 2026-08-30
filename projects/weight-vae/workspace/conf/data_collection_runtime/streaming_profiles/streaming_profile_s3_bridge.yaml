@@ -1,0 +1,8 @@
+defaults:
+  - streaming_common_settings
+  - _self_
+
+mode: s3_bridge
+
+producer:
+  refill_after_consumed_chunks: 250

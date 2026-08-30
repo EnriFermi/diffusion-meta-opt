@@ -1,0 +1,43 @@
+name: cord_v2
+description: "Изображения кассовых чеков; задача извлечения структурированных полей из документов."
+enabled: true
+gated: false
+sampling_weight: 1.0
+models:
+  - donut_base
+  - trocr_base_printed
+  - blip_image_captioning_base
+  - clip_vit_b32
+  - dinov2_base
+collector_device: null
+
+hf:
+  repo: naver-clova-ix/cord-v2
+  subset: null
+  split: train
+  streaming: true
+  shuffle_buffer: 1000
+  trust_remote_code: false
+  stream_via_datasets_server: false
+
+schema:
+  image_mode: image_field
+  image_field: image
+  image_field_candidates: [image, img, pixel_values, jpg, png]
+  url_field: null
+  url_field_candidates: []
+  id_field: null
+  extra_fields: []
+
+cache:
+  num_chunks_kept: 2
+  chunk_size_images: 256
+
+worker:
+  idle_sleep_s: 0.5
+  get_timeout_s: 5.0
+  request_timeout_s: 10
+  max_retries: 2
+  max_worker_restarts: 5
+
+licensing_note: "CC BY 4.0 (check dataset card)."

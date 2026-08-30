@@ -1,0 +1,42 @@
+name: visual_genome
+description: "Фотографии с region-level описаниями; задачи grounding, captioning и scene understanding."
+enabled: true
+gated: false
+sampling_weight: 1.0
+models:
+  - clip_vit_b32
+  - dinov2_base
+  - dinov2_vits14
+  - grounding_dino_tiny
+  - blip_image_captioning_base
+collector_device: null
+
+hf:
+  repo: ranjaykrishna/visual_genome
+  subset: region_descriptions_v1.2.0
+  split: train
+  streaming: true
+  shuffle_buffer: 10000
+  trust_remote_code: true
+
+schema:
+  image_mode: url_field
+  image_field: null
+  image_field_candidates: []
+  url_field: image_url
+  url_field_candidates: [image_url, imageURL, url, flickr_url]
+  id_field: image_id
+  extra_fields: [phrase, region_id]
+
+cache:
+  num_chunks_kept: 2
+  chunk_size_images: 256
+
+worker:
+  idle_sleep_s: 0.5
+  get_timeout_s: 5.0
+  request_timeout_s: 10
+  max_retries: 2
+  max_worker_restarts: 5
+
+licensing_note: "Requires trust_remote_code and Visual Genome licensing compliance."

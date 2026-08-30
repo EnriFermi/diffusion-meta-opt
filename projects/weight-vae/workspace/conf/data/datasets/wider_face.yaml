@@ -1,0 +1,42 @@
+name: wider_face
+description: "Фотографии с лицами в сложных сценах; задача face detection."
+enabled: true
+gated: false
+sampling_weight: 1.0
+models:
+  - clip_vit_b32
+  - dinov2_vits14
+  - swinv2_base
+  - grounding_dino_tiny
+  - mask2former_swin_base
+collector_device: null
+
+hf:
+  repo: CUHK-CSE/wider_face
+  subset: null
+  split: train
+  streaming: false
+  shuffle_buffer: 10000
+  trust_remote_code: true
+
+schema:
+  image_mode: image_field
+  image_field: image
+  image_field_candidates: [image, img, pixel_values, jpg, png]
+  url_field: null
+  url_field_candidates: []
+  id_field: null
+  extra_fields: [faces]
+
+cache:
+  num_chunks_kept: 2
+  chunk_size_images: 256
+
+worker:
+  idle_sleep_s: 0.5
+  get_timeout_s: 5.0
+  request_timeout_s: 10
+  max_retries: 2
+  max_worker_restarts: 5
+
+licensing_note: "CC BY-NC-ND 4.0 (non-commercial/no-derivatives)."

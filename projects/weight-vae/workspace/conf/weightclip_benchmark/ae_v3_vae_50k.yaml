@@ -1,0 +1,26 @@
+schema: weightclip_ae_v3_vae_50k_v1
+
+base_resolved_config: /home/coder/project/projects/shared/storage/artifacts/weightclip_benchmark/ae_704m_lat384_feedback_v2_production_500k/config_resolved_v2.json
+output_root: /home/coder/project/projects/shared/storage/artifacts/weightclip_benchmark/ae_725m_lat384_prenorm_v3_vae_50k
+
+architecture_version: latent_feedback_prenorm_v3
+training_horizon_steps: 500000
+stop_after_step: 50000
+slice_batch_size: 32
+grad_accum_steps: 1
+learning_rate: 5.0e-5
+weight_decay: 0.01
+weight_decay_2d_only: true
+scheduler_name: constant
+seed: 42
+
+# KL is mean-reduced over the 32*384 latent coordinates.  This value is
+# finalized by the real-batch component-gradient calibration before launch.
+kl_beta: 10.0
+sampling_gate_start_step: 0
+sampling_gate_ramp_steps: 20000
+
+log_every: 10
+gradient_monitor_every: 100
+checkpoint_every: 10000
+resume_state_every: 1000

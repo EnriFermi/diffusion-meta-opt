@@ -1,0 +1,41 @@
+schema: weightclip_ae_v6_two_operator_causal_bundle_v1
+base_two_operator_config: conf/weightclip_benchmark/ae_v6_two_operator_overfit_2000step.yaml
+steps: 500
+eval_every_steps: 100
+checkpoint_every: 500
+log_every: 10
+seed: 42
+
+# The interrupted mixed V6 run produced a valid immutable step-500 model and
+# evaluation row before its later resume-state write was stopped. This path is
+# documentary only; the launcher never reads or resumes it.
+existing_v6_baseline_step500: /mnt/shared/weightclip_benchmark/ae_v6_two_full_operator_posfilm_overfit_2000step/checkpoints/train/weightclip_ae_v6_two_full_operator_posfilm_overfit_2000step/stage_1/step_0000500.pt
+
+arms:
+  mixed:
+    output_root: /mnt/shared/weightclip_benchmark/ae_v6_two_op_causal_mixed_500step
+    run_id: weightclip_ae_v6_two_op_causal_mixed_500step
+  alternating_homogeneous:
+    output_root: /mnt/shared/weightclip_benchmark/ae_v6_two_op_causal_alternating_homogeneous_500step
+    run_id: weightclip_ae_v6_two_op_causal_alternating_homogeneous_500step
+    homogeneous_first_operator: 0
+  cyclic_singleton:
+    output_root: /mnt/shared/weightclip_benchmark/ae_v6_two_op_causal_cyclic_singleton_504step
+    run_id: weightclip_ae_v6_two_op_causal_cyclic_singleton_504step
+    steps: 504
+  centered_value:
+    output_root: /mnt/shared/weightclip_benchmark/ae_v6_two_op_causal_centered_value_500step
+    run_id: weightclip_ae_v6_two_op_causal_centered_value_500step
+  zero_common_bias:
+    output_root: /mnt/shared/weightclip_benchmark/ae_v6_two_op_causal_zero_common_bias_500step
+    run_id: weightclip_ae_v6_two_op_causal_zero_common_bias_500step
+    zero_all_return_biases: false
+    freeze_zeroed_biases: true
+  mandatory_cross_refresh:
+    output_root: /mnt/shared/weightclip_benchmark/ae_v7_two_op_causal_mandatory_cross_refresh_500step
+    run_id: weightclip_ae_v7_two_op_causal_mandatory_cross_refresh_500step
+    cross_refresh_rms: 1.0
+  clean_content_readout:
+    output_root: /mnt/shared/weightclip_benchmark/ae_v8_two_op_clean_content_readout_500step
+    run_id: weightclip_ae_v8_two_op_clean_content_readout_500step
+    fixed_x_w_swap_dir_delta_min: 0.03

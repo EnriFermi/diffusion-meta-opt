@@ -1,0 +1,18 @@
+defaults:
+  - streaming_common_settings
+  - _self_
+
+mode: local_disk
+
+# Make first ready chunks appear quickly; 256 is too heavy for layer-level samples.
+chunk_size_samples: 64
+
+producer:
+  ready_store_max_chunks: 400
+  refill_after_consumed_chunks: 200
+  # Keep window narrow so emitted samples quickly reach `chunk_size_samples`.
+  # Large values (e.g. inherited via refill window) can delay first ready chunks.
+  stripe_window_chunks: 1
+
+consumer:
+  randomize_chunk_order: true

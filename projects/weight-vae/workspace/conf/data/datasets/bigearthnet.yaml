@@ -1,0 +1,39 @@
+name: bigearthnet
+description: "Remote sensing image classification (BigEarthNet RGB subset)."
+enabled: true
+gated: true
+sampling_weight: 1.0
+models:
+  - vit_large_p16_224
+  - siglip_so400m_p14_384
+collector_device: null
+
+hf:
+  repo: danielz01/BigEarthNet-S2-v1.0
+  subset: s2-rgb
+  split: train
+  streaming: true
+  shuffle_buffer: 1000
+  trust_remote_code: false
+
+schema:
+  image_mode: image_field
+  image_field: img
+  image_field_candidates: [img, image, pixel_values, jpg, png]
+  url_field: null
+  url_field_candidates: []
+  id_field: id
+  extra_fields: [labels]
+
+cache:
+  num_chunks_kept: 2
+  chunk_size_images: 256
+
+worker:
+  idle_sleep_s: 0.5
+  get_timeout_s: 5.0
+  request_timeout_s: 10
+  max_retries: 2
+  max_worker_restarts: 5
+
+licensing_note: "BigEarthNet terms may require accepted access; use HF token with granted access."

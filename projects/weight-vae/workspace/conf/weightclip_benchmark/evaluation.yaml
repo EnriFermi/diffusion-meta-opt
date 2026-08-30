@@ -1,0 +1,66 @@
+experiment_id: weightclip_resnet18slim_v1
+
+runtime:
+  device: cuda
+  dtype: float32
+  verbose: true
+  cache_mode: content_addressed
+
+# Project-specific callables. Each generator writes a candidate manifest, then
+# this shared launcher applies exactly one of the frozen estimators.
+adapter:
+  model_factory: big_vae.weightclip_benchmark.runtime_factories:build_model
+  loaders_factory: big_vae.weightclip_benchmark.runtime_factories:build_loaders
+
+official_weightclip:
+  repo_path: /home/coder/project/projects/shared/compatibility/external/weightclip
+  cache_dir: /home/coder/project/projects/shared/storage/models/weightclip_official
+  git_url: https://github.com/HSG-AIML/weightCLIP.git
+  git_commit: be080677a6eceacdbe3b2823caffe3c0cc73fa7e
+  hf_repo: aasefaw/WeightCLIP
+  hf_revision: cb672e6fe1b56e929705d1b6b2eb6635fcc1e604
+  checkpoint_path: /home/coder/project/projects/shared/storage/models/weightclip_official/aasefaw--WeightCLIP/cb672e6fe1b56e929705d1b6b2eb6635fcc1e604/checkpoints/resnet18/checkpoint.pt
+  checkpoint_sha256: 73b2a5de1a9a167145ecdfe3684725c9094ed766156589d4a00647e21128d95a
+  dataset_encoder_path: /home/coder/project/projects/shared/storage/models/weightclip_official/aasefaw--WeightCLIP/cb672e6fe1b56e929705d1b6b2eb6635fcc1e604/checkpoints/resnet18/dataset_encoder.pt
+  dataset_encoder_sha256: 9b507ba96c0d5afd400c32ca760a134127c6ed2a0301a97db6f41e151d601b26
+  dataset_prompt_images: 10
+  image_shape: [3, 32, 32]
+  image_range: [-1.0, 1.0]
+
+evaluation:
+  # Controlled runs override only the declared method-specific BN policy.
+  head_policy: fresh_default_random_paired_seed
+  batchnorm_policy: architecture_default_then_common_calibration
+  head_module_path: fc
+  controlled_candidate_count: 100
+  controlled_top_k: 5
+  native_candidate_count: 100
+  native_top_k: 5
+  batch_size: 10
+  num_workers: 4
+  loader_seed: 0
+  evaluation_seeds: [0, 42, 777]
+  model_dropout: 0.15
+  pin_memory: true
+
+# Must be populated with content-addressed dataset.pt references before an
+# evaluation launch. Missing entries are fatal; there is no synthetic fallback.
+datasets: {}
+
+fine_tuning:
+  epochs: 10
+  learning_rate: 0.00015
+  momentum: 0.9
+  weight_decay: 0.0
+  bn_calibration_batches: 200
+
+protocol_labels:
+  primary: controlled_single
+  secondary: controlled_validation_best_k
+  native_oracle: native_test_top5_oracle
+
+weightclip_baseline_scope:
+  full_model_label: WeightCLIP codec + common-zoo full-window prior
+  released_mapper_or_bank: false
+  exact_released_single_window_downstream_baseline: unavailable
+  reason: released mapping path emits one fixed 512-token window while ResNet18Slim requires the complete multi-window checkpoint

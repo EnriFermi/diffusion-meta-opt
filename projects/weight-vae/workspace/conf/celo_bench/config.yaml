@@ -1,0 +1,46 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    name: celo_bench
+
+benchmark:
+  run_label: celo_paper_17
+  artifact_root: ${oc.env:CELO_BENCH_ARTIFACT_ROOT,./artifacts/celo_bench}
+  run_dir: ""
+  cache_first: true
+  force_rerun: false
+  continue_on_task_error: false
+  show_progress: true
+  log_level: INFO
+  dry_run: false
+
+runtime:
+  device: auto
+  dtype: float32
+  seed: 0
+  xla_preallocate: "false"
+  tensorflow_hide_gpus: true
+  tfds_try_gcs_for_wikipedia: true
+
+tasks:
+  preset: celo_paper_17
+  enabled: null
+
+evaluation:
+  steps: 2000
+  seeds: [0, 1, 2]
+  eval_every: 10
+  eval_batches: 5
+  last_eval_batches: 10
+  metrics_every: 10
+  score_split: eval/train/loss
+  ema_alpha: 0.9
+
+adam_reference:
+  enabled: true
+  lrs: [1e-7, 3e-7, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0]
+
+methods:
+  items: []

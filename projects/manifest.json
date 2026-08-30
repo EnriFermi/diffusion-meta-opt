@@ -1,0 +1,50 @@
+{
+  "schema_version": 3,
+  "layout": "research_domain",
+  "domains": ["weight-vae", "cfm", "lsdl", "unclassified", "shared"],
+  "policy": {
+    "canonical_directories_live_under_projects": true,
+    "compatibility_alias_type": "relative_symlink",
+    "compatibility_boundary": "repository_root",
+    "environment_mount_exception": "workflow_data"
+  },
+  "entries": [
+    {"domain": "weight-vae", "name": "benchmark", "view": "projects/weight-vae/workspace/benchmark", "compatibility_alias": "benchmark"},
+    {"domain": "weight-vae", "name": "big-vae", "view": "projects/weight-vae/workspace/big_vae", "compatibility_alias": "big_vae"},
+    {"domain": "weight-vae", "name": "config", "view": "projects/weight-vae/workspace/conf", "compatibility_alias": "conf"},
+    {"domain": "weight-vae", "name": "data-pipeline", "view": "projects/weight-vae/workspace/dataset", "compatibility_alias": "dataset"},
+    {"domain": "weight-vae", "name": "docs", "view": "projects/weight-vae/workspace/docs", "compatibility_alias": "docs"},
+    {"domain": "weight-vae", "name": "experiments", "view": "projects/weight-vae/workspace/experiments", "compatibility_alias": "experiments"},
+    {"domain": "weight-vae", "name": "legacy", "view": "projects/weight-vae/workspace/legacy", "compatibility_alias": "legacy"},
+    {"domain": "weight-vae", "name": "post-train-research", "view": "projects/weight-vae/workspace/post_train_research", "compatibility_alias": "post_train_research"},
+    {"domain": "weight-vae", "name": "scripts", "view": "projects/weight-vae/workspace/scripts", "compatibility_alias": "scripts"},
+    {"domain": "weight-vae", "name": "tests", "view": "projects/weight-vae/workspace/tests", "compatibility_alias": "tests"},
+    {"domain": "weight-vae", "name": "training", "view": "projects/weight-vae/workspace/training", "compatibility_alias": "training"},
+    {"domain": "weight-vae", "name": "jupyter-virtual-documents", "view": "projects/weight-vae/runtime/virtual-documents", "compatibility_alias": ".virtual_documents"},
+
+    {"domain": "cfm", "name": "cfm-diff-text", "view": "projects/cfm/source", "compatibility_alias": ".CFM-DIFF-TEXT/cfm-text-distillation-smiles-2026"},
+    {"domain": "cfm", "name": "bd3lms-upstream", "view": "projects/cfm/baselines/bd3lms-upstream", "compatibility_alias": "external/bd3lms_upstream"},
+    {"domain": "cfm", "name": "semicat", "view": "projects/cfm/semicat/working", "compatibility_alias": "external/semicat"},
+    {"domain": "cfm", "name": "semicat-clean-20260709", "view": "projects/cfm/semicat/clean-20260709", "compatibility_alias": "external/semicat_clean_20260709"},
+    {"domain": "cfm", "name": "semicat-fresh-20260711", "view": "projects/cfm/semicat/fresh-20260711", "compatibility_alias": "external/semicat_fresh_20260711"},
+    {"domain": "cfm", "name": "semicat-upstream-20260709", "view": "projects/cfm/semicat/upstream-20260709", "compatibility_alias": "external/semicat_upstream_fresh_20260709_210043"},
+    {"domain": "cfm", "name": "tinystories-paper", "view": "projects/cfm/paper/tinystories-revision-20260807", "compatibility_alias": "overleaf_tinystories_revision_20260807"},
+
+    {"domain": "lsdl", "name": "lsdl", "view": "projects/lsdl/source", "compatibility_alias": ".LSDL"},
+
+    {"domain": "unclassified", "name": "guided-diffusion", "view": "projects/unclassified/guided-diffusion", "compatibility_alias": "guided"},
+    {"domain": "unclassified", "name": "adhocs", "view": "projects/unclassified/adhocs", "compatibility_alias": "adhocs"},
+    {"domain": "unclassified", "name": "zo-muon-sst2", "view": "projects/unclassified/zo-muon-sst2"},
+    {"domain": "unclassified", "name": "loose-root", "view": "projects/unclassified/loose-root"},
+    {"domain": "unclassified", "name": "jai-probe-new", "view": "projects/unclassified/runtime/jai-probe-new", "compatibility_alias": "__jai_probe_new"},
+    {"domain": "unclassified", "name": "ipynb-checkpoints", "view": "projects/unclassified/runtime/ipynb-checkpoints", "compatibility_alias": ".ipynb_checkpoints"},
+    {"domain": "unclassified", "name": "workflow-data", "view": "projects/unclassified/runtime/workflow-data", "target": "workflow_data"},
+
+    {"domain": "shared", "name": "artifacts", "view": "projects/shared/storage/artifacts", "compatibility_alias": "artifacts"},
+    {"domain": "shared", "name": "data", "view": "projects/shared/storage/data", "compatibility_alias": "data"},
+    {"domain": "shared", "name": "logs", "view": "projects/shared/storage/logs", "compatibility_alias": "logs"},
+    {"domain": "shared", "name": "outputs", "view": "projects/shared/storage/outputs", "compatibility_alias": "outputs"},
+    {"domain": "shared", "name": "pytest-cache", "view": "projects/shared/runtime/pytest-cache", "compatibility_alias": ".pytest_cache"},
+    {"domain": "shared", "name": "ruff-cache", "view": "projects/shared/runtime/ruff-cache", "compatibility_alias": ".ruff_cache"}
+  ]
+}

@@ -1,0 +1,38 @@
+data:
+  codec: weightclip
+  record_globs: [artifacts/weightclip_benchmark/task_latents/weightclip/*.pt]
+  expected_inventory_path: REQUIRED_WEIGHTCLIP_TASK_FIT_INVENTORY_JSON
+  matched_record_globs:
+    ours: [artifacts/weightclip_benchmark/task_latents/ours/*.pt]
+    weightclip: [artifacts/weightclip_benchmark/task_latents/weightclip/*.pt]
+  num_workers: 4
+model:
+  d_model: 512
+  depth: 8
+  heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.15
+train:
+  experiment_label: weightclip_oracle_anchor
+  path_kind: paired_anchor
+  output_dir: artifacts/weightclip_benchmark/flows/weightclip_oracle_anchor
+  steps: 100000
+  effective_batch_size: 256
+  microbatch_size: 8
+  grad_accum_steps: 32
+  learning_rate: 0.0001
+  min_learning_rate: 0.000001
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  validation_interval: 2000
+  checkpoint_interval: 2000
+  log_interval: 50
+  seed: 0
+  device: cuda
+  dtype: bfloat16
+  resume: true
+  cache_mode: grouped_latent_records
+  validation_solver: heun
+  validation_nfe_steps: 16

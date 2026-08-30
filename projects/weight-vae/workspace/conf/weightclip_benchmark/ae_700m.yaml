@@ -1,0 +1,116 @@
+status: pending_user_architecture_scaling_approval
+
+# Resolved relative to this file, so moving the workspace does not change the contract.
+base_model_config: ../big_vae_experiment/model_parameters_specific_to_big_vae_stage.yaml
+profile_output_dir: ../../artifacts/weightclip_benchmark/ae_scaling_profile
+target_trainable_parameters: 700000000
+target_relative_tolerance: 0.01
+tile_shape: [128, 128]
+training_steps: 500000
+
+# Match the effective representation rate of the released WeightCLIP sparse
+# codec on the same ten ResNet18Slim dataset topologies.  WeightCLIP processes
+# 288-wide sparse tokens into 192-wide latent tokens in padded 512-token
+# windows.  Across one representative checkpoint per dataset this is
+# 27,977,128 valid scalars / (250 * 512 * 192) = 1.1383922526.
+# Our operator bank has 2,790,240 valid scalars across 193 tiles per checkpoint,
+# or 14,457.2021 per tile.  The nearest simple 32-slot bottleneck is 32 * 400.
+representation_rate_contract:
+  reference: official_weightclip_resnet18slim_sparse_codec
+  official_token_width: 288
+  official_latent_width: 192
+  official_window_tokens: 512
+  official_dataset_topologies: 10
+  official_valid_weight_scalars: 27977128
+  official_sparse_tokens_unpadded: 124264
+  official_padded_windows: 250
+  official_raw_valid_scalars_per_latent_scalar: 1.1726180416961738
+  official_padding_adjusted_valid_scalars_per_latent_scalar: 1.1383922526041668
+  operator_tiles_per_checkpoint: 193
+  operator_valid_weight_scalars_per_checkpoint: 2790240
+  operator_mean_valid_weight_scalars_per_tile: 14457.20207253886
+  selected_num_latents: 32
+  selected_d_lat: 400
+  selected_latent_scalars_per_tile: 12800
+  selected_valid_scalars_per_latent_scalar: 1.1294689119170984
+  relative_rate_error_vs_weightclip: -0.007838546570090865
+
+# Filled only after build_operator_dataset.py has finalized the immutable pair.
+# The approval-gated launcher refuses to run without this exact manifest.
+data_contract:
+  mode: operator_bank
+  seed: 42
+  pair_manifest: null
+  tile_rows: 128
+  tile_cols: 128
+  activation_rows: 512
+  permutation_views: 5
+  # Released WeightCLIP emits canonical + five permutations uniformly.
+  canonical_probability: 0.16666666666666666
+  hot_shards: 8
+  model_patch_size: 16
+  slice_batch_size: 32
+  loader_workers: 8
+  # Full bundles are already multi-megabyte tensors. Avoid batch-of-four HOL
+  # latency and bound the eight-worker prefetch queue to 8*2+1=17 bundles.
+  loader_batch_size: 1
+  loader_prefetch_factor: 2
+  max_inflight_bundles: 17
+  max_inflight_bundle_bytes: 134217728
+  # The mixer preserves the old global dataset/op/depth/role stratum sequence
+  # exactly and keeps at most one current full bundle per stratum.
+  max_active_strata: 256
+  max_active_bundle_bytes: 1610612736
+  loss_recipe:
+    behavioral_coef: 1.0
+    behavioral_lambda_operator: 50.0
+    behavioral_lambda_dir: 1.0
+    behavioral_lambda_scale: 10.0
+    structural_coef: 1.0
+    structural_lambda_dir: 1.0
+    structural_lambda_scale: 10.0
+    structural_lambda_rec: 0.0
+    structural_lambda_rel: 0.0
+
+# This remains false until the user chooses one exact fingerprint.  The launcher
+# additionally requires a matching approval JSON, so flipping this flag alone is
+# insufficient to start production.
+production_launch_enabled_after_approval: false
+selected_candidate: null
+approval_file: null
+
+# Equal-budget alternatives intentionally spend capacity on different axes.
+# None is selected by this file.
+candidates:
+  - name: balanced_880_e24_d8_ffn4p2_l32_lat400
+    d_model: 880
+    d_lat: 400
+    num_latents: 32
+    num_encoder_layers: 24
+    num_decoder_layers: 8
+    n_heads: 16
+    ffn_mult: 4.2
+  - name: deep_720_e32_d16_ffn4p4_l32_lat400
+    d_model: 720
+    d_lat: 400
+    num_latents: 32
+    num_encoder_layers: 32
+    num_decoder_layers: 16
+    n_heads: 16
+    ffn_mult: 4.4
+  - name: decoder_heavy_960_e14_d20_ffn4_l32_lat400
+    d_model: 960
+    d_lat: 400
+    num_latents: 32
+    num_encoder_layers: 14
+    num_decoder_layers: 20
+    n_heads: 16
+    ffn_mult: 4.0
+  - name: ffn_heavy_912_e20_d10_ffn5p2_l32_lat400
+    d_model: 912
+    d_lat: 400
+    num_latents: 32
+    num_encoder_layers: 20
+    num_decoder_layers: 10
+    n_heads: 16
+    ffn_mult: 5.2

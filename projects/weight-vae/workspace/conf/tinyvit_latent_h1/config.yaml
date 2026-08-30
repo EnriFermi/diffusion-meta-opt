@@ -1,0 +1,97 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    name: tinyvit_latent_h1
+
+experiment:
+  run_label: ""
+  notes: ""
+  tags: []
+
+storage:
+  root_dir: ${oc.env:BIG_VAE_TINYVIT_H1_ROOT,${oc.env:BIG_VAE_ARTIFACT_ROOT,./artifacts/big_vae}/eval/tinyvit_latent_h1}
+
+source:
+  vit_scaling_artifacts_root: ${oc.env:BIG_VAE_VIT_SCALING_ROOT,${oc.env:BIG_VAE_ARTIFACT_ROOT,./artifacts/big_vae}/eval/vit_latent_scaling}
+  run_dir: ""
+  checkpoint_name: best
+  use_checkpoint_vit_config: true
+  use_checkpoint_setup_config: true
+  bootstrap_kind: source
+  random_init_std: 0.02
+  diffusion_prior_checkpoint: ""
+  diffusion_prior_steps: 50
+  diffusion_prior_sampler: ddim
+  diffusion_prior_eta: 0.0
+  calibration_batches: 1
+  train_anchor: false
+  anchor_steps: 0
+  anchor_lr: 0.0
+  anchor_weight_decay: 0.0
+
+data:
+  data_dir: ./data/cifar10
+  download: true
+  train_subset: 10000
+  test_subset: 2000
+  train_batch_size: 128
+  eval_batch_size: 512
+  num_workers: 4
+
+model:
+  image_size: 32
+  patch_size: 4
+  in_channels: 3
+  num_classes: 10
+  hidden_dim: 128
+  depth: 3
+  num_heads: 4
+  mlp_ratio: 2.0
+  dropout: 0.0
+  attention_dropout: 0.0
+
+setup:
+  big_vae_checkpoint: ""
+  big_vae_decode: ""
+  big_vae_tile_T_patches: 0
+  big_vae_tile_d_out: 0
+  big_vae_latent_parameterization: ""
+
+search:
+  epsilons: [0.05, 0.10]
+  random_directions: 4
+  alpha_min: 1e-5
+  alpha_max: 10.0
+  bracket_multiplier: 1.8
+  binary_search_steps: 18
+
+train:
+  device: ${oc.env:DEVICE,auto}
+  seed: 42
+  steps: 300
+  raw_lrs: [1e-3, 3e-4]
+  latent_lrs: [1e-2, 3e-3]
+  raw_weight_decay: 0.0
+  latent_weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1e-9
+  grad_clip_norm: 0.0
+  amp: true
+  tf32: true
+  log_every_steps: 10
+  eval_every_steps: 25
+  recover_eps: 0.01
+
+telemetry:
+  comet:
+    enabled: false
+    api_key: ${oc.env:COMET_API_KEY,""}
+    workspace: ${oc.env:COMET_WORKSPACE,""}
+    project_name: tinyvit_latent_h1
+    experiment_name: ""
+    offline_directory: ""
+    log_code: false
+    tags: []

@@ -1,0 +1,232 @@
+{
+  "code_prior": {
+    "bayes_hard_class": 7,
+    "bayes_hard_class_signed_code": 0,
+    "bayes_hard_metrics": {
+      "accuracy": 0.16967111910751845,
+      "mean_absolute_bin_error": 1.9476816719594177,
+      "mean_squared_bin_error": 6.303194725120633,
+      "off_by_one_accuracy": 0.4708559306305935
+    },
+    "bayes_input_independent_entropy": 0.7361516698973626,
+    "bayes_input_independent_ordinal_loss": 0.08339976585046235,
+    "bayes_input_independent_probabilities": [
+      0.0004844736244910042,
+      0.002136864112435074,
+      0.006511700399648841,
+      0.01857945083807072,
+      0.0493344888104874,
+      0.11478528326986161,
+      0.20628542562987337,
+      0.2460731147940769,
+      0.18567720644897212,
+      0.09913930321102038,
+      0.04368363851454915,
+      0.017536387417639854,
+      0.006703190419050875,
+      0.0024514453508478473,
+      0.0006180271589748543
+    ],
+    "empirical_marginal_ordinal_loss": 0.09110066705250461,
+    "heldout_zero_fraction": 0.16967111910751845,
+    "uniform_ordinal_loss": 0.15738806867651473
+  },
+  "live_window_mean": {
+    "code_accuracy": 0.17052335143089295,
+    "code_mean_absolute_bin_error": 1.9385316252708436,
+    "code_mean_squared_bin_error": 6.261739063262939,
+    "code_off_by_one_accuracy": 0.4741019159555435,
+    "code_ordinal_loss": 0.08258632719516754,
+    "code_prediction_entropy": 0.7340596497058869,
+    "diagnostic_old_behavioral_direction": 0.9719498872756958,
+    "diagnostic_old_behavioral_operator_actual": 0.02870755158364773,
+    "diagnostic_old_latent_cross_std_median": 0.04694829434156418,
+    "diagnostic_old_latent_interaction_rms_ratio": 0.047800103202462196,
+    "diagnostic_old_latent_within_std_median": 0.045505198463797566,
+    "diagnostic_old_structural_direction": 0.9694512963294983,
+    "hard_decode_raw_nrmse": 1.0016386032104492,
+    "scale_accuracy": 0.06130642406642437,
+    "scale_mean_absolute_bin_error": 5.853489923477173,
+    "scale_mean_squared_bin_error": 67.17431030273437,
+    "scale_off_by_one_accuracy": 0.18926933407783508,
+    "scale_ordinal_loss": 0.002677586628124118,
+    "scale_prediction_entropy": 0.19205650985240935
+  },
+  "live_window_steps": [
+    910,
+    1000
+  ],
+  "scale_global_mode_heldout": {
+    "accuracy": 0.03363163972286374,
+    "empirical_marginal_ordinal_loss": 0.01711717801385483,
+    "mean_absolute_bin_error": 14.198542147806005,
+    "mean_squared_bin_error": 395.81704676674366,
+    "off_by_one_accuracy": 0.09750288683602772,
+    "prediction_class": 122
+  },
+  "schema": "parallel_categorical_gptq_prior_review_v1",
+  "snapshot_step": 1000,
+  "step_1": {
+    "code_accuracy": 0.06343475729227066,
+    "code_mean_absolute_bin_error": 4.21846342086792,
+    "code_mean_squared_bin_error": 25.53841781616211,
+    "code_off_by_one_accuracy": 0.1918840855360031,
+    "code_ordinal_loss": 0.16404691338539124,
+    "code_prediction_entropy": 0.903397798538208,
+    "diagnostic_old_behavioral_direction": 1.0053821802139282,
+    "diagnostic_old_behavioral_operator_actual": 0.4580823481082916,
+    "diagnostic_old_latent_cross_std_median": 0.8746463656425476,
+    "diagnostic_old_latent_interaction_rms_ratio": 0.8740642070770264,
+    "diagnostic_old_latent_within_std_median": 0.8759357929229736,
+    "diagnostic_old_structural_direction": 0.9367121458053589,
+    "hard_decode_raw_nrmse": 30.54376220703125,
+    "scale_accuracy": 0.009342783130705357,
+    "scale_mean_absolute_bin_error": 65.15560150146484,
+    "scale_mean_squared_bin_error": 5940.5927734375,
+    "scale_off_by_one_accuracy": 0.02255154587328434,
+    "scale_ordinal_loss": 0.11132614314556122,
+    "scale_prediction_entropy": 0.9430379867553711
+  },
+  "step_gradient": {
+    "groups": {
+      "bottleneck_projections": {
+        "gradient_rms": 2.717324990026874e-06,
+        "numel": 1179648,
+        "parameter_tensors": 2
+      },
+      "categorical_tail": {
+        "gradient_rms": 5.320437683730054e-07,
+        "numel": 35834880,
+        "parameter_tensors": 6
+      },
+      "code_head": {
+        "gradient_rms": 1.1154424876930092e-05,
+        "numel": 368640,
+        "parameter_tensors": 1
+      },
+      "decoder_block_1": {
+        "gradient_rms": 7.530243143034402e-07,
+        "numel": 35834880,
+        "parameter_tensors": 6
+      },
+      "decoder_block_2": {
+        "gradient_rms": 5.384918229867339e-07,
+        "numel": 35834880,
+        "parameter_tensors": 6
+      },
+      "decoder_block_3": {
+        "gradient_rms": 5.177601728219302e-07,
+        "numel": 35834880,
+        "parameter_tensors": 6
+      },
+      "decoder_block_4": {
+        "gradient_rms": 5.028214226934059e-07,
+        "numel": 35834880,
+        "parameter_tensors": 6
+      },
+      "decoder_block_5": {
+        "gradient_rms": 5.200059336083462e-07,
+        "numel": 35834880,
+        "parameter_tensors": 6
+      },
+      "distribution_encoder": {
+        "gradient_rms": 2.0195607449714906e-08,
+        "numel": 5384576,
+        "parameter_tensors": 94
+      },
+      "encoder_block_1": {
+        "gradient_rms": 1.1987753333612598e-06,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "encoder_block_10": {
+        "gradient_rms": 1.87706395885774e-07,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "encoder_block_11": {
+        "gradient_rms": 1.7286649291254083e-07,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "encoder_block_12": {
+        "gradient_rms": 1.659751420699742e-07,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "encoder_block_13": {
+        "gradient_rms": 1.5199319198147868e-07,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "encoder_block_2": {
+        "gradient_rms": 8.786019370765751e-07,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "encoder_block_3": {
+        "gradient_rms": 7.239506668658452e-07,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "encoder_block_4": {
+        "gradient_rms": 5.044716883211889e-07,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "encoder_block_5": {
+        "gradient_rms": 3.7241590339168467e-07,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "encoder_block_6": {
+        "gradient_rms": 3.0543385205388824e-07,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "encoder_block_7": {
+        "gradient_rms": 2.6164491651892224e-07,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "encoder_block_8": {
+        "gradient_rms": 2.3022238715957122e-07,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "encoder_block_9": {
+        "gradient_rms": 2.0010915600081762e-07,
+        "numel": 36228096,
+        "parameter_tensors": 7
+      },
+      "input_and_queries": {
+        "gradient_rms": 1.949073130630705e-06,
+        "numel": 3486720,
+        "parameter_tensors": 14
+      },
+      "none_parameter_names": [],
+      "none_parameter_tensors": 0,
+      "scale_head": {
+        "gradient_rms": 9.70656348265661e-06,
+        "numel": 393216,
+        "parameter_tensors": 1
+      }
+    },
+    "latent_code_scale_gradients": {
+      "code_gradient_rms": 2.4986235303003923e-09,
+      "code_scale_gradient_cosine": 0.1222839280962944,
+      "scale_gradient_rms": 5.625806043241255e-09,
+      "scale_over_code_gradient_rms": 2.2515621185302734
+    },
+    "schema": "weightclip_parallel_categorical_gptq_700m_production_v1",
+    "step": 1000
+  },
+  "validity": {
+    "code_zero_fraction_fit": 0.1696249636567536,
+    "code_zero_fraction_heldout": 0.16967111910751845,
+    "fit_heldout_disjoint_logical_windows": true,
+    "limitation": "The prior probe uses logical samples 0..319 while the live snapshot averages later online batches. Agreement across all hard code metrics, loss, and entropy is therefore stronger than a same-batch comparison, but this is not a frozen per-example evaluation set.",
+    "same_data_contract": true,
+    "same_target_implementation": true
+  }
+}

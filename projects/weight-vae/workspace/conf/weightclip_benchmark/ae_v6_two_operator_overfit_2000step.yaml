@@ -1,0 +1,34 @@
+schema: weightclip_ae_v6_two_full_operator_overfit_v1
+
+base_v5_run_config: conf/weightclip_benchmark/ae_v6_mandatory_bridge_posfilm_structural_b128_scale01_fresh_50k.yaml
+output_root: /mnt/shared/weightclip_benchmark/ae_v6_two_full_operator_posfilm_overfit_2000step
+run_id: weightclip_ae_v6_two_full_operator_posfilm_overfit_2000step
+
+steps: 2000
+checkpoint_every: 500
+log_every: 10
+comet_enabled: false
+eval_every_steps: 100
+free_weight_control_steps: 50
+free_weight_control_lr: 0.01
+identity_diagnostics: true
+
+early_success:
+  enabled: true
+  min_step: 500
+  consecutive_evals: 3
+  # Causal rescue requires beating the ~0.765 common-template direction
+  # regime and using operator-specific z, sustained for three evaluations.
+  matched_mean_dir_max: 0.745
+  struct_dir_max: 0.80
+  struct_scale_max: 0.20
+  nrmse_max: 2.0
+  swap_dir_delta_min: 0.03
+
+# Two distinct complete 1152x128 layer3.0.conv2 matrices, nine canonical
+# 128x128 tiles each. One optimizer step consumes the exact 18-tile cycle.
+selected_operators:
+  - checkpoint_sha256: 646f6c7e2e026c914fea50d43fa962ea1b5ba68a819f36d46a50df1117178e41
+    layer_key: layer3.0.conv2.weight
+  - checkpoint_sha256: 6ae94b4f94e14020ee02d689bc6c0153b9fce6e7447665b55006b1a4a929f3a0
+    layer_key: layer3.0.conv2.weight

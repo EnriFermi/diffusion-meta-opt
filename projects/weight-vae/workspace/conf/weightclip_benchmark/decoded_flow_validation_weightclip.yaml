@@ -1,0 +1,5 @@
+schema_version: 2
+template_only: true
+codec: weightclip
+resolution_contract: training.weightclip_benchmark.resolve_stage_dg_dag
+note: Per-arm checkpoint, normalizer, exact validation records/bundles, pinned official codec and output are emitted only in the resolved DAG.

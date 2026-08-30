@@ -1,0 +1,37 @@
+# Final optimizer budget remains a source-validation choice after the 8--16-lineage cost profile.
+task_batch_size: 128
+decoder:
+  factory: big_vae.weightclip_benchmark.decoder_adapters.build_bigvae_tile_decoder_adapter
+  checkpoint: REQUIRED_BIGVAE_CHECKPOINT_PATH
+  kwargs:
+    model_config_path: REQUIRED_APPROVED_BIGVAE_MODEL_CONFIG_PATH
+resnet:
+  # Derived from and asserted against each source checkpoint.
+  width_mult: null
+  channels_in: null
+  num_classes: null
+  activation: relu
+  context_rows: 512
+  context_seed: 0
+  head_policy: original_frozen_source
+  bn_policy: original_frozen_source
+  dropout: 0.15
+fit:
+  steps: 500
+  learning_rate: 0.01
+  weight_decay: 0.0
+  grad_clip: 5.0
+  validation_interval: 25
+  log_interval: 10
+  device: cuda
+  dtype: float32
+  activation_conditioning: true
+  head_policy: original_frozen_source
+  bn_policy: original_frozen_source
+  # Must remain in provenance until the user explicitly seals the critic policy.
+  head_policy_pending_confirmation: false
+  seed: 0
+  task_batch_size: 128
+  optimization_batches_per_step: 1
+  output_dir: artifacts/weightclip_benchmark/task_latents/ours
+  model_dropout: 0.15

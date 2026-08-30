@@ -1,0 +1,42 @@
+name: relaion400m
+description: "Масштабный веб-корпус URL-изображений с текстом; задача vision-language pretraining."
+enabled: true
+gated: true
+sampling_weight: 1.0
+models:
+  - clip_vit_b32
+  - siglip_base_p16_384
+  - blip_image_captioning_base
+  - dinov2_vits14
+  - vit_mae_base
+collector_device: null
+
+hf:
+  repo: laion/relaion400m
+  subset: null
+  split: train
+  streaming: true
+  shuffle_buffer: 50000
+  trust_remote_code: false
+
+schema:
+  image_mode: url_field
+  image_field: null
+  image_field_candidates: []
+  url_field: url
+  url_field_candidates: [url, image_url, URL, jpg, source_url, image]
+  id_field: null
+  extra_fields: [caption]
+
+cache:
+  num_chunks_kept: 2
+  chunk_size_images: 256
+
+worker:
+  idle_sleep_s: 0.5
+  get_timeout_s: 5.0
+  request_timeout_s: 10
+  max_retries: 2
+  max_worker_restarts: 5
+
+licensing_note: "GATED: accept LAION terms on HF and ensure token access."
