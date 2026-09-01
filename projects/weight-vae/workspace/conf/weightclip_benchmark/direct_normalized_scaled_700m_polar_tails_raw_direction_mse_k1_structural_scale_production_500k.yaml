@@ -1,0 +1,70 @@
+schema: weightclip_direct_normalized_scaled_700m_polar_tails_raw_direction_mse_structural_scale_production_v1
+objective: raw_p16_direction_mse_plus_structural_scale
+output_root: /mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_raw_direction_mse_k1_structural_scale_500k_v1
+device: cuda:0
+seed: 42
+steps: 500000
+batch_size: 32
+learning_rate: 0.00005
+scheduler: constant
+betas: [0.9, 0.999]
+eps: 0.00000001
+weight_decay: 0.01
+grad_clip_norm: 5.0
+tf32: true
+log_every: 10
+gradient_log_every: 100
+plot_every: 1000
+
+architecture:
+  input_values_per_token: 32
+  output_patch_size: 16
+  shared_decoder_depth: 5
+  direction_tail_depth: 1
+  scale_tail_depth: 1
+  log_scale_min: -3.0
+  log_scale_max: 6.0
+  initial_log_radius: -2.0
+  gradient_routing: coordinate_owned_stop_gradient
+
+normalization:
+  kind: per_output_maxabs_q7_continuous
+  qmax: 7.0
+  log2_scale_mean: -6.328672409057617
+  log2_scale_std: 0.5959522128105164
+
+direction_regression:
+  kind: scaled_raw_p16_vector_mse
+  components: 1
+  target_radius: 0.08615882694721222
+  normalization: half_squared_l2_over_target_radius_squared
+  patch_weighting: sqrt_target_radius_within_output
+
+loss:
+  raw_direction_mse: 1.0
+  behavioral_coef: 0.0
+  behavioral_operator: 0.0
+  behavioral_direction: 0.0
+  behavioral_scale: 0.0
+  structural_coef: 1.0
+  structural_direction: 0.0
+  structural_scale: 10.0
+  structural_reconstruction: 0.0
+  structural_relational: 0.0
+
+operator_bank:
+  pair_manifest: /home/coder/project/datasets/weightclip_resnet18slim_operator_dataset/operator_dataset-resolved-c478efe716506765.json
+  pair_manifest_sha256: c394c33203a9d2161a09167498a3d54470bab522c7c1a02e944fed14f5b77c09
+  permutation_views: true
+  canonical_probability: 0.16666666666666666
+  hot_shards: 8
+  loader_workers: 8
+  loader_batch_size: 1
+  loader_prefetch_factor: 2
+  max_active_strata: 256
+  max_active_bundle_bytes: 1610612736
+
+resume_checkpoint: /dev/shm/weightclip_direct_normalized_scaled_700m_p32_polar_tails_raw_direction_mse_k1_structural_scale_500k_v1/resume_latest.pt
+resume_save_every: 1000
+persistent_model_checkpoint: /mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_raw_direction_mse_k1_structural_scale_500k_v1/model_latest.pt
+model_save_every: 10000

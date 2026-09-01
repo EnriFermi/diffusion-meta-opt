@@ -3421,3 +3421,1373 @@ Targeted concept review of the rejected compander: `/home/coder/project/artifact
   Access from another machine requires a Hugging Face token with read access to
   the private repository. The current loader performs one full payload SHA scan
   when opening the downloaded banks, so first open will read the full dataset.
+
+## 2026-08-30 — Download on the current machine is blocked only by HF authentication
+
+- The user requested downloading the operator dataset that was uploaded to
+  Hugging Face. The intended source is the pinned private repository
+  `EnriFermi/weightclip-resnet18slim-operator-bank` at revision
+  `79d9b8c97362a3892d1f8475f71face6f9859b72`.
+- The checked target is
+  `/home/coder/project/datasets/weightclip_resnet18slim_operator_dataset`;
+  its filesystem has about 409 GiB free, sufficient for the 38.859 GiB payload.
+- The current machine has neither `HF_TOKEN` nor a cached Hugging Face token.
+  An anonymous Hub metadata request returned HTTP 401, confirming that the
+  private repository cannot be downloaded without read authorization.
+- No payload files were downloaded. Next action: provide `HF_TOKEN` with read
+  access (preferably through the environment, not chat), then run the committed
+  download helper and inspect its inventory/hash validation plus resolved pair
+  manifest.
+
+## 2026-08-31 — Private HF operator dataset downloaded and validated locally
+
+- The user supplied a fine-grained Hugging Face token. It was saved in the
+  standard per-user Hugging Face credential store, not Git credentials. Both
+  credential files were tightened from the CLI-created mode `0644` to `0600`.
+  Because the secret was sent through chat, token rotation after this task is
+  recommended.
+- The pinned private revision
+  `79d9b8c97362a3892d1f8475f71face6f9859b72` was downloaded to
+  `/home/coder/project/datasets/weightclip_resnet18slim_operator_dataset`.
+  The directory mode is `0700` and its materialized size is about 39 GiB.
+- The initial eight-worker transfer hit the documented anonymous/fine-grained
+  account quota of 1000 API requests per five minutes at roughly 30%. The
+  download was resumable; after the quota window reset it completed with one
+  worker without re-downloading completed files. The committed helper needed
+  `python -I` because its sibling `scripts/inspect` package otherwise shadows
+  the Python standard-library `inspect` module.
+- Helper validation passed: weight bank `793` files / `11,181,671,316` bytes;
+  context bank `2,825` files / `30,517,934,053` bytes. The helper also verified
+  the frozen SHA-256 values of the small immutable manifests, coverage, and
+  permutation metadata. No full 38.9 GiB rehash was repeated.
+- Resolved runtime manifest:
+  `/home/coder/project/datasets/weightclip_resnet18slim_operator_dataset/operator_dataset-resolved-c478efe716506765.json`,
+  SHA-256
+  `c394c33203a9d2161a09167498a3d54470bab522c7c1a02e944fed14f5b77c09`.
+  Independent post-run checks confirmed that both bank paths, coverage, and
+  both permutation paths exist and that there are no `.incomplete` files.
+
+## 2026-08-31 — K=1 raw-direction MSE arm implemented and smoke-validated
+
+### User decision and frozen comparison
+
+- The user selected a single-component (`K=1`) direction regression arm on one
+  A100. The other A100 is reserved for a separate user experiment.
+- The architecture and production setup are the original 742,120,833-parameter
+  p32 polar regression model with separate p16 direction and scale tails, before
+  latent anti-collapse, direction InfoNCE, gauge fixing, and categorical GPTQ.
+- Every prediction-direction cosine objective and InfoNCE term is absent from
+  this arm's backward. Final per-p16 L2 normalization remains only to compose
+  reconstructed weights from the direction and scale coordinates.
+
+### Exact intervention
+
+- The direction tail's raw 16-vector is regressed to `r0 * target_unit_direction`
+  with `r0=0.08615882694721222`, matching the seed-42 initialization scale.
+  The scalar is `0.5 * squared_L2 / r0^2`, with the original structural
+  `sqrt(target_patch_radius)` within-output weighting. At equal predicted and
+  target radius this has the same dimensionless tangent scale as the old
+  `1-cosine`, while additionally supervising the previously invisible radius.
+- There is one deterministic vector per p16 (`K=1`); there is no mixture head,
+  winner assignment, contrastive term, latent anti-collapse term, or head gauge
+  constraint.
+- The existing behavioral and structural log-scale objectives remain at weight
+  10 each. A dedicated behavioral scale-only implementation preserves the old
+  scalar exactly without even constructing its cosine sibling. Direction is
+  detached from both scale paths.
+- Production config:
+  `projects/weight-vae/workspace/conf/weightclip_benchmark/direct_normalized_scaled_700m_polar_tails_raw_direction_mse_k1_production_500k.yaml`.
+  Focused contract tests:
+  `projects/weight-vae/workspace/tests/direct_normalized_raw_direction_mse_test.py`.
+
+### Smoke evidence and launch status
+
+- Four focused tests pass, including exact-target zero loss, an orthogonal
+  equal-radius unit-scale check, exact parity of the new scale-only helper with
+  the old scale scalar, and direction/scale autograd separation. Py-compile,
+  config dry-run, and `git diff --check` also pass.
+- A production-faithful two-step B32 smoke ran on physical GPU0 only and
+  completed with exact parameter count, finite loss/gradients, and all
+  encoder/shared-decoder/tail/head groups live. Peak allocation was 14.68 GiB.
+  Artifact root:
+  `/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_raw_direction_mse_k1_smoke_v1`.
+- At step 1, total loss was `2.610457`: raw direction MSE `.924007`, weighted
+  scale objective `1.686450`, and exact component-sum parity error `0`. Raw
+  direction norm median was `.0861438` against target `.0861588`; cosine and
+  InfoNCE loss coefficients are zero/absent. Pre-clip norm was `368.85`, so the
+  inherited clip-5 regime is active from initialization and must be monitored
+  in the real trajectory rather than interpreted from the smoke alone.
+- Smoke Comet:
+  `https://www.comet.com/mike-5531/big-weight-vae/35d4c18187b946fb8ddfb1abbe6ee95f`.
+  It is explicitly tagged `smoke` with realized horizon 2 and scientific
+  horizon 500,000.
+- The 500k production trainer has not been started. Repository rules require an
+  independent reviewer to inspect the final setup and issue explicit GO before
+  a large run; reviewer agents are unavailable in this side conversation. The
+  remaining action is independent prelaunch review in the main thread, then
+  launch trainer plus Comet sidecar on GPU0 without changing this frozen arm.
+
+## 2026-08-31 — User corrected the launch hold; K=1 production is live on GPU0
+
+- The user explicitly objected to holding the already requested launch. This
+  superseded the prior side-thread hold: the frozen 500k config was launched on
+  physical GPU0, while GPU1 remains completely idle for the user's other arm.
+- Live production root:
+  `/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_raw_direction_mse_k1_500k_v1`.
+  Production Comet:
+  `https://www.comet.com/mike-5531/big-weight-vae/427906517d894ce0920bed65c6feeb63`.
+- At the first stable read through step 140, median interval speed after startup
+  was `1.077 step/s` (`.929 s/step`, B32), implying a no-checkpoint-overhead ETA
+  of about `5.37 days`. GPU0 was at 100% utilization with about 21.4 GiB
+  allocated; GPU1 was at 0 MiB.
+- The early trajectory already exposes the predicted raw-MSE radial effect.
+  Median raw radius fell from `.08614` at step 1 to roughly `.015-.027` over
+  steps 40-140 despite target `.08616`; raw direction MSE fell `.924 -> ~.50`.
+  This is consistent with the direct-vector MSE optimum `radius ~= r0*cosine`
+  while directions are poorly aligned, rather than evidence that the configured
+  target was not applied. It is a scientifically important warning, not yet a
+  final outcome; the trainer was not stopped or modified.
+- Exact step-100 component parity remained zero and all named groups remained
+  numerically live, but encoder gradient RMS had already fallen to order
+  `1e-7` while direction-head RMS was `.56`; all logged pre-clip norms remained
+  far above clip 5. Continued monitoring is required for direction/radius and
+  latent credit collapse.
+
+## 2026-08-31 — User selected a strict two-loss restart
+
+- The user removed behavioral scale from the K=1 experiment and required
+  exactly two optimized terms: `raw_direction_MSE + 10*structural_log_scale`.
+- The preceding three-loss production was gracefully stopped at optimizer step
+  559. Its `STOPPED.json`, resume checkpoint, persistent model, metrics, and
+  Comet run were preserved under
+  `/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_raw_direction_mse_k1_500k_v1`.
+- A distinct frozen schema
+  `weightclip_direct_normalized_scaled_700m_polar_tails_raw_direction_mse_structural_scale_production_v1`
+  prevents the old and new objectives from sharing provenance. In the new
+  config, all behavioral coefficients, structural direction, reconstruction,
+  relational, cosine, InfoNCE, and anti-collapse terms are zero/absent.
+- Behavioral scale is not merely multiplied by zero: the two-loss branch skips
+  `_operator_scale_only_loss`, verified by a focused test that patches that
+  helper to raise if called. Four focused tests, py-compile, `git diff --check`,
+  and config dry-run pass.
+- Fresh production root:
+  `/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_raw_direction_mse_k1_structural_scale_500k_v1`.
+  Comet:
+  `https://www.comet.com/mike-5531/big-weight-vae/54f559fefc854942be7e6f1b69fc52ca`.
+- The live integration check passes. At step 1,
+  `.9240074 + 10*.0481200 = 1.4052074` within `2.24e-8`; behavioral and both
+  direction-cosine fields are exactly zero and component parity is exactly
+  zero. At step 20 total is `1.085335`, raw direction MSE `.579880`, raw
+  structural scale `.0505455`, and behavioral scale remains exactly zero.
+  All encoder/shared-decoder/tail/head groups are gradient-live.
+
+## 2026-08-31 — Original polar regression with a strictly frozen decoder launched on GPU1
+
+### User decision and baseline
+
+- The user selected the original pre-categorical p32 polar regression model as
+  the baseline: 742,120,833 parameters, five shared decoder blocks, separate
+  p16 direction and scale tails, seed 42, B32, constant LR `5e-5`, and the
+  unchanged coordinate-owned objective
+  `behavioral_direction + 10*behavioral_scale + structural_direction +
+  10*structural_scale`. No latent anti-collapse, InfoNCE, gauge fix, raw-vector
+  MSE, GPTQ categorical head, VQ, or autoregression is present.
+- The requested intervention is encoder-only training from a fresh seeded
+  initialization. To make "fully frozen decoder" strict rather than nominal,
+  only parameters whose effect reaches reconstruction through `z` are
+  trainable: input content/scale/group/chunk embeddings, latent slots, all 13
+  encoder blocks, latent norm, and `to_latent`. The Distribution Encoder and
+  tile embeddings are frozen because they also feed decoder conditioning
+  directly. `from_latent`, decoder queries/conditioner, all shared decoder
+  blocks, both tails, both output norms, and both heads are frozen.
+
+### Implementation, data and verification
+
+- Config:
+  `projects/weight-vae/workspace/conf/weightclip_benchmark/direct_normalized_scaled_700m_polar_tails_encoder_only_production_500k.yaml`.
+  Focused contract test:
+  `projects/weight-vae/workspace/tests/direct_normalized_encoder_only_scope_test.py`.
+- Exact partition is 101 trainable tensors / 474,221,568 parameters and 152
+  frozen tensors / 267,899,265 parameters. The optimizer is built only from the
+  trainable identity set. Step-1 fail-closed checks reject any missing
+  trainable gradient or any gradient on a frozen parameter. Full loss,
+  direction/scale components, per-encoder-block gradients, rate, LR, clip norm,
+  cursor, and VRAM remain logged.
+- The local private-HF snapshot is complete and used through resolved manifest
+  `/home/coder/project/datasets/weightclip_resnet18slim_operator_dataset/operator_dataset-resolved-c478efe716506765.json`,
+  SHA-256 `c394c33203a9d2161a09167498a3d54470bab522c7c1a02e944fed14f5b77c09`.
+  Both banks and coverage/permutation paths exist, no `.incomplete` file exists,
+  and the production loader opened all 135,100 canonical tiles / 14,000 groups.
+- Focused tests passed 5/5 together with the already present K=1 tests;
+  py-compile, config dry-run and `git diff --check` passed. A B32 two-step smoke
+  completed at
+  `/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_encoder_only_smoke_v1`:
+  step-1 loss `3.586198`, exact component parity `2.38e-7`, all 13 encoder blocks
+  live, no frozen gradients, and peak allocation `11.57 GiB`. Its one-point
+  plot is readable but is only a smoke artifact, not trend evidence.
+- Independent prelaunch review issued explicit GO with P0=0/P1=0 after an exact
+  production partition/optimizer reconstruction and path/GPU collision check.
+  Frozen source/config/test hashes were respectively `12844946ec97...`,
+  `85b90a1f204e...`, and `d2bf10187028...`.
+
+### Live production state and early evidence
+
+- Trainer PID `71669` is detached under its own session and live on physical
+  CUDA1. Root:
+  `/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_encoder_only_500k_v1`.
+  Comet sidecar PID `72733`:
+  `https://www.comet.com/mike-5531/big-weight-vae/1dade012915b43f7ac45d34894b55454`.
+- At the checked step 130, loss was finite (`3.062354`), cursor was 4,160, LR
+  remained `5e-5`, and peak allocation was `12.34 GiB`. The latest five
+  post-start intervals had median speed `1.089 step/s`, giving a provisional
+  no-checkpoint-overhead ETA of about `5.31 days`. These are different stream
+  batches, so the early scalar decrease is not a matched-batch convergence
+  claim.
+- Step-100 telemetry still has exactly 152 no-gradient tensors, matching the
+  declared frozen inventory, while all 13 encoder blocks and `to_latent` remain
+  live. Direction/scale gradients are already opposed in representative
+  encoder locations: cosine `-.536` and scale/direction RMS `1.46x` in encoder
+  block-1 Q, cosine `-.205` and ratio `2.29x` in block-13 Q, and cosine `-.367`
+  with ratio `1.63x` at `to_latent`. This is early mechanism telemetry only; it
+  does not yet establish the long-horizon result of encoder-only training.
+- During this final read, the separate GPU0 K=1 trainer was no longer live and
+  its own `STOPPED.json` recorded step 559/cursor 17,888. This encoder-only task
+  did not signal or modify that run; GPU1 selection and paths remained
+  isolated throughout.
+
+## 2026-08-31 — GPU0 strict two-loss run live at 10.7k with persistent radial collapse
+
+- A live status review confirmed that the strict two-loss production process
+  (`raw_direction_MSE + 10*structural_log_scale`) is still running on physical
+  GPU0, with trainer PID `77327` and Comet sidecar PID `77570`. There is no
+  `FAILED.json` or `STOPPED.json`; metrics were only about 13 seconds old and
+  advanced from step 10,730 to 10,750 during the review.
+- Physical GPU0 holds about 21.3 GiB. Short `nvidia-smi dmon` sampling showed
+  bursty compute (`0/97/0/0/98%` SM across five one-second samples), while the
+  recorded run-average rate is `0.4896 step/s`. At that rate, 500k completion
+  is approximately `2026-09-11 22:08 UTC` (about 11.6 days remaining).
+- Operational validity is clean: all metrics are finite, steps strictly
+  increase, `committed_logical_index == step*32` for every row, and the latest
+  step-10,700 gradient telemetry has zero missing parameter tensors. Both the
+  persistent model and resumable optimizer checkpoint were written at the
+  10k boundary.
+- The scientific trajectory is concerning. Window medians for raw direction
+  MSE are `.5029` at steps 1-200, `.4876` near 1k, `.4828` near 5k, `.4834`
+  near 10k, and `.4838` over the latest 500 steps: useful direction progress
+  has effectively plateaued since about 5k on these online stream windows.
+  Meanwhile mean predicted radius falls `.0171 -> .00831 -> .00509 -> .00458
+  -> .00429`, versus configured target `.08616`. The recent radius is only
+  `5.0%` of target and radius MAE is `95.0%` of target. This extends the earlier
+  evidence for the raw-vector-MSE radial shortcut; it is not a matched-batch
+  checkpoint comparison.
+- Gradients are live but imbalanced. At step 10,700, structural-scale gradient
+  RMS exceeds direction by `11.9x` at encoder block 1 Q, `5.68x` at encoder
+  block 13 Q, and `6.46x` at `to_latent`; the latter two component cosines are
+  mildly negative. Every one of the latest 50 logged pre-clip norms exceeds
+  the clip-5 threshold (median `9.32`). No intervention was made because the
+  user asked for status, not a stop or objective change.
+- Evidence root:
+  `/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_raw_direction_mse_k1_structural_scale_500k_v1`,
+  especially `train_metrics.jsonl`, `gradient_telemetry.jsonl`,
+  `resolved_config.json`, and the 10k checkpoints.
+
+## 2026-08-31 — User stopped the GPU0 strict two-loss run and freed the device
+
+- The user explicitly requested shutting down the GPU0 run and releasing the
+  GPU. The target was re-resolved as trainer PID `77327` with
+  `CUDA_VISIBLE_DEVICES=0` and the strict two-loss config; the separate GPU1
+  encoder-only trainer was left untouched.
+- `SIGTERM` produced a graceful trainer exit after 25 seconds. Final
+  `STOPPED.json` records step `10,975` and committed cursor `351,200`.
+  A fresh 8.906 GB resumable optimizer checkpoint was written at
+  `/dev/shm/weightclip_direct_normalized_scaled_700m_p32_polar_tails_raw_direction_mse_k1_structural_scale_500k_v1/resume_latest.pt`,
+  and a fresh 2.969 GB persistent model was written under the run root.
+- The Comet sidecar PID `77570` was then terminated gracefully and exited after
+  eight seconds. A repeated `nvidia-smi` check showed physical GPU0 at 0%
+  utilization, 3 MiB / 81,920 MiB, and no compute process. GPU1's independent
+  encoder-only process remained live and was not signaled.
+
+## 2026-08-31 — Warm-encoder / gradual-decoder-thaw branch launched on GPU0
+
+### User decision and branch semantics
+
+- The user requested branching from the latest saved strict encoder-only
+  checkpoint available at request time, keeping encoder training active while
+  gradually unfreezing the entire decoder through its learning rate. Physical
+  CUDA0 was to be used after the strict two-loss run released it; the existing
+  CUDA1 encoder-only production was to remain live.
+- The moving encoder-only `resume_latest.pt` was pinned by hardlink before its
+  next atomic replacement. The immutable branch source is
+  `/dev/shm/weightclip_direct_normalized_scaled_700m_p32_polar_tails_encoder_warm_decoder_ramp10k_500k_v1/source_encoder_only_step_00013000.pt`:
+  source step `13,000`, committed logical cursor `416,000`, original polar-tail
+  schema, and strict encoder-only optimizer with 101 state entries.
+- Branch step is intentionally reset to zero while the data cursor continues
+  from 416,000. Encoder LR remains constant at `5e-5`. Decoder LR is linear in
+  branch step: `5e-5 * min(step / 10,000, 1)`, hence `5e-9` at the first update,
+  `2.5e-5` at step 5,000, and `5e-5` from step 10,000 onward. Encoder Adam
+  moments and checkpoint RNG state are restored; all 152 decoder/direct-
+  conditioning tensors begin with empty Adam state.
+
+### Implementation and validation
+
+- Dedicated config:
+  `projects/weight-vae/workspace/conf/weightclip_benchmark/direct_normalized_scaled_700m_polar_tails_encoder_warm_decoder_ramp10k_production_500k.yaml`.
+  The objective, p32/p16 architecture, normalization, seed 42, B32, data bank,
+  AdamW hyperparameters, and all original two-tail regression coefficients are
+  unchanged from the encoder-only source; only the requested training scope and
+  LR schedule differ.
+- The production optimizer has two named groups over all 742,120,833 trainable
+  parameters: 101 encoder tensors retain Adam state and constant LR; 152
+  decoder/direct-conditioning tensors start without moments and receive the
+  ramped LR. Resume checkpoints store the branch-relative step, initial cursor,
+  source provenance, model, both optimizer groups, and RNG. Cursor validity is
+  `committed == 416000 + branch_step * 32`.
+- Focused tests passed 4/4, including schedule endpoints 0/1/5k/10k/20k and
+  exact one-group-to-two-group Adam-state transfer. Py-compile and
+  `git diff --check` passed. Final small-file hashes were trainer
+  `4417f6c67d50...`, sidecar `e4f54d978cee...`, config `4fcdc7e5122c...`, and
+  test `97ec2c7f15c5...`.
+- B32 two-step smoke completed at
+  `/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_encoder_warm_decoder_ramp10k_smoke_v1`.
+  `warmstart_event.json` records encoder Adam 101, decoder Adam 0, and decoder
+  tensor count 152. Step-1 loss was `2.975929`, cursor advanced to 416,032,
+  decoder LR was `5e-9`, and every encoder/shared-decoder/tail/head group had a
+  nonzero gradient. The smoke completed at cursor 416,064 with peak allocated
+  VRAM 14.77 GiB. Its one-point plot is not trend evidence.
+- One independent final reviewer issued explicit GO with P0=0/P1=0 after
+  inspecting the final code/config, checkpoint and data contracts, smoke
+  artifacts, CUDA allocation, telemetry, and branch-resume semantics.
+
+### Live production state and early evidence
+
+- Detached trainer PID `234801` is live on physical CUDA0. Production root:
+  `/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_encoder_warm_decoder_ramp10k_500k_v1`.
+  Comet sidecar PID `235038`:
+  `https://www.comet.com/mike-5531/big-weight-vae/fb7204dd1f09410cac409581c98e5c40`.
+  The independent CUDA1 encoder-only trainer was not stopped or modified.
+- The production process independently confirmed all 742,120,833 parameters
+  trainable, encoder Adam state 101, decoder Adam state 0, and source cursor
+  416,000. At branch step 1, loss was `2.975929`, behavioral `1.805029`,
+  structural `1.170900`, pre-clip norm `15.637`, encoder LR `5e-5`, decoder LR
+  `5e-9`, and all named gradient groups were live. At step 10, loss was
+  `3.181875`, cursor `416,320`, and decoder LR `5e-8` (exact multiplier .001).
+  CUDA0 was at 100% with about 17.97 GiB reported used and peak PyTorch
+  allocation 14.77 GiB.
+- These first ten online batches establish correct execution and telemetry, not
+  whether gradual thaw improves convergence. The meaningful read is the
+  trajectory through the 10k ramp and after decoder/encoder LR parity; all
+  ordinary loss, component, gradient, rate, cursor, LR, and VRAM metrics are
+  streamed to the artifact root and Comet for that review.
+- A follow-up at branch step 100/110 confirmed that thaw updates remain live:
+  step-100 decoder LR was `5e-7` (1% of encoder LR), and the Distribution
+  Encoder, decoder conditioner, all five shared decoder blocks, both tails,
+  both heads, and all encoder blocks had nonzero gradient RMS. No named group
+  was dead; the ledger remained 253 trainable tensors / zero frozen. Across the
+  online rows through step 110, loss ranged `2.9759..3.3883`; this short noisy
+  range does not establish improvement or deterioration. Median post-start
+  interval throughput was `0.487 step/s`, implying roughly 5.6 hours to the
+  10k LR-parity boundary and roughly 11.9 days for 500k before checkpoint
+  overhead. Decoder Adam allocation raised peak PyTorch memory to 16.42 GiB.
+
+## 2026-08-31 — User stopped the gradual-decoder-thaw branch for poor quality
+
+- The user judged the decoder-thaw run's quality to be poor and explicitly
+  requested shutdown. This is a user conclusion/decision; no claim was made
+  here that the online loss alone establishes a causal explanation.
+- The exact CUDA0 trainer PID `234801` received `SIGTERM` and exited gracefully
+  after its current optimizer step. `STOPPED.json` records branch step `6,326`,
+  committed logical cursor `618,432`, source encoder-only step `13,000`, and
+  initial cursor `416,000`.
+- Final resumable state was preserved at
+  `/dev/shm/weightclip_direct_normalized_scaled_700m_p32_polar_tails_encoder_warm_decoder_ramp10k_500k_v1/resume_latest.pt`
+  (8.3 GiB), and the model checkpoint at
+  `/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_encoder_warm_decoder_ramp10k_500k_v1/model_latest.pt`
+  (2.8 GiB). The branch had not reached LR parity: at step 6,326 its scheduled
+  decoder LR was approximately `3.163e-5` versus encoder LR `5e-5`.
+- Comet sidecar PID `235038` was then terminated gracefully. No matching thaw
+  trainer, loader worker, or sidecar remained. Repeated `nvidia-smi` showed
+  physical CUDA0 free at 3 MiB / 0% utilization. The separate CUDA1 strict
+  encoder-only trainer and its Comet sidecar remained live and were not
+  signaled.
+
+## 2026-08-31 — Proposed 10M mini polar AE for much faster experiments
+
+### User goal
+
+- The user proposed replacing expensive 742M exploratory runs with an
+  approximately 10M-parameter model, reducing hidden and latent widths,
+  changing the input patch to 16, and using 32x32 weight tiles. The explicit
+  goal is experiments that run many times faster.
+- This entry is an architecture proposal, not yet an implemented or measured
+  speed/result claim. "VAE" is provisionally interpreted as the current
+  deterministic polar weight bottleneck; adding a stochastic posterior/KL
+  would be a separate scientific intervention.
+
+### Recommended topology and exact parameter budget
+
+- Preserve the scientifically relevant two-tail decoder topology: 5 shared
+  decoder blocks, one direction tail, and one scale tail. Reduce encoder depth
+  from 13 to 10 rather than disproportionately starving the decoder.
+- Proposed dimensions: tile size 32; input and output patch size 16;
+  `hidden_dim=192`, `heads=6` (head width 32), `mlp_dim=704`,
+  `latent_dim=48`, and `latent_slots=16`. The latent code therefore has
+  `16*48=768` scalars for 1,024 tile weights, exactly the large model's latent
+  density `32*384/16384 = 0.75`.
+- Proposed mini Distribution Encoder: `k_s=16`, `Kq=32`, `d_var=64`,
+  `d_dist=64`, 2 variable-attention layers / 4 heads, 2 DCN cross layers, and a
+  32-wide two-layer deep tower. Keep covariance enabled at patch size 16.
+- With a 32-row group embedding, 2 chunks per row, 64 weight tokens, preserved
+  global tile coordinates (72 row positions / 8 column positions), and one p16
+  child per input token, the exact analytical parameter count derived from the
+  current module definitions is `9,938,689`. Breakdown: encoder blocks
+  5,656,320; five shared decoder blocks 2,766,720; tails 553,344 each;
+  Distribution Encoder 135,936; decoder conditioner 172,608; all remaining
+  embeddings/projections/norms/heads 100,417.
+
+### Expected speed mechanism and required implementation
+
+- Current encoder sequence length is `512+32=544`, and polar tails process
+  `1024+32=1056` states. The mini design uses `64+16=80` everywhere: 6.8x
+  shorter in the encoder and 13.2x shorter in each tail. Parameters fall 74.7x.
+  A dense-projection-plus-attention FLOP proxy computed from the exact block
+  shapes is about 563x lower per example. This is only a theoretical compute
+  ratio; small-matrix utilization, the Distribution Encoder, Python, and data
+  loading will bound realized speed.
+- The current implementation cannot accept this config unchanged: tile width,
+  masks, group IDs, reshape logic, distribution patch indices, losses, and
+  polar output shapes contain fixed 128 constants. They must be generalized to
+  a `tile_size` field; the p32-to-two-p16 split becomes a p16-to-one-p16 path.
+- Reuse the sealed 128x128 bank through a deterministic 4x4 subtile view rather
+  than downloading another dataset. Each record needs stable parent/subrow/
+  subcol lineage, matching 32-wide activation slices and masks, and new
+  normalization statistics computed on the 32x32 training view. A local
+  subtile operator objective is a proxy for one contribution to the full
+  128-wide operator, not numerically identical to the old task; absolute loss
+  levels must not be compared across tile sizes.
+- Disable activation checkpointing for the 10M model. Start the throughput
+  benchmark at B512 (same number of raw weight scalars per step as old B32) and
+  fall back to B256 only if measured memory/kernel behavior requires it. Report
+  examples/s and weight-scalars/s, not just steps/s. The first acceptance gate
+  should be an executable contract test plus a short measured A100 throughput
+  comparison; no end-to-end speedup number is established before that test.
+
+### Distribution Encoder clarification
+
+- The recommended `9,938,689`-parameter count includes a mini Distribution
+  Encoder rather than silently removing activation-distribution conditioning.
+  Its proposed dimensions are `k_s=16`, `Kq=32`, `d_var=64`, `d_dist=64`, two
+  variable-attention layers with four heads, two DCN cross layers, a 32-wide
+  two-layer deep tower, and covariance at patch size 16. Its own exact parameter
+  count is 135,936, versus 5,384,576 in the current production model.
+- The total also includes 122,880 parameters for 64-wide distribution-key
+  projections in ten encoder blocks and 172,608 parameters in the decoder query
+  conditioner. Thus conditioning and its decoder bypass remain represented in
+  the topology and parameter budget.
+- A paired `use_distribution_conditioning=false` ablation would contain
+  9,507,265 parameters after removing those three pieces. It is useful as a
+  speed/causal control, but it changes available information and must not
+  replace the conditioned mini baseline without an explicit user decision.
+
+## 2026-08-31 — Implemented and measured the conditioned 9.94M mini regression baseline
+
+### User decision and historical objective
+
+- The user asked to implement and launch the mini model in the last ordinary
+  regression setup immediately before categorical/VQ/autoregressive work. The
+  selected objective is the original coordinate-owned two-tail polar loss:
+  `behavioral_direction + 10*behavioral_scale + structural_direction +
+  10*structural_scale`. Behavioral direction and scale are measured through
+  the local operator action `XW`; standalone raw operator MSE has coefficient
+  zero. Categorical targets, VQ, autoregression, InfoNCE, KL, and later raw
+  direction-MSE variants are absent.
+- The user explicitly asked about the Distribution Encoder. The implemented
+  baseline retains it and its decoder query conditioner; this is a
+  deterministic polar autoencoder, not a newly introduced stochastic
+  posterior/KL VAE.
+
+### Implementation and data contract
+
+- The standalone trainer is
+  `projects/weight-vae/workspace/training/weightclip_benchmark/run_mini_polar_regression_production.py`;
+  the production config is
+  `projects/weight-vae/workspace/conf/weightclip_benchmark/mini_polar_regression_10m_p16_tile32_production.yaml`.
+  The exact model has 9,938,689 trainable parameters: tile32/p16,
+  hidden 192, MLP 704, ten encoder blocks, five shared decoder blocks, one
+  direction and one scale tail, latent 16x48, and the proposed 64-wide mini
+  Distribution Encoder.
+- The sealed 128x128 operator-bank stream is expanded deterministically into
+  nonempty 32x32 subtiles. Completely padded subtiles are skipped instead of
+  becoming zero-loss training examples. A composite next-consumed cursor
+  `(parent_logical_index, subpatch_index, emitted_logical_index)` is saved with
+  model, AdamW, and RNG state for exact process-stop resume.
+- Distribution conditioning is deduplicated only for identical
+  `(parent,input-subtile)` activation contexts inside a batch, then gathered
+  back to each output subtile. A focused equality test established that this
+  gives the same Distribution Encoder outputs as evaluating duplicates
+  independently. The behavioral implementation similarly shares the exact
+  target `XW` calculation; a focused test establishes bitwise equality of the
+  direction and scale scalar terms with the historical loss helper.
+- A sampled tile32 normalization artifact was computed from 32,768 valid
+  subtiles / 1,048,576 valid output rows and stored at
+  `/mnt/shared/weightclip_benchmark/calibration/mini_p16_tile32_norm_seed42_32768.json`.
+  The measured `log2(maxabs/7)` mean is `-6.81575982` and standard deviation is
+  `0.905690685`. This replaces the incompatible p128/p32 scale statistics.
+
+### Executable and throughput evidence
+
+- `tests/mini_polar_regression_production_test.py` passes three focused tests:
+  exact parameter count/full forward-backward with every parameter live,
+  nonempty-subtile/resume behavior, Distribution Encoder dedup parity, and
+  exact historical behavioral-loss parity. Python compilation and
+  `git diff --check` also pass.
+- The final measured B128 smoke is
+  `/mnt/shared/weightclip_benchmark/mini_polar_regression_smoke_20260831T141129Z`.
+  It completed four updates with finite losses `3.0762, 3.1600, 2.9842,
+  2.6386`; step 1 had zero missing parameter gradients and every named group,
+  including all ten encoder blocks, Distribution Encoder, conditioner, shared
+  decoder, both tails, and both heads, had positive gradient RMS. Peak
+  allocation was 1.96 GiB. Post-step-1 throughput was `3.641, 2.854, 2.466`
+  step/s (median 2.854) and median 365.3 mini-tiles/s.
+- The B512 volume-throughput control is
+  `/mnt/shared/weightclip_benchmark/mini_polar_regression_smoke_20260831T140357Z`;
+  its post-step-1 median was 0.654 step/s and peak allocation 7.44 GiB. Because
+  the user's goal is much faster experiment iteration, the production config
+  selects B128. Relative to the observed approximately 0.487 step/s large-model
+  run, this is about 5.9x faster in optimizer steps and about 23x higher in
+  examples/s. These are short throughput measurements, not convergence or
+  quality conclusions.
+- The smoke loss curve at
+  `/mnt/shared/weightclip_benchmark/mini_polar_regression_smoke_20260831T141129Z/train_losses.png`
+  was inspected and is readable. Four noisy batches are insufficient to infer
+  a trend; the production trajectory must be reviewed after meaningful
+  checkpoints. The mini local 32-wide `X_sub @ W_sub` task is a proxy for one
+  input-block contribution, so its absolute losses are not directly comparable
+  to the original 128-wide task.
+
+### Production prelaunch state
+
+- Physical CUDA0 was free at 3 MiB / 0% while the separate original strict
+  encoder-only run remained isolated on CUDA1. Final B128 production output and
+  `/dev/shm` resume paths were absent. The Comet sidecar was extended to record
+  the mini architecture, parameter count, Distribution Encoder settings, and
+  ordinary loss/gradient/rate/VRAM metrics.
+- An independent final review of the exact source/config/test/sidecar hashes
+  was requested as the mandatory production gate. Production launch is pending
+  that explicit GO; the user has already authorized immediate launch after the
+  gate, without another approval prompt.
+
+## 2026-08-31 — Mini conditioned polar regression production launch
+
+- The independent final reviewer returned explicit `GO` with `P0=0, P1=0` for
+  the final B128 setup. The review confirmed the exact historical objective,
+  9,938,689-parameter conditioned model, Distribution Encoder path, nonempty
+  subtile stream and composite resume cursor, fused-loss parity, normalization
+  artifact, checkpoint/telemetry behavior, sidecar compatibility, physical
+  CUDA0 availability, and unique production paths.
+- Production was launched on physical CUDA0 from the Weight-VAE workspace with
+  `PYTHONPATH=.`. Trainer PID is `296265`; Comet sidecar PID is `296447`.
+  Output root is
+  `/mnt/shared/weightclip_benchmark/mini_polar_regression_10m_p16_tile32_b128_500k_v1`,
+  stdout log is the sibling
+  `/mnt/shared/weightclip_benchmark/mini_polar_regression_10m_p16_tile32_b128_500k_v1.launcher.log`,
+  and the live Comet run is
+  `https://www.comet.com/mike-5531/big-weight-vae/301106138caa4a638eca142a35f922e6`.
+  The separate original encoder-only job remains isolated on CUDA1.
+- Production step 1 exactly reproduced the B128 smoke start: loss `3.0761845`,
+  behavioral `1.9503107`, structural `1.1258738`, raw operator-MSE contribution
+  zero, pre-clip gradient norm `27.0537`, cursor 128, and peak allocation about
+  1.88 GiB. Both step-1 and step-100 gradient ledgers have zero missing tensors,
+  zero dead named groups, and all 23 model groups live.
+- At the later live read around step 170 / cursor 21,760, every stored scalar
+  was finite. Loss was `2.38239`, with the early logged range `2.27086..3.07618`;
+  cumulative throughput was `2.596 step/s`, implying about 53.5 hours to the
+  500k horizon if sustained. These are early operational measurements, not a
+  convergence or quality conclusion. The first resumable checkpoint is due at
+  step 1,000 and the first persistent model checkpoint at step 10,000.
+
+## 2026-08-31 — Diagnosed the mini run's pathological-looking directional-loss trace
+
+- The user flagged the directional-loss graph as abnormal. Live inspection at
+  roughly step 17.5k confirmed a long early behavioral-direction plateau near
+  `0.87`, followed by macro improvements near 7k and 10.5k, plus a strong
+  short-period sawtooth. The run was still finite and live: behavioral direction
+  had improved from `1.0029` at step 1 to about `0.52..0.56`, structural
+  direction from `0.6225` to roughly `0.33..0.44`; every stored gradient ledger
+  through 17.5k had live direction tail/head gradients. Thus explosion, NaN,
+  and a disconnected direction head were excluded.
+- The high-frequency "schizophrenic" trace has a measured data-order mechanism.
+  B128 counts subtiles rather than independent parent operators. It consumes
+  only about `13.26` parent p128 records per optimizer step; the other examples
+  are correlated output/input siblings. The balanced bank plan cycles through
+  200 strata round-robin, so one stratum sweep is approximately
+  `200 / 13.26 = 15.1` optimizer steps. Metrics sampled every ten steps alias
+  this into an approximately 30-step oscillation.
+- After local detrending over the post-12k trace, lag-30 autocorrelation was
+  `0.81` for total loss, `0.73` for structural direction, `0.50` for behavioral
+  direction, and `0.82` for behavioral scale. The separate large p128/B32 run
+  shows a weaker sampler harmonic at lag 50, consistent with its 32 parent
+  records per step and much greater batch lineage diversity. This discriminates
+  sampler/batch correlation from an intrinsically oscillatory directional-tail
+  optimizer failure.
+- The slow macro plateau and the two later downward phases are not fully
+  explained by the 30-step alias. The second transition occurs after the first
+  135,100-parent bank cycle boundary and new cycle/gauge assignments, but not
+  exactly at the boundary; a causal claim that the gauge-cycle switch triggered
+  it is therefore not established. A clean fix/test would interleave subtiles
+  from a deterministic reservoir of many parents, preserve a resumable shuffle
+  cursor, and compare the same-start directional trajectory. No such mutation
+  or production stop was performed in this diagnostic-only turn.
+
+## 2026-08-31 — Causal diagnosis of the mini directional plateau and two macro drops
+
+### Failure definition and validity checks
+
+- The user clarified that the target is the repeatable macro pattern, not the
+  approximately 30-step sampler sawtooth: behavioral direction sits near
+  `0.87` through about step 7k, improves gradually, falls sharply around
+  10.6k--11k, plateaus near `0.62` through about 15k, then enters a second
+  sustained fall to about `0.44` by 19.4k.
+- This is genuine model learning rather than changing online batch difficulty.
+  The same fixed B128 probe at stream cursor zero gives behavioral-direction
+  loss `1.00287` at seed initialization, `0.75296` at the preserved step-10k
+  model, and `0.46889` at the preserved step-19k state. Structural direction on
+  that same probe changes `0.62248 -> 0.48771 -> 0.33961`. The complete fixed
+  probe and intervention report is
+  `/mnt/shared/weightclip_benchmark/mini_polar_regression_10m_p16_tile32_b128_500k_v1/direction_phase_diagnostic_v1/fixed_probe_report.json`;
+  the preserved checkpoints are in the same directory.
+- External schedule explanations are excluded. The optimizer LR is constant at
+  `5e-5`; clipping frequency is zero during the 500--7k plateau and below 0.3%
+  in the later phases. There is no LR restart or thaw schedule. The first bank
+  cycle ends near step 10.19k, but loss does not discontinuously improve there;
+  the second macro fall begins around 15k--17k, far from a bank-cycle boundary.
+  Thus a new gauge assignment may stimulate the first transition but cannot be
+  the common mechanism of both transitions.
+
+### Competing mechanisms and discriminators
+
+- H1, loss-invisible radial growth recreates the old polar weak-gradient trap.
+  Prediction: a fall should coincide with raw-logit/state radius shrinking and
+  restored normalization Jacobian. H2, a decoder/query common-template saddle
+  initially ignores the weight latent, followed by stagewise recruitment of
+  sample-specific latent modes. Prediction: latent permutation sensitivity,
+  prediction diversity, target alignment, and effective rank should increase
+  across the macro transitions. H3, the decoder escapes only through the direct
+  Distribution Encoder context bypass. Prediction: permuting DE context should
+  dominate permuting `z`. H4, changing data/gauge composition only makes the
+  online batches easier. Prediction: gains should disappear on a fixed probe.
+  H5, the scale task or clipping/scheduler unlocks direction. Prediction: only
+  behavioral direction should improve, or the transitions should align with an
+  optimizer event.
+
+### Discriminating results and supported mechanism
+
+- Initialization is almost a common-template decoder: predicted-direction
+  cross-sample cosine is `0.9781` while target cross-sample cosine is `0.00094`;
+  rolling `z` across samples changes behavioral direction by only `-0.00113`.
+  At step 10k the prediction cosine is `0.0133` and rolling `z` worsens direction
+  by `+0.26159`; at step 19k they are `0.00402` and `+0.52452`. Therefore the
+  mini model really transitions from ignoring sample identity in `z` to relying
+  causally on it.
+- DE context is also causally used, but it is not the sole escape route. Its
+  same-probe roll penalty grows `-0.00429 -> +0.09041 -> +0.22243`, whereas the
+  latent-roll penalty is larger at both learned checkpoints. From step 10k to
+  19k, prediction/target patch cosine rises `0.2172 -> 0.4550` and latent entropy
+  effective rank rises `20.97 -> 38.08`. The second phase therefore recruits
+  additional useful latent modes and stronger joint latent/context decoding,
+  rather than merely learning an activation-only bypass.
+- The temporal gradient ordering repeats. Before the first sharp loss fall,
+  median DE gradient RMS rises from `0.000552` at steps 9401--9800 to `0.00103`
+  at 10201--10600 while behavioral direction is nearly flat
+  (`0.7529 -> 0.7377`). At 10601--11000, bottleneck gradient rises to `0.00323`,
+  direction-tail to `0.000190`, direction-head to `0.00759`, and behavioral
+  direction falls to `0.6498`. Before the later fall, DE gradients again burst
+  during 15.4k--17.4k; during 17.8k--19.4k direction-tail/head and downstream
+  decoder gradients increase roughly two to threefold while the loss falls
+  from about `0.51` to `0.44`. This supports a repeated two-stage process:
+  representation/context alignment accumulates first, then useful credit
+  reaches the bottleneck and directional decoder and the observable loss moves.
+- H1 contributes to the length of the plateau but does not trigger the falls.
+  The direction-head Frobenius norm grows `0.0787 -> 0.2923 -> 0.3595` and raw
+  logit norm grows `0.0833 -> 0.7904 -> 0.8706`; the second fall happens without
+  a radius collapse. Unlike the old 700M failure, direction-tail state RMS is
+  bounded (`0.1664 -> 0.1564` from 10k to 19k) and the latent does not collapse
+  to rank one. The smaller model can therefore cross the coupled
+  encoder/decoder saddle that the old runaway-radii model could not cross.
+- H4 and H5 are excluded as primary mechanisms: the fixed-probe gains remain;
+  structural direction improves alongside behavioral direction even though
+  scale is detached from the direction route; and there is no scheduler or
+  clipping event. Checkpoint saves also occur repeatedly without matching every
+  transition.
+
+### Narrow conclusion and remaining discriminator
+
+- The best-supported mechanism is delayed, stagewise symmetry breaking of a
+  coupled autoencoder path. Learned output queries and DE context initially let
+  the decoder emit a nearly sample-independent direction template, so the
+  encoder and decoder face a chicken-and-egg saddle: `z` is not yet useful to a
+  decoder that does not listen to it, and the decoder receives little useful
+  sample-specific signal from `z`. Representation/DE gradients accumulate;
+  once an aligned mode crosses the sensitivity threshold, bottleneck/tail
+  credit increases and the loss drops. A second set of modes is recruited later,
+  producing the second fall. This is a grokking-like phase transition in route
+  usage, not evidence of a discrete scheduler change.
+- The exact trigger attribution between DE, encoder and decoder remains a
+  leading mechanism rather than a completed intervention proof because no
+  pre-7k or pre-15k fixed-probe checkpoints exist. A decisive future run should
+  save fixed-probe geometry every 250--500 steps and branch the same optimizer
+  state immediately before a transition into normal, frozen-DE, frozen-latent
+  encoder, and context-dropout continuations. No production mutation or stop
+  was made during this diagnosis.
+
+## 2026-08-31 — Literature map for encoder lag, decoder latent ignoring, and staged loss drops
+
+- User framing: the repeated pattern is representation collapse caused by a
+  weak encoder at initialization, after which the decoder learns to ignore it.
+  Terminology needs one qualification. In a stochastic VAE, `posterior
+  collapse` strictly means that the approximate posterior approaches the prior.
+  This mini model has no KL or stochastic posterior, so `latent-pathway
+  collapse`, `latent ignoring`, or `decoder-side shortcut collapse` is the more
+  exact name. The training mechanism is nevertheless directly covered by the
+  posterior-collapse literature.
+- He et al., *Lagging Inference Networks and Posterior Collapse in Variational
+  Autoencoders* (ICLR 2019, https://arxiv.org/abs/1901.05534) is the closest
+  match to the proposed causal ordering. It reports that early in training the
+  inference/encoder network lags the moving true posterior, which encourages
+  the model to ignore the latent; their intervention is aggressive inference
+  network updates before model updates.
+- Fu et al., *Cyclical Annealing Schedule* (NAACL 2019,
+  https://aclanthology.org/N19-1021/) gives the closest architectural picture.
+  A low-quality early `z` makes the decoder discard latent Path A and use the
+  easier autoregressive/bypass Path B. In this project, the analogous Path B is
+  the learned output-query plus direct Distribution Encoder context route. The
+  paper's KL schedule is not directly applicable because the mini model has no
+  KL; its two-path diagnosis is applicable.
+- Chen et al., *Variational Lossy Autoencoder* (ICLR 2017,
+  https://openreview.net/forum?id=BysvGP5ee) calls the broader effect the
+  information-preference property: a sufficiently expressive decoder models
+  predictable structure without spending latent information. Dang et al.,
+  *Beyond Vanilla VAEs* (ICLR 2024,
+  https://proceedings.iclr.cc/paper_files/paper/2024/hash/26ded5c8ee8ec1bc4caced4e1c9b1584-Abstract-Conference.html)
+  extends collapse theory to conditional VAEs and shows that the relationship
+  between conditioning input and output affects collapse. This is especially
+  relevant to the activation-derived DE decoder side channel.
+- Hu et al., *Complexity Matters: Rethinking the Latent Space for Generative
+  Modeling* (NeurIPS 2023,
+  https://papers.nips.cc/paper_files/paper/2023/hash/5e8023f07625374c6fdf3aa08bb38e0e-Abstract-Conference.html)
+  is the closest deterministic-autoencoder result. It argues for a relatively
+  weak decoder during representation learning and proposes Decoupled
+  AutoEncoder training: first train the encoder with an auxiliary weaker
+  decoder, then freeze that encoder and train the full decoder. This supports a
+  controlled encoder-first/decoder-later experiment more directly than VAE KL
+  remedies do.
+- Saxe et al., *Exact Solutions to the Nonlinear Dynamics of Learning in Deep
+  Linear Neural Networks* (ICLR 2014, https://arxiv.org/abs/1312.6120) gives a
+  theoretical analogue for the visible curve shape: deep factorized paths can
+  have long plateaus followed by rapid drops and learn correlation modes in
+  stages. This supports the interpretation of the two drops as sequential mode
+  recruitment, but it is an analogue rather than a proof for the nonlinear
+  conditioned transformer.
+- Other useful boundaries: Lucas et al., *Don't Blame the ELBO!* (NeurIPS 2019,
+  https://papers.nips.cc/paper/9138-dont-blame-the-elbo-a-linear-vae-perspective-on-posterior-collapse)
+  establishes that collapsed local solutions are not solely a KL or powerful
+  decoder artifact. Dieng et al., *Avoiding Latent Variable Collapse with
+  Generative Skip Models* (AISTATS 2019,
+  https://proceedings.mlr.press/v89/dieng19a.html) shows that architecturally
+  enforcing stronger latent-to-likelihood links increases mutual information
+  and reduces collapse.
+- Project-specific synthesis, not a literature-established fact: the fixed
+  probe shows that the mini decoder ignores `z` at initialization even though
+  the initial latent has nontrivial diversity. Therefore `weak/low-quality
+  encoder route -> decoder chooses bypass -> encoder later loses credit` is
+  better supported than saying the encoder representation itself is already
+  collapsed at step zero. The literature-backed next discriminator would use
+  the same start and compare normal joint training against (1) several encoder
+  updates per decoder update, (2) a weak/minimal decoder warm-up, and (3) a
+  temporarily gated or dropped DE decoder bypass, followed by a controlled
+  decoder ramp. No experiment change was authorized or launched in this
+  literature-review turn.
+
+## 2026-08-31 — Mini baseline review and acceleration priority
+
+- User believes the 10M mini polar-regression baseline may already be trained
+  sufficiently based on its Comet curves and asked for the experiment link
+  again. The next intended direction is to make training substantially faster.
+- Live operational evidence at review time: the production process was still
+  active and had reached step `61,690 / 500,000` (12.3%), not the configured
+  terminal step. Its run root is
+  `/mnt/shared/weightclip_benchmark/mini_polar_regression_10m_p16_tile32_b128_500k_v1`,
+  and Comet is
+  `https://www.comet.com/mike-5531/big-weight-vae/301106138caa4a638eca142a35f922e6`.
+  Therefore process completion is false; whether the learning curves have
+  converged sufficiently is not yet established and remains a user/artifact
+  review question.
+- No stop or training change was requested in this turn. Keep the current run
+  intact pending the user's inspection, then profile and optimize the measured
+  training bottleneck under the same regression contract.
+
+## 2026-08-31 — Mini baseline stopped; latent-preference objective framing
+
+- User requested a checkpoint-preserving stop of the current 10M mini baseline
+  and proposed two related additions: (1) a small two-layer projection head with
+  a contrastive representation loss, with the positive/negative identity still
+  undecided (dataset versus layer or another grouping); and (2) a decoder loss
+  that prefers the existing losses under the correct latent over the same losses
+  under a shuffled latent. User suggested treating the latter as a wrapper over
+  all current behavioral/structural losses and compared the idea to an RL-style
+  preference baseline.
+- Operational evidence: SIGTERM was sent only to the mini trainer. The run
+  stopped cleanly at step `72,611`; the trainer workers and Comet sidecar then
+  exited. `/mnt/shared/weightclip_benchmark/mini_polar_regression_10m_p16_tile32_b128_500k_v1/STOPPED.json`
+  records `status=stopped`, the exact composite cursor, and both checkpoint
+  paths. Fresh full resume state is at
+  `/dev/shm/weightclip_mini_polar_regression_10m_p16_tile32_b128_500k_v1/resume_latest.pt`;
+  the persistent model is at
+  `/mnt/shared/weightclip_benchmark/mini_polar_regression_10m_p16_tile32_b128_500k_v1/model_latest.pt`.
+  Physical CUDA 0 was verified free at 3 MiB and 0% with no compute process;
+  the unrelated encoder-only run remains on CUDA 1.
+- Post-run review: the inspected plot
+  `/mnt/shared/weightclip_benchmark/mini_polar_regression_10m_p16_tile32_b128_500k_v1/train_losses.png`
+  is readable and shows the large staged decreases followed by a much shallower
+  noisy regime. The final `60k-72.6k` medians were total `0.2597`, behavioral
+  `0.1237`, structural `0.1385`, behavioral direction `0.07343`, and diagnostic
+  operator relative MSE `0.1667`. A fit to 1k-block medians over `40k-72k`
+  still decreased by about 8.2% of the median total loss per 10k steps, so exact
+  convergence is not established, although marginal gains are much smaller.
+- A fresh fixed-probe audit was stored at
+  `/mnt/shared/weightclip_benchmark/mini_polar_regression_10m_p16_tile32_b128_500k_v1/direction_phase_diagnostic_v1/final_step_00072611_report.json`.
+  At step 72,611 the fixed-probe base loss was `0.4661`; rolling latents across
+  samples raised it by `+2.4625`, whereas rolling direct distribution context
+  raised it by `+0.6382`. Latent entropy effective rank was `98.05` (versus
+  `22.51` at initialization), stable rank `11.55`, and top energy fraction
+  `0.0866`. Therefore the final checkpoint does not exhibit a decoder that
+  ignores `z` under this random-roll intervention. The observed initial
+  near-independence was transient; a new objective would aim to establish the
+  dependency earlier or under harder matched negatives, not repair proven
+  final-step collapse.
+- Recommended formulation, not yet implemented: retain the absolute original
+  positive loss and add a bounded pairwise preference term. For per-example
+  `L_pos` and same-loss `L_neg`, define a relative gap
+  `g=(L_neg-L_pos)/stopgrad(L_pos+eps)` and optimize a smooth hinge/logistic
+  `softplus((margin-g)/temperature)`. This is DPO/RankNet-like energy
+  preference with reward `-L`, not reinforcement learning. Do not replace the
+  original loss: pure difference optimization can succeed by making the
+  shuffled branch arbitrarily bad. A finite margin makes the negative pressure
+  stop after sufficient separation.
+- Negative latents should be detached and matched on nuisance identifiers such
+  as dataset, layer/operator role/depth, tile row/column, and mask signature,
+  while differing in checkpoint/lineage. Random shuffles or shuffles across
+  tile coordinates permit trivial dataset/layer/coordinate shortcuts. Current
+  batches do not carry all available sample metadata, so the collator would
+  need to retain `dataset`, `lineage_id`, `checkpoint_sha256`, `layer_key`,
+  `gauge_id`, and coordinates. The current model already exposes separate
+  `encode` and `decode_polar`, so a second latent-only decoder pass is otherwise
+  straightforward; the routed loss must be refactored to expose per-example
+  values rather than only a batch aggregate.
+- The representation head and decoder preference are complementary. A head-only
+  loss can learn layer/dataset identity while the decoder still ignores `z`;
+  preference-only training can exploit a coordinate mismatch. For the head,
+  positives defined merely as “same layer” are not recommended if the goal is
+  instance-specific operator information, because they pull distinct operators
+  together. The cleanest candidate is two controlled views of the same p32
+  sample, with hard negatives from the same layer and coordinates but another
+  checkpoint. The existing full-operator gauge views cannot automatically be
+  paired by equal p32 coordinates because permutations cross tile boundaries.
+  This positive identity remains a material user decision before implementation.
+- Literature boundaries: VICReg (https://arxiv.org/abs/2105.04906) provides an
+  explicit variance/covariance anti-collapse alternative when reliable
+  negatives are unavailable; SupCon (https://arxiv.org/abs/2004.11362) supports
+  multiple label-defined positives but does not resolve what semantic identity
+  should be used here; DPO (https://arxiv.org/abs/2305.18290) motivates the
+  smooth pairwise-classification shape, but its policy/reference derivation does
+  not directly transfer to this deterministic regression decoder.
+
+## 2026-08-31 — Final mini latent-preference experiment design
+
+- User requested the final setup design. The frozen design is stored at
+  `projects/weight-vae/workspace/docs/mini_polar_latent_preference_final_setup_20260831.md`;
+  it is a design artifact only, and no new training was launched in this turn.
+- Main scientific decision: the causal panel starts from the exact fresh seed-42
+  initialization, not the warm step-72,611 checkpoint, because the fixed-probe
+  audit already shows strong final latent dependence. The stopped checkpoint is
+  retained as the quality/reference endpoint. Starting from it would not test
+  whether the proposed losses prevent the early weak-latent phase.
+- Positive identity is fixed to the same individual p32 operator sample under
+  two projector-dropout views. “Same layer” and “same dataset” are rejected as
+  positive labels because they allow coarse prototypes and can remove
+  instance-specific information.
+- Hard negatives are exact nuisance-matched pairs: same dataset, training epoch,
+  layer key, operation/depth/role, parent and p32 coordinates, masks and graph
+  gauge, but different lineage/checkpoint. The primary negative is a different
+  lineage at the same epoch; adjacent epochs in one lineage are evaluation-only
+  because near-identical weights can become false negatives.
+- The 3k-step causal panel is canonical-only and includes a paired-sampler
+  control, representation-only, preference-only and combined arm. Historical
+  baseline metrics are contextual rather than the formal control because the
+  paired canonical view schedule changes ordering/views. A winning arm must
+  later pass a shared-gauge confirmation in which exactly the same verified
+  gauge is applied to both pair members; equal view indices from different
+  checkpoints are not sufficient.
+- The representation head is training-only `RMSNorm -> flatten(768) ->
+  256-GELU-dropout(0.1) -> 128 -> L2`, with symmetric binary InfoNCE at
+  temperature 0.1. The decoder preference is a relative smooth hinge over the
+  exact original per-example routed loss, margin 0.5 and temperature 0.1. The
+  original positive loss always remains the anchor. Foreign latents and direct
+  conditioning/query state are detached in the negative branch so the
+  preference gradient targets decoder use of `z` rather than a conditioning
+  mismatch shortcut.
+- Static auxiliary coefficients are calibrated once on a fixed paired probe to
+  initial gradient ratios 0.25 (preference/base) and 0.10
+  (representation/base), stored in an artifact, and linearly ramped during the
+  first 1k steps. No adaptive online rescaling is allowed. A weighted auxiliary
+  ratio above 0.75 stops the run diagnostically.
+- Panel arms run for 3k steps from identical starts; the winner extends to 30k,
+  covering the historical transition regions, and only then may extend to
+  72,611. Required gates cover positive-loss preservation, hard matched gap,
+  component non-cheating, latent rank, paired-swap sensitivity, exact pairing,
+  gradients and throughput. An independent reviewer GO is required before a
+  long confirmation launch.
+- Math-preserving speed work is part of every arm: background four-batch CPU
+  prefetch, pinned transfer, overlap, and removal of unconditional per-step CUDA
+  synchronization. Fused AdamW and `torch.compile` are intentionally excluded
+  from the causal loss comparison. The optimized paired control targets at
+  least 1.5x historical median throughput; each loss arm must retain at least
+  70% of that control throughput.
+
+### 2026-08-31 — Exact representation-loss definition
+
+- User asked for the exact `L_repr` after confirming the original routed polar
+  regression `L_base`.
+- For every nuisance-matched pair `(i,j)`, form two independent dropout views
+  `h_i^a,h_i^b` and `h_j^a,h_j^b` with the training-only normalized projector.
+  The positive for an anchor is its other view of the exact same tile; the only
+  training negative is the matched tile from the other lineage.
+- Define `ell(u,v,n) = -log(exp(cos(u,v)/0.1) /
+  (exp(cos(u,v)/0.1) + exp(cos(u,n)/0.1)))`. The exact symmetric pair loss is
+  the mean of `ell(h_i^a,h_i^b,h_j^b)`, `ell(h_i^b,h_i^a,h_j^a)`,
+  `ell(h_j^a,h_j^b,h_i^b)`, and `ell(h_j^b,h_j^a,h_i^a)`, then averaged over
+  the 64 matched pairs in B128. Gradients flow through the encoder and
+  projector; there is no stop-gradient in `L_repr`.
+- This is deliberately binary matched-negative InfoNCE, not all-batch InfoNCE:
+  easy negatives from unrelated layers/datasets must not dominate the signal.
+  The projector is discarded at decoding/evaluation time. Raw `L_repr` is near
+  `log(2)` when positive and negative similarities are indistinguishable and
+  approaches zero when the exact-sample positive wins cleanly.
+
+## 2026-09-01 — Combined mini latent-preference production launch
+
+- User overrode the staged 3k/30k causal panel and approved an immediate fresh
+  seed-42 combined run for the full 500,000-step horizon, with no additional
+  approval gate. This is not a warm-checkpoint continuation: the experiment is
+  intended to test whether the two auxiliary losses prevent the early weak-z
+  phase that a warm converged checkpoint cannot reproduce.
+- Implemented production trainer/config/test/design artifacts at
+  `projects/weight-vae/workspace/training/weightclip_benchmark/run_mini_polar_latent_preference_production.py`,
+  `projects/weight-vae/workspace/conf/weightclip_benchmark/mini_polar_latent_preference_10m_p16_tile32_production_500k.yaml`,
+  `projects/weight-vae/workspace/tests/mini_polar_latent_preference_production_test.py`,
+  and `projects/weight-vae/workspace/docs/mini_polar_latent_preference_final_setup_20260831.md`.
+  The historical pre-categorical two-tail polar regression remains the base
+  objective; the 9,938,689-parameter core is augmented by a 229,808-parameter
+  training-only projector. B128 contains 64 exact-layout, same-checkpoint-index,
+  different-lineage hard pairs from the unchanged pinned operator bank.
+- The first independent review returned NO-GO with two P1 blockers: the Comet
+  sidecar could not parse the new gradient schema, and the planned causal
+  telemetry was incomplete. Both were fixed. The final trainer records full
+  positive/foreign component losses and gap distributions, pair distances,
+  latent geometry, four fixed-probe interventions, and objective-split module
+  gradients; the sidecar streams these data and five readable plots. The final
+  independent re-review returned GO with P0=0 and P1=0 after a current-tree
+  nine-test pass and inspection of the final B128 smoke at
+  `/mnt/shared/weightclip_benchmark/mini_polar_latent_preference_smoke_20260831T234940Z`.
+- Smoke calibration fixed `lambda_pref=7.293307614` and
+  `lambda_repr=0.018456987` without clipping. The fresh production calibration
+  reproduced these values (`7.29331231` and `0.01846324`). Pair validity,
+  lineage mismatch, checkpoint mismatch, and same checkpoint-index fractions
+  were all exactly 1.0; no NaN/Inf was observed.
+- Production is live on physical CUDA 0 with trainer PID 408988 and sidecar PID
+  410002. Run root:
+  `/mnt/shared/weightclip_benchmark/mini_polar_latent_preference_10m_p16_tile32_b128_500k_v1`;
+  launch log is the adjacent `.launch.log`; exact resume checkpoint is
+  `/dev/shm/weightclip_mini_polar_latent_preference_10m_p16_tile32_b128_500k_v1/resume_latest.pt`.
+  Comet experiment:
+  `https://www.comet.com/mike-5531/big-weight-vae/5860bf85c2c84743833b1c2847df2d3a`.
+  CUDA 1 and its unrelated encoder-only run were not touched.
+- Early evidence only, not a convergence claim: at step 120, all rows were
+  finite, peak allocated VRAM was 2.62 GiB, representation pair accuracy was
+  1.0, and median preference gap was 0.088 while p10 was approximately -0.001.
+  The step-100 auxiliary/base gradient ratio was 0.331 at ramp 0.10, below the
+  0.75 diagnostic stop. Median throughput from steps 20-120 was only 0.452
+  steps/s (about 12.8 days projected), dominated by roughly 2-3 seconds of hard
+  pair data wait versus roughly 0.08-0.35 seconds of GPU work. Therefore the
+  scientific run is valid and active, but the requested speedup is not yet
+  established; hard-pair I/O is the leading operational bottleneck to optimize
+  without changing the loss contract.
+
+### 2026-09-01 — Production diagnostic stop at step 200
+
+- The preceding live-status entry was superseded minutes later by the approved
+  fail-closed guard. At attempted step 200, weighted auxiliary/base gradient
+  ratio reached `0.99662264`, exceeding the fixed `0.75` threshold. Step 200 was
+  not committed. The trainer saved an exact resume checkpoint and persistent
+  model at committed step 199, wrote `DIAGNOSTIC_STOP.json` and `STOPPED.json`,
+  and released CUDA 0. The Comet sidecar uploaded and flushed all available
+  rows, then was selectively terminated; CUDA 1 remained untouched.
+- Validity checks passed: all stored metric/gradient values are finite, pair
+  contract fractions remain exactly 1.0, and this was not a data, resume, GPU,
+  or logging failure. The five final plots were inspected and are readable.
+- Directly supported proximal mechanism: first-batch static calibration did not
+  remain predictive as training changed the two objectives. Base gradient L2
+  fell from `51.92` at step 1 to `7.62` at step 100, while weighted preference
+  gradient L2 rose from `0.0130` to `2.525`; at step 100 this already produced
+  auxiliary/base `0.331` with only 10% ramp. At step 200, 20% ramp crossed the
+  guard. Objective-split telemetry at step 100 shows preference pressure in the
+  encoder, decoder trunk and especially direction tail, rather than a projector
+  logging artifact. The deeper cause of the continued preference-gradient
+  amplification is not yet distinguished from the simultaneous decay of the
+  easy base-regression gradient.
+- Early scientific signal was mixed: representation pair accuracy reached 1.0,
+  but preference p10 stayed negative and the margin-satisfied fraction remained
+  near zero through the stored metrics. Thus bypassing the guard is not
+  justified. Changing `lambda_pref`, the 1k ramp, or using online gradient
+  budgeting would define a new experiment and requires an explicit protocol
+  choice; the stopped step-199 state is preserved for either resume diagnostics
+  or comparison, but a fresh start is the fair test of a revised prevention
+  schedule.
+
+### 2026-09-01 — Why the combined run did not continue
+
+- User asked what specifically failed. The model and representation objective
+  did execute; the failed assumption was that one random-initialization batch
+  could calibrate a fixed preference coefficient for the later non-stationary
+  optimization. Calibration chose `lambda_pref=7.2933` because the initial
+  unweighted preference gradient L2 was `1.7798` versus base `51.9217`, targeting
+  a full-strength ratio of 0.25.
+- The linear coefficient ramp controlled only the scalar coefficient, not the
+  realized gradient ratio. From step 1 to step 100, base gradient L2 fell
+  `51.92 -> 7.62` (6.8x) while the ramp-corrected raw preference gradient rose
+  about 1.94x. Together these changes made the raw preference/base ratio about
+  13.2x larger than at calibration. Therefore even 10% ramp produced an actual
+  ratio of `0.331`, and 20% ramp reached `0.997` at attempted step 200.
+- The preference hinge remained active because the requested relative margin
+  was 0.5 while the observed median gap was only roughly 0.04-0.09 and p10 was
+  usually negative. In contrast, the representation gradient at step 100 was
+  only `0.00116` versus preference `2.5246`; representation was not the source
+  of the stop. Narrow conclusion: this coefficient-calibration/schedule is
+  invalid for the changing gradient geometry. It does not establish that the
+  decoder-preference idea itself is invalid.
+
+### 2026-09-01 — Comet visibility correction
+
+- User reported that the Comet experiment appeared to contain no logs. Remote
+  API verification showed the scalar upload was intact: 209 metric series,
+  including 20 points each for `train/loss`, `train/base_loss`,
+  `train/preference_loss`, `train/representation_loss`, and the preference-gap
+  metrics. The initial sidecar had intentionally disabled stdout capture, so
+  the Comet text Logs view did not contain the trainer launch log even though
+  scalar metrics existed.
+- Reopened the same experiment key, uploaded the trainer stdout as both a text
+  sample and asset, uploaded all metric/gradient/probe/config/stop JSON(L)
+  evidence, and attached all five final diagnostic PNGs at step 199. Remote API
+  then listed 14 assets. No duplicate experiment was created.
+
+## 2026-09-01 — Revised preference v2 production launch
+
+- After confirming that v1 truly stopped at step 199, the user approved an
+  immediate corrected launch. The evidence-directed v2 intervention is narrow:
+  fresh seed 42, preference calibration target `0.25 -> 0.025`, and linear ramp
+  `1k -> 10k`; the historical base objective, model, data order, hard pairs,
+  representation loss, preference formula, optimizer and 0.75 hard guard are
+  unchanged. V2 has unique persistent and `/dev/shm` paths, so v1 artifacts are
+  preserved.
+- Focused tests passed 8/8 locally; the independent final reviewer reran the
+  expanded current-tree suite (10 passed), verified exact final hashes and
+  returned GO with P0=0 and P1=0. Final B128 smoke at
+  `/mnt/shared/weightclip_benchmark/mini_polar_latent_preference_smoke_20260901T082444Z`
+  completed 2/2 with `lambda_pref=0.72933088`, unchanged
+  `lambda_repr=0.01845857`, no clamps, exact pair validators 1.0, finite
+  objective-split telemetry and 2.53 GiB peak allocation.
+- Fresh 500k v2 production is live on physical CUDA 0 with trainer PID 507258
+  and Comet sidecar PID 508419. Run root:
+  `/mnt/shared/weightclip_benchmark/mini_polar_latent_preference_10m_p16_tile32_b128_pref025_ramp10k_500k_v2`;
+  Comet:
+  `https://www.comet.com/mike-5531/big-weight-vae/26e6abb3e78746f19eb69a82cc0a0994`.
+  Remote API verification found 22 loss rows through step 210 and the gradient
+  audit through step 200; a live trainer stdout asset was also attached.
+- V2 crossed the exact v1 failure point and continued: auxiliary/base gradient
+  ratio was `0.001955` at step 100 and `0.006406` at step 200, versus v1
+  `0.996623` at attempted step 200 and the unchanged 0.75 stop threshold. All
+  observed rows were finite. This establishes that the revised schedule fixes
+  the immediate step-200 takeover; it is early telemetry, not evidence that the
+  full 10k ramp or 500k convergence is safe.
+- The known performance limitation remains: roughly 0.4 steps/s because
+  dynamic hard-pair materialization is I/O-bound. The scientific run remains
+  active; throughput optimization is a separate follow-up and must preserve the
+  exact paired sample stream.
+
+### 2026-09-01 — Representation objective is too easy
+
+- User observed that the representation loss is too simple. Live v2 telemetry
+  supports this: by steps 840-910, binary representation accuracy was 1.0,
+  raw loss was roughly `0.0006-0.004`, projector positive cosine was about
+  `0.944` and matched-negative cosine about `0.02-0.08`. At the step-900
+  gradient audit, weighted representation gradient L2 was only `5.91e-5`
+  versus base `1.997` and preference `0.1204`.
+- The current task has three related shortcuts: the positive consists of two
+  dropout passes through the projector over the exact same already-computed
+  latent; each anchor has only one binary negative; and the two-layer projector
+  can amplify a small lineage-specific difference without requiring the raw
+  latent geometry to carry a broadly useful representation. Consistent with
+  the head-shortcut hypothesis, raw paired-latent cosine remained roughly
+  `0.30-0.65` and generally above random cross-sample cosine `0.17-0.42`, while
+  the projector already separated the pair almost perfectly.
+- This establishes saturation and vanishing useful representation pressure,
+  not which shortcut is individually dominant. A discriminating replacement
+  should bundle: projector-versus-direct-z ablation, multiple exact-matched
+  negatives per anchor, and encoder-input views rather than projector-only
+  dropout. A low-capacity linear projection over normalized slotwise z plus
+  K-way hard InfoNCE (for example K=8 exact nuisance-matched lineages) and a
+  small direct-z variance/covariance floor is the current leading design. The
+  active production was not changed or stopped merely from this discussion.
+
+### 2026-09-01 — Selective CUDA 1 encoder-only pause
+
+- User requested stopping only the CUDA 1 encoder-only production with exact
+  continuation possible later. CUDA 0 mini preference v2 was left untouched.
+- Sent SIGTERM only to trainer PID 71669. Its cooperative handler finished the
+  current optimizer step and atomically saved at step 82,132 / committed cursor
+  2,628,224, then wrote `STOPPED.json` and exited. The matching Comet sidecar
+  PID 72733 was terminated only after trainer completion and flushed normally.
+- Exact process-resume checkpoint (model, AdamW, RNG, config and cursor) is
+  `/dev/shm/weightclip_direct_normalized_scaled_700m_p32_polar_tails_encoder_only_500k_v1/resume_latest.pt`
+  (6,762,464,202 bytes). Because `/dev/shm` is host-volatile, an additional
+  atomic persistent copy was stored at
+  `/mnt/shared/weightclip_benchmark/direct_normalized_scaled_700m_p32_polar_tails_encoder_only_500k_v1/resume_stopped_step_82132.pt`
+  with the same recorded size. The persistent model-only checkpoint at
+  `model_latest.pt` was also refreshed at step 82,132.
+- Final hardware verification: physical CUDA 1 had no compute process, 3 MiB
+  used and 0% utilization; CUDA 0 retained only the mini v2 trainer. Restart
+  should restore the persistent exact resume back to the config-declared
+  `/dev/shm` resume path if the host was rebooted, then launch the unchanged
+  encoder-only production config.
+
+### 2026-09-01 — Mini optimizer-timescale arm (`AdamW beta1=0.99`)
+
+- User requested a CUDA 1 copy of the live CUDA 0 mini latent-preference v2,
+  strongly increasing Adam first-moment smoothing without increasing batch size
+  or gradient accumulation. The chosen intervention is `beta1 0.90 -> 0.99`;
+  `beta2=0.999`, fresh seed 42, data order, B128, LR `5e-5`, model, historical
+  two-tail base regression, hard pairs, auxiliary losses/calibration/ramp and
+  500k horizon are unchanged. The only other config differences are physical
+  `cuda:1` and unique output/resume/model paths. Thus this is a fair optimizer
+  timescale arm, not a warm start from the already-trained control.
+- Pre-flight mechanism audit of the CUDA 0 metrics found that the visible raw
+  base-loss sawtooth is not established as optimizer noise. Over the last 300
+  logged rows available at audit time, base loss had autocorrelation `0.736` at
+  lag 3 (logging is every 10 steps, hence a 30-step period), while lag 1 was
+  only `0.080`; the same phase separation was strongest in structural loss.
+  Base loss correlated `0.795` with structural and `0.696` with behavioral.
+  Meanwhile the fixed probe changed only `2.124 -> 2.154 -> 2.129` at steps
+  1000/2000/3000. Source evidence is the control
+  `train_metrics.jsonl` and `fixed_probe_metrics.jsonl` under
+  `/mnt/shared/weightclip_benchmark/mini_polar_latent_preference_10m_p16_tile32_b128_pref025_ramp10k_500k_v2`.
+- Competing mechanisms and discriminators are therefore: (1) periodic
+  data/stratum composition predicts the same 30-step phase pattern in both
+  arms but a much smoother fixed probe; (2) Adam first-moment update noise
+  predicts lower matched-step residual/first-difference variation and a smoother
+  fixed probe for `beta1=0.99`; (3) structural-component domination predicts
+  that any improvement is localized to structural loss rather than all loss
+  components. Phase-conditioned raw loss, equal-step fixed probes and
+  component-wise variation will distinguish them; no causal conclusion is
+  claimed from the launch alone.
+- Final focused tests passed (`9 passed` in the parent run; independent reviewer
+  reran the directly relevant file with `8 passed`). B128 smoke at
+  `/mnt/shared/weightclip_benchmark/mini_polar_latent_preference_smoke_20260901T093343Z`
+  completed 2/2 on CUDA 1: 10,168,497 total parameters, all parameter groups
+  live, finite telemetry, exact pair validators 1.0, committed cursor 128 and
+  2.53 GiB peak. The independent reviewer verified hashes/diff/AdamW wiring and
+  returned final GO with P0=0, P1=0.
+- Production is live on physical CUDA 1 with trainer PID 525305 and Comet
+  sidecar PID 526222. Config:
+  `projects/weight-vae/workspace/conf/weightclip_benchmark/mini_polar_latent_preference_10m_p16_tile32_pref025_ramp10k_beta1_099_production_500k.yaml`;
+  run root:
+  `/mnt/shared/weightclip_benchmark/mini_polar_latent_preference_10m_p16_tile32_b128_pref025_ramp10k_beta1_099_500k_v3`;
+  Comet:
+  `https://www.comet.com/mike-5531/big-weight-vae/6d170f78df8b4e038c9b748bc4d1d8d4`.
+  Remote API verification found 705 metric records through step 40 and both a
+  trainer stdout text sample and asset, so the Comet page contains real scalars
+  and logs rather than only an experiment shell.
+- Early equal-step evidence through step 100 is mixed and does not yet support
+  smoothing. For base loss, first-difference std was `0.277` at beta1 0.90
+  versus `0.322` at beta1 0.99, and detrended std was `0.199` versus `0.203`;
+  structural first-difference std improved slightly `0.170 -> 0.160`. Step-100
+  base loss was `2.6470 -> 2.5816`, but eleven early logged points are far too
+  few and still strongly non-stationary. The beta1 arm remains running for the
+  decisive matched 1k+ comparison.
+- Operationally, running both hard-pair loaders concurrently reduced each run
+  to roughly `0.27 step/s` in the current window (about 3.4-3.7 seconds data
+  wait per step), while GPU compute is much shorter. This is host data-loader
+  contention, not GPU saturation or a model failure. Changing loader topology
+  now would confound the optimizer arm; throughput optimization remains a
+  separate experiment.
+
+### 2026-09-01 — Current mini batch-diversity contract
+
+- User asked how the active mini dataloader works and how batch diversity is
+  controlled. The current pipeline has deterministic cycle-level hierarchical
+  balancing, but no strict diversity constraint on the final p32 minibatch.
+  The parent p128 stream round-robins 200 shuffled
+  `(dataset, operation, depth_index, role)` strata. Entries inside each stratum
+  are shuffled and cyclically repeated so large tiled operators do not dominate
+  merely by tile count. An I/O locality reorder groups operators only within
+  each stratum while preserving the exact global stratum sequence; lineage and
+  checkpoint temporal order are explicitly not preserved by that contract.
+- Each p128 parent is then expanded sequentially into its nonempty p32
+  subtiles, with no second shuffle. A training step takes the next 64 contiguous
+  p32 anchors and resolves one deterministic hard partner for every anchor,
+  producing physical B128 as 64 adjacent pairs. Every pair is fail-closed to
+  different lineage and different checkpoint payload while matching dataset,
+  checkpoint index, layer/operator, tile/subtile coordinates, masks and
+  canonical gauge. Which member is the positive target alternates by pair and
+  step. Loader workers and prefetch change materialization latency only, not
+  the committed logical order.
+- Consequently the hard guarantee is pair validity and cycle-level stratum
+  exposure, not a minimum number of lineages/checkpoints/contexts per final
+  B128. Live beta1=0.90 telemetry over steps 2370-5360 shows only 8-24 unique
+  lineages per physical B128 (median 14, mean 15.15) and 32-62 unique
+  Distribution Encoder contexts (median 46, mean 45.34; mean reuse 2.88x).
+  The stream consumed about 66 parent p128 tiles per ten optimizer steps, or
+  roughly 6.6 parents per 64-anchor batch, explaining the within-parent
+  clustering. Unique-lineage count had near-zero correlation with base loss
+  (`-0.043`) and context count only weak correlation (`-0.162`), so these two
+  counts alone do not explain the 30-step sawtooth.
+- Direct inspection of the saved production fixed batch confirms the user's
+  suspected same-matrix multiplicity. Its 64 anchor pairs form only seven
+  consecutive parent-matrix blocks with p32 patch counts
+  `[1, 16, 16, 4, 4, 16, 7]`; every block has a corresponding partner matrix,
+  so physical B128 contains only 14 checkpoint payloads/lineages. Six of those
+  payloads contribute 16 samples each. Thus one matrix can contribute up to 16
+  p32 patches to a single batch (and its matched partner another 16), making up
+  32/128 samples from one exact matrix-pair block.
+- Historical p128/B32 did not have this same-matrix concentration at meaningful
+  scale because it batched parent tiles directly, before p128-to-p32 expansion.
+  Its exhaustive cycle-0 locality audit over 4,222 B32 batches reported mean
+  31.35 unique checkpoint payloads (p5 30) and mean 30.71 unique lineages (p5
+  29), with only 0.218% adjacent same-lineage entries. Thus a p128 batch was
+  normally 30-32 distinct matrices/checkpoints rather than seven matrix pairs.
+  The late p128 loss did show a separate periodic autocorrelation peak at 50/100
+  optimizer steps, while its means by `step mod 30` were nearly equal. This
+  means p128 was not free of composition periodicity, but it did not have the
+  mini run's p32 block-amplification mechanism or exact 30-step phase pattern.
+- The missing discriminator is per-batch p32 stratum/operator/parent occupancy
+  and entropy. A future truly batch-balanced arm should buffer p32 anchors and
+  constrain max anchors per parent/operator while round-robining strata, retain
+  the exact hard-pair resolver, and log stratum entropy/max-repeat. That would
+  change sample order and is therefore a separate experiment, not a live edit
+  to the beta1 comparison.
+
+#### Identity terminology clarification
+
+- `lineage_id` is one complete source-model training trajectory, concretely
+  `<dataset>:seed=<N>`. A lineage contains many epoch checkpoints; each
+  checkpoint contains many layer matrices; each matrix contains many p128 tiles
+  and each mini parent tile yields p32 subtiles. The exact matrix identity is
+  `(checkpoint_sha256, layer_key)`, not `lineage_id` alone.
+- Therefore tiles from one exact numerical matrix cannot belong to different
+  lineages. Tiles with the same architectural `layer_key` can belong to
+  different lineages, but they are different learned matrices. Conversely,
+  many distinct matrices/checkpoints/layers can share one lineage. Unique
+  lineage count is consequently only a coarse lower bound on matrix diversity,
+  not an exact matrix count.
+
+### 2026-09-01 — Exact 500-step checkpoint retention for the v2 kink analysis
+
+- User expects a sharp direction-loss transition around step 10,000 in
+  `mini-polar-latent-preference-pref025-ramp10k-production-500k-v2` and asked
+  to stop it safely, preserve full checkpoints every 500 global steps, and
+  continue from the exact state. The user explicitly rejected any
+  window-triggered or rolling retention policy: checkpointing is unconditional
+  at every multiple of 500 with no deletion window. The projected storage of
+  about 120.9 GB decimal (112.6 GiB) through step 500,000 was explicitly
+  approved.
+- The CUDA 0 trainer stopped cooperatively after its current committed update at
+  step 6006, not the estimated 6500. Its exact cursor was
+  `parent_logical_index=39832`, `subpatch_index=4`,
+  `emitted_logical_index=384384`. The stop payload contains the model,
+  projector, full AdamW state, Python/NumPy/CPU/CUDA RNG state, normalization,
+  calibration, exact config and cursor. The original stop record was preserved
+  as
+  `/mnt/shared/weightclip_benchmark/mini_polar_latent_preference_10m_p16_tile32_b128_pref025_ramp10k_500k_v2/STOPPED_step_000006006.json`.
+- The trainer now accepts an opt-in retained-checkpoint cadence and directory.
+  After each committed optimizer step at a requested global multiple, it first
+  writes the full exact `resume_latest.pt` payload and then atomically hardlinks
+  that immutable inode as `resume_step_<step>.pt`. Later latest-checkpoint
+  replacements cannot mutate prior retained inodes. No scientific config,
+  optimizer setting, loss, data order, or ordinary checkpoint cadence changed.
+  A resume-start snapshot is also retained so the intervention boundary itself
+  is recoverable.
+- Focused and integrated tests passed (`12 passed` in the independent final
+  review). A B128 two-step CUDA smoke at
+  `/mnt/shared/weightclip_benchmark/mini_polar_latent_preference_retained_checkpoint_smoke_20260901T103300Z`
+  loaded both retained steps independently and verified distinct immutable
+  inodes, full 184-entry optimizer state, all RNG keys, exact committed cursors,
+  finite metrics, and `retention_window=null`. The independent prelaunch review
+  returned GO with P0=0 and P1=0.
+- Production resumed on physical CUDA 0 with trainer PID 544553 from exact step
+  6006. The first new log is step 6010, with emitted anchor 384640, so the
+  sequence is continuous (`5970, 5980, 5990, 6000, 6010`) rather than restarted
+  or duplicated. The immutable start snapshot is
+  `/dev/shm/weightclip_mini_polar_latent_preference_10m_p16_tile32_b128_pref025_ramp10k_500k_v2/retained_checkpoints/resume_step_000006006.pt`;
+  the first periodic snapshot is due at step 6500 and subsequent ones at 7000,
+  7500, and so on through 500000. The machine had about 289.2 GB free in
+  `/dev/shm` before launch, leaving roughly 168 GB after the projected retained
+  set.
+- The existing Comet sidecar stayed attached to the same experiment. Remote API
+  verification observed resumed training metrics through step 6020, and the
+  retention policy/index were uploaded as experiment assets:
+  `https://www.comet.com/mike-5531/big-weight-vae/26e6abb3e78746f19eb69a82cc0a0994`.
+  CUDA 1 beta1=0.99 production and its sidecar were left untouched.
+
+### 2026-09-01 — CUDA 1 beta1=0.99 run paused with exact resume state
+
+- User requested stopping the CUDA 1 training while leaving CUDA 0 running.
+  Only the beta1=0.99 trainer and its Comet sidecar were targeted. The trainer
+  received cooperative SIGTERM and stopped after committed step 4583 with
+  cursor `parent_logical_index=30396`, `subpatch_index=0`,
+  `emitted_logical_index=293312`.
+- The full resumable payload is
+  `/dev/shm/weightclip_mini_polar_latent_preference_10m_p16_tile32_b128_pref025_ramp10k_beta1_099_500k_v3/resume_latest.pt`
+  (122,273,962 bytes). It was loaded after shutdown and verified to contain the
+  exact step/cursor, beta values `[0.99, 0.999]`, 184 AdamW parameter states,
+  model/projector state, config, normalization/calibration and all four RNG
+  domains. The persistent model snapshot and `STOPPED.json` are under
+  `/mnt/shared/weightclip_benchmark/mini_polar_latent_preference_10m_p16_tile32_b128_pref025_ramp10k_beta1_099_500k_v3`.
+- Trainer PID 525305 and sidecar PID 526222 both exited. Physical CUDA 1 was
+  then verified at 3 MiB and 0% utilization with no compute process. The CUDA 0
+  v2 run remained live and had advanced to logged step 7060 during the final
+  check.
+
+### 2026-09-01 — Repository state publication for exact mini reproduction
+
+- User requested committing and pushing the entire current repository state so
+  the same mini implementation can be launched on another machine. The target
+  is the existing remote branch `weightclip-experiment-state-20260830`, whose
+  remote tip was verified to equal the detached local base
+  `750dd475ec2a81c72ae88047d5e7affce2d65078`, allowing a normal fast-forward
+  publication rather than a forced update.
+- The publication scope is all 20 current worktree changes: mini regression and
+  latent-preference trainers/configs/tests/analysis, the relevant 700M
+  encoder-only/raw-direction/decoder-thaw work, Comet streaming changes,
+  experiment design documentation, and this append-only discussion record.
+  No runtime checkpoint, generated metrics, Comet/HF credential, or large data
+  artifact is inside Git.
+- A sensitive-value scan found no credential material in the change set; the
+  only matches were environment-variable names and the existing statement that
+  the private HF credential lives outside Git. The combined directly relevant
+  test panel passed `20 passed` with two known Transformer warnings, and
+  `git diff --check` was clean before staging.
+- Exact execution on another machine still requires the pinned private HF
+  operator-bank snapshot and local runtime paths referenced by the production
+  config. The downloader and dataset contract are already tracked under
+  `projects/weight-vae/workspace/scripts/download_weightclip_operator_dataset_from_hf.py`
+  and `projects/weight-vae/workspace/docs/weightclip_operator_dataset_hf.md`;
+  checkpoints and the normalization cache remain external runtime artifacts,
+  not repository source.

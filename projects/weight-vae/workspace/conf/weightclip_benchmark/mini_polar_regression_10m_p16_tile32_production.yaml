@@ -1,0 +1,79 @@
+schema: weightclip_mini_polar_regression_production_v1
+objective: pre_categorical_polar_behavioral_plus_structural_regression
+output_root: /mnt/shared/weightclip_benchmark/mini_polar_regression_10m_p16_tile32_b128_500k_v1
+device: cuda:0
+seed: 42
+steps: 500000
+batch_size: 128
+learning_rate: 0.00005
+scheduler: constant
+betas: [0.9, 0.999]
+eps: 0.00000001
+weight_decay: 0.01
+grad_clip_norm: 5.0
+tf32: true
+log_every: 10
+gradient_log_every: 100
+plot_every: 1000
+
+architecture:
+  tile_size: 32
+  values_per_token: 16
+  output_patch_size: 16
+  hidden_dim: 192
+  heads: 6
+  mlp_dim: 704
+  encoder_depth: 10
+  shared_decoder_depth: 5
+  direction_tail_depth: 1
+  scale_tail_depth: 1
+  latent_slots: 16
+  latent_dim: 48
+  max_tile_rows: 72
+  max_tile_cols: 8
+  use_distribution_conditioning: true
+  distribution_k_s: 16
+  distribution_Kq: 32
+  distribution_d_var: 64
+  distribution_d_dist: 64
+  distribution_num_var_attn_layers: 2
+  distribution_var_attn_heads: 4
+  distribution_dcn_num_cross_layers: 2
+  distribution_dcn_deep_hidden: 32
+  distribution_dcn_deep_layers: 2
+  distribution_use_covariance: true
+  activation_checkpointing: false
+
+normalization:
+  kind: per_output_maxabs_q7_continuous
+  qmax: 7.0
+  stats_path: /mnt/shared/weightclip_benchmark/calibration/mini_p16_tile32_norm_seed42_32768.json
+  calibration_valid_subtiles: 32768
+
+loss:
+  behavioral_coef: 1.0
+  behavioral_operator: 0.0
+  behavioral_direction: 1.0
+  behavioral_scale: 10.0
+  structural_coef: 1.0
+  structural_direction: 1.0
+  structural_scale: 10.0
+  structural_reconstruction: 0.0
+  structural_relational: 0.0
+
+operator_bank:
+  pair_manifest: /home/coder/project/datasets/weightclip_resnet18slim_operator_dataset/operator_dataset-resolved-c478efe716506765.json
+  pair_manifest_sha256: c394c33203a9d2161a09167498a3d54470bab522c7c1a02e944fed14f5b77c09
+  permutation_views: true
+  canonical_probability: 0.16666666666666666
+  hot_shards: 8
+  loader_workers: 8
+  loader_batch_size: 1
+  loader_prefetch_factor: 2
+  max_active_strata: 256
+  max_active_bundle_bytes: 1610612736
+
+resume_checkpoint: /dev/shm/weightclip_mini_polar_regression_10m_p16_tile32_b128_500k_v1/resume_latest.pt
+resume_save_every: 1000
+persistent_model_checkpoint: /mnt/shared/weightclip_benchmark/mini_polar_regression_10m_p16_tile32_b128_500k_v1/model_latest.pt
+model_save_every: 10000

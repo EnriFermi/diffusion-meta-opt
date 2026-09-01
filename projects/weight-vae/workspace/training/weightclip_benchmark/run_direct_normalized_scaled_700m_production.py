@@ -48,6 +48,18 @@ BOUNDED_BALANCED_SCHEMA = (
 POLAR_TAIL_SCHEMA = (
     "weightclip_direct_normalized_scaled_700m_polar_tails_production_v1"
 )
+POLAR_TAIL_RAW_DIRECTION_MSE_SCHEMA = (
+    "weightclip_direct_normalized_scaled_700m_"
+    "polar_tails_raw_direction_mse_production_v1"
+)
+POLAR_TAIL_RAW_DIRECTION_MSE_TWO_LOSS_SCHEMA = (
+    "weightclip_direct_normalized_scaled_700m_"
+    "polar_tails_raw_direction_mse_structural_scale_production_v1"
+)
+POLAR_TAIL_ENCODER_WARM_DECODER_RAMP_SCHEMA = (
+    "weightclip_direct_normalized_scaled_700m_"
+    "polar_tails_encoder_warm_decoder_lr_ramp_production_v1"
+)
 LATENT_ROOTED_POLAR_TAIL_SCHEMA = (
     "weightclip_direct_normalized_scaled_700m_latent_rooted_polar_tails_production_v1"
 )
@@ -70,6 +82,26 @@ DEFAULT_CONFIG = Path(
 LEGACY_EXPECTED_PARAMETERS = 706_301_312
 POLAR_TAIL_EXPECTED_PARAMETERS = 742_120_833
 POLAR_TAIL_GAUGE_FIXED_EXPECTED_PARAMETERS = 742_119_297
+
+STRICT_ENCODER_ONLY_SCOPE = {
+    "kind": "strict_encoder_only_via_z",
+    "decoder_frozen": True,
+    "direct_decoder_conditioning_frozen": True,
+}
+STRICT_ENCODER_ONLY_TRAINABLE_PREFIXES = (
+    "continuous_projection.",
+    "scale_mlp.",
+    "group_embedding.",
+    "chunk_embedding.",
+    "encoder_blocks.",
+    "latent_slots",
+    "latent_norm.",
+    "to_latent.",
+)
+DECODER_THAW_OPTIMIZER_GROUPS = {
+    "encoder_continuation",
+    "decoder_linear_thaw",
+}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -104,6 +136,9 @@ def _load_config(path: Path) -> dict[str, Any]:
         SCHEMA,
         BOUNDED_BALANCED_SCHEMA,
         POLAR_TAIL_SCHEMA,
+        POLAR_TAIL_RAW_DIRECTION_MSE_SCHEMA,
+        POLAR_TAIL_RAW_DIRECTION_MSE_TWO_LOSS_SCHEMA,
+        POLAR_TAIL_ENCODER_WARM_DECODER_RAMP_SCHEMA,
         LATENT_ROOTED_POLAR_TAIL_SCHEMA,
         POLAR_TAIL_LATENT_ANTICOLLAPSE_SCHEMA,
         POLAR_TAIL_LATENT_ANTICOLLAPSE_DIRECTION_INFONCE_SCHEMA,
@@ -116,6 +151,9 @@ def _load_config(path: Path) -> dict[str, Any]:
     balanced = payload["schema"] == BOUNDED_BALANCED_SCHEMA
     polar_tails = payload["schema"] in {
         POLAR_TAIL_SCHEMA,
+        POLAR_TAIL_RAW_DIRECTION_MSE_SCHEMA,
+        POLAR_TAIL_RAW_DIRECTION_MSE_TWO_LOSS_SCHEMA,
+        POLAR_TAIL_ENCODER_WARM_DECODER_RAMP_SCHEMA,
         LATENT_ROOTED_POLAR_TAIL_SCHEMA,
         POLAR_TAIL_LATENT_ANTICOLLAPSE_SCHEMA,
         POLAR_TAIL_LATENT_ANTICOLLAPSE_DIRECTION_INFONCE_SCHEMA,
@@ -134,6 +172,54 @@ def _load_config(path: Path) -> dict[str, Any]:
     gauge_fixed_direction = (
         payload["schema"] == POLAR_TAIL_GAUGE_FIXED_DIRECTION_INFONCE_SCHEMA
     )
+    raw_direction_mse = payload["schema"] in {
+        POLAR_TAIL_RAW_DIRECTION_MSE_SCHEMA,
+        POLAR_TAIL_RAW_DIRECTION_MSE_TWO_LOSS_SCHEMA,
+    }
+    raw_direction_mse_two_loss = (
+        payload["schema"] == POLAR_TAIL_RAW_DIRECTION_MSE_TWO_LOSS_SCHEMA
+    )
+    decoder_thaw = payload["schema"] == POLAR_TAIL_ENCODER_WARM_DECODER_RAMP_SCHEMA
+    training_scope = payload.get("training_scope")
+    if training_scope is not None:
+        if payload["schema"] != POLAR_TAIL_SCHEMA:
+            raise ValueError(
+                "a restricted training scope is supported only for the original "
+                "polar-tail regression schema"
+            )
+        if training_scope != STRICT_ENCODER_ONLY_SCOPE:
+            raise ValueError(
+                "encoder-only training scope drifted: "
+                f"expected {STRICT_ENCODER_ONLY_SCOPE}, got {training_scope}"
+            )
+    expected_decoder_thaw = {
+        "kind": "linear_decoder_lr_ramp",
+        "source_checkpoint": (
+            "/dev/shm/weightclip_direct_normalized_scaled_700m_p32_polar_tails_"
+            "encoder_warm_decoder_ramp10k_500k_v1/"
+            "source_encoder_only_step_00013000.pt"
+        ),
+        "source_step": 13_000,
+        "source_committed_logical_index": 416_000,
+        "encoder_learning_rate": 5.0e-5,
+        "decoder_start_learning_rate": 0.0,
+        "decoder_target_learning_rate": 5.0e-5,
+        "ramp_steps": 10_000,
+        "preserve_encoder_optimizer_state": True,
+        "reset_decoder_optimizer_state": True,
+        "restore_rng_state": True,
+        "continue_data_cursor": True,
+    }
+    if decoder_thaw:
+        if payload.get("decoder_thaw") != expected_decoder_thaw:
+            raise ValueError(
+                "decoder thaw contract drifted: "
+                f"expected {expected_decoder_thaw}, got {payload.get('decoder_thaw')}"
+            )
+        if training_scope is not None:
+            raise ValueError("decoder thaw requires all model parameters to be trainable")
+    elif "decoder_thaw" in payload:
+        raise ValueError("decoder thaw settings require the dedicated production schema")
     resume_lr_transition = payload.get("resume_learning_rate_transition")
     expected_resume_lr_transition = {
         "kind": "preserve_adam_state_override_param_group_lr",
@@ -178,8 +264,13 @@ def _load_config(path: Path) -> dict[str, Any]:
             "production contract requires learning_rate="
             f"{expected_learning_rate}, got {payload['learning_rate']}"
         )
-    if payload["scheduler"] != "constant":
-        raise ValueError("production contract requires constant LR")
+    expected_scheduler = (
+        "constant_encoder_linear_decoder_thaw" if decoder_thaw else "constant"
+    )
+    if payload["scheduler"] != expected_scheduler:
+        raise ValueError(
+            f"production contract requires scheduler={expected_scheduler!r}"
+        )
     if tuple(payload["betas"]) != (0.9, 0.999):
         raise ValueError("production contract requires AdamW betas=(0.9,0.999)")
     objective = str(payload.get("objective", "behavioral_plus_structural"))
@@ -192,26 +283,69 @@ def _load_config(path: Path) -> dict[str, Any]:
         else "behavioral_direction_scale_plus_structural",
         "gradient_balanced_direction_scale" if balanced else "structural_only",
     }
+    if raw_direction_mse:
+        allowed_objectives.update(
+            {
+                "raw_p16_direction_mse_plus_scale",
+                "raw_p16_direction_mse_plus_structural_scale",
+            }
+        )
     if objective not in allowed_objectives:
         raise ValueError(f"unsupported production objective: {objective!r}")
-    if polar_tails and objective != "behavioral_direction_scale_plus_structural":
+    expected_polar_objective = (
+        "raw_p16_direction_mse_plus_structural_scale"
+        if raw_direction_mse_two_loss
+        else (
+            "raw_p16_direction_mse_plus_scale"
+            if raw_direction_mse
+            else "behavioral_direction_scale_plus_structural"
+        )
+    )
+    if polar_tails and objective != expected_polar_objective:
         raise ValueError(
-            "polar-tail production requires behavioral direction/scale plus structural loss"
+            f"polar-tail production schema requires objective={expected_polar_objective!r}"
         )
     behavioral_enabled = balanced or objective != "structural_only"
     operator_enabled = not balanced and objective == "behavioral_plus_structural"
     scale_coefficient = 1.0 if balanced else 10.0
-    expected_loss = {
-        "behavioral_coef": 1.0 if behavioral_enabled else 0.0,
-        "behavioral_operator": 50.0 if operator_enabled else 0.0,
-        "behavioral_direction": 1.0,
-        "behavioral_scale": scale_coefficient,
-        "structural_coef": 1.0,
-        "structural_direction": 1.0,
-        "structural_scale": scale_coefficient,
-        "structural_reconstruction": 0.0,
-        "structural_relational": 0.0,
-    }
+    if raw_direction_mse_two_loss:
+        expected_loss = {
+            "raw_direction_mse": 1.0,
+            "behavioral_coef": 0.0,
+            "behavioral_operator": 0.0,
+            "behavioral_direction": 0.0,
+            "behavioral_scale": 0.0,
+            "structural_coef": 1.0,
+            "structural_direction": 0.0,
+            "structural_scale": 10.0,
+            "structural_reconstruction": 0.0,
+            "structural_relational": 0.0,
+        }
+    elif raw_direction_mse:
+        expected_loss = {
+            "raw_direction_mse": 1.0,
+            "behavioral_coef": 1.0,
+            "behavioral_operator": 0.0,
+            "behavioral_direction": 0.0,
+            "behavioral_scale": 10.0,
+            "structural_coef": 1.0,
+            "structural_direction": 0.0,
+            "structural_scale": 10.0,
+            "structural_reconstruction": 0.0,
+            "structural_relational": 0.0,
+        }
+    else:
+        expected_loss = {
+            "behavioral_coef": 1.0 if behavioral_enabled else 0.0,
+            "behavioral_operator": 50.0 if operator_enabled else 0.0,
+            "behavioral_direction": 1.0,
+            "behavioral_scale": scale_coefficient,
+            "structural_coef": 1.0,
+            "structural_direction": 1.0,
+            "structural_scale": scale_coefficient,
+            "structural_reconstruction": 0.0,
+            "structural_relational": 0.0,
+        }
     if {key: float(payload["loss"][key]) for key in expected_loss} != expected_loss:
         raise ValueError(
             f"production loss coefficients drifted from the {objective!r} contract"
@@ -293,6 +427,28 @@ def _load_config(path: Path) -> dict[str, Any]:
     elif "direction_gauge_constraint" in payload:
         raise ValueError(
             "direction gauge settings require the dedicated production schema"
+        )
+    expected_direction_regression = {
+        "kind": "scaled_raw_p16_vector_mse",
+        "components": 1,
+        "target_radius": 0.08615882694721222,
+        "normalization": "half_squared_l2_over_target_radius_squared",
+        "patch_weighting": "sqrt_target_radius_within_output",
+    }
+    if raw_direction_mse:
+        if payload.get("direction_regression") != expected_direction_regression:
+            raise ValueError(
+                "raw direction regression contract drifted: "
+                f"expected {expected_direction_regression}, "
+                f"got {payload.get('direction_regression')}"
+            )
+        if "direction_contrastive" in payload or "latent_anticollapse" in payload:
+            raise ValueError(
+                "raw direction MSE K=1 must not include InfoNCE or latent anti-collapse"
+            )
+    elif "direction_regression" in payload:
+        raise ValueError(
+            "direction regression settings require the dedicated raw-MSE schema"
         )
     if polar_tails:
         expected_architecture = {
@@ -824,6 +980,10 @@ class PolarTailedUnifiedWeightBottleneck(UnifiedWeightBottleneck):
         direction_norm = (
             direction_logits.float().square().sum(dim=-1, keepdim=True) + 1.0e-12
         ).sqrt()
+        if getattr(self, "capture_raw_direction_logits", False):
+            self._last_direction_raw_logits = direction_logits
+            self._last_direction_raw_logit_norms = direction_norm.squeeze(-1).detach()
+            self._last_direction_valid_mask = component_mask.any(dim=-1).detach()
         if hasattr(self, "direction_head_frobenius_radius"):
             self._last_direction_raw_logit_norms = direction_norm.squeeze(-1).detach()
             self._last_direction_valid_mask = component_mask.any(dim=-1).detach()
@@ -1152,6 +1312,137 @@ class LatentRootedPolarTailedUnifiedWeightBottleneck(
         return prediction, pred_dirs, pred_log_scales
 
 
+def _decoder_thaw_parameter_partition(
+    model: nn.Module,
+) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+    encoder_parameters: list[nn.Parameter] = []
+    decoder_parameters: list[nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            raise RuntimeError(
+                "decoder thaw requires every model parameter to be trainable: "
+                f"{name!r} is frozen"
+            )
+        target = (
+            encoder_parameters
+            if name.startswith(STRICT_ENCODER_ONLY_TRAINABLE_PREFIXES)
+            else decoder_parameters
+        )
+        target.append(parameter)
+    if not encoder_parameters or not decoder_parameters:
+        raise RuntimeError("decoder thaw parameter partition is empty")
+    if len(encoder_parameters) + len(decoder_parameters) != len(
+        list(model.parameters())
+    ):
+        raise RuntimeError("decoder thaw parameter partition drifted")
+    return encoder_parameters, decoder_parameters
+
+
+def _decoder_thaw_groups_by_name(
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, dict[str, Any]]:
+    groups = {
+        str(group.get("group_name")): group for group in optimizer.param_groups
+    }
+    if set(groups) != DECODER_THAW_OPTIMIZER_GROUPS:
+        raise RuntimeError(
+            "decoder thaw optimizer groups drifted: "
+            f"expected={sorted(DECODER_THAW_OPTIMIZER_GROUPS)} "
+            f"actual={sorted(groups)}"
+        )
+    return groups
+
+
+def _set_decoder_thaw_learning_rates(
+    optimizer: torch.optim.Optimizer,
+    config: dict[str, Any],
+    *,
+    step: int,
+) -> dict[str, float | int]:
+    thaw = config["decoder_thaw"]
+    ramp_steps = int(thaw["ramp_steps"])
+    if step < 0 or ramp_steps <= 0:
+        raise ValueError("decoder thaw schedule requires nonnegative step and positive ramp")
+    progress = min(float(step) / float(ramp_steps), 1.0)
+    encoder_lr = float(thaw["encoder_learning_rate"])
+    decoder_start_lr = float(thaw["decoder_start_learning_rate"])
+    decoder_target_lr = float(thaw["decoder_target_learning_rate"])
+    decoder_lr = decoder_start_lr + progress * (
+        decoder_target_lr - decoder_start_lr
+    )
+    groups = _decoder_thaw_groups_by_name(optimizer)
+    groups["encoder_continuation"]["lr"] = encoder_lr
+    groups["decoder_linear_thaw"]["lr"] = decoder_lr
+    return {
+        "encoder_learning_rate": encoder_lr,
+        "decoder_learning_rate": decoder_lr,
+        "decoder_lr_multiplier": decoder_lr / encoder_lr,
+        "decoder_thaw_step": min(int(step), ramp_steps),
+        "decoder_thaw_ramp_steps": ramp_steps,
+    }
+
+
+def _restore_encoder_only_optimizer_state_for_decoder_thaw(
+    optimizer: torch.optim.Optimizer,
+    source_optimizer_state: dict[str, Any],
+) -> dict[str, int]:
+    """Map the one-group encoder Adam state into the thaw optimizer by order."""
+    source_groups = source_optimizer_state.get("param_groups", [])
+    if len(source_groups) != 1:
+        raise RuntimeError("encoder-only source optimizer must have exactly one group")
+    target_state = optimizer.state_dict()
+    target_groups_by_name = {
+        str(group.get("group_name")): group
+        for group in target_state["param_groups"]
+    }
+    if set(target_groups_by_name) != DECODER_THAW_OPTIMIZER_GROUPS:
+        raise RuntimeError("target decoder thaw optimizer groups drifted")
+    source_ids = list(source_groups[0]["params"])
+    encoder_target_ids = list(
+        target_groups_by_name["encoder_continuation"]["params"]
+    )
+    decoder_target_ids = list(
+        target_groups_by_name["decoder_linear_thaw"]["params"]
+    )
+    if len(source_ids) != len(encoder_target_ids):
+        raise RuntimeError(
+            "encoder-only Adam tensor count disagrees with thaw encoder group: "
+            f"{len(source_ids)} != {len(encoder_target_ids)}"
+        )
+    source_state = source_optimizer_state.get("state", {})
+    missing_source_state = [source_id for source_id in source_ids if source_id not in source_state]
+    if missing_source_state:
+        raise RuntimeError(
+            "encoder-only source Adam state is incomplete: "
+            f"missing={len(missing_source_state)}"
+        )
+    remapped_state = {
+        target_id: source_state[source_id]
+        for source_id, target_id in zip(source_ids, encoder_target_ids, strict=True)
+    }
+    optimizer.load_state_dict(
+        {
+            "state": remapped_state,
+            "param_groups": target_state["param_groups"],
+        }
+    )
+    if len(optimizer.state) != len(encoder_target_ids):
+        raise RuntimeError("restored thaw optimizer state has an unexpected size")
+    decoder_state_entries = sum(
+        int(parameter in optimizer.state)
+        for parameter in _decoder_thaw_groups_by_name(optimizer)[
+            "decoder_linear_thaw"
+        ]["params"]
+    )
+    if decoder_state_entries:
+        raise RuntimeError("decoder Adam state was not reset for thaw warm-start")
+    return {
+        "encoder_optimizer_state_entries": len(encoder_target_ids),
+        "decoder_optimizer_state_entries": decoder_state_entries,
+        "decoder_parameter_tensors": len(decoder_target_ids),
+    }
+
+
 def _build_production_optimizer(
     model: nn.Module,
     config: dict[str, Any],
@@ -1161,18 +1452,45 @@ def _build_production_optimizer(
         "betas": tuple(float(value) for value in config["betas"]),
         "eps": float(config["eps"]),
     }
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise RuntimeError("production model has no trainable parameters")
+    if config["schema"] == POLAR_TAIL_ENCODER_WARM_DECODER_RAMP_SCHEMA:
+        encoder_parameters, decoder_parameters = _decoder_thaw_parameter_partition(model)
+        return torch.optim.AdamW(
+            [
+                {
+                    "params": encoder_parameters,
+                    "lr": float(config["decoder_thaw"]["encoder_learning_rate"]),
+                    "weight_decay": float(config["weight_decay"]),
+                    "group_name": "encoder_continuation",
+                },
+                {
+                    "params": decoder_parameters,
+                    "lr": float(config["decoder_thaw"]["decoder_start_learning_rate"]),
+                    "weight_decay": float(config["weight_decay"]),
+                    "group_name": "decoder_linear_thaw",
+                },
+            ],
+            weight_decay=0.0,
+            **common,
+        )
     if not isinstance(model, GaugeFixedPolarTailedUnifiedWeightBottleneck):
         return torch.optim.AdamW(
-            model.parameters(),
+            trainable_parameters,
             weight_decay=float(config["weight_decay"]),
             **common,
         )
 
     direction_weight = model.direction_head.weight
     main_parameters = [
-        parameter for parameter in model.parameters() if parameter is not direction_weight
+        parameter
+        for parameter in trainable_parameters
+        if parameter is not direction_weight
     ]
-    if len(main_parameters) + 1 != sum(1 for _ in model.parameters()):
+    if len(main_parameters) + 1 != len(trainable_parameters):
         raise RuntimeError("gauge-fixed optimizer parameter partition drifted")
     return torch.optim.AdamW(
         [
@@ -1190,6 +1508,87 @@ def _build_production_optimizer(
         weight_decay=0.0,
         **common,
     )
+
+
+def _configure_parameter_training_scope(
+    model: nn.Module,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze decoder paths while keeping only the pure encoder-to-z path live."""
+    scope = config.get("training_scope")
+    if scope is None:
+        trainable = [(name, parameter) for name, parameter in model.named_parameters()]
+        return {
+            "kind": "all_parameters",
+            "trainable_parameter_tensors": len(trainable),
+            "trainable_parameters": sum(parameter.numel() for _name, parameter in trainable),
+            "frozen_parameter_tensors": 0,
+            "frozen_parameters": 0,
+        }
+    if scope != STRICT_ENCODER_ONLY_SCOPE:
+        raise ValueError(f"unsupported parameter training scope: {scope}")
+
+    trainable_names: list[str] = []
+    frozen_names: list[str] = []
+    trainable_numel = 0
+    frozen_numel = 0
+    for name, parameter in model.named_parameters():
+        should_train = name.startswith(STRICT_ENCODER_ONLY_TRAINABLE_PREFIXES)
+        parameter.requires_grad_(should_train)
+        if should_train:
+            trainable_names.append(name)
+            trainable_numel += int(parameter.numel())
+        else:
+            frozen_names.append(name)
+            frozen_numel += int(parameter.numel())
+
+    required_live_prefixes = (
+        "continuous_projection.",
+        "scale_mlp.",
+        "encoder_blocks.",
+        "to_latent.",
+    )
+    missing_live = [
+        prefix
+        for prefix in required_live_prefixes
+        if not any(name.startswith(prefix) for name in trainable_names)
+    ]
+    forbidden_live_prefixes = (
+        "distribution_encoder.",
+        "tile_embedding.",
+        "extra_tile_row_embedding.",
+        "tile_col_embedding.",
+        "from_latent.",
+        "output_queries",
+        "decoder_query_conditioner.",
+        "decoder_blocks.",
+        "direction_tail.",
+        "scale_tail.",
+        "direction_output_norm.",
+        "scale_output_norm.",
+        "direction_head.",
+        "scale_head.",
+    )
+    forbidden_live = [
+        name
+        for name in trainable_names
+        if name.startswith(forbidden_live_prefixes)
+    ]
+    if missing_live or forbidden_live or not trainable_names or not frozen_names:
+        raise RuntimeError(
+            "strict encoder-only parameter partition drifted: "
+            f"missing_live={missing_live} forbidden_live={forbidden_live}"
+        )
+    return {
+        **scope,
+        "trainable_prefixes": list(STRICT_ENCODER_ONLY_TRAINABLE_PREFIXES),
+        "trainable_parameter_tensors": len(trainable_names),
+        "trainable_parameters": trainable_numel,
+        "frozen_parameter_tensors": len(frozen_names),
+        "frozen_parameters": frozen_numel,
+        "trainable_parameter_names": trainable_names,
+        "frozen_parameter_names": frozen_names,
+    }
 
 
 @torch.no_grad()
@@ -1386,6 +1785,216 @@ def _weights_from_polar_components(
         1,
         2,
     ).contiguous()
+
+
+def _raw_p16_direction_mse(
+    raw_direction_logits: torch.Tensor,
+    W: torch.Tensor,
+    d_in_mask: torch.Tensor,
+    d_out_mask: torch.Tensor,
+    *,
+    target_radius: float,
+    eps: float = 1.0e-12,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Regress one raw p16 vector (K=1) to a radius-matched target direction."""
+    if W.ndim != 3:
+        raise ValueError("raw direction MSE expects W=[B,d_in,d_out]")
+    batch, d_in, d_out = W.shape
+    if d_in != 128 or tuple(raw_direction_logits.shape) != (batch, d_out, 8, 16):
+        raise ValueError(
+            "raw direction logits must be [B,d_out,8,16] for d_in=128, got "
+            f"W={tuple(W.shape)} logits={tuple(raw_direction_logits.shape)}"
+        )
+    if tuple(d_in_mask.shape) != (batch, d_in):
+        raise ValueError("d_in_mask does not match W")
+    if tuple(d_out_mask.shape) != (batch, d_out):
+        raise ValueError("d_out_mask does not match W")
+    radius = float(target_radius)
+    if not math.isfinite(radius) or radius <= 0.0:
+        raise ValueError("target_radius must be finite and positive")
+
+    component_mask = (
+        d_out_mask[:, :, None, None]
+        & d_in_mask.view(batch, 8, 16)[:, None, :, :]
+    )
+    target_patches = W.float().transpose(1, 2).contiguous().view(batch, d_out, 8, 16)
+    target_patches = target_patches * component_mask.to(dtype=target_patches.dtype)
+    target_patch_radius = target_patches.square().sum(dim=-1).sqrt()
+    valid_patch = component_mask.any(dim=-1) & (target_patch_radius > float(eps))
+    target_direction = target_patches / target_patch_radius.clamp_min(float(eps)).unsqueeze(-1)
+    regression_target = radius * target_direction
+
+    squared_l2 = (
+        (raw_direction_logits.float() - regression_target)
+        .square()
+        .mul(component_mask.to(dtype=torch.float32))
+        .sum(dim=-1)
+    )
+    per_patch = 0.5 * squared_l2 / (radius * radius)
+    patch_weight = (target_patch_radius + float(eps)).sqrt()
+    patch_weight = patch_weight * valid_patch.to(dtype=patch_weight.dtype)
+    patch_weight = patch_weight / patch_weight.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    per_output = (per_patch * patch_weight).sum(dim=-1)
+    valid_output = valid_patch.any(dim=-1)
+    per_sample = (
+        per_output * valid_output.to(dtype=per_output.dtype)
+    ).sum(dim=-1) / valid_output.sum(dim=-1).clamp_min(1).to(dtype=per_output.dtype)
+    loss = per_sample.mean()
+
+    valid_pred_radius = raw_direction_logits.float().norm(dim=-1)[valid_patch]
+    if valid_pred_radius.numel() == 0:
+        zero = loss.detach().new_zeros(())
+        stats = {
+            "raw_direction_pred_radius_mean": zero,
+            "raw_direction_pred_radius_median": zero,
+            "raw_direction_radius_mae": zero,
+            "raw_direction_valid_patches": zero,
+        }
+    else:
+        stats = {
+            "raw_direction_pred_radius_mean": valid_pred_radius.detach().mean(),
+            "raw_direction_pred_radius_median": valid_pred_radius.detach().median(),
+            "raw_direction_radius_mae": (valid_pred_radius.detach() - radius).abs().mean(),
+            "raw_direction_valid_patches": loss.detach().new_tensor(
+                float(valid_pred_radius.numel())
+            ),
+        }
+    return loss, stats
+
+
+def _operator_scale_only_loss(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    W_hat: torch.Tensor,
+    x_mask: torch.Tensor,
+    d_out_mask: torch.Tensor,
+    *,
+    eps: float = 1.0e-8,
+    huber_delta: float = 0.1,
+) -> torch.Tensor:
+    """The old behavioral scale term without constructing its cosine sibling."""
+    if X.ndim != 3 or W.ndim != 3 or tuple(W_hat.shape) != tuple(W.shape):
+        raise ValueError("operator scale-only loss expects batched X/W/W_hat")
+    batch, rows, _ = X.shape
+    d_out = W.shape[-1]
+    if tuple(x_mask.shape) != (batch, rows):
+        raise ValueError("x_mask does not match X")
+    if tuple(d_out_mask.shape) != (batch, d_out):
+        raise ValueError("d_out_mask does not match W")
+    pred = torch.matmul(X.float(), W_hat.float())
+    target = torch.matmul(X.float(), W.float())
+    output_mask = d_out_mask[:, None, :].to(device=pred.device, dtype=pred.dtype)
+    pred = pred * output_mask
+    target = target * output_mask
+    pred_norm = pred.norm(dim=-1)
+    target_norm = target.norm(dim=-1)
+    active = target_norm > float(eps)
+    row_weight = x_mask.to(device=pred.device, dtype=pred.dtype) * active.to(
+        device=pred.device, dtype=pred.dtype
+    )
+    delta = torch.log(pred_norm + float(eps)) - torch.log(target_norm + float(eps))
+    abs_delta = delta.abs()
+    huber = torch.where(
+        abs_delta <= float(huber_delta),
+        0.5 * delta.square(),
+        float(huber_delta) * (abs_delta - 0.5 * float(huber_delta)),
+    )
+    return (huber * row_weight).sum() / row_weight.sum().clamp_min(1.0)
+
+
+def _polar_raw_direction_mse_production_loss(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    raw_direction_logits: torch.Tensor,
+    pred_dirs: torch.Tensor,
+    pred_log_scales: torch.Tensor,
+    x_mask: torch.Tensor,
+    d_in_mask: torch.Tensor,
+    d_out_mask: torch.Tensor,
+    loss_cfg: dict[str, Any],
+    direction_regression_cfg: dict[str, Any],
+) -> tuple[
+    torch.Tensor,
+    dict[str, torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """K=1 raw direction MSE plus the two original scale-only objectives."""
+    if any(
+        float(loss_cfg[key]) != 0.0
+        for key in (
+            "behavioral_operator",
+            "behavioral_direction",
+            "structural_direction",
+            "structural_reconstruction",
+            "structural_relational",
+        )
+    ):
+        raise ValueError("raw direction MSE path requires every old direction loss off")
+    raw_direction_mse, raw_stats = _raw_p16_direction_mse(
+        raw_direction_logits,
+        W,
+        d_in_mask,
+        d_out_mask,
+        target_radius=float(direction_regression_cfg["target_radius"]),
+    )
+    direction_objective = float(loss_cfg["raw_direction_mse"]) * raw_direction_mse
+    scale_prediction = _weights_from_polar_components(
+        pred_dirs,
+        pred_log_scales,
+        detach_direction=True,
+        detach_scale=False,
+    )
+    behavioral_scale_weight = (
+        float(loss_cfg["behavioral_coef"])
+        * float(loss_cfg["behavioral_scale"])
+    )
+    if behavioral_scale_weight == 0.0:
+        behavioral_scale = raw_direction_mse.new_zeros(())
+    else:
+        behavioral_scale = _operator_scale_only_loss(
+            X,
+            W,
+            scale_prediction,
+            x_mask,
+            d_out_mask,
+            huber_delta=0.1,
+        )
+    structural_scale, structural_parts = BigWeightVAELossMixin.patch_structure_loss(
+        W,
+        scale_prediction,
+        patch_size=16,
+        gamma=0.5,
+        lambda_dir=0.0,
+        lambda_scale=1.0,
+        lambda_rec=0.0,
+        lambda_rel=0.0,
+        huber_delta=0.1,
+        d_in_mask=d_in_mask,
+        d_out_mask=d_out_mask,
+        pred_dirs=None,
+    )
+    weighted_behavioral_scale = behavioral_scale_weight * behavioral_scale
+    weighted_structural_scale = (
+        float(loss_cfg["structural_coef"])
+        * float(loss_cfg["structural_scale"])
+        * structural_scale
+    )
+    scale_objective = weighted_behavioral_scale + weighted_structural_scale
+    total = direction_objective + scale_objective
+    zero = total.detach().new_zeros(())
+    return total, {
+        "raw_direction_mse": raw_direction_mse.detach(),
+        "raw_direction_mse_weighted": direction_objective.detach(),
+        **raw_stats,
+        "behavioral": weighted_behavioral_scale.detach(),
+        "behavioral_operator": zero,
+        "behavioral_direction": zero,
+        "behavioral_scale": behavioral_scale.detach(),
+        "structural": weighted_structural_scale.detach(),
+        "structural_direction": zero,
+        "structural_scale": structural_parts["L_scale"],
+    }, direction_objective, scale_objective
 
 
 def _polar_routed_production_loss(
@@ -1980,7 +2589,10 @@ def _polar_component_gradient_telemetry(
             ("scale_head.weight", model.scale_head.weight, False),
         ]
     )
+    named_parameters = [row for row in named_parameters if row[1].requires_grad]
     parameters = [parameter for _name, parameter, _is_qkv in named_parameters]
+    if not parameters:
+        raise RuntimeError("polar gradient telemetry has no trainable parameters")
     direction_grads = torch.autograd.grad(
         direction_loss,
         parameters,
@@ -2263,12 +2875,26 @@ def _plot_metrics(path: Path, output: Path) -> None:
     steps = [row["step"] for row in rows]
     fig, ax = plt.subplots(figsize=(10, 5.5))
     ax.plot(steps, [row["loss"] for row in rows], label="production total", linewidth=1.5)
-    if all("legacy_task_loss" in row for row in rows):
+    if all("task_loss" in row for row in rows):
+        ax.plot(
+            steps,
+            [row["task_loss"] for row in rows],
+            label="task objective",
+            linewidth=1.35,
+        )
+    elif all("legacy_task_loss" in row for row in rows):
         ax.plot(
             steps,
             [row["legacy_task_loss"] for row in rows],
             label="legacy task objective",
             linewidth=1.35,
+        )
+    if any("raw_direction_mse" in row for row in rows):
+        ax.plot(
+            steps,
+            [row.get("raw_direction_mse", float("nan")) for row in rows],
+            label="raw p16 direction MSE",
+            linewidth=1.1,
         )
     if any(float(row.get("latent_anticollapse_weighted_loss", 0.0)) > 0.0 for row in rows):
         ax.plot(
@@ -2308,6 +2934,9 @@ def main() -> None:
     balanced_backward = run_schema == BOUNDED_BALANCED_SCHEMA
     polar_tails = run_schema in {
         POLAR_TAIL_SCHEMA,
+        POLAR_TAIL_RAW_DIRECTION_MSE_SCHEMA,
+        POLAR_TAIL_RAW_DIRECTION_MSE_TWO_LOSS_SCHEMA,
+        POLAR_TAIL_ENCODER_WARM_DECODER_RAMP_SCHEMA,
         LATENT_ROOTED_POLAR_TAIL_SCHEMA,
         POLAR_TAIL_LATENT_ANTICOLLAPSE_SCHEMA,
         POLAR_TAIL_LATENT_ANTICOLLAPSE_DIRECTION_INFONCE_SCHEMA,
@@ -2326,6 +2955,14 @@ def main() -> None:
     gauge_fixed_direction = (
         run_schema == POLAR_TAIL_GAUGE_FIXED_DIRECTION_INFONCE_SCHEMA
     )
+    raw_direction_mse = run_schema in {
+        POLAR_TAIL_RAW_DIRECTION_MSE_SCHEMA,
+        POLAR_TAIL_RAW_DIRECTION_MSE_TWO_LOSS_SCHEMA,
+    }
+    raw_direction_mse_two_loss = (
+        run_schema == POLAR_TAIL_RAW_DIRECTION_MSE_TWO_LOSS_SCHEMA
+    )
+    decoder_thaw = run_schema == POLAR_TAIL_ENCODER_WARM_DECODER_RAMP_SCHEMA
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if args.output_root is not None:
         output_root = args.output_root.resolve()
@@ -2407,13 +3044,33 @@ def main() -> None:
             "production parameter count drifted: "
             f"{parameter_count} != {expected_parameters}"
         )
+    if raw_direction_mse:
+        model.capture_raw_direction_logits = True
+    parameter_training_scope = _configure_parameter_training_scope(model, config)
+    if (
+        int(parameter_training_scope["trainable_parameters"])
+        + int(parameter_training_scope["frozen_parameters"])
+        != parameter_count
+    ):
+        raise RuntimeError("parameter training-scope ledger does not sum to the model total")
+    parameter_scope_path = output_root / "parameter_training_scope.json"
+    _atomic_json(parameter_scope_path, parameter_training_scope)
+    startup["parameter_training_scope"] = parameter_training_scope
+    startup["parameter_training_scope_path"] = str(parameter_scope_path)
+    if not args.resume:
+        _atomic_json(output_root / "resolved_config.json", startup)
     optimizer = _build_production_optimizer(model, config)
     start_step = 0
     committed_logical_index = 0
+    initial_committed_logical_index = 0
+    source_checkpoint_step: int | None = None
+    source_checkpoint_path: str | None = None
     resume_lr_event: dict[str, Any] | None = None
     if args.resume:
         print(f"[direct-normalized-production] stage=resume-load path={resume_path}", flush=True)
         payload = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if str(payload["schema"]) != run_schema:
+            raise RuntimeError("resume checkpoint schema disagrees with requested config")
         if config.get("resume_learning_rate_transition") is not None:
             checkpoint_config = dict(payload["config"])
             requested_config = dict(config)
@@ -2438,13 +3095,39 @@ def main() -> None:
         optimizer.load_state_dict(payload["optimizer_state"])
         start_step = int(payload["step"])
         committed_logical_index = int(payload["committed_logical_index"])
-        if committed_logical_index != start_step * batch_size:
-            raise RuntimeError("resume logical cursor disagrees with step and batch size")
-        resume_lr_event = _apply_resume_learning_rate(
-            optimizer,
-            config,
-            checkpoint_step=start_step,
+        initial_committed_logical_index = int(
+            payload.get("initial_committed_logical_index", 0)
         )
+        source_checkpoint_step = payload.get("source_checkpoint_step")
+        if source_checkpoint_step is not None:
+            source_checkpoint_step = int(source_checkpoint_step)
+        source_checkpoint_path = payload.get("source_checkpoint_path")
+        expected_logical_index = (
+            initial_committed_logical_index + start_step * batch_size
+        )
+        if committed_logical_index != expected_logical_index:
+            raise RuntimeError("resume logical cursor disagrees with step and batch size")
+        if decoder_thaw:
+            previous_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+            thaw_state = _set_decoder_thaw_learning_rates(
+                optimizer,
+                config,
+                step=start_step,
+            )
+            resume_lr_event = {
+                "kind": "decoder_thaw_resume",
+                "checkpoint_step": start_step,
+                "previous_learning_rates": previous_lrs,
+                "effective_learning_rate": thaw_state["encoder_learning_rate"],
+                "optimizer_state_entries": len(optimizer.state),
+                **thaw_state,
+            }
+        else:
+            resume_lr_event = _apply_resume_learning_rate(
+                optimizer,
+                config,
+                checkpoint_step=start_step,
+            )
         _restore_rng_state(payload["rng_state"])
         del payload
         stopped_path = output_root / "STOPPED.json"
@@ -2487,16 +3170,100 @@ def main() -> None:
             f"optimizer_state_entries={resume_lr_event.get('optimizer_state_entries')}",
             flush=True,
         )
-    effective_lrs = {
-        float(group["lr"])
-        for group in optimizer.param_groups
-    }
-    if effective_lrs != {float(config["learning_rate"])}:
-        raise RuntimeError(
-            "effective optimizer LR disagrees with config after model/resume setup: "
-            f"{sorted(effective_lrs)}"
+    elif decoder_thaw:
+        thaw = config["decoder_thaw"]
+        source_path = Path(str(thaw["source_checkpoint"])).resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError(f"decoder thaw source checkpoint is absent: {source_path}")
+        print(
+            "[direct-normalized-production] stage=decoder-thaw-warmstart-load "
+            f"path={source_path}",
+            flush=True,
         )
-    effective_learning_rate = next(iter(effective_lrs))
+        payload = torch.load(
+            source_path,
+            map_location="cpu",
+            weights_only=False,
+            mmap=True,
+        )
+        source_config = payload["config"]
+        if str(payload["schema"]) != POLAR_TAIL_SCHEMA:
+            raise RuntimeError("decoder thaw source is not the original polar-tail schema")
+        if source_config.get("training_scope") != STRICT_ENCODER_ONLY_SCOPE:
+            raise RuntimeError("decoder thaw source is not strict encoder-only training")
+        source_checkpoint_step = int(payload["step"])
+        committed_logical_index = int(payload["committed_logical_index"])
+        if source_checkpoint_step != int(thaw["source_step"]):
+            raise RuntimeError("decoder thaw source checkpoint step drifted")
+        if committed_logical_index != int(thaw["source_committed_logical_index"]):
+            raise RuntimeError("decoder thaw source logical cursor drifted")
+        for key in (
+            "seed",
+            "batch_size",
+            "learning_rate",
+            "betas",
+            "eps",
+            "weight_decay",
+            "architecture",
+            "normalization",
+            "loss",
+            "operator_bank",
+        ):
+            if source_config[key] != config[key]:
+                raise RuntimeError(
+                    f"decoder thaw source changed baseline/data contract field {key!r}"
+                )
+        model.load_state_dict(payload["model_state"], strict=True)
+        optimizer_restore_stats = _restore_encoder_only_optimizer_state_for_decoder_thaw(
+            optimizer,
+            payload["optimizer_state"],
+        )
+        _restore_rng_state(payload["rng_state"])
+        initial_committed_logical_index = committed_logical_index
+        source_checkpoint_path = str(source_path)
+        thaw_state = _set_decoder_thaw_learning_rates(optimizer, config, step=0)
+        warmstart_event = {
+            "schema": run_schema,
+            "kind": "encoder_warm_decoder_linear_thaw",
+            "source_checkpoint_path": source_checkpoint_path,
+            "source_checkpoint_step": source_checkpoint_step,
+            "initial_committed_logical_index": initial_committed_logical_index,
+            **optimizer_restore_stats,
+            **thaw_state,
+            "initialized_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _atomic_json(output_root / "warmstart_event.json", warmstart_event)
+        print(
+            "[direct-normalized-production] stage=decoder-thaw-warmstart-ready "
+            f"source_step={source_checkpoint_step} "
+            f"logical_index={initial_committed_logical_index} "
+            f"encoder_adam={optimizer_restore_stats['encoder_optimizer_state_entries']} "
+            f"decoder_adam={optimizer_restore_stats['decoder_optimizer_state_entries']} "
+            f"encoder_lr={thaw_state['encoder_learning_rate']:.3e} "
+            f"decoder_lr={thaw_state['decoder_learning_rate']:.3e}",
+            flush=True,
+        )
+        del payload
+    if decoder_thaw:
+        thaw_state = _set_decoder_thaw_learning_rates(
+            optimizer,
+            config,
+            step=start_step,
+        )
+        effective_learning_rate = float(thaw_state["encoder_learning_rate"])
+        if effective_learning_rate != float(config["learning_rate"]):
+            raise RuntimeError("decoder thaw encoder LR disagrees with config")
+    else:
+        effective_lrs = {
+            float(group["lr"])
+            for group in optimizer.param_groups
+        }
+        if effective_lrs != {float(config["learning_rate"])}:
+            raise RuntimeError(
+                "effective optimizer LR disagrees with config after model/resume setup: "
+                f"{sorted(effective_lrs)}"
+            )
+        effective_learning_rate = next(iter(effective_lrs))
     if gauge_fixed_direction:
         initial_gauge_stats = _direction_gauge_telemetry(model, optimizer)
         if initial_gauge_stats["direction_head_frobenius_relative_error"] > 2.0e-6:
@@ -2518,6 +3285,9 @@ def main() -> None:
     print(
         "[direct-normalized-production] stage=model-build-complete "
         f"parameters={parameter_count} start_step={start_step} "
+        f"trainable={parameter_training_scope['trainable_parameters']} "
+        f"frozen={parameter_training_scope['frozen_parameters']} "
+        f"training_scope={parameter_training_scope['kind']} "
         f"logical_index={committed_logical_index}",
         flush=True,
     )
@@ -2555,6 +3325,9 @@ def main() -> None:
                 "schema": run_schema,
                 "step": step,
                 "committed_logical_index": logical_index,
+                "initial_committed_logical_index": initial_committed_logical_index,
+                "source_checkpoint_step": source_checkpoint_step,
+                "source_checkpoint_path": source_checkpoint_path,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "rng_state": _rng_state(),
@@ -2573,6 +3346,9 @@ def main() -> None:
             {
                 "schema": run_schema,
                 "step": step,
+                "initial_committed_logical_index": initial_committed_logical_index,
+                "source_checkpoint_step": source_checkpoint_step,
+                "source_checkpoint_path": source_checkpoint_path,
                 "model_state": model.state_dict(),
                 "model_config": asdict(model_cfg),
                 "config": config,
@@ -2633,7 +3409,25 @@ def main() -> None:
         shutdown_workers = getattr(loader_iter, "_shutdown_workers", None)
         if callable(shutdown_workers):
             stack.callback(shutdown_workers)
-        if balanced_backward:
+        if raw_direction_mse_two_loss:
+            regression_cfg = config["direction_regression"]
+            backward_description = (
+                "backward=K1-scaled-raw-p16-vector-MSE"
+                f"(target_radius={regression_cfg['target_radius']},"
+                "normalization=half_squared_l2/radius^2) "
+                "plus=10*structural_log_scale "
+                "behavioral=disabled cosine=disabled InfoNCE=disabled"
+            )
+        elif raw_direction_mse:
+            regression_cfg = config["direction_regression"]
+            backward_description = (
+                "backward=K1-scaled-raw-p16-vector-MSE"
+                f"(target_radius={regression_cfg['target_radius']},"
+                "normalization=half_squared_l2/radius^2) "
+                "scale_only=10*behavioral_log_scale+10*structural_log_scale "
+                "cosine=disabled InfoNCE=disabled"
+            )
+        elif balanced_backward:
             backward_description = (
                 "backward=bottleneck-gradient-RMS-bisector "
                 "tasks=(behavioral+structural)-direction,(behavioral+structural)-scale"
@@ -2662,15 +3456,29 @@ def main() -> None:
                     f"(temperature={contrastive_cfg['temperature']},"
                     f"lambda={contrastive_cfg['coefficient']},target=detached)"
                 )
+            if decoder_thaw:
+                thaw = config["decoder_thaw"]
+                backward_description += (
+                    " optimizer=encoder-Adam-continuation+decoder-fresh-Adam "
+                    f"decoder_lr=linear({thaw['decoder_start_learning_rate']}->"
+                    f"{thaw['decoder_target_learning_rate']} over "
+                    f"{thaw['ramp_steps']} branch steps)"
+                )
         print(
             "[direct-normalized-production] stage=train "
-            f"steps={steps} batch={batch_size} lr={effective_learning_rate} constant "
+            f"steps={steps} batch={batch_size} encoder_lr={effective_learning_rate} "
+            f"scheduler={config['scheduler']} "
             f"objective={config.get('objective', 'behavioral_plus_structural')} "
             + backward_description,
             flush=True,
         )
 
         for step in range(start_step + 1, steps + 1):
+            thaw_state = (
+                _set_decoder_thaw_learning_rates(optimizer, config, step=step)
+                if decoder_thaw
+                else {}
+            )
             cpu_batch = _batch_from_stream(stream, batch_size)
             layout_groups = (
                 _exact_layout_groups(
@@ -2707,6 +3515,7 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 pred_dirs: torch.Tensor | None = None
                 pred_log_scales: torch.Tensor | None = None
+                raw_direction_logits: torch.Tensor | None = None
                 if polar_tails:
                     (
                         prediction,
@@ -2725,6 +3534,14 @@ def main() -> None:
                         activation_sample_mask=x_mask,
                         token_valid_mask=token_valid,
                     )
+                    if raw_direction_mse:
+                        raw_direction_logits = getattr(
+                            model, "_last_direction_raw_logits", None
+                        )
+                        if raw_direction_logits is None:
+                            raise RuntimeError(
+                                "raw direction MSE schema did not capture direction logits"
+                            )
                 else:
                     prediction, _latent, _telemetry = model(
                         content,
@@ -2751,16 +3568,40 @@ def main() -> None:
                     if polar_tails:
                         if pred_dirs is None or pred_log_scales is None:
                             raise RuntimeError("polar model did not return output coordinates")
-                        legacy_task_loss, parts = _polar_routed_production_loss(
-                            X,
-                            W,
-                            pred_dirs,
-                            pred_log_scales,
-                            x_mask,
-                            d_in_mask,
-                            d_out_mask,
-                            config["loss"],
-                        )
+                        if raw_direction_mse:
+                            if raw_direction_logits is None:
+                                raise RuntimeError("raw direction logits are unavailable")
+                            (
+                                legacy_task_loss,
+                                parts,
+                                raw_direction_objective,
+                                raw_scale_objective,
+                            ) = _polar_raw_direction_mse_production_loss(
+                                X,
+                                W,
+                                raw_direction_logits,
+                                pred_dirs,
+                                pred_log_scales,
+                                x_mask,
+                                d_in_mask,
+                                d_out_mask,
+                                config["loss"],
+                                config["direction_regression"],
+                            )
+                            if gradient_due:
+                                component_direction_loss = raw_direction_objective
+                                component_scale_loss = raw_scale_objective
+                        else:
+                            legacy_task_loss, parts = _polar_routed_production_loss(
+                                X,
+                                W,
+                                pred_dirs,
+                                pred_log_scales,
+                                x_mask,
+                                d_in_mask,
+                                d_out_mask,
+                                config["loss"],
+                            )
                     else:
                         legacy_task_loss, parts = _production_loss(
                             X,
@@ -2772,7 +3613,7 @@ def main() -> None:
                             config["loss"],
                             pred_dirs=pred_dirs,
                         )
-                    if polar_tails and gradient_due:
+                    if polar_tails and gradient_due and not raw_direction_mse:
                         if pred_dirs is None or pred_log_scales is None:
                             raise RuntimeError("polar model did not return output coordinates")
                         component_direction_loss, component_scale_loss = (
@@ -2917,11 +3758,17 @@ def main() -> None:
                 gradient_row = {
                     "schema": run_schema,
                     "step": step,
+                    **thaw_state,
                     **balance_stats,
                     **component_stats,
                     "latent_objective_gradients": latent_gradient_stats,
                     "direction_scale_component_gradients": component_gradient_rows,
                     "groups": _gradient_telemetry(model),
+                    "parameter_training_scope": {
+                        key: value
+                        for key, value in parameter_training_scope.items()
+                        if key not in {"trainable_parameter_names", "frozen_parameter_names"}
+                    },
                 }
                 if gauge_fixed_direction:
                     gradient_row.update(_direction_gauge_telemetry(model, optimizer))
@@ -2945,21 +3792,33 @@ def main() -> None:
                     for depth in range(1, model_cfg.encoder_depth + 1):
                         if gradient_row["groups"][f"encoder_block_{depth}"]["gradient_rms"] <= 0:
                             raise RuntimeError(f"encoder block {depth} is gradient-dead")
-                    decoder_depth = (
-                        model.shared_decoder_depth if polar_tails else model_cfg.decoder_depth
-                    )
-                    for depth in range(1, decoder_depth + 1):
-                        if gradient_row["groups"][f"decoder_block_{depth}"]["gradient_rms"] <= 0:
-                            raise RuntimeError(f"decoder block {depth} is gradient-dead")
-                    if polar_tails:
-                        for group in (
-                            "direction_tail",
-                            "scale_tail",
-                            "direction_head",
-                            "scale_head",
-                        ):
-                            if gradient_row["groups"][group]["gradient_rms"] <= 0:
-                                raise RuntimeError(f"polar group {group} is gradient-dead")
+                    if config.get("training_scope") is None:
+                        decoder_depth = (
+                            model.shared_decoder_depth if polar_tails else model_cfg.decoder_depth
+                        )
+                        for depth in range(1, decoder_depth + 1):
+                            if gradient_row["groups"][f"decoder_block_{depth}"]["gradient_rms"] <= 0:
+                                raise RuntimeError(f"decoder block {depth} is gradient-dead")
+                        if polar_tails:
+                            for group in (
+                                "direction_tail",
+                                "scale_tail",
+                                "direction_head",
+                                "scale_head",
+                            ):
+                                if gradient_row["groups"][group]["gradient_rms"] <= 0:
+                                    raise RuntimeError(f"polar group {group} is gradient-dead")
+                    else:
+                        frozen_with_grad = [
+                            name
+                            for name, parameter in model.named_parameters()
+                            if not parameter.requires_grad and parameter.grad is not None
+                        ]
+                        if frozen_with_grad:
+                            raise RuntimeError(
+                                "frozen decoder received parameter gradients: "
+                                f"{frozen_with_grad}"
+                            )
             grad_norm = float(
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), float(config["grad_clip_norm"])
@@ -2983,18 +3842,34 @@ def main() -> None:
                     "schema": run_schema,
                     "step": step,
                     "loss": float(loss.detach().item()),
-                    "legacy_task_loss": float(legacy_task_loss.detach().item()),
-                    "latent_anticollapse_weighted_loss": float(
-                        weighted_anticollapse_loss.detach().item()
+                    "task_loss": float(legacy_task_loss.detach().item()),
+                    **(
+                        {}
+                        if raw_direction_mse
+                        else {
+                            "legacy_task_loss": float(
+                                legacy_task_loss.detach().item()
+                            )
+                        }
                     ),
-                    "direction_contrastive_weighted_loss": float(
-                        weighted_direction_contrastive_loss.detach().item()
+                    **(
+                        {}
+                        if raw_direction_mse
+                        else {
+                            "latent_anticollapse_weighted_loss": float(
+                                weighted_anticollapse_loss.detach().item()
+                            ),
+                            "direction_contrastive_weighted_loss": float(
+                                weighted_direction_contrastive_loss.detach().item()
+                            ),
+                        }
                     ),
                     **anticollapse_stats,
                     **direction_contrastive_stats,
                     **{key: float(value.item()) for key, value in parts.items()},
                     "grad_norm_pre_clip": grad_norm,
                     "learning_rate": effective_learning_rate,
+                    **thaw_state,
                     "elapsed_seconds": elapsed,
                     "steps_per_second": step / max(elapsed, 1.0e-9),
                     "committed_logical_index": committed_logical_index,
@@ -3003,18 +3878,42 @@ def main() -> None:
                     **gauge_stats,
                 }
                 _append_jsonl(metrics_path, row)
-                print(
-                    "[direct-normalized-production] stage=train "
-                    f"step={step}/{steps} loss={row['loss']:.6f} "
-                    f"legacy={row['legacy_task_loss']:.6f} "
-                    f"anti={row['latent_anticollapse_weighted_loss']:.6f} "
-                    f"direction_nce={row['direction_contrastive_weighted_loss']:.6f} "
-                    f"behavioral={row['behavioral']:.6f} structural={row['structural']:.6f} "
-                    f"grad={grad_norm:.4e} lr={effective_learning_rate:.3e} "
-                    f"rate={row['steps_per_second']:.3f}_steps_per_s "
-                    f"peak={row['cuda_peak_gib']:.2f}GiB",
-                    flush=True,
-                )
+                if raw_direction_mse:
+                    print(
+                        "[direct-normalized-production] stage=train "
+                        f"step={step}/{steps} loss={row['loss']:.6f} "
+                        f"raw_direction_mse={row['raw_direction_mse']:.6f} "
+                        f"behavioral_scale={row['behavioral_scale']:.6f} "
+                        f"structural_scale={row['structural_scale']:.6f} "
+                        f"raw_radius_median={row['raw_direction_pred_radius_median']:.6f} "
+                        f"grad={grad_norm:.4e} lr={effective_learning_rate:.3e} "
+                        + (
+                            f"decoder_lr={thaw_state['decoder_learning_rate']:.3e} "
+                            if decoder_thaw
+                            else ""
+                        )
+                        + f"rate={row['steps_per_second']:.3f}_steps_per_s "
+                        f"peak={row['cuda_peak_gib']:.2f}GiB",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[direct-normalized-production] stage=train "
+                        f"step={step}/{steps} loss={row['loss']:.6f} "
+                        f"legacy={row['legacy_task_loss']:.6f} "
+                        f"anti={row['latent_anticollapse_weighted_loss']:.6f} "
+                        f"direction_nce={row['direction_contrastive_weighted_loss']:.6f} "
+                        f"behavioral={row['behavioral']:.6f} structural={row['structural']:.6f} "
+                        f"grad={grad_norm:.4e} lr={effective_learning_rate:.3e} "
+                        + (
+                            f"decoder_lr={thaw_state['decoder_learning_rate']:.3e} "
+                            if decoder_thaw
+                            else ""
+                        )
+                        + f"rate={row['steps_per_second']:.3f}_steps_per_s "
+                        f"peak={row['cuda_peak_gib']:.2f}GiB",
+                        flush=True,
+                    )
             if step % int(config["plot_every"]) == 0:
                 _plot_metrics(metrics_path, output_root / "train_loss_curve.png")
             if not args.smoke and step % int(config["resume_save_every"]) == 0:
@@ -3031,6 +3930,9 @@ def main() -> None:
                         "schema": run_schema,
                         "step": step,
                         "committed_logical_index": committed_logical_index,
+                        "initial_committed_logical_index": initial_committed_logical_index,
+                        "source_checkpoint_step": source_checkpoint_step,
+                        "source_checkpoint_path": source_checkpoint_path,
                     },
                 )
                 print(f"[direct-normalized-production] stage=stopped step={step}", flush=True)
@@ -3045,6 +3947,9 @@ def main() -> None:
         "complete": True,
         "step": steps,
         "committed_logical_index": committed_logical_index,
+        "initial_committed_logical_index": initial_committed_logical_index,
+        "source_checkpoint_step": source_checkpoint_step,
+        "source_checkpoint_path": source_checkpoint_path,
         "elapsed_seconds": time.monotonic() - started,
         "cuda_peak_gib": torch.cuda.max_memory_allocated(device) / (1024**3),
         "metrics_path": str(metrics_path),
